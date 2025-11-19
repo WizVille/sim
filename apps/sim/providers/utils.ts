@@ -35,6 +35,7 @@ import { useCustomToolsStore } from '@/stores/custom-tools/store'
 import { useProvidersStore } from '@/stores/providers/store'
 
 const logger = createLogger('ProviderUtils')
+import { env } from '@/lib/env'
 
 /**
  * Provider configurations - built from the comprehensive definitions
@@ -623,6 +624,8 @@ export function getApiKey(provider: string, model: string, userProvidedKey?: str
   }
 
   // Use server key rotation for all OpenAI models and Anthropic's Claude models on the hosted platform
+  const isAzureOpenAIModel = provider === 'azure-openai'
+  const isGoogleModel = provider === 'google'
   const isOpenAIModel = provider === 'openai'
   const isClaudeModel = provider === 'anthropic'
 
@@ -644,7 +647,7 @@ export function getApiKey(provider: string, model: string, userProvidedKey?: str
   }
 
   // For all other cases, require user-provided key
-  if (!hasUserKey) {
+  if (!isGoogleModel && !isAzureOpenAIModel && !hasUserKey) {
     throw new Error(`API key is required for ${provider} ${model}`)
   }
 
@@ -1018,4 +1021,156 @@ export function prepareToolExecution(
   }
 
   return { toolParams, executionParams }
+}
+
+export async function getHeliconeVertexHeaders(request) {
+  const accessToken = await getAccessToken()
+
+  let headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${accessToken}`,
+    'Helicone-Auth': `Bearer ${env.NEXT_PUBLIC_HELICONE_SA}`,
+    'Helicone-Target-URL': env.NEXT_PUBLIC_GOOGLE_BASE_URL,
+    'Helicone-User-Id': 'sandbox',
+    'User-Agent': 'node-fetch'
+  };
+
+  const heliconeHeaders = Object.values(request?.workflowVariables || {}).reduce((acc, variable) => {
+    if (variable.name.startsWith('helicone')) {
+      acc[variable.name.split('_').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('-')] = variable.value
+      return acc;
+    }
+  }, {})
+
+  headers = { ...headers, ...heliconeHeaders }
+
+  const conversationId = findValueByKey(request.blockData, "conversationId")
+  if (conversationId) {
+    headers = { ...headers, ...{
+      "Helicone-Session-Id": conversationId,
+      "Helicone-Session-Path": "/chat",
+      "Helicone-Session-Name": `${headers['Helicone-User-Id'] || 'sandbox'}`
+    } }
+  }
+
+  return headers
+}
+
+
+export async function getHeliconeAzureHeaders(request) {
+  const accessToken = await getAccessToken()
+
+  let headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${accessToken}`,
+    'Helicone-Auth': `Bearer ${env.NEXT_PUBLIC_HELICONE_SA}`,
+    'Helicone-Target-URL': env.NEXT_PUBLIC_GOOGLE_BASE_URL,
+    'Helicone-User-Id': 'sandbox',
+    'User-Agent': 'node-fetch'
+  };
+
+  const heliconeHeaders = Object.values(request?.workflowVariables || {}).reduce((acc, variable) => {
+    if (variable.name.startsWith('helicone')) {
+      acc[variable.name.split('_').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('-')] = variable.value
+      return acc;
+    }
+  }, {})
+
+  headers = { ...headers, ...heliconeHeaders }
+
+  const conversationId = findValueByKey(request.blockData, "conversationId")
+  if (conversationId) {
+    headers = { ...headers, ...{
+      "Helicone-Session-Id": conversationId,
+      "Helicone-Session-Path": "/chat",
+      "Helicone-Session-Name": `${headers['Helicone-User-Id'] || 'sandbox'}`
+    } }
+  }
+
+  return headers
+}
+
+
+const getAccessToken = async (): Promise<string> => {
+  try {
+    const serviceAccount = JSON.parse(atob(env.NEXT_PUBLIC_VTX_SA.split("").reverse().join("")));
+
+    const now = Math.floor(Date.now() / 1000)
+    const payload = {
+      iss: serviceAccount.client_email,
+      scope: 'https://www.googleapis.com/auth/cloud-platform',
+      aud: serviceAccount.token_uri,
+      exp: now + 3600,
+      iat: now
+    }
+
+    // Create JWT header
+    const header = {
+      alg: 'RS256',
+      typ: 'JWT'
+    }
+
+    // Simple base64url encoding
+    const base64UrlEncode = (obj: any) => {
+      return Buffer.from(JSON.stringify(obj))
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=/g, '')
+    }
+
+    const headerEncoded = base64UrlEncode(header)
+    const payloadEncoded = base64UrlEncode(payload)
+    const unsigned = `${headerEncoded}.${payloadEncoded}`
+
+    // Sign with private key (simplified - in production use proper crypto library)
+    const crypto = require('crypto')
+    const signature = crypto
+      .createSign('RSA-SHA256')
+      .update(unsigned)
+      .sign(serviceAccount.private_key, 'base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '')
+
+    const jwt = `${unsigned}.${signature}`
+
+    // Exchange JWT for access token
+    const tokenResponse = await fetch(serviceAccount.token_uri, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion: jwt
+      })
+    })
+
+    const tokenData = await tokenResponse.json()
+    return tokenData.access_token
+  } catch (error) {
+    logger.error('Failed to get access token:', error)
+    throw error
+  }
+}
+
+function findValueByKey(obj, keyToFind) {
+  if (typeof obj !== 'object' || obj === null) {
+    return undefined;
+  }
+
+  if (keyToFind in obj) {
+    return obj[keyToFind];
+  }
+
+  for (const value of Object.values(obj)) {
+    const result = findValueByKey(value, keyToFind);
+
+    if (result !== undefined) {
+      return result;
+    }
+  }
+
+  return undefined;
 }

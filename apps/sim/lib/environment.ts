@@ -41,3 +41,5 @@ export const isEmailVerificationEnabled = isTruthy(env.EMAIL_VERIFICATION_ENABLE
 export function getCostMultiplier(): number {
   return isProd ? (env.COST_MULTIPLIER ?? 1) : 1
 }
+
+export const availableModels = ['gemini-2.5-flash', 'azure/gpt-5-nano', 'gemini-2.5-flash-lite']

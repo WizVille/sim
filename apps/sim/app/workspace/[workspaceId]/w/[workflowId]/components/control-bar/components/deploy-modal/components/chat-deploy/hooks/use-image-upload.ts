@@ -68,7 +68,7 @@ export function useImageUpload({
           Object.assign(uploadHeaders, presignedData.uploadHeaders)
         }
 
-        const uploadResponse = await fetch(presignedData.uploadUrl, {
+        const uploadResponse = await fetch(presignedData.presignedUrl, {
           method: 'PUT',
           body: file,
           headers: uploadHeaders,

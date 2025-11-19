@@ -13,6 +13,7 @@ import {
   prepareToolExecution,
   prepareToolsWithUsageControl,
   trackForcedToolUsage,
+  getHeliconeAzureHeaders
 } from '@/providers/utils'
 import { executeTool } from '@/tools'
 
@@ -96,9 +97,10 @@ export const azureOpenAIProvider: ProviderConfig = {
 
     // API key is now handled server-side before this function is called
     const azureOpenAI = new AzureOpenAI({
-      apiKey: request.apiKey,
+      apiKey: request.apiKey || env.AZURE_OPENAI_API_KEY,
       apiVersion: azureApiVersion,
       endpoint: azureEndpoint,
+      defaultHeaders: getHeliconeAzureHeaders(request)
     })
 
     // Start with an empty array for all messages

@@ -37,6 +37,7 @@ sim-standalone.tar.gz
 .env.development
 .env.test
 .env.production
+RunFile.rb
 
 # vercel
 .vercel

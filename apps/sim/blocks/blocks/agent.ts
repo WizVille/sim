@@ -1,5 +1,5 @@
 import { AgentIcon } from '@/components/icons'
-import { isHosted } from '@/lib/environment'
+import { isHosted, availableModels } from '@/lib/environment'
 import { createLogger } from '@/lib/logs/console/logger'
 import type { BlockConfig } from '@/blocks/types'
 import { AuthMode } from '@/blocks/types'
@@ -65,7 +65,7 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
   longDescription:
     'The Agent block is a core workflow block that is a wrapper around an LLM. It takes in system/user prompts and calls an LLM provider. It can also make tool calls by directly containing tools inside of its tool input. It can additionally return structured output.',
   bestPractices: `
-  - Cannot use core blocks like API, Webhook, Function, Workflow, Memory as tools. Only integrations or custom tools. 
+  - Cannot use core blocks like API, Webhook, Function, Workflow, Memory as tools. Only integrations or custom tools.
   - Check custom tools examples for YAML syntax. Only construct these if there isn't an existing integration for that purpose.
   - Response Format should be a valid JSON Schema. This determines the output of the agent only if present. Fields can be accessed at root level by the following blocks: e.g. <agent1.field>. If response format is not present, the agent will return the standard outputs: content, model, tokens, toolCalls.
   `,
@@ -164,7 +164,7 @@ Create a system prompt appropriately detailed for the request, using clear langu
         const openrouterModels = providersState.providers.openrouter.models
         const allModels = Array.from(new Set([...baseModels, ...ollamaModels, ...openrouterModels]))
 
-        return allModels.map((model) => {
+        return availableModels.map((model) => {
           const icon = getProviderIcon(model)
           return { label: model, id: model, ...(icon && { icon }) }
         })
@@ -245,7 +245,7 @@ Create a system prompt appropriately detailed for the request, using clear langu
       placeholder: 'Enter your API key',
       password: true,
       connectionDroppable: false,
-      required: true,
+      required: false,
       // Hide API key for hosted models and Ollama models
       condition: isHosted
         ? {
@@ -256,7 +256,7 @@ Create a system prompt appropriately detailed for the request, using clear langu
         : () => ({
             field: 'model',
             value: getCurrentOllamaModels(),
-            not: true, // Show for all models EXCEPT Ollama models
+            not: false, // Show for all models EXCEPT Ollama models
           }),
     },
     {
@@ -268,7 +268,7 @@ Create a system prompt appropriately detailed for the request, using clear langu
       connectionDroppable: false,
       condition: {
         field: 'model',
-        value: providers['azure-openai'].models,
+        value: [] || providers['azure-openai'].models,
       },
     },
     {
@@ -279,7 +279,7 @@ Create a system prompt appropriately detailed for the request, using clear langu
       connectionDroppable: false,
       condition: {
         field: 'model',
-        value: providers['azure-openai'].models,
+        value: [] || providers['azure-openai'].models,
       },
     },
     {
