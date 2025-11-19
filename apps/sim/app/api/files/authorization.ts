@@ -115,7 +115,7 @@ export async function verifyFileAccess(
     const inferredContext = context || inferContextFromKey(cloudKey)
 
     // 0. Profile pictures: Public access (anyone can view creator profile pictures)
-    if (inferredContext === 'profile-pictures') {
+    if (inferredContext === 'profile-pictures' || inferredContext === 'chat') {
       logger.info('Profile picture access allowed (public)', { cloudKey })
       return true
     }
