@@ -78,8 +78,7 @@ async function callEmbeddingAPI(inputs: string[], config: EmbeddingConfig): Prom
       const response = await fetch(config.apiUrl, {
         method: 'POST',
         headers: config.headers,
-        body: JSON.stringify(requestBody),
-        verbose: true
+        body: JSON.stringify(requestBody)
       })
 
       if (!response.ok) {
