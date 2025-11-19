@@ -79,6 +79,7 @@ async function callEmbeddingAPI(inputs: string[], config: EmbeddingConfig): Prom
         method: 'POST',
         headers: config.headers,
         body: JSON.stringify(requestBody),
+        verbose: true
       })
 
       if (!response.ok) {
