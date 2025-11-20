@@ -42,4 +42,4 @@ export function getCostMultiplier(): number {
   return isProd ? (env.COST_MULTIPLIER ?? 1) : 1
 }
 
-export const availableModels = ['gemini-2.5-flash', 'azure/gpt-5-nano', 'gemini-2.5-flash-lite']
+export const availableModels = ['azure/gpt-5-nano', 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite']

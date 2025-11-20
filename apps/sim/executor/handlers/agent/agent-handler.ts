@@ -18,6 +18,7 @@ import { getApiKey, getProviderFromModel, transformBlockTool } from '@/providers
 import type { SerializedBlock } from '@/serializer/types'
 import { executeTool } from '@/tools'
 import { getTool, getToolAsync } from '@/tools/utils'
+import { getMaxTokens } from '@/providers/models'
 
 const logger = createLogger('AgentBlockHandler')
 
@@ -446,7 +447,7 @@ export class AgentBlockHandler implements BlockHandler {
       context: stringifyJSON(messages),
       tools: formattedTools,
       temperature: inputs.temperature,
-      maxTokens: inputs.maxTokens,
+      maxTokens: inputs.maxTokens || getMaxTokens(model),
       apiKey: inputs.apiKey,
       azureEndpoint: inputs.azureEndpoint,
       azureApiVersion: inputs.azureApiVersion,

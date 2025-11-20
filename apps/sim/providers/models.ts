@@ -599,6 +599,7 @@ export const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     modelPatterns: [/^gemini/],
     capabilities: {
       toolUsageControl: true,
+      maxTokens: 10000
     },
     icon: GeminiIcon,
     models: [
@@ -1368,4 +1369,12 @@ export function getModelsWithVerbosity(): string[] {
     }
   }
   return models
+}
+
+/**
+ * Get maximum temperature for a model
+ */
+export function getMaxTokens(modelId: string): number | undefined {
+  const capabilities = getModelCapabilities(modelId)
+  return capabilities?.maxTokens
 }
