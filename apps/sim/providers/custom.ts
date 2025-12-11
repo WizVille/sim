@@ -4,34 +4,13 @@ import { AzureOpenAI } from 'openai'
 export async function getHeliconeVertexHeaders(request) {
   const accessToken = await getAccessToken()
 
-  let headers = {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${accessToken}`,
-    'Helicone-Auth': `Bearer ${getEnv('NEXT_PUBLIC_HELICONE_SA')}`,
-    'Helicone-Target-URL': getEnv('NEXT_PUBLIC_GOOGLE_BASE_URL'),
-    'Helicone-User-Id': 'sandbox',
-    'User-Agent': 'node-fetch'
-  };
-
-  const heliconeHeaders = Object.values(request?.workflowVariables || {}).reduce((acc, variable) => {
-    if (variable.name.startsWith('helicone')) {
-      acc[variable.name.split('_').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('-')] = variable.value
-      return acc;
-    }
-  }, {})
-
-  headers = { ...headers, ...heliconeHeaders }
-
-  const conversationId = findValueByKey(request.blockData, "conversationId")
-  if (conversationId) {
-    headers = { ...headers, ...{
-      "Helicone-Session-Id": conversationId,
-      "Helicone-Session-Path": "/chat",
-      "Helicone-Session-Name": `${headers['Helicone-User-Id'] || 'sandbox'}`
-    } }
+  return {
+    ...{
+      'Authorization': `Bearer ${accessToken}`,
+      'Helicone-Target-URL': getEnv('NEXT_PUBLIC_GOOGLE_BASE_URL')
+    },
+    ...getHeliconeHeaders(request)
   }
-
-  return headers
 }
 
 export function getHeliconeAzureOpenAI(request) {
@@ -47,11 +26,34 @@ export function getHeliconeAzureOpenAI(request) {
 }
 
 export function getHeliconeAzureHeaders(request) {
+  return {
+    ...{
+        'Helicone-OpenAI-Api-Base': getEnv('AZURE_OPENAI_ENDPOINT'),
+        "api-key": getEnv('AZURE_OPENAI_API_KEY'),
+    },
+    ...getHeliconeHeaders(request)
+  }
+}
+
+const getAccessToken = async (): Promise<string> => {
+  const endpoint = getEnv('NEXT_PUBLIC_WIZVILLE_APP_URL') || getEnv('NEXT_PUBLIC_APP_URL').replace("ai.", "app.").replace("3003", "3000")
+  const response = await fetch(
+    `${endpoint}/api/ilovellm/google_access_token?hsa=${getEnv('NEXT_PUBLIC_HELICONE_SA')}`,
+    {
+      headers: {
+        'Content-Type': 'application/json',
+      }
+    }
+  );
+  const body = await response.json()
+  return body.token
+}
+
+function getHeliconeHeaders(request) {
   let headers = {
     'Content-Type': 'application/json',
     'Helicone-Auth': `Bearer ${getEnv('NEXT_PUBLIC_HELICONE_SA')}`,
-    'Helicone-OpenAI-Api-Base': getEnv('AZURE_OPENAI_ENDPOINT'),
-    "api-key": getEnv('AZURE_OPENAI_API_KEY'),
+    "Helicone-Cache-Enabled": "true",
     'Helicone-User-Id': 'sandbox',
     'User-Agent': 'node-fetch'
   };
@@ -75,20 +77,6 @@ export function getHeliconeAzureHeaders(request) {
   }
 
   return headers
-}
-
-const getAccessToken = async (): Promise<string> => {
-  const endpoint = getEnv('NEXT_PUBLIC_WIZVILLE_APP_URL') || getEnv('NEXT_PUBLIC_APP_URL').replace("ai.", "app.").replace("3003", "3000")
-  const response = await fetch(
-    `${endpoint}/api/ilovellm/google_access_token?hsa=${getEnv('NEXT_PUBLIC_HELICONE_SA')}`,
-    {
-      headers: {
-        'Content-Type': 'application/json',
-      }
-    }
-  );
-  const body = await response.json()
-  return body.token
 }
 
 function findValueByKey(obj, keyToFind) {
