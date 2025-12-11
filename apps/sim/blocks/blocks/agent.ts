@@ -69,7 +69,7 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
   longDescription:
     'The Agent block is a core workflow block that is a wrapper around an LLM. It takes in system/user prompts and calls an LLM provider. It can also make tool calls by directly containing tools inside of its tool input. It can additionally return structured output.',
   bestPractices: `
-  - Cannot use core blocks like API, Webhook, Function, Workflow, Memory as tools. Only integrations or custom tools. 
+  - Cannot use core blocks like API, Webhook, Function, Workflow, Memory as tools. Only integrations or custom tools.
   - Check custom tools examples for YAML syntax. Only construct these if there isn't an existing integration for that purpose.
   - Response Format should be a valid JSON Schema. This determines the output of the agent only if present. Fields can be accessed at root level by the following blocks: e.g. <agent1.field>. If response format is not present, the agent will return the standard outputs: content, model, tokens, toolCalls.
   `,
@@ -101,7 +101,9 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
           new Set([...baseModels, ...ollamaModels, ...vllmModels, ...openrouterModels])
         )
 
-        return allModels.map((model) => {
+
+
+        return allModels.filter(m => ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-pro', 'azure/gpt-5', 'azure/gpt-5-mini', 'azure/gpt-5-nano', 'azure/gpt-5.1'].includes(m)).map((model) => {
           const icon = getProviderIcon(model)
           return { label: model, id: model, ...(icon && { icon }) }
         })
@@ -152,7 +154,7 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
       connectionDroppable: false,
       condition: {
         field: 'model',
-        value: providers['azure-openai'].models,
+        value: [] || providers['azure-openai'].models,
       },
     },
     {
@@ -163,7 +165,7 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
       connectionDroppable: false,
       condition: {
         field: 'model',
-        value: providers['azure-openai'].models,
+        value: [] || providers['azure-openai'].models,
       },
     },
     {
@@ -190,7 +192,7 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
         : () => ({
             field: 'model',
             value: [...getCurrentOllamaModels(), ...getCurrentVLLMModels()],
-            not: true, // Show for all models EXCEPT Ollama and vLLM models
+            not: false, // Show for all models EXCEPT Ollama and vLLM models
           }),
     },
     {
