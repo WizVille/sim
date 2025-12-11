@@ -101,7 +101,7 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
           new Set([...baseModels, ...ollamaModels, ...vllmModels, ...openrouterModels])
         )
 
-        return allModels.filter(m => m.startsWith('gemini-2.5')).map((model) => {
+        return allModels.filter(m => ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-pro', 'azure/gpt-5', 'azure/gpt-5-mini', 'azure/gpt-5-nano', 'azure/gpt-5.1'].includes(m)).map((model) => {
           const icon = getProviderIcon(model)
           return { label: model, id: model, ...(icon && { icon }) }
         })
@@ -152,7 +152,7 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
       connectionDroppable: false,
       condition: {
         field: 'model',
-        value: providers['azure-openai'].models,
+        value: [] || providers['azure-openai'].models,
       },
     },
     {
@@ -163,7 +163,7 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
       connectionDroppable: false,
       condition: {
         field: 'model',
-        value: providers['azure-openai'].models,
+        value: [] || providers['azure-openai'].models,
       },
     },
     {

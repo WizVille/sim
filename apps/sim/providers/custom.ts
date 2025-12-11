@@ -1,4 +1,5 @@
 import { getEnv, isTruthy } from '@/lib/core/config/env'
+import { AzureOpenAI } from 'openai'
 
 export async function getHeliconeVertexHeaders(request) {
   const accessToken = await getAccessToken()
@@ -33,15 +34,24 @@ export async function getHeliconeVertexHeaders(request) {
   return headers
 }
 
+export function getHeliconeAzureOpenAI(request) {
+  const azureEndpoint = "https://oai.helicone.ai"
+  const azureApiVersion = request.azureApiVersion || getEnv('AZURE_OPENAI_API_VERSION') || '2024-07-01-preview'
 
-export async function getHeliconeAzureHeaders(request) {
-  const accessToken = await getAccessToken()
+  return new AzureOpenAI({
+    apiKey: request.apiKey || getEnv('AZURE_OPENAI_API_KEY'),
+    apiVersion: azureApiVersion,
+    endpoint: azureEndpoint,
+    defaultHeaders: getHeliconeAzureHeaders(request)
+  })
+}
 
+export function getHeliconeAzureHeaders(request) {
   let headers = {
     'Content-Type': 'application/json',
-    'Authorization': `Bearer ${accessToken}`,
     'Helicone-Auth': `Bearer ${getEnv('NEXT_PUBLIC_HELICONE_SA')}`,
-    'Helicone-Target-URL': getEnv('NEXT_PUBLIC_GOOGLE_BASE_URL'),
+    'Helicone-OpenAI-Api-Base': getEnv('AZURE_OPENAI_ENDPOINT'),
+    "api-key": getEnv('AZURE_OPENAI_API_KEY'),
     'Helicone-User-Id': 'sandbox',
     'User-Agent': 'node-fetch'
   };
@@ -68,7 +78,7 @@ export async function getHeliconeAzureHeaders(request) {
 }
 
 const getAccessToken = async (): Promise<string> => {
-  const endpoint = getEnv('NEXT_PUBLIC_APP_URL').replace("ai.", "app.").replace("3003", "3000")
+  const endpoint = getEnv('NEXT_PUBLIC_WIZVILLE_APP_URL') || getEnv('NEXT_PUBLIC_APP_URL').replace("ai.", "app.").replace("3003", "3000")
   const response = await fetch(
     `${endpoint}/api/ilovellm/google_access_token?hsa=${getEnv('NEXT_PUBLIC_HELICONE_SA')}`,
     {

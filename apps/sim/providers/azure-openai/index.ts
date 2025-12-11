@@ -1,5 +1,6 @@
-import { AzureOpenAI } from 'openai'
+import { getHeliconeAzureOpenAI } from '@/providers/custom'
 import { env } from '@/lib/core/config/env'
+import { AzureOpenAI } from 'openai'
 import { createLogger } from '@/lib/logs/console/logger'
 import type { StreamingExecution } from '@/executor/types'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
@@ -95,11 +96,7 @@ export const azureOpenAIProvider: ProviderConfig = {
     }
 
     // API key is now handled server-side before this function is called
-    const azureOpenAI = new AzureOpenAI({
-      apiKey: request.apiKey,
-      apiVersion: azureApiVersion,
-      endpoint: azureEndpoint,
-    })
+    const azureOpenAI = getHeliconeAzureOpenAI(request)
 
     // Start with an empty array for all messages
     const allMessages = []
