@@ -1,3 +1,5 @@
+import { getEnv } from '@/lib/core/config/env'
+import { getHeliconeVertexHeaders } from '@/providers/custom'
 import { createLogger } from '@/lib/logs/console/logger'
 import type { StreamingExecution } from '@/executor/types'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
@@ -218,9 +220,9 @@ export const googleProvider: ProviderConfig = {
   executeRequest: async (
     request: ProviderRequest
   ): Promise<ProviderResponse | StreamingExecution> => {
-    if (!request.apiKey) {
-      throw new Error('API key is required for Google Gemini')
-    }
+    // if (!request.apiKey) {
+    //   throw new Error('API key is required for Google Gemini')
+    // }
 
     logger.info('Preparing Google Gemini request', {
       model: request.model || 'gemini-2.5-pro',
@@ -321,9 +323,13 @@ export const googleProvider: ProviderConfig = {
       const shouldStream = request.stream && !tools?.length
 
       // Use streamGenerateContent for streaming requests
+      const streamGenerateContentEndpoint = `${getEnv('NEXT_PUBLIC_HELICONE_BASE_URL')}/v1/projects/wizville-2014/locations/europe-west9/publishers/google/models/${requestedModel}:streamGenerateContent`
+      const generateContentEndpoint = `${getEnv('NEXT_PUBLIC_HELICONE_BASE_URL')}/v1/projects/wizville-2014/locations/europe-west9/publishers/google/models/${requestedModel}:generateContent`
+      const headers = await getHeliconeVertexHeaders(request)
       const endpoint = shouldStream
-        ? `https://generativelanguage.googleapis.com/v1beta/models/${requestedModel}:streamGenerateContent?key=${request.apiKey}`
-        : `https://generativelanguage.googleapis.com/v1beta/models/${requestedModel}:generateContent?key=${request.apiKey}`
+        ? streamGenerateContentEndpoint
+        : generateContentEndpoint
+
 
       if (request.stream && tools?.length) {
         logger.info('Streaming disabled for initial request due to tools presence', {
@@ -334,9 +340,7 @@ export const googleProvider: ProviderConfig = {
 
       const response = await fetch(endpoint, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: headers,
         body: JSON.stringify(payload),
       })
 
@@ -650,12 +654,10 @@ export const googleProvider: ProviderConfig = {
                   checkPayload.stream = undefined
 
                   const checkResponse = await fetch(
-                    `https://generativelanguage.googleapis.com/v1beta/models/${requestedModel}:generateContent?key=${request.apiKey}`,
+                    generateContentEndpoint,
                     {
                       method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/json',
-                      },
+                      headers: headers,
                       body: JSON.stringify(checkPayload),
                     }
                   )
@@ -720,12 +722,10 @@ export const googleProvider: ProviderConfig = {
 
                   // Make the streaming request with streamGenerateContent endpoint
                   const streamingResponse = await fetch(
-                    `https://generativelanguage.googleapis.com/v1beta/models/${requestedModel}:streamGenerateContent?key=${request.apiKey}`,
+                    streamGenerateContentEndpoint,
                     {
                       method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/json',
-                      },
+                      headers: headers,
                       body: JSON.stringify(streamingPayload),
                     }
                   )
@@ -838,12 +838,10 @@ export const googleProvider: ProviderConfig = {
                 }
 
                 const nextResponse = await fetch(
-                  `https://generativelanguage.googleapis.com/v1beta/models/${requestedModel}:generateContent?key=${request.apiKey}`,
+                  generateContentEndpoint,
                   {
                     method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                    },
+                    headers: headers,
                     body: JSON.stringify(nextPayload),
                   }
                 )
