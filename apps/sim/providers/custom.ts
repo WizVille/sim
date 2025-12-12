@@ -37,7 +37,7 @@ export async function getHeliconeVertexHeaders(request) {
 
 export function getHeliconeAzureOpenAI(request) {
   const azureEndpoint = "https://oai.helicone.ai"
-  const azureApiVersion = request.azureApiVersion || getEnv('AZURE_OPENAI_API_VERSION') || '2024-07-01-preview'
+  const azureApiVersion = '2025-04-01-preview'
 
   return new AzureOpenAI({
     apiKey: request.apiKey || getEnv('AZURE_OPENAI_API_KEY'),
