@@ -338,6 +338,12 @@ export default function ChatClient({ identifier }: { identifier: string }) {
     }, CHAT_REQUEST_TIMEOUT_MS)
 
     try {
+      let params = new URLSearchParams(document.location.search);
+      const workflowVariables: any = {}
+      for (let [key, value] of params.entries()) {
+        workflowVariables[key] = value
+      }
+
       // Send structured payload to maintain chat context
       const payload: any = {
         input:
@@ -345,8 +351,8 @@ export default function ChatClient({ identifier }: { identifier: string }) {
             ? userMessage.content
             : JSON.stringify(userMessage.content),
         conversationId,
+        workflowVariables
       }
-
       // Add files if present (convert to base64 for JSON transmission)
       if (files && files.length > 0) {
         payload.files = await Promise.all(

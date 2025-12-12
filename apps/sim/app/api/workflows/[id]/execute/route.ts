@@ -86,6 +86,16 @@ export async function executeWorkflow(
   const loggingSession = new LoggingSession(workflowId, executionId, triggerType, requestId)
 
   try {
+    const workflowVariables = (workflow.variables as Record<string, any>) || {}
+    if (input?.workflowVariables) {
+      Object.entries(input.workflowVariables).forEach(([key, value]) => {
+        const workflowVariableContext =  Object.values(workflowVariables).find(item => item.name === key)
+        if (workflowVariableContext) {
+          workflowVariableContext.value = value
+        }
+      })
+    }
+
     const metadata: ExecutionMetadata = {
       requestId,
       executionId,

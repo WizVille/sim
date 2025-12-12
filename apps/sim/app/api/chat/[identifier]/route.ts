@@ -33,6 +33,7 @@ const chatPostBodySchema = z.object({
   email: z.string().email('Invalid email format').optional().or(z.literal('')),
   conversationId: z.string().optional(),
   files: z.array(chatFileSchema).optional().default([]),
+  workflowVariables: z.any().optional().default({})
 })
 
 export const dynamic = 'force-dynamic'
@@ -127,8 +128,7 @@ export async function POST(
       )
     }
 
-    const { input, password, email, conversationId, files } = parsedBody
-
+    const { input, password, email, conversationId, files, workflowVariables } = parsedBody
     if ((password || email) && !input) {
       const response = addCorsHeaders(createSuccessResponse({ authenticated: true }), request)
 
@@ -186,7 +186,7 @@ export async function POST(
       const { SSE_HEADERS } = await import('@/lib/core/utils/sse')
       const { createFilteredResult } = await import('@/app/api/workflows/[id]/execute/route')
 
-      const workflowInput: any = { input, conversationId }
+      const workflowInput: any = { input, conversationId, workflowVariables }
       if (files && Array.isArray(files) && files.length > 0) {
         const executionContext = {
           workspaceId,
