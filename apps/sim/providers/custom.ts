@@ -1,5 +1,17 @@
 import { getEnv, isTruthy } from '@/lib/core/config/env'
 import { AzureOpenAI } from 'openai'
+import OpenAI from 'openai'
+
+export function getHeliconeMistral(request) {
+  console.log("MISTRAL_API_KEY", getEnv('MISTRAL_API_KEY'))
+  const mistral = new OpenAI({
+    baseURL: 'https://mistral.helicone.ai/v1',
+    apiKey: getEnv('MISTRAL_API_KEY'),
+    defaultHeaders: getHeliconeHeaders(request)
+  })
+
+  return mistral
+}
 
 export async function getHeliconeVertexHeaders(request) {
   const accessToken = await getAccessToken()

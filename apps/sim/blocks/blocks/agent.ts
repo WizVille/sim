@@ -101,7 +101,7 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
           new Set([...baseModels, ...ollamaModels, ...vllmModels, ...openrouterModels])
         )
 
-        return allModels.filter(m => ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-pro', 'azure/gpt-5', 'azure/gpt-5-mini', 'azure/gpt-5-nano', 'azure/gpt-5.1'].includes(m)).map((model) => {
+        return allModels.filter(m => ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-pro', 'azure/gpt-5', 'azure/gpt-5-mini', 'azure/gpt-5-nano', 'azure/gpt-5.1', 'mistral-large-latest', 'mistral-medium-latest', 'mistral-small-latest'].includes(m)).map((model) => {
           const icon = getProviderIcon(model)
           return { label: model, id: model, ...(icon && { icon }) }
         })

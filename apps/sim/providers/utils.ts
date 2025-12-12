@@ -642,6 +642,7 @@ export function getApiKey(provider: string, model: string, userProvidedKey?: str
   const isClaudeModel = provider === 'anthropic'
   const isGeminiModel = provider === 'google'
   const isAzureOpenAIModel = provider === 'azure-openai'
+  const isMistralModel = provider === 'mistral'
 
   if (isHosted && (isOpenAIModel || isClaudeModel || isGeminiModel)) {
     // Only use server key if model is explicitly in our hosted list
@@ -662,9 +663,8 @@ export function getApiKey(provider: string, model: string, userProvidedKey?: str
       }
     }
   }
-
   // For all other cases, require user-provided key
-  if (!isGeminiModel && !isAzureOpenAIModel && !hasUserKey) {
+  if (!isMistralModel && !isGeminiModel && !isAzureOpenAIModel && !hasUserKey) {
     throw new Error(`API key is required for ${provider} ${model}`)
   }
 

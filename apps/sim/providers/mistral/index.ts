@@ -1,3 +1,4 @@
+import { getHeliconeMistral } from '@/providers/custom'
 import OpenAI from 'openai'
 import { createLogger } from '@/lib/logs/console/logger'
 import type { StreamingExecution } from '@/executor/types'
@@ -75,14 +76,16 @@ export const mistralProvider: ProviderConfig = {
       stream: !!request.stream,
     })
 
-    if (!request.apiKey) {
-      throw new Error('API key is required for Mistral AI')
-    }
+    // if (!request.apiKey) {
+    //   throw new Error('API key is required for Mistral AI')
+    // }
 
-    const mistral = new OpenAI({
-      apiKey: request.apiKey,
-      baseURL: 'https://api.mistral.ai/v1',
-    })
+    // const mistral = new OpenAI({
+    //   apiKey: request.apiKey,
+    //   baseURL: 'https://api.mistral.ai/v1',
+    // })
+
+    const mistral = getHeliconeMistral(request)
 
     const allMessages = []
 
