@@ -66,6 +66,7 @@ function getHeliconeHeaders(request) {
     'Content-Type': 'application/json',
     'Helicone-Auth': `Bearer ${getEnv('NEXT_PUBLIC_HELICONE_SA')}`,
     "Helicone-Cache-Enabled": "true",
+    "Cache-Control": "max-age=31536000",
     'Helicone-User-Id': 'sandbox',
     'User-Agent': 'node-fetch'
   };
