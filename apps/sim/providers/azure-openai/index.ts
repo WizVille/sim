@@ -49,6 +49,9 @@ export const azureOpenAIProvider: ProviderConfig = {
     })
 
     const azureEndpoint = request.azureEndpoint || env.AZURE_OPENAI_ENDPOINT
+    request.azureApiVersion = '2025-04-01-preview'
+    request.apiKey = env.AZURE_OPENAI_API_KEY
+
     const azureApiVersion =
       request.azureApiVersion || env.AZURE_OPENAI_API_VERSION || '2024-07-01-preview'
 

@@ -114,7 +114,7 @@ export async function getApiKeyWithBYOK(
       workspaceId,
       isHosted,
     })
-    throw new Error(`API key is required for ${provider} ${model}`)
+    // throw new Error(`API key is required for ${provider} ${model}`)
   }
 
   return { apiKey: userProvidedKey, isBYOK: false }

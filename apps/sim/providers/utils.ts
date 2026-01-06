@@ -618,9 +618,9 @@ export function getApiKey(provider: string, model: string, userProvidedKey?: str
     }
   }
 
-  if (!hasUserKey) {
-    throw new Error(`API key is required for ${provider} ${model}`)
-  }
+  // if (!hasUserKey) {
+  //   throw new Error(`API key is required for ${provider} ${model}`)
+  // }
 
   return userProvidedKey!
 }

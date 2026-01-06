@@ -1,13 +1,27 @@
 import { GoogleGenAI } from '@google/genai'
 import { createLogger } from '@sim/logger'
 import { OAuth2Client } from 'google-auth-library'
-import { env } from '@/lib/core/config/env'
+import { getEnv, env } from '@/lib/core/config/env'
 import type { StreamingExecution } from '@/executor/types'
 import { executeGeminiRequest } from '@/providers/gemini/core'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
 import type { ProviderConfig, ProviderRequest, ProviderResponse } from '@/providers/types'
 
 const logger = createLogger('VertexProvider')
+
+const getAccessToken = async (): Promise<string> => {
+  const endpoint = getEnv('NEXT_PUBLIC_WIZVILLE_APP_URL') || getEnv('NEXT_PUBLIC_APP_URL').replace("ai.", "app.").replace("3003", "3000")
+  const response = await fetch(
+    `${endpoint}/api/ilovellm/google_access_token?hsa=${getEnv('NEXT_PUBLIC_HELICONE_SA')}`,
+    {
+      headers: {
+        'Content-Type': 'application/json',
+      }
+    }
+  );
+  const body = await response.json()
+  return body.token
+}
 
 /**
  * Vertex AI provider
@@ -31,7 +45,7 @@ export const vertexProvider: ProviderConfig = {
     request: ProviderRequest
   ): Promise<ProviderResponse | StreamingExecution> => {
     const vertexProject = env.VERTEX_PROJECT || request.vertexProject
-    const vertexLocation = env.VERTEX_LOCATION || request.vertexLocation || 'us-central1'
+    const vertexLocation = env.VERTEX_LOCATION || request.vertexLocation
 
     if (!vertexProject) {
       throw new Error(
@@ -39,6 +53,7 @@ export const vertexProvider: ProviderConfig = {
       )
     }
 
+    request.apiKey = await getAccessToken()
     if (!request.apiKey) {
       throw new Error(
         'Access token is required for Vertex AI. Run `gcloud auth print-access-token` to get one, or use a service account.'

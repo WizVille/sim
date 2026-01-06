@@ -1,3 +1,4 @@
+import { getEnv } from '@/lib/core/config/env'
 import { createLogger } from '@sim/logger'
 import OpenAI from 'openai'
 import type { ChatCompletionCreateParamsStreaming } from 'openai/resources/chat/completions'
@@ -45,6 +46,7 @@ export const mistralProvider: ProviderConfig = {
       stream: !!request.stream,
     })
 
+    request.apiKey = request.apiKey || getEnv('MISTRAL_API_KEY')
     if (!request.apiKey) {
       throw new Error('API key is required for Mistral AI')
     }
