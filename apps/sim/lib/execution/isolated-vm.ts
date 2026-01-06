@@ -4,6 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createLogger } from '@sim/logger'
 import { validateProxyUrl } from '@/lib/core/security/input-validation'
+import { getEnv, env } from '@/lib/core/config/env'
 
 const logger = createLogger('IsolatedVMExecution')
 
@@ -12,7 +13,8 @@ let nodeAvailable: boolean | null = null
 function checkNodeAvailable(): boolean {
   if (nodeAvailable !== null) return nodeAvailable
   try {
-    execSync('node --version', { stdio: 'ignore' })
+    logger.info(`${getEnv('NODE_PATH')}node --version`);
+    execSync(`${getEnv('NODE_PATH')}/node --version`, { stdio: 'ignore' })
     nodeAvailable = true
   } catch {
     nodeAvailable = false
@@ -203,7 +205,7 @@ async function ensureWorker(): Promise<void> {
     }
 
     import('node:child_process').then(({ spawn }) => {
-      worker = spawn('node', [workerPath], {
+      worker = spawn(`${getEnv('NODE_PATH')}node`, [workerPath], {
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         serialization: 'json',
       })
