@@ -12,8 +12,13 @@ import { CareersConfirmationEmail, CareersSubmissionEmail } from '@/components/e
 import {
   BatchInvitationEmail,
   InvitationEmail,
+  PollingGroupInvitationEmail,
   WorkspaceInvitationEmail,
 } from '@/components/emails/invitations'
+import {
+  WorkflowNotificationEmail,
+  type WorkflowNotificationEmailProps,
+} from '@/components/emails/notifications'
 import { HelpConfirmationEmail } from '@/components/emails/support'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 
@@ -184,6 +189,24 @@ export async function renderWorkspaceInvitationEmail(
   )
 }
 
+export async function renderPollingGroupInvitationEmail(params: {
+  inviterName: string
+  organizationName: string
+  pollingGroupName: string
+  provider: 'google-email' | 'outlook'
+  inviteLink: string
+}): Promise<string> {
+  return await render(
+    PollingGroupInvitationEmail({
+      inviterName: params.inviterName,
+      organizationName: params.organizationName,
+      pollingGroupName: params.pollingGroupName,
+      provider: params.provider,
+      inviteLink: params.inviteLink,
+    })
+  )
+}
+
 export async function renderPaymentFailedEmail(params: {
   userName?: string
   amountDue: number
@@ -238,4 +261,10 @@ export async function renderCareersSubmissionEmail(params: {
       message: params.message,
     })
   )
+}
+
+export async function renderWorkflowNotificationEmail(
+  params: WorkflowNotificationEmailProps
+): Promise<string> {
+  return await render(WorkflowNotificationEmail(params))
 }

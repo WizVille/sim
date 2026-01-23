@@ -10,6 +10,7 @@ import { getWorkflowById } from '@/lib/workflows/utils'
 import { ExecutionSnapshot } from '@/executor/execution/snapshot'
 import type { ExecutionMetadata } from '@/executor/execution/types'
 import type { ExecutionResult } from '@/executor/types'
+import type { CoreTriggerType } from '@/stores/logs/filters/types'
 
 const logger = createLogger('TriggerWorkflowExecution')
 
@@ -17,8 +18,9 @@ export type WorkflowExecutionPayload = {
   workflowId: string
   userId: string
   input?: any
-  triggerType?: 'api' | 'webhook' | 'schedule' | 'manual' | 'chat' | 'mcp'
+  triggerType?: CoreTriggerType
   metadata?: Record<string, any>
+  preflighted?: boolean
 }
 
 /**
@@ -50,6 +52,7 @@ export async function executeWorkflowJob(payload: WorkflowExecutionPayload) {
       checkRateLimit: true,
       checkDeployment: true,
       loggingSession: loggingSession,
+      preflightEnvVars: !payload.preflighted,
     })
 
     if (!preprocessResult.success) {
@@ -106,6 +109,8 @@ export async function executeWorkflowJob(payload: WorkflowExecutionPayload) {
       snapshot,
       callbacks: {},
       loggingSession,
+      includeFileBase64: true,
+      base64MaxBytes: undefined,
     })
 
     if (result.status === 'paused') {

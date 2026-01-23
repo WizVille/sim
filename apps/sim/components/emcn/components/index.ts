@@ -8,7 +8,15 @@ export {
 } from './avatar/avatar'
 export { Badge } from './badge/badge'
 export { Breadcrumb, type BreadcrumbItem, type BreadcrumbProps } from './breadcrumb/breadcrumb'
-export { Button, buttonVariants } from './button/button'
+export { Button, type ButtonProps, buttonVariants } from './button/button'
+export {
+  ButtonGroup,
+  ButtonGroupItem,
+  type ButtonGroupItemProps,
+  type ButtonGroupProps,
+  buttonGroupItemVariants,
+  buttonGroupVariants,
+} from './button-group/button-group'
 export {
   Checkbox,
   type CheckboxProps,
@@ -85,6 +93,11 @@ export {
   type SModalSidebarItemProps,
   SModalSidebarSection,
   SModalSidebarSectionTitle,
+  SModalTabs,
+  SModalTabsBody,
+  SModalTabsContent,
+  SModalTabsList,
+  SModalTabsTrigger,
   SModalTrigger,
 } from './s-modal/s-modal'
 export { Slider, type SliderProps } from './slider/slider'
@@ -99,6 +112,16 @@ export {
   TableHeader,
   TableRow,
 } from './table/table'
+export {
+  type FileInputOptions,
+  Tag,
+  TagInput,
+  type TagInputProps,
+  type TagItem,
+  type TagProps,
+  tagInputVariants,
+  tagVariants,
+} from './tag-input/tag-input'
 export { Textarea } from './textarea/textarea'
 export { TimePicker, type TimePickerProps, timePickerVariants } from './time-picker/time-picker'
 export { Tooltip } from './tooltip/tooltip'

@@ -17,6 +17,7 @@ export interface ExecutionMetadata {
   isClientSession?: boolean
   pendingBlocks?: string[]
   resumeFromSnapshot?: boolean
+  credentialAccountUserId?: string
   workflowStateOverride?: {
     blocks: Record<string, any>
     edges: Edge[]
@@ -88,6 +89,8 @@ export interface ContextExtensions {
    * When aborted, the execution should stop gracefully.
    */
   abortSignal?: AbortSignal
+  includeFileBase64?: boolean
+  base64MaxBytes?: number
   onStream?: (streamingExecution: unknown) => Promise<void>
   onBlockStart?: (
     blockId: string,

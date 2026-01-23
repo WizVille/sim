@@ -52,6 +52,7 @@
 import * as React from 'react'
 import * as PopoverPrimitive from '@radix-ui/react-popover'
 import { Check, ChevronLeft, ChevronRight, Search } from 'lucide-react'
+import { createPortal } from 'react-dom'
 import { cn } from '@/lib/core/utils/cn'
 
 type PopoverSize = 'sm' | 'md'
@@ -119,10 +120,8 @@ const STYLES = {
         'hover:bg-[var(--border-1)] hover:text-[var(--text-primary)] hover:[&_svg]:text-[var(--text-primary)]',
     },
     secondary: {
-      active:
-        'bg-[var(--brand-secondary)] text-[var(--text-inverse)] [&_svg]:text-[var(--text-inverse)]',
-      hover:
-        'hover:bg-[var(--brand-secondary)] hover:text-[var(--text-inverse)] dark:hover:text-[var(--text-inverse)] hover:[&_svg]:text-[var(--text-inverse)] dark:hover:[&_svg]:text-[var(--text-inverse)]',
+      active: 'bg-[var(--brand-secondary)] text-white [&_svg]:text-white',
+      hover: 'hover:bg-[var(--brand-secondary)] hover:text-white hover:[&_svg]:text-white',
     },
     inverted: {
       active:
@@ -168,6 +167,21 @@ interface PopoverContextValue {
   colorScheme: PopoverColorScheme
   searchQuery: string
   setSearchQuery: (query: string) => void
+  /** ID of the last hovered item (for hover submenus) */
+  lastHoveredItem: string | null
+  setLastHoveredItem: (id: string | null) => void
+  /** Whether keyboard navigation is active. When true, hover styles are suppressed. */
+  isKeyboardNav: boolean
+  setKeyboardNav: (value: boolean) => void
+  /** Currently selected item index for keyboard navigation */
+  selectedIndex: number
+  setSelectedIndex: (index: number) => void
+  /** Register a menu item and get its index. Returns a cleanup function. */
+  registerItem: (id: string) => number
+  /** Unregister a menu item */
+  unregisterItem: (id: string) => void
+  /** Get the total number of registered items */
+  itemCount: number
 }
 
 const PopoverContext = React.createContext<PopoverContextValue | null>(null)
@@ -210,12 +224,44 @@ const Popover: React.FC<PopoverProps> = ({
   variant = 'default',
   size = 'md',
   colorScheme = 'default',
+  open,
   ...props
 }) => {
   const [currentFolder, setCurrentFolder] = React.useState<string | null>(null)
   const [folderTitle, setFolderTitle] = React.useState<string | null>(null)
   const [onFolderSelect, setOnFolderSelect] = React.useState<(() => void) | null>(null)
   const [searchQuery, setSearchQuery] = React.useState<string>('')
+  const [lastHoveredItem, setLastHoveredItem] = React.useState<string | null>(null)
+  const [isKeyboardNav, setIsKeyboardNav] = React.useState(false)
+  const [selectedIndex, setSelectedIndex] = React.useState(-1)
+  const registeredItemsRef = React.useRef<string[]>([])
+
+  const registerItem = React.useCallback((id: string) => {
+    if (!registeredItemsRef.current.includes(id)) {
+      registeredItemsRef.current.push(id)
+    }
+    return registeredItemsRef.current.indexOf(id)
+  }, [])
+
+  const unregisterItem = React.useCallback((id: string) => {
+    const index = registeredItemsRef.current.indexOf(id)
+    if (index !== -1) {
+      registeredItemsRef.current.splice(index, 1)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    if (open === false) {
+      setCurrentFolder(null)
+      setFolderTitle(null)
+      setOnFolderSelect(null)
+      setSearchQuery('')
+      setLastHoveredItem(null)
+      setIsKeyboardNav(false)
+      setSelectedIndex(-1)
+      registeredItemsRef.current = []
+    }
+  }, [open])
 
   const openFolder = React.useCallback(
     (id: string, title: string, onLoad?: () => void | Promise<void>, onSelect?: () => void) => {
@@ -235,6 +281,12 @@ const Popover: React.FC<PopoverProps> = ({
     setOnFolderSelect(null)
   }, [])
 
+  const setKeyboardNav = React.useCallback((value: boolean) => {
+    setIsKeyboardNav(value)
+  }, [])
+
+  const itemCount = registeredItemsRef.current.length
+
   const contextValue = React.useMemo<PopoverContextValue>(
     () => ({
       openFolder,
@@ -248,6 +300,15 @@ const Popover: React.FC<PopoverProps> = ({
       colorScheme,
       searchQuery,
       setSearchQuery,
+      lastHoveredItem,
+      setLastHoveredItem,
+      isKeyboardNav,
+      setKeyboardNav,
+      selectedIndex,
+      setSelectedIndex,
+      registerItem,
+      unregisterItem,
+      itemCount,
     }),
     [
       openFolder,
@@ -259,12 +320,21 @@ const Popover: React.FC<PopoverProps> = ({
       size,
       colorScheme,
       searchQuery,
+      lastHoveredItem,
+      isKeyboardNav,
+      setKeyboardNav,
+      selectedIndex,
+      registerItem,
+      unregisterItem,
+      itemCount,
     ]
   )
 
   return (
     <PopoverContext.Provider value={contextValue}>
-      <PopoverPrimitive.Root {...props}>{children}</PopoverPrimitive.Root>
+      <PopoverPrimitive.Root open={open} {...props}>
+        {children}
+      </PopoverPrimitive.Root>
     </PopoverContext.Provider>
   )
 }
@@ -363,6 +433,99 @@ const PopoverContent = React.forwardRef<
 
     const effectiveSideOffset = sideOffset ?? (side === 'top' ? 20 : 14)
 
+    const handleMouseMove = React.useCallback(() => {
+      if (context?.isKeyboardNav) {
+        context.setKeyboardNav(false)
+      }
+    }, [context])
+
+    const contentRef = React.useRef<HTMLDivElement>(null)
+
+    const mergedRef = React.useCallback(
+      (node: HTMLDivElement | null) => {
+        contentRef.current = node
+        if (typeof ref === 'function') {
+          ref(node)
+        } else if (ref) {
+          ref.current = node
+        }
+      },
+      [ref]
+    )
+
+    React.useEffect(() => {
+      if (!context) return
+
+      const handleKeyDown = (e: KeyboardEvent) => {
+        const content = contentRef.current
+        if (!content) return
+
+        const activeElement = document.activeElement
+        const isInputFocused =
+          activeElement instanceof HTMLInputElement ||
+          activeElement instanceof HTMLTextAreaElement ||
+          activeElement?.getAttribute('contenteditable') === 'true'
+        if (isInputFocused) return
+
+        const items = content.querySelectorAll<HTMLElement>(
+          '[role="menuitem"]:not([aria-disabled="true"])'
+        )
+        if (items.length === 0) return
+
+        const currentIndex = context.selectedIndex
+
+        switch (e.key) {
+          case 'ArrowDown':
+            e.preventDefault()
+            e.stopPropagation()
+            context.setKeyboardNav(true)
+            if (currentIndex < 0) {
+              context.setSelectedIndex(0)
+            } else {
+              context.setSelectedIndex(currentIndex < items.length - 1 ? currentIndex + 1 : 0)
+            }
+            break
+          case 'ArrowUp':
+            e.preventDefault()
+            e.stopPropagation()
+            context.setKeyboardNav(true)
+            if (currentIndex < 0) {
+              context.setSelectedIndex(items.length - 1)
+            } else {
+              context.setSelectedIndex(currentIndex > 0 ? currentIndex - 1 : items.length - 1)
+            }
+            break
+          case 'Enter':
+          case ' ':
+            if (currentIndex >= 0) {
+              e.preventDefault()
+              e.stopPropagation()
+              const selectedItem = items[currentIndex]
+              if (selectedItem) {
+                selectedItem.click()
+              }
+            }
+            break
+        }
+      }
+
+      window.addEventListener('keydown', handleKeyDown, true)
+      return () => window.removeEventListener('keydown', handleKeyDown, true)
+    }, [context])
+
+    React.useEffect(() => {
+      const content = contentRef.current
+      if (!content || !context?.isKeyboardNav || context.selectedIndex < 0) return
+
+      const items = content.querySelectorAll<HTMLElement>(
+        '[role="menuitem"]:not([aria-disabled="true"])'
+      )
+      const selectedItem = items[context.selectedIndex]
+      if (selectedItem) {
+        selectedItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+      }
+    }, [context?.selectedIndex, context?.isKeyboardNav])
+
     const hasUserWidthConstraint =
       maxWidth !== undefined ||
       minWidth !== undefined ||
@@ -406,7 +569,7 @@ const PopoverContent = React.forwardRef<
 
     const content = (
       <PopoverPrimitive.Content
-        ref={ref}
+        ref={mergedRef}
         side={side}
         align={align}
         sideOffset={effectiveSideOffset}
@@ -415,6 +578,7 @@ const PopoverContent = React.forwardRef<
         sticky='partial'
         hideWhenDetached={false}
         onWheel={handleWheel}
+        onMouseMove={handleMouseMove}
         onOpenAutoFocus={handleOpenAutoFocus}
         onCloseAutoFocus={handleCloseAutoFocus}
         {...restProps}
@@ -474,14 +638,20 @@ const PopoverScrollArea = React.forwardRef<HTMLDivElement, PopoverScrollAreaProp
 PopoverScrollArea.displayName = 'PopoverScrollArea'
 
 export interface PopoverItemProps extends React.HTMLAttributes<HTMLDivElement> {
-  /** Whether this item is currently active/selected */
+  /**
+   * Whether this item has active/highlighted background styling.
+   * Use for keyboard navigation focus or persistent highlight states.
+   */
   active?: boolean
   /** Only show when not inside any folder */
   rootOnly?: boolean
   /** Whether this item is disabled */
   disabled?: boolean
   /**
-   * Show checkmark when active
+   * Show a checkmark to indicate selection/checked state.
+   * Unlike `active`, this only shows the checkmark without background highlight,
+   * following the pattern where hover provides interaction feedback
+   * and checkmarks indicate current value.
    * @default false
    */
   showCheck?: boolean
@@ -492,13 +662,46 @@ export interface PopoverItemProps extends React.HTMLAttributes<HTMLDivElement> {
  */
 const PopoverItem = React.forwardRef<HTMLDivElement, PopoverItemProps>(
   (
-    { className, active, rootOnly, disabled, showCheck = false, children, onClick, ...props },
+    {
+      className,
+      active,
+      rootOnly,
+      disabled,
+      showCheck = false,
+      children,
+      onClick,
+      onMouseEnter,
+      ...props
+    },
     ref
   ) => {
     const context = React.useContext(PopoverContext)
     const variant = context?.variant || 'default'
     const size = context?.size || 'md'
     const colorScheme = context?.colorScheme || 'default'
+    const itemRef = React.useRef<HTMLDivElement>(null)
+    const [itemIndex, setItemIndex] = React.useState(-1)
+
+    const mergedRef = React.useCallback(
+      (node: HTMLDivElement | null) => {
+        itemRef.current = node
+        if (typeof ref === 'function') {
+          ref(node)
+        } else if (ref) {
+          ref.current = node
+        }
+      },
+      [ref]
+    )
+
+    React.useEffect(() => {
+      if (!itemRef.current) return
+      const content = itemRef.current.closest('[data-radix-popper-content-wrapper]')
+      if (!content) return
+      const items = content.querySelectorAll('[role="menuitem"]:not([aria-disabled="true"])')
+      const index = Array.from(items).indexOf(itemRef.current)
+      setItemIndex(index)
+    }, [])
 
     if (rootOnly && context?.isInFolder) return null
 
@@ -510,25 +713,44 @@ const PopoverItem = React.forwardRef<HTMLDivElement, PopoverItemProps>(
       onClick?.(e)
     }
 
+    const handleMouseEnter = (e: React.MouseEvent<HTMLDivElement>) => {
+      context?.setLastHoveredItem(null)
+      if (itemIndex >= 0 && context) {
+        context.setSelectedIndex(itemIndex)
+      }
+      onMouseEnter?.(e)
+    }
+
+    // Determine if this item is active:
+    // - Use explicit `active` prop if provided
+    // - Otherwise use context selectedIndex match
+    const isActive =
+      active !== undefined ? active : itemIndex >= 0 && context?.selectedIndex === itemIndex
+
+    // Suppress hover when in keyboard mode to prevent dual highlights
+    const suppressHover = context?.isKeyboardNav && !isActive
+
     return (
       <div
+        ref={mergedRef}
         className={cn(
           STYLES.itemBase,
           STYLES.colorScheme[colorScheme].text,
           STYLES.size[size].item,
-          getItemStateClasses(variant, colorScheme, !!active),
+          getItemStateClasses(variant, colorScheme, !!isActive),
+          suppressHover && 'hover:!bg-transparent',
           disabled && 'pointer-events-none cursor-not-allowed opacity-50',
           className
         )}
-        ref={ref}
         role='menuitem'
-        aria-selected={active}
+        aria-selected={isActive}
         aria-disabled={disabled}
         onClick={handleClick}
+        onMouseEnter={handleMouseEnter}
         {...props}
       >
         {children}
-        {showCheck && active && <Check className={cn('ml-auto', STYLES.size[size].icon)} />}
+        {showCheck && <Check className={cn('ml-auto', STYLES.size[size].icon)} />}
       </div>
     )
   }
@@ -585,44 +807,167 @@ export interface PopoverFolderProps extends Omit<React.HTMLAttributes<HTMLDivEle
   children?: React.ReactNode
   /** Whether currently active/selected */
   active?: boolean
+  /**
+   * Expand folder on hover to show submenu alongside parent
+   * When true, hovering shows a floating submenu; clicking still uses inline navigation
+   * @default false
+   */
+  expandOnHover?: boolean
 }
 
 /**
  * Expandable folder that shows nested content.
+ * Supports two modes:
+ * - Click mode (default): Replaces parent content, shows back button
+ * - Hover mode (expandOnHover): Shows floating submenu alongside parent
  */
 const PopoverFolder = React.forwardRef<HTMLDivElement, PopoverFolderProps>(
-  ({ className, id, title, icon, onOpen, onSelect, children, active, ...props }, ref) => {
-    const { openFolder, currentFolder, isInFolder, variant, size, colorScheme } =
-      usePopoverContext()
+  (
+    {
+      className,
+      id,
+      title,
+      icon,
+      onOpen,
+      onSelect,
+      children,
+      active,
+      expandOnHover = false,
+      ...props
+    },
+    ref
+  ) => {
+    const {
+      openFolder,
+      currentFolder,
+      isInFolder,
+      variant,
+      size,
+      colorScheme,
+      lastHoveredItem,
+      setLastHoveredItem,
+      isKeyboardNav,
+      selectedIndex,
+      setSelectedIndex,
+    } = usePopoverContext()
+    const [submenuPosition, setSubmenuPosition] = React.useState<{ top: number; left: number }>({
+      top: 0,
+      left: 0,
+    })
+    const triggerRef = React.useRef<HTMLDivElement>(null)
+    const [itemIndex, setItemIndex] = React.useState(-1)
+
+    const isHoverOpen = expandOnHover && lastHoveredItem === id
+
+    const mergedRef = React.useCallback(
+      (node: HTMLDivElement | null) => {
+        triggerRef.current = node
+        if (typeof ref === 'function') {
+          ref(node)
+        } else if (ref) {
+          ref.current = node
+        }
+      },
+      [ref]
+    )
+
+    React.useEffect(() => {
+      if (!triggerRef.current) return
+      const content = triggerRef.current.closest('[data-radix-popper-content-wrapper]')
+      if (!content) return
+      const items = content.querySelectorAll('[role="menuitem"]:not([aria-disabled="true"])')
+      const index = Array.from(items).indexOf(triggerRef.current)
+      setItemIndex(index)
+    }, [])
 
     if (isInFolder && currentFolder !== id) return null
     if (currentFolder === id) return <>{children}</>
 
-    const handleClick = (e: React.MouseEvent) => {
-      e.stopPropagation()
+    const handleClickOpen = () => {
       openFolder(id, title, onOpen, onSelect)
     }
 
+    const handleClick = (e: React.MouseEvent) => {
+      e.stopPropagation()
+      if (expandOnHover) {
+        setLastHoveredItem(null)
+      }
+      handleClickOpen()
+    }
+
+    const handleMouseEnter = () => {
+      if (itemIndex >= 0) {
+        setSelectedIndex(itemIndex)
+      }
+
+      if (!expandOnHover) return
+
+      if (triggerRef.current) {
+        const rect = triggerRef.current.getBoundingClientRect()
+        const parentPopover = triggerRef.current.closest('[data-radix-popper-content-wrapper]')
+        const parentRect = parentPopover?.getBoundingClientRect()
+
+        setSubmenuPosition({
+          top: rect.top,
+          left: parentRect ? parentRect.right + 4 : rect.right + 4,
+        })
+      }
+
+      setLastHoveredItem(id)
+      onOpen?.()
+    }
+
+    const isActive = active !== undefined ? active : itemIndex >= 0 && selectedIndex === itemIndex
+
+    // Suppress hover when in keyboard mode to prevent dual highlights
+    const suppressHover = isKeyboardNav && !isActive && !isHoverOpen
+
     return (
-      <div
-        ref={ref}
-        className={cn(
-          STYLES.itemBase,
-          STYLES.colorScheme[colorScheme].text,
-          STYLES.size[size].item,
-          getItemStateClasses(variant, colorScheme, !!active),
-          className
-        )}
-        role='menuitem'
-        aria-haspopup='true'
-        aria-expanded={false}
-        onClick={handleClick}
-        {...props}
-      >
-        {icon}
-        <span className='flex-1'>{title}</span>
-        <ChevronRight className={STYLES.size[size].icon} />
-      </div>
+      <>
+        <div
+          ref={mergedRef}
+          className={cn(
+            STYLES.itemBase,
+            STYLES.colorScheme[colorScheme].text,
+            STYLES.size[size].item,
+            getItemStateClasses(variant, colorScheme, isActive || isHoverOpen),
+            suppressHover && 'hover:!bg-transparent',
+            className
+          )}
+          role='menuitem'
+          aria-haspopup='true'
+          aria-expanded={isHoverOpen}
+          aria-selected={isActive}
+          onClick={handleClick}
+          onMouseEnter={handleMouseEnter}
+          {...props}
+        >
+          {icon}
+          <span className='flex-1'>{title}</span>
+          <ChevronRight className={STYLES.size[size].icon} />
+        </div>
+
+        {/* Hover submenu - rendered as a portal to escape overflow clipping */}
+        {isHoverOpen &&
+          typeof document !== 'undefined' &&
+          createPortal(
+            <div
+              className={cn(
+                'fixed z-[10000201] min-w-[120px]',
+                STYLES.content,
+                STYLES.colorScheme[colorScheme].content,
+                'shadow-lg'
+              )}
+              style={{
+                top: submenuPosition.top,
+                left: submenuPosition.left,
+              }}
+            >
+              {children}
+            </div>,
+            document.body
+          )}
+      </>
     )
   }
 )
@@ -661,7 +1006,10 @@ const PopoverBackButton = React.forwardRef<HTMLDivElement, PopoverBackButtonProp
             className
           )}
           role='button'
-          onClick={closeFolder}
+          onClick={(e) => {
+            e.stopPropagation()
+            closeFolder()
+          }}
           {...props}
         >
           <ChevronLeft className={STYLES.size[size].icon} />

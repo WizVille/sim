@@ -6,16 +6,18 @@
  * This file contains unit tests for the Function Execute tool,
  * which runs JavaScript code in a secure sandbox.
  */
+
+import { ToolTester } from '@sim/testing/builders'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_EXECUTION_TIMEOUT_MS } from '@/lib/execution/constants'
-import { ToolTester } from '@/tools/__test-utils__/test-tools'
 import { functionExecuteTool } from '@/tools/function/execute'
 
 describe('Function Execute Tool', () => {
-  let tester: ToolTester
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let tester: ToolTester<any, any>
 
   beforeEach(() => {
-    tester = new ToolTester(functionExecuteTool)
+    tester = new ToolTester(functionExecuteTool as any)
     process.env.NEXT_PUBLIC_APP_URL = 'http://localhost:3000'
   })
 
@@ -54,6 +56,7 @@ describe('Function Execute Tool', () => {
         workflowVariables: {},
         blockData: {},
         blockNameMapping: {},
+        blockOutputSchemas: {},
         isCustomTool: false,
         language: 'javascript',
         timeout: 5000,
@@ -81,6 +84,7 @@ describe('Function Execute Tool', () => {
         workflowVariables: {},
         blockData: {},
         blockNameMapping: {},
+        blockOutputSchemas: {},
         isCustomTool: false,
         language: 'javascript',
         workflowId: undefined,
@@ -99,6 +103,7 @@ describe('Function Execute Tool', () => {
         workflowVariables: {},
         blockData: {},
         blockNameMapping: {},
+        blockOutputSchemas: {},
         isCustomTool: false,
         language: 'javascript',
         workflowId: undefined,
@@ -338,7 +343,7 @@ describe('Function Execute Tool', () => {
         code: '',
       })
 
-      const body = tester.getRequestBody({ code: '' })
+      const body = tester.getRequestBody({ code: '' }) as { code: string }
       expect(body.code).toBe('')
     })
 
@@ -346,7 +351,7 @@ describe('Function Execute Tool', () => {
       const body = tester.getRequestBody({
         code: 'return 42',
         timeout: 1, // 1ms timeout
-      })
+      }) as { timeout: number }
 
       expect(body.timeout).toBe(1)
     })

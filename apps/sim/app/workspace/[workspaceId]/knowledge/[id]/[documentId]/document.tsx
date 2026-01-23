@@ -47,8 +47,14 @@ import {
 import { ActionBar } from '@/app/workspace/[workspaceId]/knowledge/[id]/components'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import { useContextMenu } from '@/app/workspace/[workspaceId]/w/components/sidebar/hooks'
-import { knowledgeKeys } from '@/hooks/queries/knowledge'
-import { useDocument, useDocumentChunks, useKnowledgeBase } from '@/hooks/use-knowledge'
+import { useDocument, useDocumentChunks, useKnowledgeBase } from '@/hooks/kb/use-knowledge'
+import {
+  knowledgeKeys,
+  useBulkChunkOperation,
+  useDeleteDocument,
+  useDocumentChunkSearchQuery,
+  useUpdateChunk,
+} from '@/hooks/queries/knowledge'
 
 const logger = createLogger('Document')
 
@@ -313,69 +319,22 @@ export function Document({
     isFetching: isFetchingChunks,
   } = useDocumentChunks(knowledgeBaseId, documentId, currentPageFromURL)
 
-  const [searchResults, setSearchResults] = useState<ChunkData[]>([])
-  const [isLoadingSearch, setIsLoadingSearch] = useState(false)
-  const [searchError, setSearchError] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (!debouncedSearchQuery.trim()) {
-      setSearchResults([])
-      setSearchError(null)
-      return
+  const {
+    data: searchResults = [],
+    isLoading: isLoadingSearch,
+    error: searchQueryError,
+  } = useDocumentChunkSearchQuery(
+    {
+      knowledgeBaseId,
+      documentId,
+      search: debouncedSearchQuery,
+    },
+    {
+      enabled: Boolean(debouncedSearchQuery.trim()),
     }
+  )
 
-    let isMounted = true
-
-    const searchAllChunks = async () => {
-      try {
-        setIsLoadingSearch(true)
-        setSearchError(null)
-
-        const allResults: ChunkData[] = []
-        let hasMore = true
-        let offset = 0
-        const limit = 100
-
-        while (hasMore && isMounted) {
-          const response = await fetch(
-            `/api/knowledge/${knowledgeBaseId}/documents/${documentId}/chunks?search=${encodeURIComponent(debouncedSearchQuery)}&limit=${limit}&offset=${offset}`
-          )
-
-          if (!response.ok) {
-            throw new Error('Search failed')
-          }
-
-          const result = await response.json()
-
-          if (result.success && result.data) {
-            allResults.push(...result.data)
-            hasMore = result.pagination?.hasMore || false
-            offset += limit
-          } else {
-            hasMore = false
-          }
-        }
-
-        if (isMounted) {
-          setSearchResults(allResults)
-        }
-      } catch (err) {
-        if (isMounted) {
-          setSearchError(err instanceof Error ? err.message : 'Search failed')
-        }
-      } finally {
-        if (isMounted) {
-          setIsLoadingSearch(false)
-        }
-      }
-    }
-
-    searchAllChunks()
-
-    return () => {
-      isMounted = false
-    }
-  }, [debouncedSearchQuery, knowledgeBaseId, documentId])
+  const searchError = searchQueryError instanceof Error ? searchQueryError.message : null
 
   const [selectedChunks, setSelectedChunks] = useState<Set<string>>(new Set())
   const [selectedChunk, setSelectedChunk] = useState<ChunkData | null>(null)
@@ -450,10 +409,12 @@ export function Document({
   const [isCreateChunkModalOpen, setIsCreateChunkModalOpen] = useState(false)
   const [chunkToDelete, setChunkToDelete] = useState<ChunkData | null>(null)
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false)
-  const [isBulkOperating, setIsBulkOperating] = useState(false)
   const [showDeleteDocumentDialog, setShowDeleteDocumentDialog] = useState(false)
-  const [isDeletingDocument, setIsDeletingDocument] = useState(false)
   const [contextMenuChunk, setContextMenuChunk] = useState<ChunkData | null>(null)
+
+  const { mutate: updateChunkMutation } = useUpdateChunk()
+  const { mutate: deleteDocumentMutation, isPending: isDeletingDocument } = useDeleteDocument()
+  const { mutate: bulkChunkMutation, isPending: isBulkOperating } = useBulkChunkOperation()
 
   const {
     isOpen: isContextMenuOpen,
@@ -487,36 +448,23 @@ export function Document({
     setSelectedChunk(null)
   }
 
-  const handleToggleEnabled = async (chunkId: string) => {
+  const handleToggleEnabled = (chunkId: string) => {
     const chunk = displayChunks.find((c) => c.id === chunkId)
     if (!chunk) return
 
-    try {
-      const response = await fetch(
-        `/api/knowledge/${knowledgeBaseId}/documents/${documentId}/chunks/${chunkId}`,
-        {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            enabled: !chunk.enabled,
-          }),
-        }
-      )
-
-      if (!response.ok) {
-        throw new Error('Failed to update chunk')
+    updateChunkMutation(
+      {
+        knowledgeBaseId,
+        documentId,
+        chunkId,
+        enabled: !chunk.enabled,
+      },
+      {
+        onSuccess: () => {
+          updateChunk(chunkId, { enabled: !chunk.enabled })
+        },
       }
-
-      const result = await response.json()
-
-      if (result.success) {
-        updateChunk(chunkId, { enabled: !chunk.enabled })
-      }
-    } catch (err) {
-      logger.error('Error updating chunk:', err)
-    }
+    )
   }
 
   const handleDeleteChunk = (chunkId: string) => {
@@ -562,107 +510,65 @@ export function Document({
   /**
    * Handles deleting the document
    */
-  const handleDeleteDocument = async () => {
+  const handleDeleteDocument = () => {
     if (!documentData) return
 
-    try {
-      setIsDeletingDocument(true)
-
-      const response = await fetch(`/api/knowledge/${knowledgeBaseId}/documents/${documentId}`, {
-        method: 'DELETE',
-      })
-
-      if (!response.ok) {
-        throw new Error('Failed to delete document')
+    deleteDocumentMutation(
+      { knowledgeBaseId, documentId },
+      {
+        onSuccess: () => {
+          router.push(`/workspace/${workspaceId}/knowledge/${knowledgeBaseId}`)
+        },
       }
-
-      const result = await response.json()
-
-      if (result.success) {
-        await queryClient.invalidateQueries({
-          queryKey: knowledgeKeys.detail(knowledgeBaseId),
-        })
-
-        router.push(`/workspace/${workspaceId}/knowledge/${knowledgeBaseId}`)
-      } else {
-        throw new Error(result.error || 'Failed to delete document')
-      }
-    } catch (err) {
-      logger.error('Error deleting document:', err)
-      setIsDeletingDocument(false)
-    }
+    )
   }
 
-  const performBulkChunkOperation = async (
+  const performBulkChunkOperation = (
     operation: 'enable' | 'disable' | 'delete',
     chunks: ChunkData[]
   ) => {
     if (chunks.length === 0) return
 
-    try {
-      setIsBulkOperating(true)
-
-      const response = await fetch(
-        `/api/knowledge/${knowledgeBaseId}/documents/${documentId}/chunks`,
-        {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            operation,
-            chunkIds: chunks.map((chunk) => chunk.id),
-          }),
-        }
-      )
-
-      if (!response.ok) {
-        throw new Error(`Failed to ${operation} chunks`)
+    bulkChunkMutation(
+      {
+        knowledgeBaseId,
+        documentId,
+        operation,
+        chunkIds: chunks.map((chunk) => chunk.id),
+      },
+      {
+        onSuccess: (result) => {
+          if (operation === 'delete' || result.errorCount > 0) {
+            refreshChunks()
+          } else {
+            chunks.forEach((chunk) => {
+              updateChunk(chunk.id, { enabled: operation === 'enable' })
+            })
+          }
+          logger.info(`Successfully ${operation}d ${result.successCount} chunks`)
+          setSelectedChunks(new Set())
+        },
       }
-
-      const result = await response.json()
-
-      if (result.success) {
-        if (operation === 'delete') {
-          await refreshChunks()
-        } else {
-          result.data.results.forEach((opResult: any) => {
-            if (opResult.operation === operation) {
-              opResult.chunkIds.forEach((chunkId: string) => {
-                updateChunk(chunkId, { enabled: operation === 'enable' })
-              })
-            }
-          })
-        }
-
-        logger.info(`Successfully ${operation}d ${result.data.successCount} chunks`)
-      }
-
-      setSelectedChunks(new Set())
-    } catch (err) {
-      logger.error(`Error ${operation}ing chunks:`, err)
-    } finally {
-      setIsBulkOperating(false)
-    }
+    )
   }
 
-  const handleBulkEnable = async () => {
+  const handleBulkEnable = () => {
     const chunksToEnable = displayChunks.filter(
       (chunk) => selectedChunks.has(chunk.id) && !chunk.enabled
     )
-    await performBulkChunkOperation('enable', chunksToEnable)
+    performBulkChunkOperation('enable', chunksToEnable)
   }
 
-  const handleBulkDisable = async () => {
+  const handleBulkDisable = () => {
     const chunksToDisable = displayChunks.filter(
       (chunk) => selectedChunks.has(chunk.id) && chunk.enabled
     )
-    await performBulkChunkOperation('disable', chunksToDisable)
+    performBulkChunkOperation('disable', chunksToDisable)
   }
 
-  const handleBulkDelete = async () => {
+  const handleBulkDelete = () => {
     const chunksToDelete = displayChunks.filter((chunk) => selectedChunks.has(chunk.id))
-    await performBulkChunkOperation('delete', chunksToDelete)
+    performBulkChunkOperation('delete', chunksToDelete)
   }
 
   const selectedChunksList = displayChunks.filter((chunk) => selectedChunks.has(chunk.id))
@@ -1208,15 +1114,19 @@ export function Document({
           <ModalHeader>Delete Document</ModalHeader>
           <ModalBody>
             <p className='text-[12px] text-[var(--text-secondary)]'>
-              Are you sure you want to delete "{effectiveDocumentName}"? This will permanently
-              delete the document and all {documentData?.chunkCount ?? 0} chunk
+              Are you sure you want to delete{' '}
+              <span className='font-medium text-[var(--text-primary)]'>
+                {effectiveDocumentName}
+              </span>
+              ? This will permanently delete the document and all {documentData?.chunkCount ?? 0}{' '}
+              chunk
               {documentData?.chunkCount === 1 ? '' : 's'} within it.{' '}
               <span className='text-[var(--text-error)]'>This action cannot be undone.</span>
             </p>
           </ModalBody>
           <ModalFooter>
             <Button
-              variant='active'
+              variant='default'
               onClick={() => setShowDeleteDocumentDialog(false)}
               disabled={isDeletingDocument}
             >

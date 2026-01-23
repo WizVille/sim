@@ -18,6 +18,7 @@ vi.mock('@/lib/core/config/feature-flags', () => ({
   getCostMultiplier: vi.fn().mockReturnValue(1),
   isEmailVerificationEnabled: false,
   isBillingEnabled: false,
+  isOrganizationsEnabled: false,
 }))
 
 vi.mock('@/providers/utils', () => ({
@@ -58,6 +59,29 @@ vi.mock('@/providers', () => ({
     cost: 0.001,
     timing: { total: 100 },
   }),
+}))
+
+vi.mock('@sim/db', () => ({
+  db: {
+    select: vi.fn().mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue([
+          { id: 'mcp-search-server', connectionStatus: 'connected' },
+          { id: 'same-server', connectionStatus: 'connected' },
+          { id: 'mcp-legacy-server', connectionStatus: 'connected' },
+        ]),
+      }),
+    }),
+  },
+}))
+
+vi.mock('@sim/db/schema', () => ({
+  mcpServers: {
+    id: 'id',
+    workspaceId: 'workspaceId',
+    connectionStatus: 'connectionStatus',
+    deletedAt: 'deletedAt',
+  },
 }))
 
 global.fetch = Object.assign(vi.fn(), { preconnect: vi.fn() }) as typeof fetch
@@ -363,7 +387,6 @@ describe('AgentBlockHandler', () => {
           code: 'return { result: "auto tool executed", input }',
           input: 'test input',
         }),
-        false, // skipProxy
         false, // skipPostProcess
         expect.any(Object) // execution context
       )
@@ -376,7 +399,6 @@ describe('AgentBlockHandler', () => {
           code: 'return { result: "force tool executed", input }',
           input: 'another test',
         }),
-        false, // skipProxy
         false, // skipPostProcess
         expect.any(Object) // execution context
       )
@@ -1383,7 +1405,7 @@ describe('AgentBlockHandler', () => {
     })
 
     it('should handle MCP tools in agent execution', async () => {
-      mockExecuteTool.mockImplementation((toolId, params, skipProxy, skipPostProcess, context) => {
+      mockExecuteTool.mockImplementation((toolId, params, skipPostProcess, context) => {
         if (isMcpTool(toolId)) {
           return Promise.resolve({
             success: true,
@@ -1658,7 +1680,7 @@ describe('AgentBlockHandler', () => {
 
     it('should provide workspaceId context for MCP tool execution', async () => {
       let capturedContext: any
-      mockExecuteTool.mockImplementation((toolId, params, skipProxy, skipPostProcess, context) => {
+      mockExecuteTool.mockImplementation((toolId, params, skipPostProcess, context) => {
         capturedContext = context
         if (isMcpTool(toolId)) {
           return Promise.resolve({

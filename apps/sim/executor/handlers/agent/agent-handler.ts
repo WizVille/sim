@@ -25,6 +25,12 @@ import type { BlockHandler, ExecutionContext, StreamingExecution } from '@/execu
 import { collectBlockData } from '@/executor/utils/block-data'
 import { buildAPIUrl, buildAuthHeaders, extractAPIErrorMessage } from '@/executor/utils/http'
 import { stringifyJSON } from '@/executor/utils/json'
+import {
+  validateBlockType,
+  validateCustomToolsAllowed,
+  validateMcpToolsAllowed,
+  validateModelProvider,
+} from '@/executor/utils/permission-check'
 import { executeProviderRequest } from '@/providers'
 import { getProviderFromModel, transformBlockTool } from '@/providers/utils'
 import type { SerializedBlock } from '@/serializer/types'
@@ -50,8 +56,14 @@ export class AgentBlockHandler implements BlockHandler {
     const filteredTools = await this.filterUnavailableMcpTools(ctx, inputs.tools || [])
     const filteredInputs = { ...inputs, tools: filteredTools }
 
+    // Validate tool permissions before processing
+    await this.validateToolPermissions(ctx, filteredInputs.tools || [])
+
     const responseFormat = this.parseResponseFormat(filteredInputs.responseFormat)
     const model = filteredInputs.model || AGENT.DEFAULT_MODEL
+
+    await validateModelProvider(ctx.userId, model, ctx)
+
     const providerId = getProviderFromModel(model)
     const formattedTools = await this.formatTools(ctx, filteredInputs.tools || [])
     const streamingConfig = this.getStreamingConfig(ctx, block)
@@ -143,6 +155,21 @@ export class AgentBlockHandler implements BlockHandler {
     return undefined
   }
 
+  private async validateToolPermissions(ctx: ExecutionContext, tools: ToolInput[]): Promise<void> {
+    if (!Array.isArray(tools) || tools.length === 0) return
+
+    const hasMcpTools = tools.some((t) => t.type === 'mcp')
+    const hasCustomTools = tools.some((t) => t.type === 'custom-tool')
+
+    if (hasMcpTools) {
+      await validateMcpToolsAllowed(ctx.userId, ctx)
+    }
+
+    if (hasCustomTools) {
+      await validateCustomToolsAllowed(ctx.userId, ctx)
+    }
+  }
+
   private async filterUnavailableMcpTools(
     ctx: ExecutionContext,
     tools: ToolInput[]
@@ -212,6 +239,9 @@ export class AgentBlockHandler implements BlockHandler {
     const otherResults = await Promise.all(
       otherTools.map(async (tool) => {
         try {
+          if (tool.type && tool.type !== 'custom-tool' && tool.type !== 'mcp') {
+            await validateBlockType(ctx.userId, tool.type, ctx)
+          }
           if (tool.type === 'custom-tool' && (tool.schema || tool.customToolId)) {
             return await this.createCustomTool(ctx, tool)
           }
@@ -275,7 +305,7 @@ export class AgentBlockHandler implements BlockHandler {
       base.executeFunction = async (callParams: Record<string, any>) => {
         const mergedParams = mergeToolParameters(userProvidedParams, callParams)
 
-        const { blockData, blockNameMapping } = collectBlockData(ctx)
+        const { blockData, blockNameMapping, blockOutputSchemas } = collectBlockData(ctx)
 
         const result = await executeTool(
           'function_execute',
@@ -287,13 +317,14 @@ export class AgentBlockHandler implements BlockHandler {
             workflowVariables: ctx.workflowVariables || {},
             blockData,
             blockNameMapping,
+            blockOutputSchemas,
             isCustomTool: true,
             _context: {
               workflowId: ctx.workflowId,
               workspaceId: ctx.workspaceId,
+              isDeployedContext: ctx.isDeployedContext,
             },
           },
-          false,
           false,
           ctx
         )
@@ -317,8 +348,8 @@ export class AgentBlockHandler implements BlockHandler {
   ): Promise<{ schema: any; code: string; title: string } | null> {
     if (typeof window !== 'undefined') {
       try {
-        const { useCustomToolsStore } = await import('@/stores/custom-tools/store')
-        const tool = useCustomToolsStore.getState().getTool(customToolId)
+        const { getCustomTool } = await import('@/hooks/queries/custom-tools')
+        const tool = getCustomTool(customToolId, ctx.workspaceId)
         if (tool) {
           return {
             schema: tool.schema,
@@ -326,9 +357,9 @@ export class AgentBlockHandler implements BlockHandler {
             title: tool.title,
           }
         }
-        logger.warn(`Custom tool not found in store: ${customToolId}`)
+        logger.warn(`Custom tool not found in cache: ${customToolId}`)
       } catch (error) {
-        logger.error('Error accessing custom tools store:', { error })
+        logger.error('Error accessing custom tools cache:', { error })
       }
     }
 
@@ -928,6 +959,9 @@ export class AgentBlockHandler implements BlockHandler {
       vertexProject: inputs.vertexProject,
       vertexLocation: inputs.vertexLocation,
       vertexCredential: inputs.vertexCredential,
+      bedrockAccessKeyId: inputs.bedrockAccessKeyId,
+      bedrockSecretKey: inputs.bedrockSecretKey,
+      bedrockRegion: inputs.bedrockRegion,
       responseFormat,
       workflowId: ctx.workflowId,
       workspaceId: ctx.workspaceId,
@@ -1029,6 +1063,9 @@ export class AgentBlockHandler implements BlockHandler {
       azureApiVersion: providerRequest.azureApiVersion,
       vertexProject: providerRequest.vertexProject,
       vertexLocation: providerRequest.vertexLocation,
+      bedrockAccessKeyId: providerRequest.bedrockAccessKeyId,
+      bedrockSecretKey: providerRequest.bedrockSecretKey,
+      bedrockRegion: providerRequest.bedrockRegion,
       responseFormat: providerRequest.responseFormat,
       workflowId: providerRequest.workflowId,
       workspaceId: ctx.workspaceId,
@@ -1038,6 +1075,7 @@ export class AgentBlockHandler implements BlockHandler {
       workflowVariables: ctx.workflowVariables || {},
       blockData,
       blockNameMapping,
+      isDeployedContext: ctx.isDeployedContext,
     })
 
     return this.processProviderResponse(response, block, responseFormat)

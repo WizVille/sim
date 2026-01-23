@@ -47,18 +47,24 @@ import { env } from '@/lib/core/config/env'
 import {
   isAuthDisabled,
   isBillingEnabled,
+  isEmailPasswordEnabled,
   isEmailVerificationEnabled,
   isHosted,
+  isOrganizationsEnabled,
   isRegistrationDisabled,
 } from '@/lib/core/config/feature-flags'
+import { PlatformEvents } from '@/lib/core/telemetry'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import { sendEmail } from '@/lib/messaging/email/mailer'
 import { getFromEmailAddress, getPersonalEmailFrom } from '@/lib/messaging/email/utils'
 import { quickValidateEmail } from '@/lib/messaging/email/validation'
+import { syncAllWebhooksForCredentialSet } from '@/lib/webhooks/utils.server'
 import { createAnonymousSession, ensureAnonymousUserExists } from './anonymous'
 import { SSO_TRUSTED_PROVIDERS } from './sso/constants'
 
 const logger = createLogger('Auth')
+
+import { getMicrosoftRefreshTokenExpiry, isMicrosoftProvider } from '@/lib/oauth/microsoft'
 
 const validStripeKey = env.STRIPE_SECRET_KEY
 
@@ -95,6 +101,15 @@ export const auth = betterAuth({
           logger.info('[databaseHooks.user.create.after] User created, initializing stats', {
             userId: user.id,
           })
+
+          try {
+            PlatformEvents.userSignedUp({
+              userId: user.id,
+              authMethod: 'email',
+            })
+          } catch {
+            // Telemetry should not fail the operation
+          }
 
           try {
             await handleNewUser(user.id)
@@ -174,6 +189,10 @@ export const auth = betterAuth({
               }
             }
 
+            const refreshTokenExpiresAt = isMicrosoftProvider(account.providerId)
+              ? getMicrosoftRefreshTokenExpiry()
+              : account.refreshTokenExpiresAt
+
             await db
               .update(schema.account)
               .set({
@@ -182,11 +201,54 @@ export const auth = betterAuth({
                 refreshToken: account.refreshToken,
                 idToken: account.idToken,
                 accessTokenExpiresAt: account.accessTokenExpiresAt,
-                refreshTokenExpiresAt: account.refreshTokenExpiresAt,
+                refreshTokenExpiresAt,
                 scope: scopeToStore,
                 updatedAt: new Date(),
               })
               .where(eq(schema.account.id, existing.id))
+
+            // Sync webhooks for credential sets after reconnecting
+            const requestId = crypto.randomUUID().slice(0, 8)
+            const userMemberships = await db
+              .select({
+                credentialSetId: schema.credentialSetMember.credentialSetId,
+                providerId: schema.credentialSet.providerId,
+              })
+              .from(schema.credentialSetMember)
+              .innerJoin(
+                schema.credentialSet,
+                eq(schema.credentialSetMember.credentialSetId, schema.credentialSet.id)
+              )
+              .where(
+                and(
+                  eq(schema.credentialSetMember.userId, account.userId),
+                  eq(schema.credentialSetMember.status, 'active')
+                )
+              )
+
+            for (const membership of userMemberships) {
+              if (membership.providerId === account.providerId) {
+                try {
+                  await syncAllWebhooksForCredentialSet(membership.credentialSetId, requestId)
+                  logger.info(
+                    '[account.create.before] Synced webhooks after credential reconnect',
+                    {
+                      credentialSetId: membership.credentialSetId,
+                      providerId: account.providerId,
+                    }
+                  )
+                } catch (error) {
+                  logger.error(
+                    '[account.create.before] Failed to sync webhooks after credential reconnect',
+                    {
+                      credentialSetId: membership.credentialSetId,
+                      providerId: account.providerId,
+                      error,
+                    }
+                  )
+                }
+              }
+            }
 
             return false
           }
@@ -235,6 +297,62 @@ export const auth = betterAuth({
               await db.update(schema.account).set(updates).where(eq(schema.account.id, account.id))
             }
           }
+
+          if (isMicrosoftProvider(account.providerId)) {
+            await db
+              .update(schema.account)
+              .set({ refreshTokenExpiresAt: getMicrosoftRefreshTokenExpiry() })
+              .where(eq(schema.account.id, account.id))
+          }
+
+          // Sync webhooks for credential sets after connecting a new credential
+          const requestId = crypto.randomUUID().slice(0, 8)
+          const userMemberships = await db
+            .select({
+              credentialSetId: schema.credentialSetMember.credentialSetId,
+              providerId: schema.credentialSet.providerId,
+            })
+            .from(schema.credentialSetMember)
+            .innerJoin(
+              schema.credentialSet,
+              eq(schema.credentialSetMember.credentialSetId, schema.credentialSet.id)
+            )
+            .where(
+              and(
+                eq(schema.credentialSetMember.userId, account.userId),
+                eq(schema.credentialSetMember.status, 'active')
+              )
+            )
+
+          for (const membership of userMemberships) {
+            if (membership.providerId === account.providerId) {
+              try {
+                await syncAllWebhooksForCredentialSet(membership.credentialSetId, requestId)
+                logger.info('[account.create.after] Synced webhooks after credential connect', {
+                  credentialSetId: membership.credentialSetId,
+                  providerId: account.providerId,
+                })
+              } catch (error) {
+                logger.error(
+                  '[account.create.after] Failed to sync webhooks after credential connect',
+                  {
+                    credentialSetId: membership.credentialSetId,
+                    providerId: account.providerId,
+                    error,
+                  }
+                )
+              }
+            }
+          }
+
+          try {
+            PlatformEvents.oauthConnected({
+              userId: account.userId,
+              provider: account.providerId,
+            })
+          } catch {
+            // Telemetry should not fail the operation
+          }
         },
       },
     },
@@ -282,7 +400,6 @@ export const auth = betterAuth({
       enabled: true,
       allowDifferentEmails: true,
       trustedProviders: [
-        // Standard OAuth providers
         'google',
         'github',
         'email-password',
@@ -298,8 +415,32 @@ export const auth = betterAuth({
         'hubspot',
         'linkedin',
         'spotify',
-
-        // Common SSO provider patterns
+        'google-email',
+        'google-calendar',
+        'google-drive',
+        'google-docs',
+        'google-sheets',
+        'google-forms',
+        'google-vault',
+        'google-groups',
+        'vertex-ai',
+        'github-repo',
+        'microsoft-teams',
+        'microsoft-excel',
+        'microsoft-planner',
+        'outlook',
+        'onedrive',
+        'sharepoint',
+        'jira',
+        'airtable',
+        'dropbox',
+        'salesforce',
+        'wealthbox',
+        'zoom',
+        'wordpress',
+        'linear',
+        'shopify',
+        'trello',
         ...SSO_TRUSTED_PROVIDERS,
       ],
     },
@@ -321,7 +462,8 @@ export const auth = betterAuth({
   },
   emailVerification: {
     autoSignInAfterVerification: true,
-    afterEmailVerification: async (user) => {
+    // onEmailVerification is called by the emailOTP plugin when email is verified via OTP
+    onEmailVerification: async (user) => {
       if (isHosted && user.email) {
         try {
           const html = await renderWelcomeEmail(user.name || undefined)
@@ -336,11 +478,11 @@ export const auth = betterAuth({
             emailType: 'transactional',
           })
 
-          logger.info('[emailVerification.afterEmailVerification] Welcome email sent', {
+          logger.info('[emailVerification.onEmailVerification] Welcome email sent', {
             userId: user.id,
           })
         } catch (error) {
-          logger.error('[emailVerification.afterEmailVerification] Failed to send welcome email', {
+          logger.error('[emailVerification.onEmailVerification] Failed to send welcome email', {
             userId: user.id,
             error,
           })
@@ -351,7 +493,7 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
     requireEmailVerification: isEmailVerificationEnabled,
-    sendVerificationOnSignUp: false,
+    sendVerificationOnSignUp: isEmailVerificationEnabled, // Auto-send verification OTP on signup when verification is required
     throwOnMissingCredentials: true,
     throwOnInvalidCredentials: true,
     sendResetPassword: async ({ user, url, token }, request) => {
@@ -376,6 +518,12 @@ export const auth = betterAuth({
     before: createAuthMiddleware(async (ctx) => {
       if (ctx.path.startsWith('/sign-up') && isRegistrationDisabled)
         throw new Error('Registration is disabled, please contact your admin.')
+
+      if (!isEmailPasswordEnabled) {
+        const emailPasswordPaths = ['/sign-in/email', '/sign-up/email', '/email-otp']
+        if (emailPasswordPaths.some((path) => ctx.path.startsWith(path)))
+          throw new Error('Email/password authentication is disabled. Please use SSO to sign in.')
+      }
 
       if (
         (ctx.path.startsWith('/sign-in') || ctx.path.startsWith('/sign-up')) &&
@@ -481,6 +629,7 @@ export const auth = betterAuth({
       sendVerificationOnSignUp: false,
       otpLength: 6, // Explicitly set the OTP length
       expiresIn: 15 * 60, // 15 minutes in seconds
+      overrideDefaultEmailVerification: true,
     }),
     genericOAuth({
       config: [
@@ -545,7 +694,7 @@ export const auth = betterAuth({
               const now = new Date()
 
               return {
-                id: profile.id.toString(),
+                id: `${profile.id.toString()}-${crypto.randomUUID()}`,
                 name: profile.name || profile.login,
                 email: profile.email,
                 image: profile.avatar_url,
@@ -576,6 +725,31 @@ export const auth = betterAuth({
           ],
           prompt: 'consent',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/google-email`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
         },
         {
           providerId: 'google-calendar',
@@ -590,6 +764,31 @@ export const auth = betterAuth({
           ],
           prompt: 'consent',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/google-calendar`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
         },
         {
           providerId: 'google-drive',
@@ -605,6 +804,31 @@ export const auth = betterAuth({
           ],
           prompt: 'consent',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/google-drive`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
         },
         {
           providerId: 'google-docs',
@@ -620,6 +844,31 @@ export const auth = betterAuth({
           ],
           prompt: 'consent',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/google-docs`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
         },
         {
           providerId: 'google-sheets',
@@ -635,6 +884,31 @@ export const auth = betterAuth({
           ],
           prompt: 'consent',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/google-sheets`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
         },
 
         {
@@ -646,10 +920,37 @@ export const auth = betterAuth({
           scopes: [
             'https://www.googleapis.com/auth/userinfo.email',
             'https://www.googleapis.com/auth/userinfo.profile',
+            'https://www.googleapis.com/auth/drive',
+            'https://www.googleapis.com/auth/forms.body',
             'https://www.googleapis.com/auth/forms.responses.readonly',
           ],
           prompt: 'consent',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/google-forms`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
         },
         {
           providerId: 'google-vault',
@@ -665,6 +966,31 @@ export const auth = betterAuth({
           ],
           prompt: 'consent',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/google-vault`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
         },
 
         {
@@ -681,6 +1007,31 @@ export const auth = betterAuth({
           ],
           prompt: 'consent',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/google-groups`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
         },
 
         {
@@ -696,6 +1047,31 @@ export const auth = betterAuth({
           ],
           prompt: 'consent',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/vertex-ai`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
         },
 
         {
@@ -732,6 +1108,30 @@ export const auth = betterAuth({
           authentication: 'basic',
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/microsoft-teams`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Microsoft user info', { status: response.status })
+                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.id}-${crypto.randomUUID()}`,
+                name: profile.displayName || 'Microsoft User',
+                email: profile.mail || profile.userPrincipalName,
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Microsoft getUserInfo', { error })
+              throw error
+            }
+          },
         },
 
         {
@@ -747,6 +1147,30 @@ export const auth = betterAuth({
           authentication: 'basic',
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/microsoft-excel`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Microsoft user info', { status: response.status })
+                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.id}-${crypto.randomUUID()}`,
+                name: profile.displayName || 'Microsoft User',
+                email: profile.mail || profile.userPrincipalName,
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Microsoft getUserInfo', { error })
+              throw error
+            }
+          },
         },
         {
           providerId: 'microsoft-planner',
@@ -769,6 +1193,30 @@ export const auth = betterAuth({
           authentication: 'basic',
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/microsoft-planner`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Microsoft user info', { status: response.status })
+                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.id}-${crypto.randomUUID()}`,
+                name: profile.displayName || 'Microsoft User',
+                email: profile.mail || profile.userPrincipalName,
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Microsoft getUserInfo', { error })
+              throw error
+            }
+          },
         },
 
         {
@@ -793,6 +1241,30 @@ export const auth = betterAuth({
           authentication: 'basic',
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/outlook`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Microsoft user info', { status: response.status })
+                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.id}-${crypto.randomUUID()}`,
+                name: profile.displayName || 'Microsoft User',
+                email: profile.mail || profile.userPrincipalName,
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Microsoft getUserInfo', { error })
+              throw error
+            }
+          },
         },
 
         {
@@ -808,6 +1280,30 @@ export const auth = betterAuth({
           authentication: 'basic',
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/onedrive`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Microsoft user info', { status: response.status })
+                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.id}-${crypto.randomUUID()}`,
+                name: profile.displayName || 'Microsoft User',
+                email: profile.mail || profile.userPrincipalName,
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Microsoft getUserInfo', { error })
+              throw error
+            }
+          },
         },
 
         {
@@ -831,6 +1327,30 @@ export const auth = betterAuth({
           authentication: 'basic',
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/sharepoint`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
+                logger.error('Failed to fetch Microsoft user info', { status: response.status })
+                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.id}-${crypto.randomUUID()}`,
+                name: profile.displayName || 'Microsoft User',
+                email: profile.mail || profile.userPrincipalName,
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Microsoft getUserInfo', { error })
+              throw error
+            }
+          },
         },
 
         {
@@ -851,7 +1371,7 @@ export const auth = betterAuth({
               const now = new Date()
 
               return {
-                id: uniqueId,
+                id: `${uniqueId}-${crypto.randomUUID()}`,
                 name: 'Wealthbox User',
                 email: `${uniqueId}@wealthbox.user`,
                 emailVerified: false,
@@ -905,7 +1425,7 @@ export const auth = betterAuth({
               const user = data.data
 
               return {
-                id: user.id.toString(),
+                id: `${user.id.toString()}-${crypto.randomUUID()}`,
                 name: user.name,
                 email: user.email,
                 emailVerified: user.activated,
@@ -997,7 +1517,7 @@ export const auth = betterAuth({
               })
 
               return {
-                id: data.user_id || data.hub_id.toString(),
+                id: `${data.user_id || data.hub_id.toString()}-${crypto.randomUUID()}`,
                 name: data.user || 'HubSpot User',
                 email: data.user || `hubspot-${data.hub_id}@hubspot.com`,
                 emailVerified: true,
@@ -1051,7 +1571,7 @@ export const auth = betterAuth({
               const data = await response.json()
 
               return {
-                id: data.user_id || data.sub,
+                id: `${data.user_id || data.sub}-${crypto.randomUUID()}`,
                 name: data.name || 'Salesforce User',
                 email: data.email || `salesforce-${data.user_id}@salesforce.com`,
                 emailVerified: data.email_verified || true,
@@ -1110,7 +1630,7 @@ export const auth = betterAuth({
               const now = new Date()
 
               return {
-                id: profile.data.id,
+                id: `${profile.data.id}-${crypto.randomUUID()}`,
                 name: profile.data.name || 'X User',
                 email: `${profile.data.username}@x.com`,
                 image: profile.data.profile_image_url,
@@ -1184,7 +1704,7 @@ export const auth = betterAuth({
               const now = new Date()
 
               return {
-                id: profile.account_id,
+                id: `${profile.account_id}-${crypto.randomUUID()}`,
                 name: profile.name || profile.display_name || 'Confluence User',
                 email: profile.email || `${profile.account_id}@atlassian.com`,
                 image: profile.picture || undefined,
@@ -1295,7 +1815,7 @@ export const auth = betterAuth({
               const now = new Date()
 
               return {
-                id: profile.account_id,
+                id: `${profile.account_id}-${crypto.randomUUID()}`,
                 name: profile.name || profile.display_name || 'Jira User',
                 email: profile.email || `${profile.account_id}@atlassian.com`,
                 image: profile.picture || undefined,
@@ -1345,7 +1865,7 @@ export const auth = betterAuth({
               const now = new Date()
 
               return {
-                id: data.id,
+                id: `${data.id}-${crypto.randomUUID()}`,
                 name: data.email ? data.email.split('@')[0] : 'Airtable User',
                 email: data.email || `${data.id}@airtable.user`,
                 emailVerified: !!data.email,
@@ -1394,7 +1914,7 @@ export const auth = betterAuth({
               const now = new Date()
 
               return {
-                id: profile.bot?.owner?.user?.id || profile.id,
+                id: `${profile.bot?.owner?.user?.id || profile.id}-${crypto.randomUUID()}`,
                 name: profile.name || profile.bot?.owner?.user?.name || 'Notion User',
                 email: profile.person?.email || `${profile.id}@notion.user`,
                 emailVerified: !!profile.person?.email,
@@ -1461,7 +1981,7 @@ export const auth = betterAuth({
               const now = new Date()
 
               return {
-                id: data.id,
+                id: `${data.id}-${crypto.randomUUID()}`,
                 name: data.name || 'Reddit User',
                 email: `${data.name}@reddit.user`,
                 image: data.icon_img || undefined,
@@ -1533,7 +2053,7 @@ export const auth = betterAuth({
               const viewer = data.viewer
 
               return {
-                id: viewer.id,
+                id: `${viewer.id}-${crypto.randomUUID()}`,
                 email: viewer.email,
                 name: viewer.name,
                 emailVerified: true,
@@ -1596,7 +2116,7 @@ export const auth = betterAuth({
               const data = await response.json()
 
               return {
-                id: data.account_id,
+                id: `${data.account_id}-${crypto.randomUUID()}`,
                 email: data.email,
                 name: data.name?.display_name || data.email,
                 emailVerified: data.email_verified || false,
@@ -1647,7 +2167,7 @@ export const auth = betterAuth({
               const now = new Date()
 
               return {
-                id: profile.gid,
+                id: `${profile.gid}-${crypto.randomUUID()}`,
                 name: profile.name || 'Asana User',
                 email: profile.email || `${profile.gid}@asana.user`,
                 image: profile.photo?.image_128x128 || undefined,
@@ -1723,7 +2243,7 @@ export const auth = betterAuth({
               logger.info('Slack credential identifier', { teamId, userId, uniqueId, teamName })
 
               return {
-                id: uniqueId,
+                id: `${uniqueId}-${crypto.randomUUID()}`,
                 name: teamName,
                 email: `${teamId}-${userId}@slack.bot`,
                 emailVerified: false,
@@ -1745,7 +2265,7 @@ export const auth = betterAuth({
           authorizationUrl: 'https://webflow.com/oauth/authorize',
           tokenUrl: 'https://api.webflow.com/oauth/access_token',
           userInfoUrl: 'https://api.webflow.com/v2/token/introspect',
-          scopes: ['sites:read', 'sites:write', 'cms:read', 'cms:write'],
+          scopes: ['sites:read', 'sites:write', 'cms:read', 'cms:write', 'forms:read'],
           responseType: 'code',
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/webflow`,
           getUserInfo: async (tokens) => {
@@ -1773,7 +2293,7 @@ export const auth = betterAuth({
               const uniqueId = `webflow-${userId}`
 
               return {
-                id: uniqueId,
+                id: `${uniqueId}-${crypto.randomUUID()}`,
                 name: data.user_name || 'Webflow User',
                 email: `${uniqueId.replace(/[^a-zA-Z0-9]/g, '')}@webflow.user`,
                 emailVerified: false,
@@ -1820,7 +2340,7 @@ export const auth = betterAuth({
               const profile = await response.json()
 
               return {
-                id: profile.sub,
+                id: `${profile.sub}-${crypto.randomUUID()}`,
                 name: profile.name || 'LinkedIn User',
                 email: profile.email || `${profile.sub}@linkedin.user`,
                 emailVerified: profile.email_verified || true,
@@ -1882,7 +2402,7 @@ export const auth = betterAuth({
               const profile = await response.json()
 
               return {
-                id: profile.id,
+                id: `${profile.id}-${crypto.randomUUID()}`,
                 name:
                   `${profile.first_name || ''} ${profile.last_name || ''}`.trim() || 'Zoom User',
                 email: profile.email || `${profile.id}@zoom.user`,
@@ -1949,7 +2469,7 @@ export const auth = betterAuth({
               const profile = await response.json()
 
               return {
-                id: profile.id,
+                id: `${profile.id}-${crypto.randomUUID()}`,
                 name: profile.display_name || 'Spotify User',
                 email: profile.email || `${profile.id}@spotify.user`,
                 emailVerified: true,
@@ -1997,7 +2517,7 @@ export const auth = betterAuth({
               const profile = await response.json()
 
               return {
-                id: profile.ID?.toString() || profile.id?.toString(),
+                id: `${profile.ID?.toString() || profile.id?.toString()}-${crypto.randomUUID()}`,
                 name: profile.display_name || profile.username || 'WordPress User',
                 email: profile.email || `${profile.username}@wordpress.com`,
                 emailVerified: profile.email_verified || false,
@@ -2074,8 +2594,22 @@ export const auth = betterAuth({
                   status: subscription.status,
                 })
 
-                const resolvedSubscription =
-                  await ensureOrganizationForTeamSubscription(subscription)
+                let resolvedSubscription = subscription
+                try {
+                  resolvedSubscription = await ensureOrganizationForTeamSubscription(subscription)
+                } catch (orgError) {
+                  logger.error(
+                    '[onSubscriptionComplete] Failed to ensure organization for team subscription',
+                    {
+                      subscriptionId: subscription.id,
+                      referenceId: subscription.referenceId,
+                      plan: subscription.plan,
+                      error: orgError instanceof Error ? orgError.message : String(orgError),
+                      stack: orgError instanceof Error ? orgError.stack : undefined,
+                    }
+                  )
+                  throw orgError
+                }
 
                 await handleSubscriptionCreated(resolvedSubscription)
 
@@ -2096,8 +2630,22 @@ export const auth = betterAuth({
                   plan: subscription.plan,
                 })
 
-                const resolvedSubscription =
-                  await ensureOrganizationForTeamSubscription(subscription)
+                let resolvedSubscription = subscription
+                try {
+                  resolvedSubscription = await ensureOrganizationForTeamSubscription(subscription)
+                } catch (orgError) {
+                  logger.error(
+                    '[onSubscriptionUpdate] Failed to ensure organization for team subscription',
+                    {
+                      subscriptionId: subscription.id,
+                      referenceId: subscription.referenceId,
+                      plan: subscription.plan,
+                      error: orgError instanceof Error ? orgError.message : String(orgError),
+                      stack: orgError instanceof Error ? orgError.stack : undefined,
+                    }
+                  )
+                  throw orgError
+                }
 
                 try {
                   await syncSubscriptionUsageLimits(resolvedSubscription)
@@ -2214,8 +2762,15 @@ export const auth = betterAuth({
               }
             },
           }),
+        ]
+      : []),
+    ...(isOrganizationsEnabled
+      ? [
           organization({
             allowUserToCreateOrganization: async (user) => {
+              if (!isBillingEnabled) {
+                return true
+              }
               const dbSubscriptions = await db
                 .select()
                 .from(schema.subscription)

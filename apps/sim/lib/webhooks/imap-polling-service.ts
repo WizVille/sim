@@ -1,8 +1,8 @@
 import { db } from '@sim/db'
-import { webhook, workflow } from '@sim/db/schema'
+import { webhook, workflow, workflowDeploymentVersion } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import type { InferSelectModel } from 'drizzle-orm'
-import { and, eq, sql } from 'drizzle-orm'
+import { and, eq, isNull, or, sql } from 'drizzle-orm'
 import type { FetchMessageObject, MailboxLockObject } from 'imapflow'
 import { ImapFlow } from 'imapflow'
 import { nanoid } from 'nanoid'
@@ -54,6 +54,17 @@ export interface SimplifiedImapEmail {
 }
 
 export interface ImapWebhookPayload {
+  messageId: string
+  subject: string
+  from: string
+  to: string
+  cc: string
+  date: string | null
+  bodyText: string
+  bodyHtml: string
+  mailbox: string
+  hasAttachments: boolean
+  attachments: ImapAttachment[]
   email: SimplifiedImapEmail
   timestamp: string
 }
@@ -113,8 +124,23 @@ export async function pollImapWebhooks() {
       .select({ webhook })
       .from(webhook)
       .innerJoin(workflow, eq(webhook.workflowId, workflow.id))
+      .leftJoin(
+        workflowDeploymentVersion,
+        and(
+          eq(workflowDeploymentVersion.workflowId, workflow.id),
+          eq(workflowDeploymentVersion.isActive, true)
+        )
+      )
       .where(
-        and(eq(webhook.provider, 'imap'), eq(webhook.isActive, true), eq(workflow.isDeployed, true))
+        and(
+          eq(webhook.provider, 'imap'),
+          eq(webhook.isActive, true),
+          eq(workflow.isDeployed, true),
+          or(
+            eq(webhook.deploymentVersionId, workflowDeploymentVersion.id),
+            and(isNull(workflowDeploymentVersion.id), isNull(webhook.deploymentVersionId))
+          )
+        )
       )
 
     const activeWebhooks = activeWebhooksResult.map((r) => r.webhook)
@@ -598,6 +624,17 @@ async function processEmails(
             }
 
             const payload: ImapWebhookPayload = {
+              messageId: simplifiedEmail.messageId,
+              subject: simplifiedEmail.subject,
+              from: simplifiedEmail.from,
+              to: simplifiedEmail.to,
+              cc: simplifiedEmail.cc,
+              date: simplifiedEmail.date,
+              bodyText: simplifiedEmail.bodyText,
+              bodyHtml: simplifiedEmail.bodyHtml,
+              mailbox: simplifiedEmail.mailbox,
+              hasAttachments: simplifiedEmail.hasAttachments,
+              attachments: simplifiedEmail.attachments,
               email: simplifiedEmail,
               timestamp: new Date().toISOString(),
             }

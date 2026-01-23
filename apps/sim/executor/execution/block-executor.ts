@@ -4,6 +4,10 @@ import { createLogger } from '@sim/logger'
 import { and, eq, inArray, isNull } from 'drizzle-orm'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import {
+  containsUserFileWithMetadata,
+  hydrateUserFilesWithBase64,
+} from '@/lib/uploads/utils/user-file-base64.server'
+import {
   BlockType,
   buildResumeApiUrl,
   buildResumeUiUrl,
@@ -26,6 +30,7 @@ import type {
 } from '@/executor/types'
 import { streamingResponseFormatProcessor } from '@/executor/utils'
 import { buildBlockExecutionError, normalizeError } from '@/executor/utils/errors'
+import { validateBlockType } from '@/executor/utils/permission-check'
 import type { VariableResolver } from '@/executor/variables/resolver'
 import type { SerializedBlock } from '@/serializer/types'
 import type { SubflowType } from '@/stores/workflows/workflow/types'
@@ -54,7 +59,8 @@ export class BlockExecutor {
       })
     }
 
-    const isSentinel = isSentinelBlockType(block.metadata?.id ?? '')
+    const blockType = block.metadata?.id ?? ''
+    const isSentinel = isSentinelBlockType(blockType)
 
     let blockLog: BlockLog | undefined
     if (!isSentinel) {
@@ -74,6 +80,10 @@ export class BlockExecutor {
     }
 
     try {
+      if (!isSentinel && blockType) {
+        await validateBlockType(ctx.userId, blockType, ctx)
+      }
+
       resolvedInputs = this.resolver.resolveInputs(ctx, node.id, block.config.params, block)
 
       if (block.metadata?.id === BlockType.AGENT && resolvedInputs.tools) {
@@ -127,6 +137,14 @@ export class BlockExecutor {
         )
       } else {
         normalizedOutput = this.normalizeOutput(output)
+      }
+
+      if (ctx.includeFileBase64 && containsUserFileWithMetadata(normalizedOutput)) {
+        normalizedOutput = (await hydrateUserFilesWithBase64(normalizedOutput, {
+          requestId: ctx.metadata.requestId,
+          executionId: ctx.executionId,
+          maxBytes: ctx.base64MaxBytes,
+        })) as NormalizedBlockOutput
       }
 
       const duration = Date.now() - startTime
@@ -331,6 +349,22 @@ export class BlockExecutor {
       }
       return filtered
     }
+
+    const isTrigger =
+      block.metadata?.category === 'triggers' ||
+      block.config?.params?.triggerMode === true ||
+      block.metadata?.id === BlockType.STARTER
+
+    if (isTrigger) {
+      const filtered: NormalizedBlockOutput = {}
+      const internalKeys = ['webhook', 'workflowId']
+      for (const [key, value] of Object.entries(output)) {
+        if (internalKeys.includes(key)) continue
+        filtered[key] = value
+      }
+      return filtered
+    }
+
     return output
   }
 
@@ -510,7 +544,7 @@ export class BlockExecutor {
     const placeholderState: BlockState = {
       output: {
         url: resumeLinks.uiUrl,
-        // apiUrl: resumeLinks.apiUrl, // Hidden from output
+        resumeEndpoint: resumeLinks.apiUrl,
       },
       executed: false,
       executionTime: existingState?.executionTime ?? 0,

@@ -1,5 +1,5 @@
+import { createMockRequest, mockAuth, mockConsoleLogger } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMockRequest, mockAuth, mockConsoleLogger } from '@/app/api/__test-utils__/utils'
 
 describe('Workspace Invitations API Route', () => {
   const mockWorkspace = { id: 'workspace-1', name: 'Test Workspace' }
@@ -100,6 +100,16 @@ describe('Workspace Invitations API Route', () => {
       and: vi.fn().mockImplementation((...args) => ({ type: 'and', conditions: args })),
       eq: vi.fn().mockImplementation((field, value) => ({ type: 'eq', field, value })),
       inArray: vi.fn().mockImplementation((field, values) => ({ type: 'inArray', field, values })),
+    }))
+
+    vi.doMock('@/executor/utils/permission-check', () => ({
+      validateInvitationsAllowed: vi.fn().mockResolvedValue(undefined),
+      InvitationsNotAllowedError: class InvitationsNotAllowedError extends Error {
+        constructor() {
+          super('Invitations are not allowed based on your permission group settings')
+          this.name = 'InvitationsNotAllowedError'
+        }
+      },
     }))
   })
 
