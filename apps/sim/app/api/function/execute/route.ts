@@ -1,5 +1,6 @@
 import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
+import { checkInternalAuth } from '@/lib/auth/hybrid'
 import { isE2bEnabled } from '@/lib/core/config/feature-flags'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { executeInE2B } from '@/lib/execution/e2b'
@@ -7,6 +8,7 @@ import { executeInIsolatedVM } from '@/lib/execution/isolated-vm'
 import { CodeLanguage, DEFAULT_CODE_LANGUAGE, isValidCodeLanguage } from '@/lib/execution/languages'
 import { escapeRegExp, normalizeName, REFERENCE } from '@/executor/constants'
 import { type OutputSchema, resolveBlockReference } from '@/executor/utils/block-reference'
+import { formatLiteralForCode } from '@/executor/utils/code-formatting'
 import {
   createEnvVarPattern,
   createWorkflowVariablePattern,
@@ -386,7 +388,12 @@ function resolveWorkflowVariables(
       if (type === 'number') {
         variableValue = Number(variableValue)
       } else if (type === 'boolean') {
-        variableValue = variableValue === 'true' || variableValue === true
+        if (typeof variableValue === 'boolean') {
+          // Already a boolean, keep as-is
+        } else {
+          const normalized = String(variableValue).toLowerCase().trim()
+          variableValue = normalized === 'true'
+        }
       } else if (type === 'json' && typeof variableValue === 'string') {
         try {
           variableValue = JSON.parse(variableValue)
@@ -581,6 +588,12 @@ export async function POST(req: NextRequest) {
   let resolvedCode = '' // Store resolved code for error reporting
 
   try {
+    const auth = await checkInternalAuth(req)
+    if (!auth.success || !auth.userId) {
+      logger.warn(`[${requestId}] Unauthorized function execution attempt`)
+      return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+    }
+
     const body = await req.json()
 
     const { DEFAULT_EXECUTION_TIMEOUT_MS } = await import('@/lib/execution/constants')
@@ -680,11 +693,7 @@ export async function POST(req: NextRequest) {
         prologue += `const environmentVariables = JSON.parse(${JSON.stringify(JSON.stringify(envVars))});\n`
         prologueLineCount++
         for (const [k, v] of Object.entries(contextVariables)) {
-          if (v === undefined) {
-            prologue += `const ${k} = undefined;\n`
-          } else {
-            prologue += `const ${k} = JSON.parse(${JSON.stringify(JSON.stringify(v))});\n`
-          }
+          prologue += `const ${k} = ${formatLiteralForCode(v, 'javascript')};\n`
           prologueLineCount++
         }
 
@@ -755,11 +764,7 @@ export async function POST(req: NextRequest) {
       prologue += `environmentVariables = json.loads(${JSON.stringify(JSON.stringify(envVars))})\n`
       prologueLineCount++
       for (const [k, v] of Object.entries(contextVariables)) {
-        if (v === undefined) {
-          prologue += `${k} = None\n`
-        } else {
-          prologue += `${k} = json.loads(${JSON.stringify(JSON.stringify(v))})\n`
-        }
+        prologue += `${k} = ${formatLiteralForCode(v, 'python')}\n`
         prologueLineCount++
       }
       const wrapped = [

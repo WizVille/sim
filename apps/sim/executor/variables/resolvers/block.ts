@@ -1,15 +1,16 @@
-import { getBlockOutputs } from '@/lib/workflows/blocks/block-outputs'
 import {
   isReference,
   normalizeName,
   parseReferencePath,
   SPECIAL_REFERENCE_PREFIXES,
 } from '@/executor/constants'
+import { getBlockSchema } from '@/executor/utils/block-data'
 import {
   InvalidFieldError,
   type OutputSchema,
   resolveBlockReference,
 } from '@/executor/utils/block-reference'
+import { formatLiteralForCode } from '@/executor/utils/code-formatting'
 import {
   navigatePath,
   type ResolutionContext,
@@ -67,15 +68,9 @@ export class BlockResolver implements Resolver {
       blockData[blockId] = output
     }
 
-    const blockType = block.metadata?.id
-    const params = block.config?.params as Record<string, unknown> | undefined
-    const subBlocks = params
-      ? Object.fromEntries(Object.entries(params).map(([k, v]) => [k, { value: v }]))
-      : undefined
     const toolId = block.config?.tool
     const toolConfig = toolId ? getTool(toolId) : undefined
-    const outputSchema =
-      toolConfig?.outputs ?? (blockType ? getBlockOutputs(blockType, subBlocks) : block.outputs)
+    const outputSchema = getBlockSchema(block, toolConfig)
 
     if (outputSchema && Object.keys(outputSchema).length > 0) {
       blockOutputSchemas[blockId] = outputSchema
@@ -165,17 +160,13 @@ export class BlockResolver implements Resolver {
     return this.nameToBlockId.get(normalizeName(name))
   }
 
-  public formatValueForBlock(
-    value: any,
-    blockType: string | undefined,
-    isInTemplateLiteral = false
-  ): string {
+  public formatValueForBlock(value: any, blockType: string | undefined, language?: string): string {
     if (blockType === 'condition') {
       return this.stringifyForCondition(value)
     }
 
     if (blockType === 'function') {
-      return this.formatValueForCodeContext(value, isInTemplateLiteral)
+      return this.formatValueForCodeContext(value, language)
     }
 
     if (blockType === 'response') {
@@ -216,29 +207,7 @@ export class BlockResolver implements Resolver {
     return String(value)
   }
 
-  private formatValueForCodeContext(value: any, isInTemplateLiteral: boolean): string {
-    if (isInTemplateLiteral) {
-      if (typeof value === 'string') {
-        return value
-      }
-      if (typeof value === 'object' && value !== null) {
-        return JSON.stringify(value)
-      }
-      return String(value)
-    }
-
-    if (typeof value === 'string') {
-      return JSON.stringify(value)
-    }
-    if (typeof value === 'object' && value !== null) {
-      return JSON.stringify(value)
-    }
-    if (value === undefined) {
-      return 'undefined'
-    }
-    if (value === null) {
-      return 'null'
-    }
-    return String(value)
+  private formatValueForCodeContext(value: any, language?: string): string {
+    return formatLiteralForCode(value, language === 'python' ? 'python' : 'javascript')
   }
 }

@@ -1,7 +1,4 @@
-import { db } from '@sim/db'
-import { mcpServers } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
-import { and, eq, inArray, isNull } from 'drizzle-orm'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import {
   containsUserFileWithMetadata,
@@ -14,8 +11,11 @@ import {
   DEFAULTS,
   EDGE,
   isSentinelBlockType,
+  isTriggerBehavior,
+  isWorkflowBlockType,
 } from '@/executor/constants'
 import type { DAGNode } from '@/executor/dag/builder'
+import { ChildWorkflowError } from '@/executor/errors/child-workflow-error'
 import type { BlockStateWriter, ContextExtensions } from '@/executor/execution/types'
 import {
   generatePauseContextId,
@@ -86,10 +86,6 @@ export class BlockExecutor {
 
       resolvedInputs = this.resolver.resolveInputs(ctx, node.id, block.config.params, block)
 
-      if (block.metadata?.id === BlockType.AGENT && resolvedInputs.tools) {
-        resolvedInputs = await this.filterUnavailableMcpToolsForLog(ctx, resolvedInputs)
-      }
-
       if (blockLog) {
         blockLog.input = resolvedInputs
       }
@@ -159,8 +155,8 @@ export class BlockExecutor {
       this.state.setBlockOutput(node.id, normalizedOutput, duration)
 
       if (!isSentinel) {
-        const filteredOutput = this.filterOutputForLog(block, normalizedOutput)
-        this.callOnBlockComplete(ctx, node, block, resolvedInputs, filteredOutput, duration)
+        const displayOutput = this.filterOutputForDisplay(block, normalizedOutput)
+        this.callOnBlockComplete(ctx, node, block, resolvedInputs, displayOutput, duration)
       }
 
       return normalizedOutput
@@ -220,23 +216,25 @@ export class BlockExecutor {
         ? resolvedInputs
         : ((block.config?.params as Record<string, any> | undefined) ?? {})
 
+    const errorOutput: NormalizedBlockOutput = {
+      error: errorMessage,
+    }
+
+    if (ChildWorkflowError.isChildWorkflowError(error)) {
+      errorOutput.childTraceSpans = error.childTraceSpans
+      errorOutput.childWorkflowName = error.childWorkflowName
+    }
+
+    this.state.setBlockOutput(node.id, errorOutput, duration)
+
     if (blockLog) {
       blockLog.endedAt = new Date().toISOString()
       blockLog.durationMs = duration
       blockLog.success = false
       blockLog.error = errorMessage
       blockLog.input = input
+      blockLog.output = this.filterOutputForLog(block, errorOutput)
     }
-
-    const errorOutput: NormalizedBlockOutput = {
-      error: errorMessage,
-    }
-
-    if (error && typeof error === 'object' && 'childTraceSpans' in error) {
-      errorOutput.childTraceSpans = (error as any).childTraceSpans
-    }
-
-    this.state.setBlockOutput(node.id, errorOutput, duration)
 
     logger.error(
       phase === 'input_resolution' ? 'Failed to resolve block inputs' : 'Block execution failed',
@@ -248,7 +246,8 @@ export class BlockExecutor {
     )
 
     if (!isSentinel) {
-      this.callOnBlockComplete(ctx, node, block, input, errorOutput, duration)
+      const displayOutput = this.filterOutputForDisplay(block, errorOutput)
+      this.callOnBlockComplete(ctx, node, block, input, displayOutput, duration)
     }
 
     const hasErrorPort = this.hasErrorPortEdge(node)
@@ -340,7 +339,9 @@ export class BlockExecutor {
     block: SerializedBlock,
     output: NormalizedBlockOutput
   ): NormalizedBlockOutput {
-    if (block.metadata?.id === BlockType.HUMAN_IN_THE_LOOP) {
+    const blockType = block.metadata?.id
+
+    if (blockType === BlockType.HUMAN_IN_THE_LOOP) {
       const filtered: NormalizedBlockOutput = {}
       for (const [key, value] of Object.entries(output)) {
         if (key.startsWith('_')) continue
@@ -350,12 +351,7 @@ export class BlockExecutor {
       return filtered
     }
 
-    const isTrigger =
-      block.metadata?.category === 'triggers' ||
-      block.config?.params?.triggerMode === true ||
-      block.metadata?.id === BlockType.STARTER
-
-    if (isTrigger) {
+    if (isTriggerBehavior(block)) {
       const filtered: NormalizedBlockOutput = {}
       const internalKeys = ['webhook', 'workflowId']
       for (const [key, value] of Object.entries(output)) {
@@ -366,6 +362,22 @@ export class BlockExecutor {
     }
 
     return output
+  }
+
+  private filterOutputForDisplay(
+    block: SerializedBlock,
+    output: NormalizedBlockOutput
+  ): NormalizedBlockOutput {
+    const filtered = this.filterOutputForLog(block, output)
+
+    if (isWorkflowBlockType(block.metadata?.id)) {
+      const { childTraceSpans: _, ...displayOutput } = filtered as {
+        childTraceSpans?: unknown
+      } & Record<string, unknown>
+      return displayOutput
+    }
+
+    return filtered
   }
 
   private callOnBlockStart(ctx: ExecutionContext, node: DAGNode, block: SerializedBlock): void {
@@ -435,60 +447,6 @@ export class BlockExecutor {
     }
 
     return undefined
-  }
-
-  /**
-   * Filters out unavailable MCP tools from agent inputs for logging.
-   * Only includes tools from servers with 'connected' status.
-   */
-  private async filterUnavailableMcpToolsForLog(
-    ctx: ExecutionContext,
-    inputs: Record<string, any>
-  ): Promise<Record<string, any>> {
-    const tools = inputs.tools
-    if (!Array.isArray(tools) || tools.length === 0) return inputs
-
-    const mcpTools = tools.filter((t: any) => t.type === 'mcp')
-    if (mcpTools.length === 0) return inputs
-
-    const serverIds = [
-      ...new Set(mcpTools.map((t: any) => t.params?.serverId).filter(Boolean)),
-    ] as string[]
-    if (serverIds.length === 0) return inputs
-
-    const availableServerIds = new Set<string>()
-    if (ctx.workspaceId && serverIds.length > 0) {
-      try {
-        const servers = await db
-          .select({ id: mcpServers.id, connectionStatus: mcpServers.connectionStatus })
-          .from(mcpServers)
-          .where(
-            and(
-              eq(mcpServers.workspaceId, ctx.workspaceId),
-              inArray(mcpServers.id, serverIds),
-              isNull(mcpServers.deletedAt)
-            )
-          )
-
-        for (const server of servers) {
-          if (server.connectionStatus === 'connected') {
-            availableServerIds.add(server.id)
-          }
-        }
-      } catch (error) {
-        logger.warn('Failed to check MCP server availability for logging:', error)
-        return inputs
-      }
-    }
-
-    const filteredTools = tools.filter((tool: any) => {
-      if (tool.type !== 'mcp') return true
-      const serverId = tool.params?.serverId
-      if (!serverId) return false
-      return availableServerIds.has(serverId)
-    })
-
-    return { ...inputs, tools: filteredTools }
   }
 
   private preparePauseResumeSelfReference(
