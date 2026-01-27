@@ -24,9 +24,9 @@ export const googleProvider: ProviderConfig = {
   executeRequest: async (
     request: ProviderRequest
   ): Promise<ProviderResponse | StreamingExecution> => {
-    if (!request.apiKey) {
-      throw new Error('API key is required for Google Gemini')
-    }
+    // if (!request.apiKey) {
+    //   throw new Error('API key is required for Google Gemini')
+    // }
 
     logger.info('Creating Google Gemini client', { model: request.model })
 
