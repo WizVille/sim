@@ -43,6 +43,7 @@ export const openaiProvider: ProviderConfig = {
       stream: !!request.stream,
     })
 
+    request.apiKey = request.apiKey || getEnv('OPENAI_API_KEY')
     const openai = new OpenAI({ apiKey: request.apiKey })
 
     const allMessages = []
