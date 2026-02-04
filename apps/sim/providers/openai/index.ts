@@ -1,3 +1,4 @@
+import { getEnv, env } from '@/lib/core/config/env'
 import { createLogger } from '@sim/logger'
 import OpenAI from 'openai'
 import type { ChatCompletionCreateParamsStreaming } from 'openai/resources/chat/completions'

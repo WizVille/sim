@@ -128,7 +128,7 @@ Return ONLY the JSON array.`,
       type: 'combobox',
       placeholder: 'Type or select a model...',
       required: true,
-      defaultValue: 'gemini-2.5-flash',
+      defaultValue: 'vertex/gemini-2.5-flash',
       options: () => {
         const providersState = useProvidersStore.getState()
         const baseModels = providersState.providers.base.models
@@ -139,7 +139,7 @@ Return ONLY the JSON array.`,
           new Set([...baseModels, ...ollamaModels, ...vllmModels, ...openrouterModels])
         )
 
-        return allModels.filter(m => ['azure/gpt-5', 'azure/gpt-5-mini', 'azure/gpt-5-nano', 'azure/gpt-5.1', 'mistral-large-latest', 'mistral-medium-latest', 'mistral-small-latest'].includes(m) || m.startsWith('vertex/')).map((model) => {
+        return allModels.filter(m => ['azure/gpt-5', 'azure/gpt-5-mini', 'azure/gpt-5-nano', 'azure/gpt-5.2', 'mistral-large-latest', 'mistral-medium-latest', 'mistral-small-latest'].includes(m) || m.startsWith('vertex/') || m.startsWith('gpt')).map((model) => {
           const icon = getProviderIcon(model)
           return { label: model, id: model, ...(icon && { icon }) }
         })
