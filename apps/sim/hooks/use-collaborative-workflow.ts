@@ -119,8 +119,6 @@ export function useCollaborativeWorkflow() {
     onWorkflowOperation,
     onSubblockUpdate,
     onVariableUpdate,
-    onUserJoined,
-    onUserLeft,
     onWorkflowDeleted,
     onWorkflowReverted,
     onOperationConfirmed,
@@ -148,10 +146,6 @@ export function useCollaborativeWorkflow() {
     cancelOperationsForVariable,
   } = useOperationQueue()
 
-  const isInActiveRoom = useCallback(() => {
-    return !!currentWorkflowId && activeWorkflowId === currentWorkflowId
-  }, [currentWorkflowId, activeWorkflowId])
-
   // Register emit functions with operation queue store
   useEffect(() => {
     registerEmitFunctions(
@@ -164,9 +158,18 @@ export function useCollaborativeWorkflow() {
 
   useEffect(() => {
     const handleWorkflowOperation = (data: any) => {
-      const { operation, target, payload, userId } = data
+      const { operation, target, payload, userId, metadata } = data
 
       if (isApplyingRemoteChange.current) return
+
+      // Filter broadcasts by workflowId to prevent cross-workflow updates
+      if (metadata?.workflowId && metadata.workflowId !== activeWorkflowId) {
+        logger.debug('Ignoring workflow operation for different workflow', {
+          broadcastWorkflowId: metadata.workflowId,
+          activeWorkflowId,
+        })
+        return
+      }
 
       logger.info(`Received ${operation} on ${target} from user ${userId}`)
 
@@ -438,16 +441,24 @@ export function useCollaborativeWorkflow() {
     }
 
     const handleSubblockUpdate = (data: any) => {
-      const { blockId, subblockId, value, userId } = data
+      const { workflowId, blockId, subblockId, value, userId } = data
 
       if (isApplyingRemoteChange.current) return
+
+      // Filter broadcasts by workflowId to prevent cross-workflow updates
+      if (workflowId && workflowId !== activeWorkflowId) {
+        logger.debug('Ignoring subblock update for different workflow', {
+          broadcastWorkflowId: workflowId,
+          activeWorkflowId,
+        })
+        return
+      }
 
       logger.info(`Received subblock update from user ${userId}: ${blockId}.${subblockId}`)
 
       isApplyingRemoteChange.current = true
 
       try {
-        // The setValue function automatically uses the active workflow ID
         useSubBlockStore.getState().setValue(blockId, subblockId, value)
         const blockType = useWorkflowStore.getState().blocks?.[blockId]?.type
         if (activeWorkflowId && blockType === 'function' && subblockId === 'code') {
@@ -461,9 +472,18 @@ export function useCollaborativeWorkflow() {
     }
 
     const handleVariableUpdate = (data: any) => {
-      const { variableId, field, value, userId } = data
+      const { workflowId, variableId, field, value, userId } = data
 
       if (isApplyingRemoteChange.current) return
+
+      // Filter broadcasts by workflowId to prevent cross-workflow updates
+      if (workflowId && workflowId !== activeWorkflowId) {
+        logger.debug('Ignoring variable update for different workflow', {
+          broadcastWorkflowId: workflowId,
+          activeWorkflowId,
+        })
+        return
+      }
 
       logger.info(`Received variable update from user ${userId}: ${variableId}.${field}`)
 
@@ -482,14 +502,6 @@ export function useCollaborativeWorkflow() {
       } finally {
         isApplyingRemoteChange.current = false
       }
-    }
-
-    const handleUserJoined = (data: any) => {
-      logger.info(`User joined: ${data.userName}`)
-    }
-
-    const handleUserLeft = (data: any) => {
-      logger.info(`User left: ${data.userId}`)
     }
 
     const handleWorkflowDeleted = (data: any) => {
@@ -600,26 +612,17 @@ export function useCollaborativeWorkflow() {
       failOperation(operationId, retryable)
     }
 
-    // Register event handlers
     onWorkflowOperation(handleWorkflowOperation)
     onSubblockUpdate(handleSubblockUpdate)
     onVariableUpdate(handleVariableUpdate)
-    onUserJoined(handleUserJoined)
-    onUserLeft(handleUserLeft)
     onWorkflowDeleted(handleWorkflowDeleted)
     onWorkflowReverted(handleWorkflowReverted)
     onOperationConfirmed(handleOperationConfirmed)
     onOperationFailed(handleOperationFailed)
-
-    return () => {
-      // Cleanup handled by socket context
-    }
   }, [
     onWorkflowOperation,
     onSubblockUpdate,
     onVariableUpdate,
-    onUserJoined,
-    onUserLeft,
     onWorkflowDeleted,
     onWorkflowReverted,
     onOperationConfirmed,
@@ -642,13 +645,9 @@ export function useCollaborativeWorkflow() {
         return
       }
 
-      if (!isInActiveRoom()) {
-        logger.debug('Skipping operation - not in active workflow', {
-          currentWorkflowId,
-          activeWorkflowId,
-          operation,
-          target,
-        })
+      // Queue operations if we have an active workflow - queue handles socket readiness
+      if (!activeWorkflowId) {
+        logger.debug('Skipping operation - no active workflow', { operation, target })
         return
       }
 
@@ -661,20 +660,13 @@ export function useCollaborativeWorkflow() {
           target,
           payload,
         },
-        workflowId: activeWorkflowId || '',
+        workflowId: activeWorkflowId,
         userId: session?.user?.id || 'unknown',
       })
 
       localAction()
     },
-    [
-      addToQueue,
-      session?.user?.id,
-      isBaselineDiffView,
-      activeWorkflowId,
-      isInActiveRoom,
-      currentWorkflowId,
-    ]
+    [addToQueue, session?.user?.id, isBaselineDiffView, activeWorkflowId]
   )
 
   const collaborativeBatchUpdatePositions = useCallback(
@@ -688,8 +680,8 @@ export function useCollaborativeWorkflow() {
         return
       }
 
-      if (!isInActiveRoom()) {
-        logger.debug('Skipping batch position update - not in active workflow')
+      if (!activeWorkflowId) {
+        logger.debug('Skipping batch position update - no active workflow')
         return
       }
 
@@ -733,7 +725,7 @@ export function useCollaborativeWorkflow() {
         }
       }
     },
-    [isBaselineDiffView, addToQueue, activeWorkflowId, session?.user?.id, isInActiveRoom, undoRedo]
+    [isBaselineDiffView, addToQueue, activeWorkflowId, session?.user?.id, undoRedo]
   )
 
   const collaborativeUpdateBlockName = useCallback(
@@ -877,8 +869,8 @@ export function useCollaborativeWorkflow() {
         return
       }
 
-      if (!isInActiveRoom()) {
-        logger.debug('Skipping batch update parent - not in active workflow')
+      if (!activeWorkflowId) {
+        logger.debug('Skipping batch update parent - no active workflow')
         return
       }
 
@@ -947,7 +939,7 @@ export function useCollaborativeWorkflow() {
 
       logger.debug('Batch updated parent for blocks', { updateCount: updates.length })
     },
-    [isBaselineDiffView, isInActiveRoom, undoRedo, addToQueue, activeWorkflowId, session?.user?.id]
+    [isBaselineDiffView, undoRedo, addToQueue, activeWorkflowId, session?.user?.id]
   )
 
   const collaborativeToggleBlockAdvancedMode = useCallback(
@@ -1039,8 +1031,8 @@ export function useCollaborativeWorkflow() {
         return false
       }
 
-      if (!isInActiveRoom()) {
-        logger.debug('Skipping batch add edges - not in active workflow')
+      if (!activeWorkflowId) {
+        logger.debug('Skipping batch add edges - no active workflow')
         return false
       }
 
@@ -1074,7 +1066,7 @@ export function useCollaborativeWorkflow() {
 
       return true
     },
-    [isBaselineDiffView, addToQueue, activeWorkflowId, session?.user?.id, isInActiveRoom, undoRedo]
+    [isBaselineDiffView, addToQueue, activeWorkflowId, session?.user?.id, undoRedo]
   )
 
   const collaborativeBatchRemoveEdges = useCallback(
@@ -1083,8 +1075,8 @@ export function useCollaborativeWorkflow() {
         return false
       }
 
-      if (!isInActiveRoom()) {
-        logger.debug('Skipping batch remove edges - not in active workflow')
+      if (!activeWorkflowId) {
+        logger.debug('Skipping batch remove edges - no active workflow')
         return false
       }
 
@@ -1132,7 +1124,7 @@ export function useCollaborativeWorkflow() {
       logger.info('Batch removed edges', { count: validEdgeIds.length })
       return true
     },
-    [isBaselineDiffView, isInActiveRoom, addToQueue, activeWorkflowId, session, undoRedo]
+    [isBaselineDiffView, addToQueue, activeWorkflowId, session, undoRedo]
   )
 
   const collaborativeSetSubblockValue = useCallback(
@@ -1167,11 +1159,9 @@ export function useCollaborativeWorkflow() {
         // Best-effort; do not block on clearing
       }
 
-      // Only emit to socket if in active room
-      if (!isInActiveRoom()) {
-        logger.debug('Local update applied, skipping socket emit - not in active workflow', {
-          currentWorkflowId,
-          activeWorkflowId,
+      // Queue socket operation if we have an active workflow
+      if (!activeWorkflowId) {
+        logger.debug('Local update applied, skipping socket queue - no active workflow', {
           blockId,
           subblockId,
         })
@@ -1193,14 +1183,7 @@ export function useCollaborativeWorkflow() {
         userId: session?.user?.id || 'unknown',
       })
     },
-    [
-      currentWorkflowId,
-      activeWorkflowId,
-      addToQueue,
-      session?.user?.id,
-      isBaselineDiffView,
-      isInActiveRoom,
-    ]
+    [activeWorkflowId, addToQueue, session?.user?.id, isBaselineDiffView]
   )
 
   // Immediate tag selection (uses queue but processes immediately, no debouncing)
@@ -1212,13 +1195,8 @@ export function useCollaborativeWorkflow() {
         return
       }
 
-      if (!isInActiveRoom()) {
-        logger.debug('Skipping tag selection - not in active workflow', {
-          currentWorkflowId,
-          activeWorkflowId,
-          blockId,
-          subblockId,
-        })
+      if (!activeWorkflowId) {
+        logger.debug('Skipping tag selection - no active workflow', { blockId, subblockId })
         return
       }
 
@@ -1239,14 +1217,7 @@ export function useCollaborativeWorkflow() {
         userId: session?.user?.id || 'unknown',
       })
     },
-    [
-      isBaselineDiffView,
-      addToQueue,
-      currentWorkflowId,
-      activeWorkflowId,
-      session?.user?.id,
-      isInActiveRoom,
-    ]
+    [isBaselineDiffView, addToQueue, activeWorkflowId, session?.user?.id]
   )
 
   const collaborativeUpdateLoopType = useCallback(
@@ -1533,8 +1504,8 @@ export function useCollaborativeWorkflow() {
       subBlockValues: Record<string, Record<string, unknown>> = {},
       options?: { skipUndoRedo?: boolean }
     ) => {
-      if (!isInActiveRoom()) {
-        logger.debug('Skipping batch add blocks - not in active workflow')
+      if (!activeWorkflowId) {
+        logger.debug('Skipping batch add blocks - no active workflow')
         return false
       }
 
@@ -1587,7 +1558,7 @@ export function useCollaborativeWorkflow() {
 
       return true
     },
-    [addToQueue, activeWorkflowId, session?.user?.id, isBaselineDiffView, isInActiveRoom, undoRedo]
+    [addToQueue, activeWorkflowId, session?.user?.id, isBaselineDiffView, undoRedo]
   )
 
   const collaborativeBatchRemoveBlocks = useCallback(
@@ -1596,8 +1567,8 @@ export function useCollaborativeWorkflow() {
         return false
       }
 
-      if (!isInActiveRoom()) {
-        logger.debug('Skipping batch remove blocks - not in active workflow')
+      if (!activeWorkflowId) {
+        logger.debug('Skipping batch remove blocks - no active workflow')
         return false
       }
 
@@ -1681,7 +1652,6 @@ export function useCollaborativeWorkflow() {
       addToQueue,
       activeWorkflowId,
       session?.user?.id,
-      isInActiveRoom,
       cancelOperationsForBlock,
       undoRedo,
     ]

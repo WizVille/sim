@@ -53,6 +53,7 @@ const ExecuteWorkflowSchema = z.object({
       parallels: z.record(z.any()).optional(),
     })
     .optional(),
+  stopAfterBlockId: z.string().optional(),
 })
 
 export const runtime = 'nodejs'
@@ -222,6 +223,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       includeFileBase64,
       base64MaxBytes,
       workflowStateOverride,
+      stopAfterBlockId,
     } = validation.data
 
     // For API key and internal JWT auth, the entire body is the input (except for our control fields)
@@ -237,6 +239,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
               includeFileBase64,
               base64MaxBytes,
               workflowStateOverride,
+              stopAfterBlockId: _stopAfterBlockId,
               workflowId: _workflowId, // Also exclude workflowId used for internal JWT auth
               ...rest
             } = body
@@ -434,6 +437,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
           loggingSession,
           includeFileBase64,
           base64MaxBytes,
+          stopAfterBlockId,
         })
 
         const outputWithBase64 = includeFileBase64
@@ -612,6 +616,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
                   input: callbackData.input,
                   error: callbackData.output.error,
                   durationMs: callbackData.executionTime || 0,
+                  startedAt: callbackData.startedAt,
+                  endedAt: callbackData.endedAt,
                   ...(iterationContext && {
                     iterationCurrent: iterationContext.iterationCurrent,
                     iterationTotal: iterationContext.iterationTotal,
@@ -637,6 +643,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
                   input: callbackData.input,
                   output: callbackData.output,
                   durationMs: callbackData.executionTime || 0,
+                  startedAt: callbackData.startedAt,
+                  endedAt: callbackData.endedAt,
                   ...(iterationContext && {
                     iterationCurrent: iterationContext.iterationCurrent,
                     iterationTotal: iterationContext.iterationTotal,
@@ -722,6 +730,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
             abortSignal: abortController.signal,
             includeFileBase64,
             base64MaxBytes,
+            stopAfterBlockId,
           })
 
           if (result.status === 'paused') {

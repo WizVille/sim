@@ -26,6 +26,7 @@ export class ExecutionEngine {
   private allowResumeTriggers: boolean
   private cancelledFlag = false
   private errorFlag = false
+  private stoppedEarlyFlag = false
   private executionError: Error | null = null
   private lastCancellationCheck = 0
   private readonly useRedisCancellation: boolean
@@ -100,12 +101,12 @@ export class ExecutionEngine {
   }
 
   async run(triggerBlockId?: string): Promise<ExecutionResult> {
-    const startTime = Date.now()
+    const startTime = performance.now()
     try {
       this.initializeQueue(triggerBlockId)
 
       while (this.hasWork()) {
-        if ((await this.checkCancellation()) || this.errorFlag) {
+        if ((await this.checkCancellation()) || this.errorFlag || this.stoppedEarlyFlag) {
           break
         }
         await this.processQueue()
@@ -124,8 +125,8 @@ export class ExecutionEngine {
         return this.buildPausedResult(startTime)
       }
 
-      const endTime = Date.now()
-      this.context.metadata.endTime = new Date(endTime).toISOString()
+      const endTime = performance.now()
+      this.context.metadata.endTime = new Date().toISOString()
       this.context.metadata.duration = endTime - startTime
 
       if (this.cancelledFlag) {
@@ -145,8 +146,8 @@ export class ExecutionEngine {
         metadata: this.context.metadata,
       }
     } catch (error) {
-      const endTime = Date.now()
-      this.context.metadata.endTime = new Date(endTime).toISOString()
+      const endTime = performance.now()
+      this.context.metadata.endTime = new Date().toISOString()
       this.context.metadata.duration = endTime - startTime
 
       if (this.cancelledFlag) {
@@ -259,6 +260,16 @@ export class ExecutionEngine {
   }
 
   private initializeQueue(triggerBlockId?: string): void {
+    if (this.context.runFromBlockContext) {
+      const { startBlockId } = this.context.runFromBlockContext
+      logger.info('Initializing queue for run-from-block mode', {
+        startBlockId,
+        dirtySetSize: this.context.runFromBlockContext.dirtySet.size,
+      })
+      this.addToQueue(startBlockId)
+      return
+    }
+
     const pendingBlocks = this.context.metadata.pendingBlocks
     const remainingEdges = (this.context.metadata as any).remainingEdges
 
@@ -385,11 +396,28 @@ export class ExecutionEngine {
       this.finalOutput = output
     }
 
+    if (this.context.stopAfterBlockId === nodeId) {
+      // For loop/parallel sentinels, only stop if the subflow has fully exited (all iterations done)
+      // shouldContinue: true means more iterations, shouldExit: true means loop is done
+      const shouldContinueLoop = output.shouldContinue === true
+      if (!shouldContinueLoop) {
+        logger.info('Stopping execution after target block', { nodeId })
+        this.stoppedEarlyFlag = true
+        return
+      }
+    }
+
     const readyNodes = this.edgeManager.processOutgoingEdges(node, output, false)
 
     logger.info('Processing outgoing edges', {
       nodeId,
       outgoingEdgesCount: node.outgoingEdges.size,
+      outgoingEdges: Array.from(node.outgoingEdges.entries()).map(([id, e]) => ({
+        id,
+        target: e.target,
+        sourceHandle: e.sourceHandle,
+      })),
+      output,
       readyNodesCount: readyNodes.length,
       readyNodes,
     })
@@ -405,8 +433,8 @@ export class ExecutionEngine {
   }
 
   private buildPausedResult(startTime: number): ExecutionResult {
-    const endTime = Date.now()
-    this.context.metadata.endTime = new Date(endTime).toISOString()
+    const endTime = performance.now()
+    this.context.metadata.endTime = new Date().toISOString()
     this.context.metadata.duration = endTime - startTime
     this.context.metadata.status = 'paused'
 
