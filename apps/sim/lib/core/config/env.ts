@@ -95,6 +95,9 @@ export const env = createEnv({
     AZURE_OPENAI_ENDPOINT:                 z.string().url().optional(),            // Shared Azure OpenAI service endpoint
     AZURE_OPENAI_API_VERSION:              z.string().optional(),                  // Shared Azure OpenAI API version
     AZURE_OPENAI_API_KEY:                  z.string().min(1).optional(),           // Shared Azure OpenAI API key
+    AZURE_ANTHROPIC_ENDPOINT:              z.string().url().optional(),            // Azure Anthropic service endpoint
+    AZURE_ANTHROPIC_API_KEY:               z.string().min(1).optional(),           // Azure Anthropic API key
+    AZURE_ANTHROPIC_API_VERSION:           z.string().min(1).optional(),           // Azure Anthropic API version (e.g. 2023-06-01)
     KB_OPENAI_MODEL_NAME:                  z.string().optional(),                  // Knowledge base OpenAI model name (works with both regular OpenAI and Azure OpenAI)
     WAND_OPENAI_MODEL_NAME:                z.string().optional(),                  // Wand generation OpenAI model name (works with both regular OpenAI and Azure OpenAI)
     OCR_AZURE_ENDPOINT:                    z.string().url().optional(),            // Azure Mistral OCR service endpoint
@@ -169,6 +172,34 @@ export const env = createEnv({
     RATE_LIMIT_TEAM_ASYNC:                 z.string().optional().default('2500'),  // Team tier async API executions per minute
     RATE_LIMIT_ENTERPRISE_SYNC:            z.string().optional().default('600'),   // Enterprise tier sync API executions per minute
     RATE_LIMIT_ENTERPRISE_ASYNC:           z.string().optional().default('5000'),  // Enterprise tier async API executions per minute
+
+    // Timeout Configuration
+    EXECUTION_TIMEOUT_FREE:                z.string().optional().default('300'),   // 5 minutes
+    EXECUTION_TIMEOUT_PRO:                 z.string().optional().default('3000'),  // 50 minutes
+    EXECUTION_TIMEOUT_TEAM:                z.string().optional().default('3000'),  // 50 minutes
+    EXECUTION_TIMEOUT_ENTERPRISE:          z.string().optional().default('3000'),  // 50 minutes
+    EXECUTION_TIMEOUT_ASYNC_FREE:          z.string().optional().default('5400'),  // 90 minutes
+    EXECUTION_TIMEOUT_ASYNC_PRO:           z.string().optional().default('5400'),  // 90 minutes
+    EXECUTION_TIMEOUT_ASYNC_TEAM:          z.string().optional().default('5400'),  // 90 minutes
+    EXECUTION_TIMEOUT_ASYNC_ENTERPRISE:    z.string().optional().default('5400'),  // 90 minutes
+
+    // Isolated-VM Worker Pool Configuration
+    IVM_POOL_SIZE:                         z.string().optional().default('4'),      // Max worker processes in pool
+    IVM_MAX_CONCURRENT:                    z.string().optional().default('10000'),  // Max concurrent executions globally
+    IVM_MAX_PER_WORKER:                    z.string().optional().default('2500'),   // Max concurrent executions per worker
+    IVM_WORKER_IDLE_TIMEOUT_MS:            z.string().optional().default('60000'),  // Worker idle cleanup timeout (ms)
+    IVM_MAX_QUEUE_SIZE:                    z.string().optional().default('10000'),  // Max pending queued executions in memory
+    IVM_MAX_FETCH_RESPONSE_BYTES:          z.string().optional().default('8388608'),// Max bytes read from sandbox fetch responses
+    IVM_MAX_FETCH_RESPONSE_CHARS:          z.string().optional().default('4000000'),// Max chars returned to sandbox from fetch body
+    IVM_MAX_FETCH_OPTIONS_JSON_CHARS:      z.string().optional().default('262144'), // Max JSON payload size for sandbox fetch options
+    IVM_MAX_FETCH_URL_LENGTH:              z.string().optional().default('8192'),   // Max URL length accepted by sandbox fetch
+    IVM_MAX_STDOUT_CHARS:                  z.string().optional().default('200000'), // Max captured stdout characters per execution
+    IVM_MAX_ACTIVE_PER_OWNER:              z.string().optional().default('200'),    // Max active executions per owner (per process)
+    IVM_MAX_QUEUED_PER_OWNER:              z.string().optional().default('2000'),   // Max queued executions per owner (per process)
+    IVM_MAX_OWNER_WEIGHT:                  z.string().optional().default('5'),      // Max accepted weight for weighted owner scheduling
+    IVM_DISTRIBUTED_MAX_INFLIGHT_PER_OWNER:z.string().optional().default('2200'),   // Max owner in-flight leases across replicas
+    IVM_DISTRIBUTED_LEASE_MIN_TTL_MS:      z.string().optional().default('120000'), // Min TTL for distributed in-flight leases (ms)
+    IVM_QUEUE_TIMEOUT_MS:                  z.string().optional().default('300000'), // Max queue wait before rejection (ms)
 
     // Knowledge Base Processing Configuration - Shared across all processing methods
     KB_CONFIG_MAX_DURATION:                z.number().optional().default(600),     // Max processing duration in seconds (10 minutes)
@@ -340,7 +371,6 @@ export const env = createEnv({
     NEXT_PUBLIC_BRAND_BACKGROUND_COLOR:    z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),     // Brand background color (hex format)
 
     // Feature Flags
-    NEXT_PUBLIC_TRIGGER_DEV_ENABLED:       z.boolean().optional(),                   // Client-side gate for async executions UI
     NEXT_PUBLIC_SSO_ENABLED:               z.boolean().optional(),                   // Enable SSO login UI components
     NEXT_PUBLIC_CREDENTIAL_SETS_ENABLED:   z.boolean().optional(),                   // Enable credential sets (email polling) on self-hosted
     NEXT_PUBLIC_ACCESS_CONTROL_ENABLED:    z.boolean().optional(),                   // Enable access control (permission groups) on self-hosted
@@ -372,7 +402,6 @@ export const env = createEnv({
     NEXT_PUBLIC_BRAND_ACCENT_COLOR: process.env.NEXT_PUBLIC_BRAND_ACCENT_COLOR,
     NEXT_PUBLIC_BRAND_ACCENT_HOVER_COLOR: process.env.NEXT_PUBLIC_BRAND_ACCENT_HOVER_COLOR,
     NEXT_PUBLIC_BRAND_BACKGROUND_COLOR: process.env.NEXT_PUBLIC_BRAND_BACKGROUND_COLOR,
-    NEXT_PUBLIC_TRIGGER_DEV_ENABLED: process.env.NEXT_PUBLIC_TRIGGER_DEV_ENABLED,
     NEXT_PUBLIC_SSO_ENABLED: process.env.NEXT_PUBLIC_SSO_ENABLED,
     NEXT_PUBLIC_CREDENTIAL_SETS_ENABLED: process.env.NEXT_PUBLIC_CREDENTIAL_SETS_ENABLED,
     NEXT_PUBLIC_ACCESS_CONTROL_ENABLED: process.env.NEXT_PUBLIC_ACCESS_CONTROL_ENABLED,

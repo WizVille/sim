@@ -24,6 +24,7 @@ import {
   Tooltip,
 } from '@/components/emcn'
 import { getEnv, isTruthy } from '@/lib/core/config/env'
+import { formatDuration } from '@/lib/core/utils/formatting'
 import { useRegisterGlobalCommands } from '@/app/workspace/[workspaceId]/providers/global-commands-provider'
 import { createCommands } from '@/app/workspace/[workspaceId]/utils/commands-utils'
 import {
@@ -43,7 +44,6 @@ import {
   type EntryNode,
   type ExecutionGroup,
   flattenBlockEntriesOnly,
-  formatDuration,
   getBlockColor,
   getBlockIcon,
   groupEntriesByExecution,
@@ -100,7 +100,7 @@ const BlockRow = memo(function BlockRow({
     >
       <div className='flex min-w-0 flex-1 items-center gap-[8px]'>
         <div
-          className='relative flex h-[14px] w-[14px] flex-shrink-0 items-center justify-center overflow-hidden rounded-[4px]'
+          className='flex h-[14px] w-[14px] flex-shrink-0 items-center justify-center rounded-[4px]'
           style={{ background: bgColor }}
         >
           {BlockIcon && <BlockIcon className='h-[9px] w-[9px] text-white' />}
@@ -128,7 +128,7 @@ const BlockRow = memo(function BlockRow({
         <StatusDisplay
           isRunning={isRunning}
           isCanceled={isCanceled}
-          formattedDuration={formatDuration(entry.durationMs)}
+          formattedDuration={formatDuration(entry.durationMs, { precision: 2 }) ?? '-'}
         />
       </span>
     </div>
@@ -201,7 +201,7 @@ const IterationNodeRow = memo(function IterationNodeRow({
           <StatusDisplay
             isRunning={hasRunningChild}
             isCanceled={hasCanceledChild}
-            formattedDuration={formatDuration(entry.durationMs)}
+            formattedDuration={formatDuration(entry.durationMs, { precision: 2 }) ?? '-'}
           />
         </span>
       </div>
@@ -276,7 +276,7 @@ const SubflowNodeRow = memo(function SubflowNodeRow({
       >
         <div className='flex min-w-0 flex-1 items-center gap-[8px]'>
           <div
-            className='relative flex h-[14px] w-[14px] flex-shrink-0 items-center justify-center overflow-hidden rounded-[4px]'
+            className='flex h-[14px] w-[14px] flex-shrink-0 items-center justify-center rounded-[4px]'
             style={{ background: bgColor }}
           >
             {BlockIcon && <BlockIcon className='h-[9px] w-[9px] text-white' />}
@@ -314,7 +314,7 @@ const SubflowNodeRow = memo(function SubflowNodeRow({
           <StatusDisplay
             isRunning={hasRunningDescendant}
             isCanceled={hasCanceledDescendant}
-            formattedDuration={formatDuration(entry.durationMs)}
+            formattedDuration={formatDuration(entry.durationMs, { precision: 2 }) ?? '-'}
           />
         </span>
       </div>
@@ -1151,7 +1151,7 @@ export const Terminal = memo(function Terminal() {
       <aside
         ref={terminalRef}
         className={clsx(
-          'terminal-container fixed right-[var(--panel-width)] bottom-0 left-[var(--sidebar-width)] z-10 overflow-hidden bg-[var(--surface-1)]',
+          'terminal-container fixed right-[var(--panel-width)] bottom-0 left-[var(--sidebar-width)] z-10 overflow-hidden border-[var(--border)] border-t bg-[var(--surface-1)]',
           isToggling && 'transition-[height] duration-100 ease-out'
         )}
         onTransitionEnd={handleTransitionEnd}
@@ -1160,7 +1160,7 @@ export const Terminal = memo(function Terminal() {
         tabIndex={-1}
         aria-label='Terminal'
       >
-        <div className='relative flex h-full border-[var(--border)] border-t'>
+        <div className='relative flex h-full'>
           {/* Left Section - Logs */}
           <div
             className={clsx('flex flex-col', !selectedEntry && 'flex-1')}

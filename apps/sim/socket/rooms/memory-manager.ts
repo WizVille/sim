@@ -26,6 +26,10 @@ export class MemoryRoomManager implements IRoomManager {
     logger.info('MemoryRoomManager initialized (single-pod mode)')
   }
 
+  isReady(): boolean {
+    return true
+  }
+
   async shutdown(): Promise<void> {
     this.workflowRooms.clear()
     this.socketToWorkflow.clear()
@@ -62,7 +66,7 @@ export class MemoryRoomManager implements IRoomManager {
     logger.debug(`Added user ${presence.userId} to workflow ${workflowId} (socket: ${socketId})`)
   }
 
-  async removeUserFromRoom(socketId: string): Promise<string | null> {
+  async removeUserFromRoom(socketId: string, _workflowIdHint?: string): Promise<string | null> {
     const workflowId = this.socketToWorkflow.get(socketId)
 
     if (!workflowId) {

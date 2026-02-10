@@ -24,6 +24,7 @@ import {
   airtableListRecordsTool,
   airtableUpdateRecordTool,
 } from '@/tools/airtable'
+import { airweaveSearchTool } from '@/tools/airweave'
 import { apifyRunActorAsyncTool, apifyRunActorSyncTool } from '@/tools/apify'
 import {
   apolloAccountBulkCreateTool,
@@ -110,17 +111,30 @@ import {
   clerkUpdateUserTool,
 } from '@/tools/clerk'
 import {
+  confluenceAddLabelTool,
+  confluenceCreateBlogPostTool,
   confluenceCreateCommentTool,
+  confluenceCreatePagePropertyTool,
   confluenceCreatePageTool,
   confluenceDeleteAttachmentTool,
   confluenceDeleteCommentTool,
   confluenceDeletePageTool,
+  confluenceGetBlogPostTool,
+  confluenceGetPageAncestorsTool,
+  confluenceGetPageChildrenTool,
+  confluenceGetPageVersionTool,
   confluenceGetSpaceTool,
   confluenceListAttachmentsTool,
+  confluenceListBlogPostsInSpaceTool,
+  confluenceListBlogPostsTool,
   confluenceListCommentsTool,
   confluenceListLabelsTool,
+  confluenceListPagePropertiesTool,
+  confluenceListPagesInSpaceTool,
+  confluenceListPageVersionsTool,
   confluenceListSpacesTool,
   confluenceRetrieveTool,
+  confluenceSearchInSpaceTool,
   confluenceSearchTool,
   confluenceUpdateCommentTool,
   confluenceUpdateTool,
@@ -270,7 +284,7 @@ import {
   exaResearchTool,
   exaSearchTool,
 } from '@/tools/exa'
-import { fileParserV2Tool, fileParseTool } from '@/tools/file'
+import { fileParserV2Tool, fileParserV3Tool, fileParseTool } from '@/tools/file'
 import {
   firecrawlAgentTool,
   firecrawlCrawlTool,
@@ -794,6 +808,7 @@ import {
 } from '@/tools/intercom'
 import { jinaReadUrlTool, jinaSearchTool } from '@/tools/jina'
 import {
+  jiraAddAttachmentTool,
   jiraAddCommentTool,
   jiraAddWatcherTool,
   jiraAddWorklogTool,
@@ -1092,7 +1107,7 @@ import {
   microsoftTeamsWriteChannelTool,
   microsoftTeamsWriteChatTool,
 } from '@/tools/microsoft_teams'
-import { mistralParserTool, mistralParserV2Tool } from '@/tools/mistral'
+import { mistralParserTool, mistralParserV2Tool, mistralParserV3Tool } from '@/tools/mistral'
 import {
   mongodbDeleteTool,
   mongodbExecuteTool,
@@ -1259,7 +1274,7 @@ import {
   posthogUpdatePropertyDefinitionTool,
   posthogUpdateSurveyTool,
 } from '@/tools/posthog'
-import { pulseParserTool } from '@/tools/pulse'
+import { pulseParserTool, pulseParserV2Tool } from '@/tools/pulse'
 import { qdrantFetchTool, qdrantSearchTool, qdrantUpsertTool } from '@/tools/qdrant'
 import {
   rdsDeleteTool,
@@ -1284,7 +1299,7 @@ import {
   redditUnsaveTool,
   redditVoteTool,
 } from '@/tools/reddit'
-import { reductoParserTool } from '@/tools/reducto'
+import { reductoParserTool, reductoParserV2Tool } from '@/tools/reducto'
 import { mailSendTool } from '@/tools/resend'
 import {
   s3CopyObjectTool,
@@ -1584,10 +1599,15 @@ import {
 } from '@/tools/stripe'
 import {
   assemblyaiSttTool,
+  assemblyaiSttV2Tool,
   deepgramSttTool,
+  deepgramSttV2Tool,
   elevenLabsSttTool,
+  elevenLabsSttV2Tool,
   geminiSttTool,
+  geminiSttV2Tool,
   whisperSttTool,
+  whisperSttV2Tool,
 } from '@/tools/stt'
 import {
   supabaseCountTool,
@@ -1623,7 +1643,7 @@ import {
   telegramSendPhotoTool,
   telegramSendVideoTool,
 } from '@/tools/telegram'
-import { textractParserTool } from '@/tools/textract'
+import { textractParserTool, textractParserV2Tool } from '@/tools/textract'
 import { thinkingTool } from '@/tools/thinking'
 import { tinybirdEventsTool, tinybirdQueryTool } from '@/tools/tinybird'
 import {
@@ -1663,7 +1683,7 @@ import {
   runwayVideoTool,
   veoVideoTool,
 } from '@/tools/video'
-import { visionTool } from '@/tools/vision'
+import { visionTool, visionToolV2 } from '@/tools/vision'
 import {
   wealthboxReadContactTool,
   wealthboxReadNoteTool,
@@ -1790,6 +1810,7 @@ export const tools: Record<string, ToolConfig> = {
   a2a_resubscribe: a2aResubscribeTool,
   a2a_send_message: a2aSendMessageTool,
   a2a_set_push_notification: a2aSetPushNotificationTool,
+  airweave_search: airweaveSearchTool,
   arxiv_search: arxivSearchTool,
   arxiv_get_paper: arxivGetPaperTool,
   arxiv_get_author_papers: arxivGetAuthorPapersTool,
@@ -1807,8 +1828,10 @@ export const tools: Record<string, ToolConfig> = {
   llm_chat: llmChatTool,
   function_execute: functionExecuteTool,
   vision_tool: visionTool,
+  vision_tool_v2: visionToolV2,
   file_parser: fileParseTool,
   file_parser_v2: fileParserV2Tool,
+  file_parser_v3: fileParserV3Tool,
   firecrawl_scrape: firecrawlScrapeTool,
   firecrawl_search: firecrawlSearchTool,
   firecrawl_crawl: firecrawlCrawlTool,
@@ -1909,6 +1932,7 @@ export const tools: Record<string, ToolConfig> = {
   jira_update_comment: jiraUpdateCommentTool,
   jira_delete_comment: jiraDeleteCommentTool,
   jira_get_attachments: jiraGetAttachmentsTool,
+  jira_add_attachment: jiraAddAttachmentTool,
   jira_delete_attachment: jiraDeleteAttachmentTool,
   jira_add_worklog: jiraAddWorklogTool,
   jira_get_worklogs: jiraGetWorklogsTool,
@@ -2551,6 +2575,7 @@ export const tools: Record<string, ToolConfig> = {
   perplexity_chat: perplexityChatTool,
   perplexity_search: perplexitySearchTool,
   pulse_parser: pulseParserTool,
+  pulse_parser_v2: pulseParserV2Tool,
   posthog_capture_event: posthogCaptureEventTool,
   posthog_batch_events: posthogBatchEventsTool,
   posthog_list_persons: posthogListPersonsTool,
@@ -2598,7 +2623,19 @@ export const tools: Record<string, ToolConfig> = {
   confluence_update: confluenceUpdateTool,
   confluence_create_page: confluenceCreatePageTool,
   confluence_delete_page: confluenceDeletePageTool,
+  confluence_list_pages_in_space: confluenceListPagesInSpaceTool,
+  confluence_get_page_children: confluenceGetPageChildrenTool,
+  confluence_get_page_ancestors: confluenceGetPageAncestorsTool,
+  confluence_list_page_versions: confluenceListPageVersionsTool,
+  confluence_get_page_version: confluenceGetPageVersionTool,
+  confluence_list_page_properties: confluenceListPagePropertiesTool,
+  confluence_create_page_property: confluenceCreatePagePropertyTool,
+  confluence_list_blogposts: confluenceListBlogPostsTool,
+  confluence_get_blogpost: confluenceGetBlogPostTool,
+  confluence_create_blogpost: confluenceCreateBlogPostTool,
+  confluence_list_blogposts_in_space: confluenceListBlogPostsInSpaceTool,
   confluence_search: confluenceSearchTool,
+  confluence_search_in_space: confluenceSearchInSpaceTool,
   confluence_create_comment: confluenceCreateCommentTool,
   confluence_list_comments: confluenceListCommentsTool,
   confluence_update_comment: confluenceUpdateCommentTool,
@@ -2607,6 +2644,7 @@ export const tools: Record<string, ToolConfig> = {
   confluence_upload_attachment: confluenceUploadAttachmentTool,
   confluence_delete_attachment: confluenceDeleteAttachmentTool,
   confluence_list_labels: confluenceListLabelsTool,
+  confluence_add_label: confluenceAddLabelTool,
   confluence_get_space: confluenceGetSpaceTool,
   confluence_list_spaces: confluenceListSpacesTool,
   cursor_list_agents: cursorListAgentsTool,
@@ -2674,8 +2712,11 @@ export const tools: Record<string, ToolConfig> = {
   apollo_email_accounts: apolloEmailAccountsTool,
   mistral_parser: mistralParserTool,
   mistral_parser_v2: mistralParserV2Tool,
+  mistral_parser_v3: mistralParserV3Tool,
   reducto_parser: reductoParserTool,
+  reducto_parser_v2: reductoParserV2Tool,
   textract_parser: textractParserTool,
+  textract_parser_v2: textractParserV2Tool,
   thinking_tool: thinkingTool,
   tinybird_events: tinybirdEventsTool,
   tinybird_query: tinybirdQueryTool,
@@ -2703,10 +2744,15 @@ export const tools: Record<string, ToolConfig> = {
   search_tool: searchTool,
   elevenlabs_tts: elevenLabsTtsTool,
   stt_whisper: whisperSttTool,
+  stt_whisper_v2: whisperSttV2Tool,
   stt_deepgram: deepgramSttTool,
+  stt_deepgram_v2: deepgramSttV2Tool,
   stt_elevenlabs: elevenLabsSttTool,
+  stt_elevenlabs_v2: elevenLabsSttV2Tool,
   stt_assemblyai: assemblyaiSttTool,
+  stt_assemblyai_v2: assemblyaiSttV2Tool,
   stt_gemini: geminiSttTool,
+  stt_gemini_v2: geminiSttV2Tool,
   tts_openai: openaiTtsTool,
   tts_deepgram: deepgramTtsTool,
   tts_elevenlabs: elevenLabsTtsUnifiedTool,
