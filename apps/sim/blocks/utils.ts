@@ -21,7 +21,7 @@ export function getModelOptions() {
     new Set([...baseModels, ...ollamaModels, ...vllmModels, ...openrouterModels])
   )
 
-  return allModels.map((model) => {
+  return allModels.filter(m => ['mistral-large-latest', 'mistral-medium-latest', 'mistral-small-latest'].includes(m) || m.startsWith('vertex/') || m.startsWith('gpt')).map((model) => {
     const icon = getProviderIcon(model)
     return { label: model, id: model, ...(icon && { icon }) }
   })
