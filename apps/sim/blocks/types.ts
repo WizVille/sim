@@ -40,6 +40,7 @@ export type GenerationType =
   | 'neo4j-parameters'
   | 'timestamp'
   | 'timezone'
+  | 'cron-expression'
 
 export type SubBlockType =
   | 'short-input' // Single line input
@@ -196,6 +197,8 @@ export interface SubBlockConfig {
   type: SubBlockType
   mode?: 'basic' | 'advanced' | 'both' | 'trigger' // Default is 'both' if not specified. 'trigger' means only shown in trigger mode
   canonicalParamId?: string
+  /** Controls parameter visibility in agent/tool-input context */
+  paramVisibility?: 'user-or-llm' | 'user-only' | 'llm-only' | 'hidden'
   required?:
     | boolean
     | {

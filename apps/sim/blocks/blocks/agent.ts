@@ -2,11 +2,10 @@ import { createLogger } from '@sim/logger'
 import { AgentIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
 import { AuthMode } from '@/blocks/types'
-import { getApiKeyCondition } from '@/blocks/utils'
+import { getApiKeyCondition, getModelOptions } from '@/blocks/utils'
 import {
   getBaseModelProviders,
   getMaxTemperature,
-  getProviderIcon,
   getReasoningEffortValuesForModel,
   getThinkingLevelsForModel,
   getVerbosityValuesForModel,
@@ -18,7 +17,6 @@ import {
   providers,
   supportsTemperature,
 } from '@/providers/utils'
-import { useProvidersStore } from '@/stores/providers'
 import type { ToolResponse } from '@/tools/types'
 
 const logger = createLogger('AgentBlock')
@@ -121,21 +119,7 @@ Return ONLY the JSON array.`,
       placeholder: 'Type or select a model...',
       required: true,
       defaultValue: 'vertex/gemini-2.5-flash',
-      options: () => {
-        const providersState = useProvidersStore.getState()
-        const baseModels = providersState.providers.base.models
-        const ollamaModels = providersState.providers.ollama.models
-        const vllmModels = providersState.providers.vllm.models
-        const openrouterModels = providersState.providers.openrouter.models
-        const allModels = Array.from(
-          new Set([...baseModels, ...ollamaModels, ...vllmModels, ...openrouterModels])
-        )
-
-        return allModels.filter(m => ['azure/gpt-5', 'azure/gpt-5-mini', 'azure/gpt-5-nano', 'azure/gpt-5.2', 'mistral-large-latest', 'mistral-medium-latest', 'mistral-small-latest'].includes(m) || m.startsWith('vertex/') || m.startsWith('gpt')).map((model) => {
-          const icon = getProviderIcon(model)
-          return { label: model, id: model, ...(icon && { icon }) }
-        })
-      },
+      options: getModelOptions,
     },
     {
       id: 'vertexCredential',
