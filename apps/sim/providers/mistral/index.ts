@@ -12,6 +12,7 @@ import type {
   ProviderResponse,
   TimeSegment,
 } from '@/providers/types'
+import { ProviderError } from '@/providers/types'
 import {
   calculateCost,
   prepareToolExecution,
@@ -144,7 +145,10 @@ export const mistralProvider: ProviderConfig = {
           ...payload,
           stream: true,
         }
-        const streamResponse = await mistral.chat.completions.create(streamingParams)
+        const streamResponse = await mistral.chat.completions.create(
+          streamingParams,
+          request.abortSignal ? { signal: request.abortSignal } : undefined
+        )
 
         const streamingResult = {
           stream: createReadableStreamFromMistralStream(streamResponse, (content, usage) => {
@@ -243,7 +247,10 @@ export const mistralProvider: ProviderConfig = {
         }
       }
 
-      let currentResponse = await mistral.chat.completions.create(payload)
+      let currentResponse = await mistral.chat.completions.create(
+        payload,
+        request.abortSignal ? { signal: request.abortSignal } : undefined
+      )
       const firstResponseTime = Date.now() - initialCallTime
 
       let content = currentResponse.choices[0]?.message?.content || ''
@@ -414,7 +421,10 @@ export const mistralProvider: ProviderConfig = {
 
         const nextModelStartTime = Date.now()
 
-        currentResponse = await mistral.chat.completions.create(nextPayload)
+        currentResponse = await mistral.chat.completions.create(
+          nextPayload,
+          request.abortSignal ? { signal: request.abortSignal } : undefined
+        )
 
         checkForForcedToolUsage(currentResponse, nextPayload.tool_choice)
 
@@ -455,7 +465,10 @@ export const mistralProvider: ProviderConfig = {
           tool_choice: 'auto',
           stream: true,
         }
-        const streamResponse = await mistral.chat.completions.create(streamingParams)
+        const streamResponse = await mistral.chat.completions.create(
+          streamingParams,
+          request.abortSignal ? { signal: request.abortSignal } : undefined
+        )
 
         const streamingResult = {
           stream: createReadableStreamFromMistralStream(streamResponse, (content, usage) => {
@@ -553,15 +566,11 @@ export const mistralProvider: ProviderConfig = {
         duration: totalDuration,
       })
 
-      const enhancedError = new Error(error instanceof Error ? error.message : String(error))
-      // @ts-ignore - Adding timing property to error for debugging
-      enhancedError.timing = {
+      throw new ProviderError(error instanceof Error ? error.message : String(error), {
         startTime: providerStartTimeISO,
         endTime: providerEndTimeISO,
         duration: totalDuration,
-      }
-
-      throw enhancedError
+      })
     }
   },
 }

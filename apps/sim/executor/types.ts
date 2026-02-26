@@ -1,7 +1,11 @@
 import type { TraceSpan } from '@/lib/logs/types'
 import type { PermissionGroupConfig } from '@/lib/permission-groups/types'
 import type { BlockOutput } from '@/blocks/types'
-import type { SerializableExecutionState } from '@/executor/execution/types'
+import type {
+  ChildWorkflowContext,
+  IterationContext,
+  SerializableExecutionState,
+} from '@/executor/execution/types'
 import type { RunFromBlockContext } from '@/executor/utils/run-from-block'
 import type { SerializedBlock, SerializedWorkflow } from '@/serializer/types'
 
@@ -168,6 +172,7 @@ export interface ExecutionContext {
   executionId?: string
   userId?: string
   isDeployedContext?: boolean
+  enforceCredentialAccess?: boolean
 
   permissionConfig?: PermissionGroupConfig | null
   permissionConfigLoaded?: boolean
@@ -239,14 +244,28 @@ export interface ExecutionContext {
     blockId: string,
     blockName: string,
     blockType: string,
-    executionOrder: number
+    executionOrder: number,
+    iterationContext?: IterationContext,
+    childWorkflowContext?: ChildWorkflowContext
   ) => Promise<void>
   onBlockComplete?: (
     blockId: string,
     blockName: string,
     blockType: string,
-    output: any
+    output: any,
+    iterationContext?: IterationContext,
+    childWorkflowContext?: ChildWorkflowContext
   ) => Promise<void>
+
+  /** Context identifying this execution as a child of a workflow block */
+  childWorkflowContext?: ChildWorkflowContext
+
+  /** Fires immediately after instanceId is generated, before child execution begins. */
+  onChildWorkflowInstanceReady?: (
+    blockId: string,
+    childWorkflowInstanceId: string,
+    iterationContext?: IterationContext
+  ) => void
 
   /**
    * AbortSignal for cancellation support.
@@ -281,6 +300,12 @@ export interface ExecutionContext {
    * Stop execution after this block completes. Used for "run until block" feature.
    */
   stopAfterBlockId?: string
+
+  /**
+   * Ordered list of workflow IDs in the current call chain, used for cycle detection.
+   * Passed to outgoing HTTP requests via the X-Sim-Via header.
+   */
+  callChain?: string[]
 
   /**
    * Counter for generating monotonically increasing execution order values.
@@ -350,6 +375,8 @@ export interface BlockHandler {
       parallelId?: string
       branchIndex?: number
       branchTotal?: number
+      originalBlockId?: string
+      isLoopNode?: boolean
     }
   ) => Promise<BlockOutput | StreamingExecution>
 }

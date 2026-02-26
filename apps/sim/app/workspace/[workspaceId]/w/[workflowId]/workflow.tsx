@@ -255,6 +255,69 @@ const WorkflowContent = React.memo(() => {
 
   const addNotification = useNotificationStore((state) => state.addNotification)
 
+  useEffect(() => {
+    const OAUTH_CONNECT_PENDING_KEY = 'sim.oauth-connect-pending'
+    const pending = window.sessionStorage.getItem(OAUTH_CONNECT_PENDING_KEY)
+    if (!pending) return
+    window.sessionStorage.removeItem(OAUTH_CONNECT_PENDING_KEY)
+
+    ;(async () => {
+      try {
+        const {
+          displayName,
+          providerId,
+          preCount,
+          workspaceId: wsId,
+          reconnect,
+        } = JSON.parse(pending) as {
+          displayName: string
+          providerId: string
+          preCount: number
+          workspaceId: string
+          reconnect?: boolean
+        }
+
+        if (reconnect) {
+          addNotification({
+            level: 'info',
+            message: `"${displayName}" reconnected successfully.`,
+          })
+          window.dispatchEvent(
+            new CustomEvent('oauth-credentials-updated', {
+              detail: { providerId, workspaceId: wsId },
+            })
+          )
+          return
+        }
+
+        const response = await fetch(
+          `/api/credentials?workspaceId=${encodeURIComponent(wsId)}&type=oauth`
+        )
+        const data = response.ok ? await response.json() : { credentials: [] }
+        const oauthCredentials = (data.credentials ?? []) as Array<{
+          displayName: string
+          providerId: string | null
+        }>
+
+        if (oauthCredentials.length > preCount) {
+          addNotification({
+            level: 'info',
+            message: `"${displayName}" credential connected successfully.`,
+          })
+        } else {
+          const existing = oauthCredentials.find((c) => c.providerId === providerId)
+          const existingName = existing?.displayName || displayName
+          addNotification({
+            level: 'info',
+            message: `This account is already connected as "${existingName}".`,
+          })
+        }
+      } catch {
+        // Ignore malformed sessionStorage data
+      }
+    })()
+  }, [])
+
   const {
     workflows,
     activeWorkflowId,
@@ -2523,7 +2586,7 @@ const WorkflowContent = React.memo(() => {
         .filter((change: any) => change.type === 'remove')
         .map((change: any) => change.id)
         .filter((edgeId: string) => {
-          // Prevent removing edges connected to protected blocks
+          // Prevent removing edges targeting protected blocks
           const edge = edges.find((e) => e.id === edgeId)
           if (!edge) return true
           return !isEdgeProtected(edge, blocks)
@@ -2595,7 +2658,7 @@ const WorkflowContent = React.memo(() => {
 
         if (!sourceNode || !targetNode) return
 
-        // Prevent connections to/from protected blocks
+        // Prevent connections to protected blocks (outbound from locked blocks is allowed)
         if (isEdgeProtected(connection, blocks)) {
           addNotification({
             level: 'info',
@@ -3357,12 +3420,12 @@ const WorkflowContent = React.memo(() => {
   /** Stable delete handler to avoid creating new function references per edge. */
   const handleEdgeDelete = useCallback(
     (edgeId: string) => {
-      // Prevent removing edges connected to protected blocks
+      // Prevent removing edges targeting protected blocks
       const edge = edges.find((e) => e.id === edgeId)
       if (edge && isEdgeProtected(edge, blocks)) {
         addNotification({
           level: 'info',
-          message: 'Cannot remove connections from locked blocks',
+          message: 'Cannot remove connections to locked blocks',
           workflowId: activeWorkflowId || undefined,
         })
         return
@@ -3420,7 +3483,7 @@ const WorkflowContent = React.memo(() => {
 
       // Handle edge deletion first (edges take priority if selected)
       if (selectedEdges.size > 0) {
-        // Get all selected edge IDs and filter out edges connected to protected blocks
+        // Get all selected edge IDs and filter out edges targeting protected blocks
         const edgeIds = Array.from(selectedEdges.values()).filter((edgeId) => {
           const edge = edges.find((e) => e.id === edgeId)
           if (!edge) return true

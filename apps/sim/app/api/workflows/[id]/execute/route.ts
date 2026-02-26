@@ -12,11 +12,16 @@ import {
 import { generateRequestId } from '@/lib/core/utils/request'
 import { SSE_HEADERS } from '@/lib/core/utils/sse'
 import { getBaseUrl } from '@/lib/core/utils/urls'
+import {
+  buildNextCallChain,
+  parseCallChain,
+  SIM_VIA_HEADER,
+  validateCallChain,
+} from '@/lib/execution/call-chain'
 import { createExecutionEventWriter, setExecutionMeta } from '@/lib/execution/event-buffer'
 import { processInputFileFields } from '@/lib/execution/files'
 import { preprocessExecution } from '@/lib/execution/preprocessing'
 import { LoggingSession } from '@/lib/logs/execution/logging-session'
-import { buildTraceSpans } from '@/lib/logs/execution/trace-spans/trace-spans'
 import {
   cleanupExecutionBase64Cache,
   hydrateUserFilesWithBase64,
@@ -38,6 +43,7 @@ import { executeWorkflowJob, type WorkflowExecutionPayload } from '@/background/
 import { normalizeName } from '@/executor/constants'
 import { ExecutionSnapshot } from '@/executor/execution/snapshot'
 import type {
+  ChildWorkflowContext,
   ExecutionMetadata,
   IterationContext,
   SerializableExecutionState,
@@ -154,10 +160,11 @@ type AsyncExecutionParams = {
   input: any
   triggerType: CoreTriggerType
   executionId: string
+  callChain?: string[]
 }
 
 async function handleAsyncExecution(params: AsyncExecutionParams): Promise<NextResponse> {
-  const { requestId, workflowId, userId, input, triggerType, executionId } = params
+  const { requestId, workflowId, userId, input, triggerType, executionId, callChain } = params
 
   const payload: WorkflowExecutionPayload = {
     workflowId,
@@ -165,6 +172,7 @@ async function handleAsyncExecution(params: AsyncExecutionParams): Promise<NextR
     input,
     triggerType,
     executionId,
+    callChain,
   }
 
   try {
@@ -235,12 +243,59 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   const requestId = generateRequestId()
   const { id: workflowId } = await params
 
+  const incomingCallChain = parseCallChain(req.headers.get(SIM_VIA_HEADER))
+  const callChainError = validateCallChain(incomingCallChain)
+  if (callChainError) {
+    logger.warn(`[${requestId}] Call chain rejected for workflow ${workflowId}: ${callChainError}`)
+    return NextResponse.json({ error: callChainError }, { status: 409 })
+  }
+  const callChain = buildNextCallChain(incomingCallChain, workflowId)
+
   try {
     const auth = await checkHybridAuth(req, { requireWorkflowId: false })
+
+    let userId: string
+    let isPublicApiAccess = false
+
     if (!auth.success || !auth.userId) {
-      return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+      const hasExplicitCredentials =
+        req.headers.has('x-api-key') || req.headers.get('authorization')?.startsWith('Bearer ')
+      if (hasExplicitCredentials) {
+        return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+      }
+
+      const { db: dbClient, workflow: workflowTable } = await import('@sim/db')
+      const { eq } = await import('drizzle-orm')
+      const [wf] = await dbClient
+        .select({
+          isPublicApi: workflowTable.isPublicApi,
+          isDeployed: workflowTable.isDeployed,
+          userId: workflowTable.userId,
+        })
+        .from(workflowTable)
+        .where(eq(workflowTable.id, workflowId))
+        .limit(1)
+
+      if (!wf?.isPublicApi || !wf.isDeployed) {
+        return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+      }
+
+      const { isPublicApiDisabled } = await import('@/lib/core/config/feature-flags')
+      if (isPublicApiDisabled) {
+        return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+      }
+
+      const { getUserPermissionConfig } = await import('@/ee/access-control/utils/permission-check')
+      const ownerConfig = await getUserPermissionConfig(wf.userId)
+      if (ownerConfig?.disablePublicApi) {
+        return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+      }
+
+      userId = wf.userId
+      isPublicApiAccess = true
+    } else {
+      userId = auth.userId
     }
-    const userId = auth.userId
 
     let body: any = {}
     try {
@@ -267,7 +322,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       )
     }
 
-    const defaultTriggerType = auth.authType === 'api_key' ? 'api' : 'manual'
+    const defaultTriggerType = isPublicApiAccess || auth.authType === 'api_key' ? 'api' : 'manual'
 
     const {
       selectedOutputs,
@@ -288,7 +343,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       | { startBlockId: string; sourceSnapshot: SerializableExecutionState }
       | undefined
     if (rawRunFromBlock) {
-      if (rawRunFromBlock.sourceSnapshot) {
+      if (rawRunFromBlock.sourceSnapshot && !isPublicApiAccess) {
+        // Public API callers cannot inject arbitrary block state via sourceSnapshot.
+        // They must use executionId to resume from a server-stored execution state.
         resolvedRunFromBlock = {
           startBlockId: rawRunFromBlock.startBlockId,
           sourceSnapshot: rawRunFromBlock.sourceSnapshot as SerializableExecutionState,
@@ -324,7 +381,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // For API key and internal JWT auth, the entire body is the input (except for our control fields)
     // For session auth, the input is explicitly provided in the input field
     const input =
-      auth.authType === 'api_key' || auth.authType === 'internal_jwt'
+      isPublicApiAccess || auth.authType === 'api_key' || auth.authType === 'internal_jwt'
         ? (() => {
             const {
               selectedOutputs,
@@ -343,19 +400,14 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
           })()
         : validatedInput
 
-    const shouldUseDraftState = useDraftState ?? auth.authType === 'session'
-    const workflowAuthorization = await authorizeWorkflowByWorkspacePermission({
-      workflowId,
-      userId,
-      action: shouldUseDraftState ? 'write' : 'read',
-    })
-    if (!workflowAuthorization.allowed) {
-      return NextResponse.json(
-        { error: workflowAuthorization.message || 'Access denied' },
-        { status: workflowAuthorization.status }
-      )
-    }
+    // Public API callers must not inject arbitrary workflow state overrides (code injection risk).
+    // stopAfterBlockId and runFromBlock are safe — they control execution flow within the deployed state.
+    const sanitizedWorkflowStateOverride = isPublicApiAccess ? undefined : workflowStateOverride
 
+    // Public API callers always execute the deployed state, never the draft.
+    const shouldUseDraftState = isPublicApiAccess
+      ? false
+      : (useDraftState ?? auth.authType === 'session')
     const streamHeader = req.headers.get('X-Stream-Response') === 'true'
     const enableSSE = streamHeader || streamParam === true
     const executionModeHeader = req.headers.get('X-Execution-Mode')
@@ -390,6 +442,21 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const useAuthenticatedUserAsActor =
       isClientSession || (auth.authType === 'api_key' && auth.apiKeyType === 'personal')
 
+    // Authorization fetches the full workflow record and checks workspace permissions.
+    // Run it first so we can pass the record to preprocessing (eliminates a duplicate DB query).
+    const workflowAuthorization = await authorizeWorkflowByWorkspacePermission({
+      workflowId,
+      userId,
+      action: shouldUseDraftState ? 'write' : 'read',
+    })
+    if (!workflowAuthorization.allowed) {
+      return NextResponse.json(
+        { error: workflowAuthorization.message || 'Access denied' },
+        { status: workflowAuthorization.status }
+      )
+    }
+
+    // Pass the pre-fetched workflow record to skip the redundant Step 1 DB query in preprocessing.
     const preprocessResult = await preprocessExecution({
       workflowId,
       userId,
@@ -400,6 +467,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       loggingSession,
       useDraftState: shouldUseDraftState,
       useAuthenticatedUserAsActor,
+      workflowRecord: workflowAuthorization.workflow ?? undefined,
     })
 
     if (!preprocessResult.success) {
@@ -432,6 +500,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         input,
         triggerType: loggingTriggerType,
         executionId,
+        callChain,
       })
     }
 
@@ -448,7 +517,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     try {
       const workflowData = shouldUseDraftState
         ? await loadWorkflowFromNormalizedTables(workflowId)
-        : await loadDeployedWorkflowState(workflowId)
+        : await loadDeployedWorkflowState(workflowId, workspaceId)
 
       if (workflowData) {
         const deployedVariables =
@@ -515,7 +584,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       )
     }
 
-    const effectiveWorkflowStateOverride = workflowStateOverride || cachedWorkflowData || undefined
+    const effectiveWorkflowStateOverride =
+      sanitizedWorkflowStateOverride || cachedWorkflowData || undefined
 
     if (!enableSSE) {
       logger.info(`[${requestId}] Using non-SSE execution (direct JSON response)`)
@@ -536,7 +606,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
           useDraftState: shouldUseDraftState,
           startTime: new Date().toISOString(),
           isClientSession,
+          enforceCredentialAccess: useAuthenticatedUserAsActor,
           workflowStateOverride: effectiveWorkflowStateOverride,
+          callChain,
         }
 
         const executionVariables = cachedWorkflowData?.variables ?? workflow.variables ?? {}
@@ -625,12 +697,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
         const executionResult = hasExecutionResult(error) ? error.executionResult : undefined
 
-        await loggingSession.safeCompleteWithError({
-          totalDurationMs: executionResult?.metadata?.duration,
-          error: { message: errorMessage },
-          traceSpans: executionResult?.logs as any,
-        })
-
         return NextResponse.json(
           {
             success: false,
@@ -649,11 +715,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       } finally {
         timeoutController.cleanup()
         if (executionId) {
-          try {
-            await cleanupExecutionBase64Cache(executionId)
-          } catch (error) {
+          void cleanupExecutionBase64Cache(executionId).catch((error) => {
             logger.error(`[${requestId}] Failed to cleanup base64 cache`, { error })
-          }
+          })
         }
       }
     }
@@ -742,7 +806,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
             blockName: string,
             blockType: string,
             executionOrder: number,
-            iterationContext?: IterationContext
+            iterationContext?: IterationContext,
+            childWorkflowContext?: ChildWorkflowContext
           ) => {
             logger.info(`[${requestId}] 🔷 onBlockStart called:`, { blockId, blockName, blockType })
             sendEvent({
@@ -761,6 +826,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
                   iterationType: iterationContext.iterationType,
                   iterationContainerId: iterationContext.iterationContainerId,
                 }),
+                ...(childWorkflowContext && {
+                  childWorkflowBlockId: childWorkflowContext.parentBlockId,
+                  childWorkflowName: childWorkflowContext.workflowName,
+                }),
               },
             })
           }
@@ -770,9 +839,20 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
             blockName: string,
             blockType: string,
             callbackData: any,
-            iterationContext?: IterationContext
+            iterationContext?: IterationContext,
+            childWorkflowContext?: ChildWorkflowContext
           ) => {
             const hasError = callbackData.output?.error
+            const childWorkflowData = childWorkflowContext
+              ? {
+                  childWorkflowBlockId: childWorkflowContext.parentBlockId,
+                  childWorkflowName: childWorkflowContext.workflowName,
+                }
+              : {}
+
+            const instanceData = callbackData.childWorkflowInstanceId
+              ? { childWorkflowInstanceId: callbackData.childWorkflowInstanceId }
+              : {}
 
             if (hasError) {
               logger.info(`[${requestId}] ✗ onBlockComplete (error) called:`, {
@@ -802,6 +882,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
                     iterationType: iterationContext.iterationType,
                     iterationContainerId: iterationContext.iterationContainerId,
                   }),
+                  ...childWorkflowData,
+                  ...instanceData,
                 },
               })
             } else {
@@ -831,6 +913,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
                     iterationType: iterationContext.iterationType,
                     iterationContainerId: iterationContext.iterationContainerId,
                   }),
+                  ...childWorkflowData,
+                  ...instanceData,
                 },
               })
             }
@@ -885,7 +969,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
             useDraftState: shouldUseDraftState,
             startTime: new Date().toISOString(),
             isClientSession,
+            enforceCredentialAccess: useAuthenticatedUserAsActor,
             workflowStateOverride: effectiveWorkflowStateOverride,
+            callChain,
           }
 
           const sseExecutionVariables = cachedWorkflowData?.variables ?? workflow.variables ?? {}
@@ -898,12 +984,34 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
             selectedOutputs
           )
 
+          const onChildWorkflowInstanceReady = (
+            blockId: string,
+            childWorkflowInstanceId: string,
+            iterationContext?: IterationContext
+          ) => {
+            sendEvent({
+              type: 'block:childWorkflowStarted',
+              timestamp: new Date().toISOString(),
+              executionId,
+              workflowId,
+              data: {
+                blockId,
+                childWorkflowInstanceId,
+                ...(iterationContext && {
+                  iterationCurrent: iterationContext.iterationCurrent,
+                  iterationContainerId: iterationContext.iterationContainerId,
+                }),
+              },
+            })
+          }
+
           const result = await executeWorkflowCore({
             snapshot,
             callbacks: {
               onBlockStart,
               onBlockComplete,
               onStream,
+              onChildWorkflowInstanceReady,
             },
             loggingSession,
             abortSignal: timeoutController.signal,
@@ -1010,15 +1118,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
           logger.error(`[${requestId}] SSE execution failed: ${errorMessage}`, { isTimeout })
 
           const executionResult = hasExecutionResult(error) ? error.executionResult : undefined
-          const { traceSpans, totalDuration } = executionResult
-            ? buildTraceSpans(executionResult)
-            : { traceSpans: [], totalDuration: 0 }
-
-          await loggingSession.safeCompleteWithError({
-            totalDurationMs: totalDuration || executionResult?.metadata?.duration,
-            error: { message: errorMessage },
-            traceSpans,
-          })
 
           sendEvent({
             type: 'execution:error',

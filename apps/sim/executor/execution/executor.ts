@@ -264,6 +264,7 @@ export class DAGExecutor {
       executionId: this.contextExtensions.executionId,
       userId: this.contextExtensions.userId,
       isDeployedContext: this.contextExtensions.isDeployedContext,
+      enforceCredentialAccess: this.contextExtensions.enforceCredentialAccess,
       blockStates: state.getBlockStates(),
       blockLogs: overrides?.runFromBlockContext ? [] : (snapshotState?.blockLogs ?? []),
       metadata: {
@@ -322,11 +323,14 @@ export class DAGExecutor {
       onStream: this.contextExtensions.onStream,
       onBlockStart: this.contextExtensions.onBlockStart,
       onBlockComplete: this.contextExtensions.onBlockComplete,
+      onChildWorkflowInstanceReady: this.contextExtensions.onChildWorkflowInstanceReady,
       abortSignal: this.contextExtensions.abortSignal,
+      childWorkflowContext: this.contextExtensions.childWorkflowContext,
       includeFileBase64: this.contextExtensions.includeFileBase64,
       base64MaxBytes: this.contextExtensions.base64MaxBytes,
       runFromBlockContext: overrides?.runFromBlockContext,
       stopAfterBlockId: this.contextExtensions.stopAfterBlockId,
+      callChain: this.contextExtensions.callChain,
     }
 
     if (this.contextExtensions.resumeFromSnapshot) {

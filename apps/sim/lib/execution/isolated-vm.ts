@@ -72,6 +72,7 @@ const DISTRIBUTED_MAX_INFLIGHT_PER_OWNER =
   MAX_ACTIVE_PER_OWNER + MAX_QUEUED_PER_OWNER
 const DISTRIBUTED_LEASE_MIN_TTL_MS = Number.parseInt(env.IVM_DISTRIBUTED_LEASE_MIN_TTL_MS) || 120000
 const DISTRIBUTED_KEY_PREFIX = 'ivm:fair:v1:owner'
+const LEASE_REDIS_DEADLINE_MS = 200
 const QUEUE_RETRY_DELAY_MS = 1000
 const DISTRIBUTED_LEASE_GRACE_MS = 30000
 
@@ -293,21 +294,37 @@ async function tryAcquireDistributedLease(
     return 1
   `
 
-  try {
-    const result = await redis.eval(
-      script,
-      1,
-      key,
-      now.toString(),
-      DISTRIBUTED_MAX_INFLIGHT_PER_OWNER.toString(),
-      expiresAt.toString(),
-      leaseId,
-      leaseTtlMs.toString()
+  let deadlineTimer: NodeJS.Timeout | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    deadlineTimer = setTimeout(
+      () => reject(new Error(`Redis lease timed out after ${LEASE_REDIS_DEADLINE_MS}ms`)),
+      LEASE_REDIS_DEADLINE_MS
     )
+  })
+
+  try {
+    const result = await Promise.race([
+      redis.eval(
+        script,
+        1,
+        key,
+        now.toString(),
+        DISTRIBUTED_MAX_INFLIGHT_PER_OWNER.toString(),
+        expiresAt.toString(),
+        leaseId,
+        leaseTtlMs.toString()
+      ),
+      deadline,
+    ])
     return Number(result) === 1 ? 'acquired' : 'limit_exceeded'
   } catch (error) {
-    logger.error('Failed to acquire distributed owner lease', { ownerKey, error })
+    logger.warn('Failed to acquire distributed owner lease — falling back to local execution', {
+      ownerKey,
+      error,
+    })
     return 'unavailable'
+  } finally {
+    clearTimeout(deadlineTimer)
   }
 }
 
@@ -620,7 +637,6 @@ function cleanupWorker(workerId: number) {
   workerInfo.activeExecutions = 0
 
   workers.delete(workerId)
-  logger.info('Worker removed from pool', { workerId, poolSize: workers.size })
 }
 
 function resetWorkerIdleTimeout(workerId: number) {
@@ -636,7 +652,6 @@ function resetWorkerIdleTimeout(workerId: number) {
     workerInfo.idleTimeout = setTimeout(() => {
       const w = workers.get(workerId)
       if (w && w.activeExecutions === 0) {
-        logger.info('Cleaning up idle worker', { workerId })
         cleanupWorker(workerId)
       }
     }, WORKER_IDLE_TIMEOUT_MS)
@@ -680,11 +695,15 @@ function spawnWorker(): Promise<WorkerInfo> {
     }
 
     const currentDir = path.dirname(fileURLToPath(import.meta.url))
-    const workerPath = path.join(currentDir, 'isolated-vm-worker.cjs')
+    const candidatePaths = [
+      path.join(currentDir, 'isolated-vm-worker.cjs'),
+      path.join(process.cwd(), 'lib', 'execution', 'isolated-vm-worker.cjs'),
+    ]
+    const workerPath = candidatePaths.find((p) => fs.existsSync(p))
 
-    if (!fs.existsSync(workerPath)) {
+    if (!workerPath) {
       settleSpawnInProgress()
-      reject(new Error(`Worker file not found at ${workerPath}`))
+      reject(new Error(`Worker file not found at any of: ${candidatePaths.join(', ')}`))
       return
     }
 
@@ -984,15 +1003,8 @@ export async function executeInIsolatedVM(
     }
   }
   if (leaseAcquireResult === 'unavailable') {
-    maybeCleanupOwner(ownerKey)
-    return {
-      result: null,
-      stdout: '',
-      error: {
-        message: 'Code execution is temporarily unavailable. Please try again in a moment.',
-        name: 'Error',
-      },
-    }
+    logger.warn('Distributed lease unavailable, falling back to local execution', { ownerKey })
+    // Continue execution — local pool still enforces per-process concurrency limits
   }
 
   let settled = false

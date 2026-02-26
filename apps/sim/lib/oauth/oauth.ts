@@ -2,6 +2,7 @@ import { createLogger } from '@sim/logger'
 import {
   AirtableIcon,
   AsanaIcon,
+  AttioIcon,
   CalComIcon,
   ConfluenceIcon,
   DropboxIcon,
@@ -18,6 +19,7 @@ import {
   JiraIcon,
   LinearIcon,
   LinkedInIcon,
+  MicrosoftDataverseIcon,
   MicrosoftExcelIcon,
   MicrosoftIcon,
   MicrosoftOneDriveIcon,
@@ -154,6 +156,20 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
     name: 'Microsoft',
     icon: MicrosoftIcon,
     services: {
+      'microsoft-dataverse': {
+        name: 'Microsoft Dataverse',
+        description: 'Connect to Microsoft Dataverse and manage records.',
+        providerId: 'microsoft-dataverse',
+        icon: MicrosoftDataverseIcon,
+        baseProviderIcon: MicrosoftIcon,
+        scopes: [
+          'openid',
+          'profile',
+          'email',
+          'https://dynamics.microsoft.com/user_impersonation',
+          'offline_access',
+        ],
+      },
       'microsoft-excel': {
         name: 'Microsoft Excel',
         description: 'Connect to Microsoft Excel and manage spreadsheets.',
@@ -614,6 +630,31 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
     },
     defaultService: 'asana',
   },
+  attio: {
+    name: 'Attio',
+    icon: AttioIcon,
+    services: {
+      attio: {
+        name: 'Attio',
+        description: 'Manage records, notes, tasks, lists, comments, and more in Attio CRM.',
+        providerId: 'attio',
+        icon: AttioIcon,
+        baseProviderIcon: AttioIcon,
+        scopes: [
+          'record_permission:read-write',
+          'object_configuration:read-write',
+          'list_configuration:read-write',
+          'list_entry:read-write',
+          'note:read-write',
+          'task:read-write',
+          'comment:read-write',
+          'user_management:read',
+          'webhook:read-write',
+        ],
+      },
+    },
+    defaultService: 'attio',
+  },
   calcom: {
     name: 'Cal.com',
     icon: CalComIcon,
@@ -949,6 +990,18 @@ function getProviderAuthConfig(provider: string): ProviderAuthConfig {
         clientSecret,
         useBasicAuth: true,
         supportsRefreshTokenRotation: true,
+      }
+    }
+    case 'attio': {
+      const { clientId, clientSecret } = getCredentials(
+        env.ATTIO_CLIENT_ID,
+        env.ATTIO_CLIENT_SECRET
+      )
+      return {
+        tokenEndpoint: 'https://app.attio.com/oauth/token',
+        clientId,
+        clientSecret,
+        useBasicAuth: false,
       }
     }
     case 'dropbox': {
