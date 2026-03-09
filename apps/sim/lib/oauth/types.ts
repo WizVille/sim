@@ -7,9 +7,13 @@ export type OAuthProvider =
   | 'google-docs'
   | 'google-sheets'
   | 'google-calendar'
+  | 'google-contacts'
+  | 'google-bigquery'
+  | 'google-tasks'
   | 'google-vault'
   | 'google-forms'
   | 'google-groups'
+  | 'google-meet'
   | 'vertex-ai'
   | 'github'
   | 'github-repo'
@@ -52,9 +56,13 @@ export type OAuthService =
   | 'google-docs'
   | 'google-sheets'
   | 'google-calendar'
+  | 'google-contacts'
+  | 'google-bigquery'
+  | 'google-tasks'
   | 'google-vault'
   | 'google-forms'
   | 'google-groups'
+  | 'google-meet'
   | 'vertex-ai'
   | 'github'
   | 'x'
@@ -114,14 +122,6 @@ export interface OAuthServiceMetadata {
   baseProvider: string
 }
 
-export interface ScopeEvaluation {
-  canonicalScopes: string[]
-  grantedScopes: string[]
-  missingScopes: string[]
-  extraScopes: string[]
-  requiresReauthorization: boolean
-}
-
 export interface Credential {
   id: string
   name: string
@@ -130,10 +130,6 @@ export interface Credential {
   lastUsed?: string
   isDefault?: boolean
   scopes?: string[]
-  canonicalScopes?: string[]
-  missingScopes?: string[]
-  extraScopes?: string[]
-  requiresReauthorization?: boolean
 }
 
 export interface ProviderConfig {

@@ -60,6 +60,7 @@ import { openCopilotWithMessage } from '@/stores/notifications/utils'
 import type { ConsoleEntry } from '@/stores/terminal'
 import { useTerminalConsoleStore, useTerminalStore } from '@/stores/terminal'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
+import { useWorkflowStore } from '@/stores/workflows/workflow/store'
 
 /**
  * Terminal height configuration constants
@@ -68,20 +69,21 @@ const MIN_HEIGHT = TERMINAL_HEIGHT.MIN
 const DEFAULT_EXPANDED_HEIGHT = TERMINAL_HEIGHT.DEFAULT
 const MIN_OUTPUT_PANEL_WIDTH_PX = OUTPUT_PANEL_WIDTH.MIN
 
-/** Returns true if any node in the subtree has an error */
-function hasErrorInTree(nodes: EntryNode[]): boolean {
-  return nodes.some((n) => Boolean(n.entry.error) || hasErrorInTree(n.children))
+const MAX_TREE_DEPTH = 50
+
+function hasMatchInTree(
+  nodes: EntryNode[],
+  predicate: (e: ConsoleEntry) => boolean,
+  depth = 0
+): boolean {
+  if (depth >= MAX_TREE_DEPTH) return false
+  return nodes.some((n) => predicate(n.entry) || hasMatchInTree(n.children, predicate, depth + 1))
 }
 
-/** Returns true if any node in the subtree is currently running */
-function hasRunningInTree(nodes: EntryNode[]): boolean {
-  return nodes.some((n) => Boolean(n.entry.isRunning) || hasRunningInTree(n.children))
-}
-
-/** Returns true if any node in the subtree was canceled */
-function hasCanceledInTree(nodes: EntryNode[]): boolean {
-  return nodes.some((n) => Boolean(n.entry.isCanceled) || hasCanceledInTree(n.children))
-}
+const hasErrorInTree = (nodes: EntryNode[]) => hasMatchInTree(nodes, (e) => Boolean(e.error))
+const hasRunningInTree = (nodes: EntryNode[]) => hasMatchInTree(nodes, (e) => Boolean(e.isRunning))
+const hasCanceledInTree = (nodes: EntryNode[]) =>
+  hasMatchInTree(nodes, (e) => Boolean(e.isCanceled))
 
 /**
  * Block row component for displaying actual block entries
@@ -160,12 +162,16 @@ const IterationNodeRow = memo(function IterationNodeRow({
   onSelectEntry,
   isExpanded,
   onToggle,
+  expandedNodes,
+  onToggleNode,
 }: {
   node: EntryNode
   selectedEntryId: string | null
   onSelectEntry: (entry: ConsoleEntry) => void
   isExpanded: boolean
   onToggle: () => void
+  expandedNodes: Set<string>
+  onToggleNode: (nodeId: string) => void
 }) {
   const { entry, children, iterationInfo } = node
   const hasError = Boolean(entry.error) || children.some((c) => c.entry.error)
@@ -226,11 +232,13 @@ const IterationNodeRow = memo(function IterationNodeRow({
       {isExpanded && hasChildren && (
         <div className={ROW_STYLES.nested}>
           {children.map((child) => (
-            <BlockRow
+            <EntryNodeRow
               key={child.entry.id}
-              entry={child.entry}
-              isSelected={selectedEntryId === child.entry.id}
-              onSelect={onSelectEntry}
+              node={child}
+              selectedEntryId={selectedEntryId}
+              onSelectEntry={onSelectEntry}
+              expandedNodes={expandedNodes}
+              onToggleNode={onToggleNode}
             />
           ))}
         </div>
@@ -257,28 +265,21 @@ const SubflowNodeRow = memo(function SubflowNodeRow({
 }) {
   const { entry, children } = node
   const BlockIcon = getBlockIcon(entry.blockType)
-  const hasError =
-    Boolean(entry.error) ||
-    children.some((c) => c.entry.error || c.children.some((gc) => gc.entry.error))
+  const hasError = Boolean(entry.error) || hasErrorInTree(children)
   const bgColor = getBlockColor(entry.blockType)
   const nodeId = entry.id
   const isExpanded = expandedNodes.has(nodeId)
   const hasChildren = children.length > 0
 
-  // Check if any nested block is running or canceled
-  const hasRunningDescendant = children.some(
-    (c) => c.entry.isRunning || c.children.some((gc) => gc.entry.isRunning)
-  )
-  const hasCanceledDescendant =
-    children.some((c) => c.entry.isCanceled || c.children.some((gc) => gc.entry.isCanceled)) &&
-    !hasRunningDescendant
+  // Check if any nested block is running or canceled (recursive for arbitrary nesting depth)
+  const hasRunningDescendant = hasRunningInTree(children)
+  const hasCanceledDescendant = hasCanceledInTree(children) && !hasRunningDescendant
 
-  const displayName =
-    entry.blockType === 'loop'
-      ? 'Loop'
-      : entry.blockType === 'parallel'
-        ? 'Parallel'
-        : entry.blockName
+  const containerId = entry.iterationContainerId
+  const storeBlockName = useWorkflowStore((state) =>
+    containerId ? state.blocks[containerId]?.name : undefined
+  )
+  const displayName = storeBlockName || entry.blockName
 
   return (
     <div className='flex min-w-0 flex-col'>
@@ -346,6 +347,8 @@ const SubflowNodeRow = memo(function SubflowNodeRow({
               onSelectEntry={onSelectEntry}
               isExpanded={expandedNodes.has(iterNode.entry.id)}
               onToggle={() => onToggleNode(iterNode.entry.id)}
+              expandedNodes={expandedNodes}
+              onToggleNode={onToggleNode}
             />
           ))}
         </div>
@@ -520,6 +523,8 @@ const EntryNodeRow = memo(function EntryNodeRow({
         onSelectEntry={onSelectEntry}
         isExpanded={expandedNodes.has(node.entry.id)}
         onToggle={() => onToggleNode(node.entry.id)}
+        expandedNodes={expandedNodes}
+        onToggleNode={onToggleNode}
       />
     )
   }
