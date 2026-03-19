@@ -6,8 +6,8 @@ import {
   CalComIcon,
   ConfluenceIcon,
   DropboxIcon,
-  GithubIcon,
   GmailIcon,
+  GoogleAdsIcon,
   GoogleBigQueryIcon,
   GoogleCalendarIcon,
   GoogleContactsIcon,
@@ -145,6 +145,18 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
           'https://www.googleapis.com/auth/userinfo.email',
           'https://www.googleapis.com/auth/userinfo.profile',
           'https://www.googleapis.com/auth/contacts',
+        ],
+      },
+      'google-ads': {
+        name: 'Google Ads',
+        description: 'Query campaigns, ad groups, and performance metrics in Google Ads.',
+        providerId: 'google-ads',
+        icon: GoogleAdsIcon,
+        baseProviderIcon: GoogleIcon,
+        scopes: [
+          'https://www.googleapis.com/auth/userinfo.email',
+          'https://www.googleapis.com/auth/userinfo.profile',
+          'https://www.googleapis.com/auth/adwords',
         ],
       },
       'google-bigquery': {
@@ -340,21 +352,6 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
     },
     defaultService: 'outlook',
   },
-  github: {
-    name: 'GitHub',
-    icon: GithubIcon,
-    services: {
-      github: {
-        name: 'GitHub',
-        description: 'Manage repositories, issues, and pull requests.',
-        providerId: 'github-repo',
-        icon: GithubIcon,
-        baseProviderIcon: GithubIcon,
-        scopes: ['repo', 'user:email', 'read:user', 'workflow'],
-      },
-    },
-    defaultService: 'github',
-  },
   x: {
     name: 'X',
     icon: xIcon,
@@ -474,6 +471,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
           'read:comment:jira',
           'delete:comment:jira',
           'read:attachment:jira',
+          'write:attachment:jira',
           'delete:attachment:jira',
           'write:issue-worklog:jira',
           'read:issue-worklog:jira',
@@ -639,6 +637,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
           'im:history',
           'im:read',
           'users:read',
+          // TODO: Add 'users:read.email' once Slack app review is approved
           'files:write',
           'files:read',
           'canvases:write',
@@ -836,7 +835,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
           'crm.import',
           'crm.lists.read',
           'crm.lists.write',
-          'tickets',
+          'crm.objects.tickets.read',
         ],
       },
     },
@@ -867,7 +866,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
         providerId: 'salesforce',
         icon: SalesforceIcon,
         baseProviderIcon: SalesforceIcon,
-        scopes: ['api', 'refresh_token', 'openid', 'offline_access'],
+        scopes: ['api', 'refresh_token', 'openid'],
       },
     },
     defaultService: 'salesforce',
@@ -961,6 +960,11 @@ interface ProviderAuthConfig {
    * instead of in the request body. Used by Cal.com.
    */
   refreshTokenInAuthHeader?: boolean
+  /**
+   * If true, the token endpoint expects a JSON body with Content-Type: application/json
+   * instead of the default application/x-www-form-urlencoded. Used by Notion.
+   */
+  useJsonBody?: boolean
 }
 
 /**
@@ -985,19 +989,6 @@ function getProviderAuthConfig(provider: string): ProviderAuthConfig {
         clientId,
         clientSecret,
         useBasicAuth: false,
-      }
-    }
-    case 'github': {
-      const { clientId, clientSecret } = getCredentials(
-        env.GITHUB_CLIENT_ID,
-        env.GITHUB_CLIENT_SECRET
-      )
-      return {
-        tokenEndpoint: 'https://github.com/login/oauth/access_token',
-        clientId,
-        clientSecret,
-        useBasicAuth: false,
-        additionalHeaders: { Accept: 'application/json' },
       }
     }
     case 'x': {
@@ -1070,8 +1061,9 @@ function getProviderAuthConfig(provider: string): ProviderAuthConfig {
         tokenEndpoint: 'https://api.notion.com/v1/oauth/token',
         clientId,
         clientSecret,
-        useBasicAuth: false,
+        useBasicAuth: true,
         supportsRefreshTokenRotation: true,
+        useJsonBody: true,
       }
     }
     case 'microsoft':
@@ -1309,9 +1301,9 @@ function getProviderAuthConfig(provider: string): ProviderAuthConfig {
 function buildAuthRequest(
   config: ProviderAuthConfig,
   refreshToken: string
-): { headers: Record<string, string>; bodyParams: Record<string, string> } {
+): { headers: Record<string, string>; bodyParams: Record<string, string>; useJsonBody?: boolean } {
   const headers: Record<string, string> = {
-    'Content-Type': 'application/x-www-form-urlencoded',
+    'Content-Type': config.useJsonBody ? 'application/json' : 'application/x-www-form-urlencoded',
     ...config.additionalHeaders,
   }
 
@@ -1340,7 +1332,7 @@ function buildAuthRequest(
     }
   }
 
-  return { headers, bodyParams }
+  return { headers, bodyParams, useJsonBody: config.useJsonBody }
 }
 
 /**
@@ -1375,12 +1367,12 @@ export async function refreshOAuthToken(
 
     const config = getProviderAuthConfig(provider)
 
-    const { headers, bodyParams } = buildAuthRequest(config, refreshToken)
+    const { headers, bodyParams, useJsonBody } = buildAuthRequest(config, refreshToken)
 
     const response = await fetch(config.tokenEndpoint, {
       method: 'POST',
       headers,
-      body: new URLSearchParams(bodyParams).toString(),
+      body: useJsonBody ? JSON.stringify(bodyParams) : new URLSearchParams(bodyParams).toString(),
     })
 
     if (!response.ok) {

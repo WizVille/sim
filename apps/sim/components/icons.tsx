@@ -548,6 +548,34 @@ export function GithubIcon(props: SVGProps<SVGSVGElement>) {
   )
 }
 
+export function GithubOutlineIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      {...props}
+      width='24'
+      height='24'
+      viewBox='0 0 24 24'
+      fill='none'
+      xmlns='http://www.w3.org/2000/svg'
+    >
+      <path
+        d='M15 21C15 21 15 18.73 15 18C15 17.37 15.15 16.04 14.5 15.5C15.89 15.37 16.98 14.92 18 14C19.02 13.08 19.5 11.69 19.5 9.5C19.5 8 19.25 7 18.5 6C18.79 5.22 18.84 4 18.5 3C16.94 3 15.53 4.07 15 4.5C14.61 4.4 13.67 4 12 4C10.33 4 9.39 4.4 9 4.5C8.47 4.07 7.06 3 5.5 3C5.16 4 5.21 5.22 5.5 6C4.75 7 4.5 8 4.5 9.5C4.5 11.69 4.98 13.08 6 14C7.02 14.92 8.11 15.37 9.5 15.5C8.85 16.04 9 17.37 9 18C9 18.73 9 21 9 21'
+        stroke='currentColor'
+        strokeWidth='2'
+        strokeLinecap='round'
+        strokeLinejoin='round'
+      />
+      <path
+        d='M9 19C7.59 19 6.16 18.44 5.31 17.81C4.47 17.18 4.22 16.15 3 15.5'
+        stroke='currentColor'
+        strokeWidth='2'
+        strokeLinecap='round'
+        strokeLinejoin='round'
+      />
+    </svg>
+  )
+}
+
 export function GitLabIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <svg {...props} width='24' height='24' viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'>
@@ -706,6 +734,155 @@ export function PerplexityIcon(props: SVGProps<SVGSVGElement>) {
         fill='currentColor'
         fillRule='nonzero'
       />
+    </svg>
+  )
+}
+
+export function ObsidianIcon(props: SVGProps<SVGSVGElement>) {
+  const id = useId()
+  const bl = `${id}-bl`
+  const tr = `${id}-tr`
+  const tl = `${id}-tl`
+  const br = `${id}-br`
+  const te = `${id}-te`
+  const le = `${id}-le`
+  const be = `${id}-be`
+  const me = `${id}-me`
+  const clip = `${id}-clip`
+  return (
+    <svg {...props} viewBox='0 0 512 512' fill='none' xmlns='http://www.w3.org/2000/svg'>
+      <radialGradient
+        id={bl}
+        cx='0'
+        cy='0'
+        gradientTransform='matrix(-59 -225 150 -39 161.4 470)'
+        gradientUnits='userSpaceOnUse'
+        r='1'
+      >
+        <stop offset='0' stopColor='#fff' stopOpacity='.4' />
+        <stop offset='1' stopOpacity='.1' />
+      </radialGradient>
+      <radialGradient
+        id={tr}
+        cx='0'
+        cy='0'
+        gradientTransform='matrix(50 -379 280 37 360 374.2)'
+        gradientUnits='userSpaceOnUse'
+        r='1'
+      >
+        <stop offset='0' stopColor='#fff' stopOpacity='.6' />
+        <stop offset='1' stopColor='#fff' stopOpacity='.1' />
+      </radialGradient>
+      <radialGradient
+        id={tl}
+        cx='0'
+        cy='0'
+        gradientTransform='matrix(69 -319 218 47 175.4 307)'
+        gradientUnits='userSpaceOnUse'
+        r='1'
+      >
+        <stop offset='0' stopColor='#fff' stopOpacity='.8' />
+        <stop offset='1' stopColor='#fff' stopOpacity='.4' />
+      </radialGradient>
+      <radialGradient
+        id={br}
+        cx='0'
+        cy='0'
+        gradientTransform='matrix(-96 -163 187 -111 335.3 512.2)'
+        gradientUnits='userSpaceOnUse'
+        r='1'
+      >
+        <stop offset='0' stopColor='#fff' stopOpacity='.3' />
+        <stop offset='1' stopOpacity='.3' />
+      </radialGradient>
+      <radialGradient
+        id={te}
+        cx='0'
+        cy='0'
+        gradientTransform='matrix(-36 166 -112 -24 310 128.2)'
+        gradientUnits='userSpaceOnUse'
+        r='1'
+      >
+        <stop offset='0' stopColor='#fff' stopOpacity='0' />
+        <stop offset='1' stopColor='#fff' stopOpacity='.2' />
+      </radialGradient>
+      <radialGradient
+        id={le}
+        cx='0'
+        cy='0'
+        gradientTransform='matrix(88 89 -190 187 111 220.2)'
+        gradientUnits='userSpaceOnUse'
+        r='1'
+      >
+        <stop offset='0' stopColor='#fff' stopOpacity='.2' />
+        <stop offset='1' stopColor='#fff' stopOpacity='.4' />
+      </radialGradient>
+      <radialGradient
+        id={be}
+        cx='0'
+        cy='0'
+        gradientTransform='matrix(9 130 -276 20 215 284)'
+        gradientUnits='userSpaceOnUse'
+        r='1'
+      >
+        <stop offset='0' stopColor='#fff' stopOpacity='.2' />
+        <stop offset='1' stopColor='#fff' stopOpacity='.3' />
+      </radialGradient>
+      <radialGradient
+        id={me}
+        cx='0'
+        cy='0'
+        gradientTransform='matrix(-198 -104 327 -623 400 399.2)'
+        gradientUnits='userSpaceOnUse'
+        r='1'
+      >
+        <stop offset='0' stopColor='#fff' stopOpacity='.2' />
+        <stop offset='.5' stopColor='#fff' stopOpacity='.2' />
+        <stop offset='1' stopColor='#fff' stopOpacity='.3' />
+      </radialGradient>
+      <clipPath id={clip}>
+        <path d='M.2.2h512v512H.2z' />
+      </clipPath>
+      <g clipPath={`url(#${clip})`}>
+        <path
+          d='M382.3 475.6c-3.1 23.4-26 41.6-48.7 35.3-32.4-8.9-69.9-22.8-103.6-25.4l-51.7-4a34 34 0 0 1-22-10.2l-89-91.7a34 34 0 0 1-6.7-37.7s55-121 57.1-127.3c2-6.3 9.6-61.2 14-90.6 1.2-7.9 5-15 11-20.3L248 8.9a34.1 34.1 0 0 1 49.6 4.3L386 125.6a37 37 0 0 1 7.6 22.4c0 21.3 1.8 65 13.6 93.2 11.5 27.3 32.5 57 43.5 71.5a17.3 17.3 0 0 1 1.3 19.2 1494 1494 0 0 1-44.8 70.6c-15 22.3-21.9 49.9-25 73.1z'
+          fill='#6c31e3'
+        />
+        <path
+          d='M165.9 478.3c41.4-84 40.2-144.2 22.6-187-16.2-39.6-46.3-64.5-70-80-.6 2.3-1.3 4.4-2.2 6.5L60.6 342a34 34 0 0 0 6.6 37.7l89.1 91.7a34 34 0 0 0 9.6 7z'
+          fill={`url(#${bl})`}
+        />
+        <path
+          d='M278.4 307.8c11.2 1.2 22.2 3.6 32.8 7.6 34 12.7 65 41.2 90.5 96.3 1.8-3.1 3.6-6.2 5.6-9.2a1536 1536 0 0 0 44.8-70.6 17 17 0 0 0-1.3-19.2c-11-14.6-32-44.2-43.5-71.5-11.8-28.2-13.5-72-13.6-93.2 0-8.1-2.6-16-7.6-22.4L297.6 13.2a34 34 0 0 0-1.5-1.7 96 96 0 0 1 2 54 198.3 198.3 0 0 1-17.6 41.3l-7.2 14.2a171 171 0 0 0-19.4 71c-1.2 29.4 4.8 66.4 24.5 115.8z'
+          fill={`url(#${tr})`}
+        />
+        <path
+          d='M278.4 307.8c-19.7-49.4-25.8-86.4-24.5-115.9a171 171 0 0 1 19.4-71c2.3-4.8 4.8-9.5 7.2-14.1 7.1-13.9 14-27 17.6-41.4a96 96 0 0 0-2-54A34.1 34.1 0 0 0 248 9l-105.4 94.8a34.1 34.1 0 0 0-10.9 20.3l-12.8 85-.5 2.3c23.8 15.5 54 40.4 70.1 80a147 147 0 0 1 7.8 24.8c28-6.8 55.7-11 82.1-8.3z'
+          fill={`url(#${tl})`}
+        />
+        <path
+          d='M333.6 511c22.7 6.2 45.6-12 48.7-35.4a187 187 0 0 1 19.4-63.9c-25.6-55-56.5-83.6-90.4-96.3-36-13.4-75.2-9-115 .7 8.9 40.4 3.6 93.3-30.4 162.2 4 1.8 8.1 3 12.5 3.3 0 0 24.4 2 53.6 4.1 29 2 72.4 17.1 101.6 25.2z'
+          fill={`url(#${br})`}
+        />
+        <g clipRule='evenodd' fillRule='evenodd'>
+          <path
+            d='M254.1 190c-1.3 29.2 2.4 62.8 22.1 112.1l-6.2-.5c-17.7-51.5-21.5-78-20.2-107.6a174.7 174.7 0 0 1 20.4-72c2.4-4.9 8-14.1 10.5-18.8 7.1-13.7 11.9-21 16-33.6 5.7-17.5 4.5-25.9 3.8-34.1 4.6 29.9-12.7 56-25.7 82.4a177.1 177.1 0 0 0-20.7 72z'
+            fill={`url(#${te})`}
+          />
+          <path
+            d='M194.3 293.4c2.4 5.4 4.6 9.8 6 16.5L195 311c-2.1-7.8-3.8-13.4-6.8-20-17.8-42-46.3-63.6-69.7-79.5 28.2 15.2 57.2 39 75.7 81.9z'
+            fill={`url(#${le})`}
+          />
+          <path
+            d='M200.6 315.1c9.8 46-1.2 104.2-33.6 160.9 27.1-56.2 40.2-110.1 29.3-160z'
+            fill={`url(#${be})`}
+          />
+          <path
+            d='M312.5 311c53.1 19.9 73.6 63.6 88.9 100-19-38.1-45.2-80.3-90.8-96-34.8-11.8-64.1-10.4-114.3 1l-1.1-5c53.2-12.1 81-13.5 117.3 0z'
+            fill={`url(#${me})`}
+          />
+        </g>
+      </g>
     </svg>
   )
 }
@@ -1213,7 +1390,7 @@ export function AmplitudeIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <svg {...props} xmlns='http://www.w3.org/2000/svg' viewBox='0 0 49 49'>
       <path
-        fill='#FFFFFF'
+        fill='currentColor'
         d='M23.4,15.3c0.6,1.8,1.2,4.1,1.9,6.7c-2.6,0-5.3-0.1-7.8-0.1h-1.3c1.5-5.7,3.2-10.1,4.6-11.1 c0.1-0.1,0.2-0.1,0.4-0.1c0.2,0,0.3,0.1,0.5,0.3C21.9,11.5,22.5,12.7,23.4,15.3z M49,24.5C49,38,38,49,24.5,49S0,38,0,24.5 S11,0,24.5,0S49,11,49,24.5z M42.7,23.9c0-0.6-0.4-1.2-1-1.3l0,0l0,0l0,0c-0.1,0-0.1,0-0.2,0h-0.2c-4.1-0.3-8.4-0.4-12.4-0.5l0,0 C27,14.8,24.5,7.4,21.3,7.4c-3,0-5.8,4.9-8.2,14.5c-1.7,0-3.2,0-4.6-0.1c-0.1,0-0.2,0-0.2,0c-0.3,0-0.5,0-0.5,0 c-0.8,0.1-1.4,0.9-1.4,1.7c0,0.8,0.6,1.6,1.5,1.7l0,0h4.6c-0.4,1.9-0.8,3.8-1.1,5.6l-0.1,0.8l0,0c0,0.6,0.5,1.1,1.1,1.1 c0.4,0,0.8-0.2,1-0.5l0,0l2.2-7.1h10.7c0.8,3.1,1.7,6.3,2.8,9.3c0.6,1.6,2,5.4,4.4,5.4l0,0c3.6,0,5-5.8,5.9-9.6 c0.2-0.8,0.4-1.5,0.5-2.1l0.1-0.2l0,0c0-0.1,0-0.2,0-0.3c-0.1-0.2-0.2-0.3-0.4-0.4c-0.3-0.1-0.5,0.1-0.6,0.4l0,0l-0.1,0.2 c-0.3,0.8-0.6,1.6-0.8,2.3v0.1c-1.6,4.4-2.3,6.4-3.7,6.4l0,0l0,0l0,0c-1.8,0-3.5-7.3-4.1-10.1c-0.1-0.5-0.2-0.9-0.3-1.3h11.7 c0.2,0,0.4-0.1,0.6-0.1l0,0c0,0,0,0,0.1,0c0,0,0,0,0.1,0l0,0c0,0,0.1,0,0.1-0.1l0,0C42.5,24.6,42.7,24.3,42.7,23.9z'
       />
     </svg>
@@ -1806,6 +1983,14 @@ export function Mem0Icon(props: SVGProps<SVGSVGElement>) {
   )
 }
 
+export function EvernoteIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...props} xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='#7fce2c'>
+      <path d='M29.343 16.818c.1 1.695-.08 3.368-.305 5.045-.225 1.712-.508 3.416-.964 5.084-.3 1.067-.673 2.1-1.202 3.074-.65 1.192-1.635 1.87-2.992 1.924l-3.832.036c-.636-.017-1.278-.146-1.9-.297-1.192-.3-1.862-1.1-2.06-2.3-.186-1.08-.173-2.187.04-3.264.252-1.23 1-1.96 2.234-2.103.817-.1 1.65-.077 2.476-.1.205-.007.275.098.203.287-.196.53-.236 1.07-.098 1.623.053.207-.023.307-.26.305a7.77 7.77 0 0 0-1.123.053c-.636.086-.96.47-.96 1.112 0 .205.026.416.066.622.103.507.45.78.944.837 1.123.127 2.247.138 3.37-.05.675-.114 1.08-.54 1.16-1.208.152-1.3.155-2.587-.228-3.845-.33-1.092-1.006-1.565-2.134-1.7l-3.36-.54c-1.06-.193-1.7-.887-1.92-1.9-.13-.572-.14-1.17-.214-1.757-.013-.106-.074-.208-.1-.3-.04.1-.106.212-.117.326-.066.68-.053 1.373-.185 2.04-.16.8-.404 1.566-.67 2.33-.185.535-.616.837-1.205.8a37.76 37.76 0 0 1-7.123-1.353l-.64-.207c-.927-.26-1.487-.903-1.74-1.787l-1-3.853-.74-4.3c-.115-.755-.2-1.523-.083-2.293.154-1.112.914-1.903 2.04-1.964l3.558-.062c.127 0 .254.003.373-.026a1.23 1.23 0 0 0 1.01-1.255l-.05-3.036c-.048-1.576.8-2.38 2.156-2.622a10.58 10.58 0 0 1 4.91.26c.933.275 1.467.923 1.715 1.83.058.22.146.3.37.287l2.582.01 3.333.37c.686.095 1.364.25 2.032.42 1.165.298 1.793 1.112 1.962 2.256l.357 3.355.3 5.577.01 2.277zm-4.534-1.155c-.02-.666-.07-1.267-.444-1.784a1.66 1.66 0 0 0-2.469-.15c-.364.4-.494.88-.564 1.4-.008.034.106.126.16.126l.8-.053c.768.007 1.523.113 2.25.393.066.026.136.04.265.077zM8.787 1.154a3.82 3.82 0 0 0-.278 1.592l.05 2.934c.005.357-.075.45-.433.45L5.1 6.156c-.583 0-1.143.1-1.554.278l5.2-5.332c.02.013.04.033.06.053z' />
+    </svg>
+  )
+}
+
 export function ElevenLabsIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <svg
@@ -1822,6 +2007,24 @@ export function ElevenLabsIcon(props: SVGProps<SVGSVGElement>) {
   )
 }
 
+export function FathomIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...props} xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 1000' fill='none'>
+      <path
+        d='M0,668.7v205.78c0,53.97,34.24,102.88,85.8,119.08,87.48,27.49,167.88-36.99,167.88-120.22v-77.45L0,668.7Z'
+        fill='#007299'
+      />
+      <path
+        d='M873.72,626.07c-19.05,0-38.38-4.3-56.58-13.38L72.78,241.43C11.15,210.69-17.51,136.6,11.18,74.05,41.2,8.59,119.26-18.53,183.23,13.38l744.25,371.21c62.45,31.15,91,109.08,59.79,171.43-22.22,44.38-67.02,70.05-113.55,70.05Z'
+        fill='#00beff'
+      />
+      <path
+        d='M500.09,813.66c-19.05,0-38.38-4.3-56.58-13.38l-370.72-184.9c-61.63-30.74-90.29-104.82-61.61-167.37,30.02-65.46,108.08-92.59,172.06-60.68l370.62,184.85c62.45,31.15,91,109.08,59.79,171.43-22.22,44.38-67.02,70.05-113.55,70.05Z'
+        fill='#00beff'
+      />
+    </svg>
+  )
+}
 export function LinkupIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <svg {...props} xmlns='http://www.w3.org/2000/svg' viewBox='0 0 154 107' fill='none'>
@@ -1893,7 +2096,7 @@ export function LangsmithIcon(props: SVGProps<SVGSVGElement>) {
 
 export function LemlistIcon(props: SVGProps<SVGSVGElement>) {
   return (
-    <svg {...props} xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 181' fill='none'>
+    <svg {...props} xmlns='http://www.w3.org/2000/svg' viewBox='24 24.92 132 132' fill='none'>
       <path
         fillRule='evenodd'
         clipRule='evenodd'
@@ -3394,6 +3597,27 @@ export const ResendIcon = (props: SVGProps<SVGSVGElement>) => (
       d='M1000.46 450C1174.77 450 1278.43 553.669 1278.43 691.282C1278.43 828.896 1174.77 932.563 1000.46 932.563H912.382L1350 1350H1040.82L707.794 1033.48C683.944 1011.47 672.936 985.781 672.935 963.765C672.935 932.572 694.959 905.049 737.161 893.122L908.712 847.244C973.85 829.812 1018.81 779.353 1018.81 713.298C1018.8 632.567 952.745 585.78 871.095 585.78H450V450H1000.46Z'
       fill='#FDFDFD'
     />
+  </svg>
+)
+
+export const GoogleAdsIcon = (props: SVGProps<SVGSVGElement>) => (
+  <svg {...props} xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>
+    <g transform='matrix(.257748 0 0 .257745 -.361416 2.515516)'>
+      <path
+        d='M85.9 28.6c2.4-6.3 5.7-12.1 10.6-16.8 19.6-19.1 52-14.3 65.3 9.7 10 18.2 20.6 36 30.9 54l51.6 89.8c14.3 25.1-1.2 56.8-29.6 61.1-17.4 2.6-33.7-5.4-42.7-21l-45.4-78.8c-.3-.6-.7-1.1-1.1-1.6-1.6-1.3-2.3-3.2-3.3-4.9L88.8 62.2c-3.9-6.8-5.7-14.2-5.5-22 .3-4 .8-8 2.6-11.6'
+        fill='#3c8bd9'
+      />
+      <path
+        d='M85.9 28.6c-.9 3.6-1.7 7.2-1.9 11-.3 8.4 1.8 16.2 6 23.5l32.9 56.9c1 1.7 1.8 3.4 2.8 5l-18.1 31.1-25.3 43.6c-.4 0-.5-.2-.6-.5-.1-.8.2-1.5.4-2.3 4.1-15 .7-28.3-9.6-39.7-6.3-6.9-14.3-10.8-23.5-12.1-12-1.7-22.6 1.4-32.1 8.9-1.7 1.3-2.8 3.2-4.8 4.2-.4 0-.6-.2-.7-.5l14.3-24.9L85.2 29.7c.2-.4.5-.7.7-1.1'
+        fill='#fabc04'
+      />
+      <path
+        d='M11.8 158l5.7-5.1c24.3-19.2 60.8-5.3 66.1 25.1 1.3 7.3.6 14.3-1.6 21.3-.1.6-.2 1.1-.4 1.7-.9 1.6-1.7 3.3-2.7 4.9-8.9 14.7-22 22-39.2 20.9C20 225.4 4.5 210.6 1.8 191c-1.3-9.5.6-18.4 5.5-26.6 1-1.8 2.2-3.4 3.3-5.2.5-.4.3-1.2 1.2-1.2'
+        fill='#34a852'
+      />
+      <path d='M11.8 158c-.4.4-.4 1.1-1.1 1.2-.1-.7.3-1.1.7-1.6l.4.4' fill='#fabc04' />
+      <path d='M81.6 201c-.4-.7 0-1.2.4-1.7l.4.4-.8 1.3' fill='#e1c025' />
+    </g>
   </svg>
 )
 

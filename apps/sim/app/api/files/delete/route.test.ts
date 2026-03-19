@@ -91,6 +91,7 @@ vi.mock('@/lib/auth', () => ({
 }))
 
 vi.mock('@/lib/auth/hybrid', () => ({
+  AuthType: { SESSION: 'session', API_KEY: 'api_key', INTERNAL_JWT: 'internal_jwt' },
   checkHybridAuth: mocks.mockCheckHybridAuth,
   checkSessionOrInternalAuth: mocks.mockCheckSessionOrInternalAuth,
   checkInternalAuth: mocks.mockCheckInternalAuth,
@@ -121,6 +122,10 @@ vi.mock('@/lib/uploads/core/storage-service', () => ({
   downloadFile: mocks.mockDownloadFile,
   deleteFile: mocks.mockDeleteFile,
   hasCloudStorage: mocks.mockHasCloudStorage,
+}))
+
+vi.mock('@/lib/uploads/server/metadata', () => ({
+  deleteFileMetadata: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('@/lib/uploads/setup.server', () => ({}))

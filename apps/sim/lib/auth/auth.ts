@@ -7,6 +7,7 @@ import { betterAuth } from 'better-auth'
 import { drizzleAdapter } from 'better-auth/adapters/drizzle'
 import { nextCookies } from 'better-auth/next-js'
 import {
+  admin,
   createAuthMiddleware,
   customSession,
   emailOTP,
@@ -33,11 +34,13 @@ import {
 } from '@/lib/auth/cimd'
 import { sendPlanWelcomeEmail } from '@/lib/billing'
 import { authorizeSubscriptionReference } from '@/lib/billing/authorization'
+import { writeBillingInterval } from '@/lib/billing/core/subscription'
 import { handleNewUser } from '@/lib/billing/core/usage'
 import {
   ensureOrganizationForTeamSubscription,
   syncSubscriptionUsageLimits,
 } from '@/lib/billing/organization'
+import { isOrgPlan, isTeam } from '@/lib/billing/plan-helpers'
 import { getPlans, resolvePlanFromStripeSubscription } from '@/lib/billing/plans'
 import { syncSeatsFromStripeQuantity } from '@/lib/billing/validation/seat-management'
 import { handleChargeDispute, handleDisputeClosed } from '@/lib/billing/webhooks/disputes'
@@ -63,10 +66,7 @@ import {
 } from '@/lib/core/config/feature-flags'
 import { PlatformEvents } from '@/lib/core/telemetry'
 import { getBaseUrl } from '@/lib/core/utils/urls'
-import {
-  handleCreateCredentialFromDraft,
-  handleReconnectCredential,
-} from '@/lib/credentials/draft-hooks'
+import { processCredentialDraft } from '@/lib/credentials/draft-processor'
 import { sendEmail } from '@/lib/messaging/email/mailer'
 import { getFromEmailAddress, getPersonalEmailFrom } from '@/lib/messaging/email/utils'
 import { quickValidateEmail } from '@/lib/messaging/email/validation'
@@ -78,6 +78,10 @@ const logger = createLogger('Auth')
 
 import { getMicrosoftRefreshTokenExpiry, isMicrosoftProvider } from '@/lib/oauth/microsoft'
 import { getCanonicalScopesForProvider } from '@/lib/oauth/utils'
+
+const blockedSignupDomains = env.BLOCKED_SIGNUP_DOMAINS
+  ? new Set(env.BLOCKED_SIGNUP_DOMAINS.split(',').map((d) => d.trim().toLowerCase()))
+  : null
 
 const validStripeKey = env.STRIPE_SECRET_KEY
 
@@ -112,6 +116,15 @@ export const auth = betterAuth({
   databaseHooks: {
     user: {
       create: {
+        before: async (user) => {
+          if (blockedSignupDomains) {
+            const emailDomain = user.email?.split('@')[1]?.toLowerCase()
+            if (emailDomain && blockedSignupDomains.has(emailDomain)) {
+              throw new Error('Sign-ups from this email domain are not allowed.')
+            }
+          }
+          return { data: user }
+        },
         after: async (user) => {
           logger.info('[databaseHooks.user.create.after] User created, initializing stats', {
             userId: user.id,
@@ -257,50 +270,12 @@ export const auth = betterAuth({
             })
           }
 
-          /**
-           * If a pending credential draft exists for this (userId, providerId),
-           * either create a new credential or reconnect an existing one.
-           *
-           * - draft.credentialId is null: create a new credential (normal connect flow)
-           * - draft.credentialId is set: update existing credential's accountId (reconnect flow)
-           */
           try {
-            const [draft] = await db
-              .select()
-              .from(schema.pendingCredentialDraft)
-              .where(
-                and(
-                  eq(schema.pendingCredentialDraft.userId, account.userId),
-                  eq(schema.pendingCredentialDraft.providerId, account.providerId),
-                  sql`${schema.pendingCredentialDraft.expiresAt} > NOW()`
-                )
-              )
-              .limit(1)
-
-            if (draft) {
-              const now = new Date()
-
-              if (draft.credentialId) {
-                await handleReconnectCredential({
-                  draft,
-                  newAccountId: account.id,
-                  workspaceId: draft.workspaceId,
-                  now,
-                })
-              } else {
-                await handleCreateCredentialFromDraft({
-                  draft,
-                  accountId: account.id,
-                  providerId: account.providerId,
-                  userId: account.userId,
-                  now,
-                })
-              }
-
-              await db
-                .delete(schema.pendingCredentialDraft)
-                .where(eq(schema.pendingCredentialDraft.id, draft.id))
-            }
+            await processCredentialDraft({
+              userId: account.userId,
+              providerId: account.providerId,
+              accountId: account.id,
+            })
           } catch (error) {
             logger.error('[account.create.after] Failed to process credential draft', {
               userId: account.userId,
@@ -486,13 +461,14 @@ export const auth = betterAuth({
         'google-docs',
         'google-sheets',
         'google-forms',
+        'google-ads',
         'google-bigquery',
         'google-vault',
         'google-groups',
         'google-meet',
         'google-tasks',
         'vertex-ai',
-        'github-repo',
+
         'microsoft-dataverse',
         'microsoft-teams',
         'microsoft-excel',
@@ -636,6 +612,16 @@ export const auth = betterAuth({
         }
       }
 
+      if (ctx.path.startsWith('/sign-up') && blockedSignupDomains) {
+        const requestEmail = ctx.body?.email?.toLowerCase()
+        if (requestEmail) {
+          const emailDomain = requestEmail.split('@')[1]
+          if (emailDomain && blockedSignupDomains.has(emailDomain)) {
+            throw new Error('Sign-ups from this email domain are not allowed.')
+          }
+        }
+      }
+
       if (ctx.path === '/oauth2/authorize' || ctx.path === '/oauth2/token') {
         const clientId = (ctx.query?.client_id ?? ctx.body?.client_id) as string | undefined
         if (clientId && isMetadataUrl(clientId)) {
@@ -663,6 +649,7 @@ export const auth = betterAuth({
   },
   plugins: [
     nextCookies(),
+    admin(),
     jwt({
       jwks: {
         keyPairConfig: { alg: 'RS256' },
@@ -754,83 +741,6 @@ export const auth = betterAuth({
     }),
     genericOAuth({
       config: [
-        {
-          providerId: 'github-repo',
-          clientId: env.GITHUB_REPO_CLIENT_ID as string,
-          clientSecret: env.GITHUB_REPO_CLIENT_SECRET as string,
-          authorizationUrl: 'https://github.com/login/oauth/authorize',
-          accessType: 'offline',
-          prompt: 'consent',
-          tokenUrl: 'https://github.com/login/oauth/access_token',
-          userInfoUrl: 'https://api.github.com/user',
-          scopes: getCanonicalScopesForProvider('github-repo'),
-          redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/github-repo`,
-          getUserInfo: async (tokens) => {
-            try {
-              const profileResponse = await fetch('https://api.github.com/user', {
-                headers: {
-                  Authorization: `Bearer ${tokens.accessToken}`,
-                  'User-Agent': 'sim-studio',
-                },
-              })
-
-              if (!profileResponse.ok) {
-                await profileResponse.text().catch(() => {})
-                logger.error('Failed to fetch GitHub profile', {
-                  status: profileResponse.status,
-                  statusText: profileResponse.statusText,
-                })
-                throw new Error(`Failed to fetch GitHub profile: ${profileResponse.statusText}`)
-              }
-
-              const profile = await profileResponse.json()
-
-              if (!profile.email) {
-                const emailsResponse = await fetch('https://api.github.com/user/emails', {
-                  headers: {
-                    Authorization: `Bearer ${tokens.accessToken}`,
-                    'User-Agent': 'sim-studio',
-                  },
-                })
-
-                if (emailsResponse.ok) {
-                  const emails = await emailsResponse.json()
-
-                  const primaryEmail =
-                    emails.find(
-                      (email: { primary: boolean; email: string; verified: boolean }) =>
-                        email.primary
-                    ) || emails[0]
-                  if (primaryEmail) {
-                    profile.email = primaryEmail.email
-                    profile.emailVerified = primaryEmail.verified || false
-                  }
-                } else {
-                  logger.warn('Failed to fetch GitHub emails', {
-                    status: emailsResponse.status,
-                    statusText: emailsResponse.statusText,
-                  })
-                }
-              }
-
-              const now = new Date()
-
-              return {
-                id: `${profile.id.toString()}-${crypto.randomUUID()}`,
-                name: profile.name || profile.login,
-                email: profile.email,
-                image: profile.avatar_url,
-                emailVerified: profile.emailVerified || false,
-                createdAt: now,
-                updatedAt: now,
-              }
-            } catch (error) {
-              logger.error('Error in GitHub getUserInfo', { error })
-              throw error
-            }
-          },
-        },
-
         // Google providers
         {
           providerId: 'google-email',
@@ -1065,6 +975,41 @@ export const auth = betterAuth({
               })
               if (!response.ok) {
                 await response.text().catch(() => {})
+                logger.error('Failed to fetch Google user info', { status: response.status })
+                throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
+              }
+              const profile = await response.json()
+              const now = new Date()
+              return {
+                id: `${profile.sub}-${crypto.randomUUID()}`,
+                name: profile.name || 'Google User',
+                email: profile.email,
+                image: profile.picture || undefined,
+                emailVerified: profile.email_verified || false,
+                createdAt: now,
+                updatedAt: now,
+              }
+            } catch (error) {
+              logger.error('Error in Google getUserInfo', { error })
+              throw error
+            }
+          },
+        },
+        {
+          providerId: 'google-ads',
+          clientId: env.GOOGLE_CLIENT_ID as string,
+          clientSecret: env.GOOGLE_CLIENT_SECRET as string,
+          discoveryUrl: 'https://accounts.google.com/.well-known/openid-configuration',
+          accessType: 'offline',
+          scopes: getCanonicalScopesForProvider('google-ads'),
+          prompt: 'consent',
+          redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/google-ads`,
+          getUserInfo: async (tokens) => {
+            try {
+              const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.accessToken}` },
+              })
+              if (!response.ok) {
                 logger.error('Failed to fetch Google user info', { status: response.status })
                 throw new Error(`Failed to fetch Google user info: ${response.statusText}`)
               }
@@ -2717,11 +2662,11 @@ export const auth = betterAuth({
             subscription: {
               enabled: true,
               plans: getPlans(),
-              authorizeReference: async ({ user, referenceId }) => {
-                return await authorizeSubscriptionReference(user.id, referenceId)
+              authorizeReference: async ({ user, referenceId, action }) => {
+                return await authorizeSubscriptionReference(user.id, referenceId, action)
               },
               getCheckoutSessionParams: async ({ plan, subscription }) => {
-                if (plan.name === 'team') {
+                if (isTeam(plan.name)) {
                   return {
                     params: {
                       allow_promotion_codes: true,
@@ -2754,7 +2699,7 @@ export const auth = betterAuth({
                 stripeSubscription: Stripe.Subscription
                 subscription: any
               }) => {
-                const { priceId, planFromStripe, isTeamPlan } =
+                const { priceId, planFromStripe, isAnnual } =
                   resolvePlanFromStripeSubscription(stripeSubscription)
 
                 logger.info('[onSubscriptionComplete] Subscription created', {
@@ -2763,18 +2708,25 @@ export const auth = betterAuth({
                   dbPlan: subscription.plan,
                   planFromStripe,
                   priceId,
+                  isAnnual,
                   status: subscription.status,
                 })
 
-                const subscriptionForOrgCreation = isTeamPlan
-                  ? { ...subscription, plan: 'team' }
-                  : subscription
+                if (!planFromStripe) {
+                  logger.error(
+                    '[onSubscriptionComplete] Could not resolve plan from Stripe price — check env var configuration',
+                    { subscriptionId: subscription.id, dbPlan: subscription.plan, priceId }
+                  )
+                }
+                const subscriptionForOrg = {
+                  ...subscription,
+                  plan: planFromStripe ?? subscription.plan,
+                }
 
                 let resolvedSubscription = subscription
                 try {
-                  resolvedSubscription = await ensureOrganizationForTeamSubscription(
-                    subscriptionForOrgCreation
-                  )
+                  resolvedSubscription =
+                    await ensureOrganizationForTeamSubscription(subscriptionForOrg)
                 } catch (orgError) {
                   logger.error(
                     '[onSubscriptionComplete] Failed to ensure organization for team subscription',
@@ -2794,6 +2746,8 @@ export const auth = betterAuth({
 
                 await syncSubscriptionUsageLimits(resolvedSubscription)
 
+                await writeBillingInterval(resolvedSubscription.id, isAnnual ? 'year' : 'month')
+
                 await sendPlanWelcomeEmail(resolvedSubscription)
               },
               onSubscriptionUpdate: async ({
@@ -2804,7 +2758,7 @@ export const auth = betterAuth({
                 subscription: any
               }) => {
                 const stripeSubscription = event.data.object as Stripe.Subscription
-                const { priceId, planFromStripe, isTeamPlan } =
+                const { priceId, planFromStripe, isTeamPlan, isAnnual } =
                   resolvePlanFromStripeSubscription(stripeSubscription)
 
                 if (priceId && !planFromStripe) {
@@ -2820,7 +2774,7 @@ export const auth = betterAuth({
 
                 const isUpgradeToTeam =
                   isTeamPlan &&
-                  subscription.plan !== 'team' &&
+                  !isTeam(subscription.plan) &&
                   !subscription.referenceId.startsWith('org_')
 
                 const effectivePlanForTeamFeatures = planFromStripe ?? subscription.plan
@@ -2831,18 +2785,25 @@ export const auth = betterAuth({
                   dbPlan: subscription.plan,
                   planFromStripe,
                   isUpgradeToTeam,
+                  isAnnual,
                   referenceId: subscription.referenceId,
                 })
 
-                const subscriptionForOrgCreation = isUpgradeToTeam
-                  ? { ...subscription, plan: 'team' }
-                  : subscription
+                if (!planFromStripe) {
+                  logger.error(
+                    '[onSubscriptionUpdate] Could not resolve plan from Stripe price — org creation may be skipped for team upgrades',
+                    { subscriptionId: subscription.id, dbPlan: subscription.plan }
+                  )
+                }
+                const subscriptionForOrg = {
+                  ...subscription,
+                  plan: planFromStripe ?? subscription.plan,
+                }
 
                 let resolvedSubscription = subscription
                 try {
-                  resolvedSubscription = await ensureOrganizationForTeamSubscription(
-                    subscriptionForOrgCreation
-                  )
+                  resolvedSubscription =
+                    await ensureOrganizationForTeamSubscription(subscriptionForOrg)
 
                   if (isUpgradeToTeam) {
                     logger.info(
@@ -2881,7 +2842,7 @@ export const auth = betterAuth({
                   })
                 }
 
-                if (effectivePlanForTeamFeatures === 'team') {
+                if (isTeam(effectivePlanForTeamFeatures)) {
                   try {
                     const quantity = stripeSubscription.items?.data?.[0]?.quantity || 1
 
@@ -2907,6 +2868,8 @@ export const auth = betterAuth({
                     })
                   }
                 }
+
+                await writeBillingInterval(resolvedSubscription.id, isAnnual ? 'year' : 'month')
               },
               onSubscriptionDeleted: async ({
                 subscription,
@@ -3000,8 +2963,7 @@ export const auth = betterAuth({
                 .where(eq(schema.subscription.referenceId, user.id))
 
               const hasTeamPlan = dbSubscriptions.some(
-                (sub) =>
-                  sub.status === 'active' && (sub.plan === 'team' || sub.plan === 'enterprise')
+                (sub) => sub.status === 'active' && isOrgPlan(sub.plan)
               )
 
               return hasTeamPlan

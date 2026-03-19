@@ -8,6 +8,7 @@ export type OAuthProvider =
   | 'google-sheets'
   | 'google-calendar'
   | 'google-contacts'
+  | 'google-ads'
   | 'google-bigquery'
   | 'google-tasks'
   | 'google-vault'
@@ -15,8 +16,6 @@ export type OAuthProvider =
   | 'google-groups'
   | 'google-meet'
   | 'vertex-ai'
-  | 'github'
-  | 'github-repo'
   | 'x'
   | 'confluence'
   | 'airtable'
@@ -57,6 +56,7 @@ export type OAuthService =
   | 'google-sheets'
   | 'google-calendar'
   | 'google-contacts'
+  | 'google-ads'
   | 'google-bigquery'
   | 'google-tasks'
   | 'google-vault'
@@ -64,7 +64,6 @@ export type OAuthService =
   | 'google-groups'
   | 'google-meet'
   | 'vertex-ai'
-  | 'github'
   | 'x'
   | 'confluence'
   | 'airtable'
@@ -95,6 +94,7 @@ export type OAuthService =
   | 'wordpress'
   | 'spotify'
   | 'calcom'
+  | 'github'
 
 export interface OAuthProviderConfig {
   name: string

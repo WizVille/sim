@@ -14,6 +14,8 @@ import { and, desc, eq, inArray, sql } from 'drizzle-orm'
 import type { Edge } from 'reactflow'
 import { v4 as uuidv4 } from 'uuid'
 import type { DbOrTx } from '@/lib/db/types'
+import { getActiveWorkflowContext } from '@/lib/workflows/active-context'
+import { remapConditionBlockIds, remapConditionEdgeHandle } from '@/lib/workflows/condition-ids'
 import {
   backfillCanonicalModes,
   migrateSubblockIds,
@@ -109,12 +111,8 @@ export async function loadDeployedWorkflowState(
 
     let resolvedWorkspaceId = providedWorkspaceId
     if (!resolvedWorkspaceId) {
-      const [wfRow] = await db
-        .select({ workspaceId: workflow.workspaceId })
-        .from(workflow)
-        .where(eq(workflow.id, workflowId))
-        .limit(1)
-      resolvedWorkspaceId = wfRow?.workspaceId ?? undefined
+      const workflowContext = await getActiveWorkflowContext(workflowId)
+      resolvedWorkspaceId = workflowContext?.workspaceId
     }
 
     if (!resolvedWorkspaceId) {
@@ -833,7 +831,12 @@ export function regenerateWorkflowStateIds(state: RegenerateStateInput): Regener
   Object.entries(state.blocks || {}).forEach(([oldId, block]) => {
     const newId = blockIdMapping.get(oldId)!
     // Duplicated blocks are always unlocked so users can edit them
-    const newBlock: BlockState = { ...block, id: newId, locked: false }
+    const newBlock: BlockState = {
+      ...block,
+      id: newId,
+      subBlocks: JSON.parse(JSON.stringify(block.subBlocks)),
+      locked: false,
+    }
 
     // Update parentId reference if it exists
     if (newBlock.data?.parentId) {
@@ -857,6 +860,21 @@ export function regenerateWorkflowStateIds(state: RegenerateStateInput): Regener
           updatedSubBlock.value = blockIdMapping.get(updatedSubBlock.value) ?? updatedSubBlock.value
         }
 
+        // Remap condition/router IDs embedded in condition-input/router-input subBlocks
+        if (
+          (updatedSubBlock.type === 'condition-input' || updatedSubBlock.type === 'router-input') &&
+          typeof updatedSubBlock.value === 'string'
+        ) {
+          try {
+            const parsed = JSON.parse(updatedSubBlock.value)
+            if (Array.isArray(parsed) && remapConditionBlockIds(parsed, oldId, newId)) {
+              updatedSubBlock.value = JSON.stringify(parsed)
+            }
+          } catch {
+            // Not valid JSON, skip
+          }
+        }
+
         updatedSubBlocks[subId] = updatedSubBlock
       })
       newBlock.subBlocks = updatedSubBlocks
@@ -871,12 +889,17 @@ export function regenerateWorkflowStateIds(state: RegenerateStateInput): Regener
     const newId = edgeIdMapping.get(edge.id)!
     const newSource = blockIdMapping.get(edge.source) || edge.source
     const newTarget = blockIdMapping.get(edge.target) || edge.target
+    const newSourceHandle =
+      edge.sourceHandle && blockIdMapping.has(edge.source)
+        ? remapConditionEdgeHandle(edge.sourceHandle, edge.source, newSource)
+        : edge.sourceHandle
 
     newEdges.push({
       ...edge,
       id: newId,
       source: newSource,
       target: newTarget,
+      sourceHandle: newSourceHandle,
     })
   })
 
@@ -1033,6 +1056,76 @@ export async function activateWorkflowVersion(params: {
     }
   } catch (error) {
     logger.error(`Error activating version ${version} for workflow ${workflowId}:`, error)
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to activate version',
+    }
+  }
+}
+
+export async function activateWorkflowVersionById(params: {
+  workflowId: string
+  deploymentVersionId: string
+}): Promise<{
+  success: boolean
+  deployedAt?: Date
+  state?: unknown
+  error?: string
+}> {
+  const { workflowId, deploymentVersionId } = params
+
+  try {
+    const [versionData] = await db
+      .select({ id: workflowDeploymentVersion.id, state: workflowDeploymentVersion.state })
+      .from(workflowDeploymentVersion)
+      .where(
+        and(
+          eq(workflowDeploymentVersion.workflowId, workflowId),
+          eq(workflowDeploymentVersion.id, deploymentVersionId)
+        )
+      )
+      .limit(1)
+
+    if (!versionData) {
+      return { success: false, error: 'Deployment version not found' }
+    }
+
+    const now = new Date()
+
+    await db.transaction(async (tx) => {
+      await tx
+        .update(workflowDeploymentVersion)
+        .set({ isActive: false })
+        .where(eq(workflowDeploymentVersion.workflowId, workflowId))
+
+      await tx
+        .update(workflowDeploymentVersion)
+        .set({ isActive: true })
+        .where(
+          and(
+            eq(workflowDeploymentVersion.workflowId, workflowId),
+            eq(workflowDeploymentVersion.id, deploymentVersionId)
+          )
+        )
+
+      await tx
+        .update(workflow)
+        .set({ isDeployed: true, deployedAt: now })
+        .where(eq(workflow.id, workflowId))
+    })
+
+    logger.info(`Activated deployment version ${deploymentVersionId} for workflow ${workflowId}`)
+
+    return {
+      success: true,
+      deployedAt: now,
+      state: versionData.state,
+    }
+  } catch (error) {
+    logger.error(
+      `Error activating deployment version ${deploymentVersionId} for workflow ${workflowId}:`,
+      error
+    )
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Failed to activate version',

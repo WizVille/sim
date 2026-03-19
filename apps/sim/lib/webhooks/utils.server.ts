@@ -1,6 +1,6 @@
 import crypto from 'crypto'
 import { db, workflowDeploymentVersion } from '@sim/db'
-import { account, webhook } from '@sim/db/schema'
+import { account, webhook, workflow } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { and, eq, isNull, or } from 'drizzle-orm'
 import { nanoid } from 'nanoid'
@@ -14,11 +14,13 @@ import {
 import { sanitizeUrlForLog } from '@/lib/core/utils/logging'
 import type { DbOrTx } from '@/lib/db/types'
 import { getProviderIdFromServiceId } from '@/lib/oauth'
+import { cleanupExternalWebhook } from '@/lib/webhooks/provider-subscriptions'
 import {
   getCredentialsForCredentialSet,
   refreshAccessTokenIfNeeded,
   resolveOAuthAccountId,
 } from '@/app/api/auth/oauth/utils'
+import { isPollingWebhookProvider } from '@/triggers/constants'
 
 const logger = createLogger('WebhookUtils')
 
@@ -1243,6 +1245,14 @@ export async function formatWebhookInput(
     return extractPageData(body)
   }
 
+  if (foundWebhook.provider === 'ashby') {
+    return {
+      ...(body.data || {}),
+      action: body.action,
+      data: body.data || {},
+    }
+  }
+
   if (foundWebhook.provider === 'stripe') {
     return body
   }
@@ -1600,6 +1610,38 @@ export function validateFirefliesSignature(
     return safeCompare(computedHash, providedSignature)
   } catch (error) {
     logger.error('Error validating Fireflies signature:', error)
+    return false
+  }
+}
+
+/**
+ * Validates an Ashby webhook signature using HMAC-SHA256.
+ * Ashby signs payloads with the secretToken and sends the digest in the Ashby-Signature header.
+ * @param secretToken - The secret token configured when creating the webhook
+ * @param signature - Ashby-Signature header value (format: 'sha256=<hex>')
+ * @param body - Raw request body string
+ * @returns Whether the signature is valid
+ */
+export function validateAshbySignature(
+  secretToken: string,
+  signature: string,
+  body: string
+): boolean {
+  try {
+    if (!secretToken || !signature || !body) {
+      return false
+    }
+
+    if (!signature.startsWith('sha256=')) {
+      return false
+    }
+
+    const providedSignature = signature.substring(7)
+    const computedHash = crypto.createHmac('sha256', secretToken).update(body, 'utf8').digest('hex')
+
+    return safeCompare(computedHash, providedSignature)
+  } catch (error) {
+    logger.error('Error validating Ashby signature:', error)
     return false
   }
 }
@@ -2222,10 +2264,7 @@ export async function syncWebhooksForCredentialSet(params: {
     `[${requestId}] Syncing webhooks for credential set ${credentialSetId}, provider ${provider}`
   )
 
-  // Polling providers get unique paths per credential (for independent state)
-  // External webhook providers share the same path (external service sends to one URL)
-  const pollingProviders = ['gmail', 'outlook', 'rss', 'imap']
-  const useUniquePaths = pollingProviders.includes(provider)
+  const useUniquePaths = isPollingWebhookProvider(provider)
 
   const credentials = await getCredentialsForCredentialSet(credentialSetId, oauthProviderId)
 
@@ -2249,9 +2288,14 @@ export async function syncWebhooksForCredentialSet(params: {
         ? and(
             eq(webhook.workflowId, workflowId),
             eq(webhook.blockId, blockId),
-            eq(webhook.deploymentVersionId, deploymentVersionId)
+            eq(webhook.deploymentVersionId, deploymentVersionId),
+            isNull(webhook.archivedAt)
           )
-        : and(eq(webhook.workflowId, workflowId), eq(webhook.blockId, blockId))
+        : and(
+            eq(webhook.workflowId, workflowId),
+            eq(webhook.blockId, blockId),
+            isNull(webhook.archivedAt)
+          )
     )
 
   // Filter to only webhooks belonging to this credential set
@@ -2273,6 +2317,15 @@ export async function syncWebhooksForCredentialSet(params: {
   }
 
   const credentialIdsInSet = new Set(credentials.map((c) => c.credentialId))
+  const [workflowRecord] = await db
+    .select({
+      id: workflow.id,
+      userId: workflow.userId,
+      workspaceId: workflow.workspaceId,
+    })
+    .from(workflow)
+    .where(eq(workflow.id, workflowId))
+    .limit(1)
 
   const result: CredentialSetWebhookSyncResult = {
     webhooks: [],
@@ -2380,6 +2433,9 @@ export async function syncWebhooksForCredentialSet(params: {
   for (const [credentialId, existingWebhook] of existingByCredentialId) {
     if (!credentialIdsInSet.has(credentialId)) {
       try {
+        if (workflowRecord) {
+          await cleanupExternalWebhook(existingWebhook, workflowRecord, requestId)
+        }
         await dbCtx.delete(webhook).where(eq(webhook.id, existingWebhook.id))
         result.deleted++
 
@@ -2435,6 +2491,7 @@ export async function syncAllWebhooksForCredentialSet(
     .where(
       and(
         eq(webhook.credentialSetId, credentialSetId),
+        isNull(webhook.archivedAt),
         or(
           eq(webhook.deploymentVersionId, workflowDeploymentVersion.id),
           and(isNull(workflowDeploymentVersion.id), isNull(webhook.deploymentVersionId))

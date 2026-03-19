@@ -8,7 +8,11 @@ import {
 } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { and, eq, isNull, min } from 'drizzle-orm'
-import { authorizeWorkflowByWorkspacePermission } from '@/lib/workflows/utils'
+import { remapConditionBlockIds, remapConditionEdgeHandle } from '@/lib/workflows/condition-ids'
+import {
+  authorizeWorkflowByWorkspacePermission,
+  deduplicateWorkflowName,
+} from '@/lib/workflows/utils'
 import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 import type { Variable } from '@/stores/panel/variables/types'
 import type { LoopConfig, ParallelConfig } from '@/stores/workflows/workflow/types'
@@ -24,6 +28,7 @@ interface DuplicateWorkflowOptions {
   workspaceId?: string
   folderId?: string | null
   requestId?: string
+  newWorkflowId?: string
 }
 
 interface DuplicateWorkflowResult {
@@ -78,6 +83,40 @@ function remapVariableIdsInSubBlocks(
 }
 
 /**
+ * Remaps condition/router block IDs within subBlocks when a block is duplicated.
+ * Returns a new object without mutating the input.
+ */
+function remapConditionIdsInSubBlocks(
+  subBlocks: Record<string, any>,
+  oldBlockId: string,
+  newBlockId: string
+): Record<string, any> {
+  const updated: Record<string, any> = {}
+
+  for (const [key, subBlock] of Object.entries(subBlocks)) {
+    if (
+      subBlock &&
+      typeof subBlock === 'object' &&
+      (subBlock.type === 'condition-input' || subBlock.type === 'router-input') &&
+      typeof subBlock.value === 'string'
+    ) {
+      try {
+        const parsed = JSON.parse(subBlock.value)
+        if (Array.isArray(parsed) && remapConditionBlockIds(parsed, oldBlockId, newBlockId)) {
+          updated[key] = { ...subBlock, value: JSON.stringify(parsed) }
+          continue
+        }
+      } catch {
+        // Not valid JSON, skip
+      }
+    }
+    updated[key] = subBlock
+  }
+
+  return updated
+}
+
+/**
  * Duplicate a workflow with all its blocks, edges, and subflows
  * This is a shared helper used by both the workflow duplicate API and folder duplicate API
  */
@@ -93,10 +132,10 @@ export async function duplicateWorkflow(
     workspaceId,
     folderId,
     requestId = 'unknown',
+    newWorkflowId: clientNewWorkflowId,
   } = options
 
-  // Generate new workflow ID
-  const newWorkflowId = crypto.randomUUID()
+  const newWorkflowId = clientNewWorkflowId || crypto.randomUUID()
   const now = new Date()
 
   // Duplicate workflow and all related data in a transaction
@@ -167,14 +206,15 @@ export async function duplicateWorkflow(
     // Mapping from old variable IDs to new variable IDs (populated during variable duplication)
     const varIdMapping = new Map<string, string>()
 
-    // Create the new workflow first (required for foreign key constraints)
+    const deduplicatedName = await deduplicateWorkflowName(name, targetWorkspaceId, targetFolderId)
+
     await tx.insert(workflow).values({
       id: newWorkflowId,
       userId,
       workspaceId: targetWorkspaceId,
       folderId: targetFolderId,
       sortOrder,
-      name,
+      name: deduplicatedName,
       description: description || source.description,
       color: color || source.color,
       lastSynced: now,
@@ -259,6 +299,15 @@ export async function duplicateWorkflow(
           )
         }
 
+        // Remap condition/router IDs to use the new block ID
+        if (updatedSubBlocks && typeof updatedSubBlocks === 'object') {
+          updatedSubBlocks = remapConditionIdsInSubBlocks(
+            updatedSubBlocks as Record<string, any>,
+            block.id,
+            newBlockId
+          )
+        }
+
         return {
           ...block,
           id: newBlockId,
@@ -286,15 +335,24 @@ export async function duplicateWorkflow(
       .where(eq(workflowEdges.workflowId, sourceWorkflowId))
 
     if (sourceEdges.length > 0) {
-      const newEdges = sourceEdges.map((edge) => ({
-        ...edge,
-        id: crypto.randomUUID(), // Generate new edge ID
-        workflowId: newWorkflowId,
-        sourceBlockId: blockIdMapping.get(edge.sourceBlockId) || edge.sourceBlockId,
-        targetBlockId: blockIdMapping.get(edge.targetBlockId) || edge.targetBlockId,
-        createdAt: now,
-        updatedAt: now,
-      }))
+      const newEdges = sourceEdges.map((edge) => {
+        const newSourceBlockId = blockIdMapping.get(edge.sourceBlockId) || edge.sourceBlockId
+        const newSourceHandle =
+          edge.sourceHandle && blockIdMapping.has(edge.sourceBlockId)
+            ? remapConditionEdgeHandle(edge.sourceHandle, edge.sourceBlockId, newSourceBlockId)
+            : edge.sourceHandle
+
+        return {
+          ...edge,
+          id: crypto.randomUUID(),
+          workflowId: newWorkflowId,
+          sourceBlockId: newSourceBlockId,
+          targetBlockId: blockIdMapping.get(edge.targetBlockId) || edge.targetBlockId,
+          sourceHandle: newSourceHandle,
+          createdAt: now,
+          updatedAt: now,
+        }
+      })
 
       await tx.insert(workflowEdges).values(newEdges)
       logger.info(`[${requestId}] Copied ${sourceEdges.length} edges with updated block references`)
@@ -379,7 +437,7 @@ export async function duplicateWorkflow(
 
     return {
       id: newWorkflowId,
-      name,
+      name: deduplicatedName,
       description: description || source.description,
       color: color || source.color,
       workspaceId: finalWorkspaceId,

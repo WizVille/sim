@@ -1,12 +1,17 @@
 import { db } from '@sim/db'
 import { settings, templateCreators, templateStars, templates, user } from '@sim/db/schema'
 import { and, desc, eq, sql } from 'drizzle-orm'
+import type { Metadata } from 'next'
 import { redirect } from 'next/navigation'
 import { getSession } from '@/lib/auth'
 import { verifyWorkspaceMembership } from '@/app/api/workflows/utils'
 import type { Template as WorkspaceTemplate } from '@/app/workspace/[workspaceId]/templates/templates'
 import Templates from '@/app/workspace/[workspaceId]/templates/templates'
 import { getUserPermissionConfig } from '@/ee/access-control/utils/permission-check'
+
+export const metadata: Metadata = {
+  title: 'Templates',
+}
 
 interface TemplatesPageProps {
   params: Promise<{
@@ -39,9 +44,9 @@ export default async function TemplatesPage({ params }: TemplatesPageProps) {
     redirect(`/workspace/${workspaceId}`)
   }
 
-  // Determine effective super user (DB flag AND UI mode enabled)
+  // Determine effective super user (admin role AND UI mode enabled)
   const currentUser = await db
-    .select({ isSuperUser: user.isSuperUser })
+    .select({ role: user.role })
     .from(user)
     .where(eq(user.id, session.user.id))
     .limit(1)
@@ -51,8 +56,8 @@ export default async function TemplatesPage({ params }: TemplatesPageProps) {
     .where(eq(settings.userId, session.user.id))
     .limit(1)
 
-  const isSuperUser = currentUser[0]?.isSuperUser || false
-  const superUserModeEnabled = userSettings[0]?.superUserModeEnabled ?? true
+  const isSuperUser = currentUser[0]?.role === 'admin'
+  const superUserModeEnabled = userSettings[0]?.superUserModeEnabled ?? false
   const effectiveSuperUser = isSuperUser && superUserModeEnabled
 
   // Load templates from database

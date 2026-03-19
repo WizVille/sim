@@ -2,7 +2,7 @@ import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
 import { validate as uuidValidate, v4 as uuidv4 } from 'uuid'
 import { z } from 'zod'
-import { checkHybridAuth } from '@/lib/auth/hybrid'
+import { AuthType, checkHybridAuth } from '@/lib/auth/hybrid'
 import { getJobQueue, shouldExecuteInline } from '@/lib/core/async-jobs'
 import {
   createTimeoutAbortController,
@@ -20,9 +20,12 @@ import {
 } from '@/lib/execution/call-chain'
 import { createExecutionEventWriter, setExecutionMeta } from '@/lib/execution/event-buffer'
 import { processInputFileFields } from '@/lib/execution/files'
+import {
+  registerManualExecutionAborter,
+  unregisterManualExecutionAborter,
+} from '@/lib/execution/manual-cancellation'
 import { preprocessExecution } from '@/lib/execution/preprocessing'
 import { LoggingSession } from '@/lib/logs/execution/logging-session'
-import { decrementSSEConnections, incrementSSEConnections } from '@/lib/monitoring/sse-connections'
 import {
   cleanupExecutionBase64Cache,
   hydrateUserFilesWithBase64,
@@ -167,19 +170,29 @@ type AsyncExecutionParams = {
 async function handleAsyncExecution(params: AsyncExecutionParams): Promise<NextResponse> {
   const { requestId, workflowId, userId, input, triggerType, executionId, callChain } = params
 
+  const correlation = {
+    executionId,
+    requestId,
+    source: 'workflow' as const,
+    workflowId,
+    triggerType,
+  }
+
   const payload: WorkflowExecutionPayload = {
     workflowId,
     userId,
     input,
     triggerType,
     executionId,
+    requestId,
+    correlation,
     callChain,
   }
 
   try {
     const jobQueue = await getJobQueue()
     const jobId = await jobQueue.enqueue('workflow-execution', payload, {
-      metadata: { workflowId, userId },
+      metadata: { workflowId, userId, correlation },
     })
 
     logger.info(`[${requestId}] Queued async workflow execution`, {
@@ -323,7 +336,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       )
     }
 
-    const defaultTriggerType = isPublicApiAccess || auth.authType === 'api_key' ? 'api' : 'manual'
+    const defaultTriggerType =
+      isPublicApiAccess || auth.authType === AuthType.API_KEY ? 'api' : 'manual'
 
     const {
       selectedOutputs,
@@ -339,11 +353,55 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       runFromBlock: rawRunFromBlock,
     } = validation.data
 
+    if (isPublicApiAccess && isClientSession) {
+      return NextResponse.json(
+        { error: 'Public API callers cannot set isClientSession' },
+        { status: 400 }
+      )
+    }
+
+    if (auth.authType === 'api_key') {
+      if (isClientSession) {
+        return NextResponse.json(
+          { error: 'API key callers cannot set isClientSession' },
+          { status: 400 }
+        )
+      }
+
+      if (workflowStateOverride) {
+        return NextResponse.json(
+          { error: 'API key callers cannot provide workflowStateOverride' },
+          { status: 400 }
+        )
+      }
+
+      if (useDraftState) {
+        return NextResponse.json(
+          { error: 'API key callers cannot execute draft workflow state' },
+          { status: 400 }
+        )
+      }
+    }
+
     // Resolve runFromBlock snapshot from executionId if needed
     let resolvedRunFromBlock:
       | { startBlockId: string; sourceSnapshot: SerializableExecutionState }
       | undefined
     if (rawRunFromBlock) {
+      if (rawRunFromBlock.sourceSnapshot && auth.authType === 'api_key') {
+        return NextResponse.json(
+          { error: 'API key callers cannot provide runFromBlock.sourceSnapshot' },
+          { status: 400 }
+        )
+      }
+
+      if (rawRunFromBlock.executionId && (auth.authType === 'api_key' || isPublicApiAccess)) {
+        return NextResponse.json(
+          { error: 'External callers cannot resume from stored execution snapshots' },
+          { status: 400 }
+        )
+      }
+
       if (rawRunFromBlock.sourceSnapshot && !isPublicApiAccess) {
         // Public API callers cannot inject arbitrary block state via sourceSnapshot.
         // They must use executionId to resume from a server-stored execution state.
@@ -352,13 +410,13 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
           sourceSnapshot: rawRunFromBlock.sourceSnapshot as SerializableExecutionState,
         }
       } else if (rawRunFromBlock.executionId) {
-        const { getExecutionState, getLatestExecutionState } = await import(
+        const { getExecutionStateForWorkflow, getLatestExecutionState } = await import(
           '@/lib/workflows/executor/execution-state'
         )
         const snapshot =
           rawRunFromBlock.executionId === 'latest'
             ? await getLatestExecutionState(workflowId)
-            : await getExecutionState(rawRunFromBlock.executionId)
+            : await getExecutionStateForWorkflow(rawRunFromBlock.executionId, workflowId)
         if (!snapshot) {
           return NextResponse.json(
             {
@@ -382,7 +440,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // For API key and internal JWT auth, the entire body is the input (except for our control fields)
     // For session auth, the input is explicitly provided in the input field
     const input =
-      isPublicApiAccess || auth.authType === 'api_key' || auth.authType === 'internal_jwt'
+      isPublicApiAccess ||
+      auth.authType === AuthType.API_KEY ||
+      auth.authType === AuthType.INTERNAL_JWT
         ? (() => {
             const {
               selectedOutputs,
@@ -408,11 +468,30 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // Public API callers always execute the deployed state, never the draft.
     const shouldUseDraftState = isPublicApiAccess
       ? false
-      : (useDraftState ?? auth.authType === 'session')
+      : (useDraftState ?? auth.authType === AuthType.SESSION)
     const streamHeader = req.headers.get('X-Stream-Response') === 'true'
     const enableSSE = streamHeader || streamParam === true
     const executionModeHeader = req.headers.get('X-Execution-Mode')
     const isAsyncMode = executionModeHeader === 'async'
+    const requiresWriteExecutionAccess = Boolean(
+      useDraftState || workflowStateOverride || rawRunFromBlock
+    )
+
+    if (
+      isAsyncMode &&
+      (body.useDraftState !== undefined ||
+        body.workflowStateOverride !== undefined ||
+        body.runFromBlock !== undefined ||
+        body.stopAfterBlockId !== undefined ||
+        body.selectedOutputs?.length ||
+        body.includeFileBase64 !== undefined ||
+        body.base64MaxBytes !== undefined)
+    ) {
+      return NextResponse.json(
+        { error: 'Async execution does not support draft or override execution controls' },
+        { status: 400 }
+      )
+    }
 
     logger.info(`[${requestId}] Starting server-side execution`, {
       workflowId,
@@ -441,14 +520,14 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // Client-side sessions and personal API keys bill/permission-check the
     // authenticated user, not the workspace billed account.
     const useAuthenticatedUserAsActor =
-      isClientSession || (auth.authType === 'api_key' && auth.apiKeyType === 'personal')
+      isClientSession || (auth.authType === AuthType.API_KEY && auth.apiKeyType === 'personal')
 
     // Authorization fetches the full workflow record and checks workspace permissions.
     // Run it first so we can pass the record to preprocessing (eliminates a duplicate DB query).
     const workflowAuthorization = await authorizeWorkflowByWorkspacePermission({
       workflowId,
       userId,
-      action: shouldUseDraftState ? 'write' : 'read',
+      action: requiresWriteExecutionAccess ? 'write' : 'read',
     })
     if (!workflowAuthorization.allowed) {
       return NextResponse.json(
@@ -486,6 +565,13 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       return NextResponse.json({ error: 'Workflow has no associated workspace' }, { status: 500 })
     }
     const workspaceId = workflow.workspaceId
+
+    if (auth.apiKeyType === 'workspace' && auth.workspaceId !== workspaceId) {
+      return NextResponse.json(
+        { error: 'API key is not authorized for this workspace' },
+        { status: 403 }
+      )
+    }
 
     logger.info(`[${requestId}] Preprocessing passed`, {
       workflowId,
@@ -671,8 +757,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
         const resultWithBase64 = { ...result, output: outputWithBase64 }
 
-        const hasResponseBlock = workflowHasResponseBlock(resultWithBase64)
-        if (hasResponseBlock) {
+        if (auth.authType !== AuthType.INTERNAL_JWT && workflowHasResponseBlock(resultWithBase64)) {
           return createHttpResponseFromBlock(resultWithBase64)
         }
 
@@ -764,7 +849,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const encoder = new TextEncoder()
     const timeoutController = createTimeoutAbortController(preprocessResult.executionTimeout?.sync)
     let isStreamClosed = false
-    let sseDecremented = false
+    let isManualAbortRegistered = false
 
     const eventWriter = createExecutionEventWriter(executionId)
     setExecutionMeta(executionId, {
@@ -775,8 +860,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
-        incrementSSEConnections('workflow-execute')
         let finalMetaStatus: 'complete' | 'error' | 'cancelled' | null = null
+
+        registerManualExecutionAborter(executionId, timeoutController.abort)
+        isManualAbortRegistered = true
 
         const sendEvent = (event: ExecutionEvent) => {
           if (!isStreamClosed) {
@@ -1145,6 +1232,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
           })
           finalMetaStatus = 'error'
         } finally {
+          if (isManualAbortRegistered) {
+            unregisterManualExecutionAborter(executionId)
+            isManualAbortRegistered = false
+          }
           try {
             await eventWriter.close()
           } catch (closeError) {
@@ -1159,10 +1250,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
           if (executionId) {
             await cleanupExecutionBase64Cache(executionId)
           }
-          if (!sseDecremented) {
-            sseDecremented = true
-            decrementSSEConnections('workflow-execute')
-          }
           if (!isStreamClosed) {
             try {
               controller.enqueue(encoder.encode('data: [DONE]\n\n'))
@@ -1174,10 +1261,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       cancel() {
         isStreamClosed = true
         logger.info(`[${requestId}] Client disconnected from SSE stream`)
-        if (!sseDecremented) {
-          sseDecremented = true
-          decrementSSEConnections('workflow-execute')
-        }
       },
     })
 

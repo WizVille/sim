@@ -38,7 +38,9 @@ import { ElasticsearchBlock } from '@/blocks/blocks/elasticsearch'
 import { ElevenLabsBlock } from '@/blocks/blocks/elevenlabs'
 import { EnrichBlock } from '@/blocks/blocks/enrich'
 import { EvaluatorBlock } from '@/blocks/blocks/evaluator'
+import { EvernoteBlock } from '@/blocks/blocks/evernote'
 import { ExaBlock } from '@/blocks/blocks/exa'
+import { FathomBlock } from '@/blocks/blocks/fathom'
 import { FileBlock, FileV2Block, FileV3Block } from '@/blocks/blocks/file'
 import { FirecrawlBlock } from '@/blocks/blocks/firecrawl'
 import { FirefliesBlock, FirefliesV2Block } from '@/blocks/blocks/fireflies'
@@ -50,6 +52,7 @@ import { GitLabBlock } from '@/blocks/blocks/gitlab'
 import { GmailBlock, GmailV2Block } from '@/blocks/blocks/gmail'
 import { GongBlock } from '@/blocks/blocks/gong'
 import { GoogleSearchBlock } from '@/blocks/blocks/google'
+import { GoogleAdsBlock } from '@/blocks/blocks/google_ads'
 import { GoogleBigQueryBlock } from '@/blocks/blocks/google_bigquery'
 import { GoogleBooksBlock } from '@/blocks/blocks/google_books'
 import { GoogleCalendarBlock, GoogleCalendarV2Block } from '@/blocks/blocks/google_calendar'
@@ -109,10 +112,12 @@ import {
   MistralParseV3Block,
 } from '@/blocks/blocks/mistral_parse'
 import { MongoDBBlock } from '@/blocks/blocks/mongodb'
+import { MothershipBlock } from '@/blocks/blocks/mothership'
 import { MySQLBlock } from '@/blocks/blocks/mysql'
 import { Neo4jBlock } from '@/blocks/blocks/neo4j'
 import { NoteBlock } from '@/blocks/blocks/note'
 import { NotionBlock, NotionV2Block } from '@/blocks/blocks/notion'
+import { ObsidianBlock } from '@/blocks/blocks/obsidian'
 import { OneDriveBlock } from '@/blocks/blocks/onedrive'
 import { OnePasswordBlock } from '@/blocks/blocks/onepassword'
 import { OpenAIBlock } from '@/blocks/blocks/openai'
@@ -159,6 +164,7 @@ import { StarterBlock } from '@/blocks/blocks/starter'
 import { StripeBlock } from '@/blocks/blocks/stripe'
 import { SttBlock, SttV2Block } from '@/blocks/blocks/stt'
 import { SupabaseBlock } from '@/blocks/blocks/supabase'
+import { TableBlock } from '@/blocks/blocks/table'
 import { TavilyBlock } from '@/blocks/blocks/tavily'
 import { TelegramBlock } from '@/blocks/blocks/telegram'
 import { TextractBlock, TextractV2Block } from '@/blocks/blocks/textract'
@@ -233,7 +239,9 @@ export const registry: Record<string, BlockConfig> = {
   dynamodb: DynamoDBBlock,
   elasticsearch: ElasticsearchBlock,
   elevenlabs: ElevenLabsBlock,
+  fathom: FathomBlock,
   enrich: EnrichBlock,
+  evernote: EvernoteBlock,
   evaluator: EvaluatorBlock,
   exa: ExaBlock,
   file: FileBlock,
@@ -252,6 +260,7 @@ export const registry: Record<string, BlockConfig> = {
   gmail_v2: GmailV2Block,
   google_calendar: GoogleCalendarBlock,
   google_calendar_v2: GoogleCalendarV2Block,
+  google_ads: GoogleAdsBlock,
   google_books: GoogleBooksBlock,
   google_contacts: GoogleContactsBlock,
   google_docs: GoogleDocsBlock,
@@ -315,11 +324,13 @@ export const registry: Record<string, BlockConfig> = {
   mistral_parse_v2: MistralParseV2Block,
   mistral_parse_v3: MistralParseV3Block,
   mongodb: MongoDBBlock,
+  mothership: MothershipBlock,
   mysql: MySQLBlock,
   neo4j: Neo4jBlock,
   note: NoteBlock,
   notion: NotionBlock,
   notion_v2: NotionV2Block,
+  obsidian: ObsidianBlock,
   onepassword: OnePasswordBlock,
   onedrive: OneDriveBlock,
   openai: OpenAIBlock,
@@ -370,8 +381,7 @@ export const registry: Record<string, BlockConfig> = {
   stt: SttBlock,
   stt_v2: SttV2Block,
   supabase: SupabaseBlock,
-  // TODO: Uncomment when working on tables
-  // table: TableBlock,
+  table: TableBlock,
   tavily: TavilyBlock,
   telegram: TelegramBlock,
   textract: TextractBlock,
