@@ -8,7 +8,6 @@ import { getDocumentIcon } from '@/components/icons/document-icons'
 import { useSession } from '@/lib/auth/auth-client'
 import {
   LandingPromptStorage,
-  LandingTemplateStorage,
   type LandingWorkflowSeed,
   LandingWorkflowSeedStorage,
 } from '@/lib/core/utils/browser-storage'
@@ -16,7 +15,6 @@ import { persistImportedWorkflow } from '@/lib/workflows/operations/import-expor
 import { MessageActions } from '@/app/workspace/[workspaceId]/components'
 import { useChatHistory, useMarkTaskRead } from '@/hooks/queries/tasks'
 import type { ChatContext } from '@/stores/panel'
-import { useSidebarStore } from '@/stores/sidebar/store'
 import {
   MessageContent,
   MothershipView,
@@ -119,12 +117,12 @@ export function Home({ chatId }: HomeProps = {}) {
       return
     }
 
-    const templateId = LandingTemplateStorage.consume()
-    if (templateId) {
-      logger.info('Retrieved landing page template, redirecting to template detail')
-      router.replace(`/workspace/${workspaceId}/templates/${templateId}?use=true`)
-      return
-    }
+    // const templateId = LandingTemplateStorage.consume()
+    // if (templateId) {
+    //   logger.info('Retrieved landing page template, redirecting to template detail')
+    //   router.replace(`/workspace/${workspaceId}/templates/${templateId}?use=true`)
+    //   return
+    // }
 
     const prompt = LandingPromptStorage.consume()
     if (prompt) {
@@ -167,8 +165,6 @@ export function Home({ chatId }: HomeProps = {}) {
 
   const handleResourceEvent = useCallback(() => {
     if (isResourceCollapsedRef.current) {
-      const { isCollapsed, toggleCollapsed } = useSidebarStore.getState()
-      if (!isCollapsed) toggleCollapsed()
       setIsResourceCollapsed(false)
       startAnimatingIn()
     }
