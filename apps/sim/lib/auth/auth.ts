@@ -8,6 +8,7 @@ import { drizzleAdapter } from 'better-auth/adapters/drizzle'
 import { nextCookies } from 'better-auth/next-js'
 import {
   admin,
+  captcha,
   createAuthMiddleware,
   customSession,
   emailOTP,
@@ -17,6 +18,7 @@ import {
   oneTimeToken,
   organization,
 } from 'better-auth/plugins'
+import { emailHarmony } from 'better-auth-harmony'
 import { and, eq, inArray, sql } from 'drizzle-orm'
 import { headers } from 'next/headers'
 import Stripe from 'stripe'
@@ -63,17 +65,14 @@ import {
   isHosted,
   isOrganizationsEnabled,
   isRegistrationDisabled,
+  isSignupEmailValidationEnabled,
 } from '@/lib/core/config/feature-flags'
 import { PlatformEvents } from '@/lib/core/telemetry'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import { processCredentialDraft } from '@/lib/credentials/draft-processor'
 import { sendEmail } from '@/lib/messaging/email/mailer'
 import { getFromEmailAddress, getPersonalEmailFrom } from '@/lib/messaging/email/utils'
-import {
-  isDisposableEmailFull,
-  isDisposableMxBackend,
-  quickValidateEmail,
-} from '@/lib/messaging/email/validation'
+import { quickValidateEmail } from '@/lib/messaging/email/validation'
 import { syncAllWebhooksForCredentialSet } from '@/lib/webhooks/utils.server'
 import { SSO_TRUSTED_PROVIDERS } from '@/ee/sso/constants'
 import { createAnonymousSession, ensureAnonymousUserExists } from './anonymous'
@@ -82,6 +81,51 @@ const logger = createLogger('Auth')
 
 import { getMicrosoftRefreshTokenExpiry, isMicrosoftProvider } from '@/lib/oauth/microsoft'
 import { getCanonicalScopesForProvider } from '@/lib/oauth/utils'
+
+/**
+ * Extracts user info from a Microsoft ID token JWT instead of calling Graph API /me.
+ * This avoids 403 errors for external tenant users whose admin hasn't consented to Graph API scopes.
+ * The ID token is always returned when the openid scope is requested.
+ */
+function getMicrosoftUserInfoFromIdToken(tokens: { accessToken?: string }, providerId: string) {
+  const idToken = (tokens as Record<string, unknown>).idToken as string | undefined
+  if (!idToken) {
+    logger.error(
+      `Microsoft ${providerId} OAuth: no ID token received. Ensure openid scope is requested.`
+    )
+    throw new Error(`Microsoft ${providerId} OAuth requires an ID token (openid scope)`)
+  }
+
+  const parts = idToken.split('.')
+  if (parts.length !== 3) {
+    throw new Error(`Microsoft ${providerId} OAuth: malformed ID token`)
+  }
+
+  let payload: Record<string, unknown>
+  try {
+    payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8'))
+  } catch {
+    throw new Error(`Microsoft ${providerId} OAuth: failed to decode ID token payload`)
+  }
+
+  const email =
+    (payload.email as string) || (payload.preferred_username as string) || (payload.upn as string)
+  if (!email) {
+    throw new Error(
+      `Microsoft ${providerId} OAuth: ID token contains no email, preferred_username, or upn claim`
+    )
+  }
+
+  const now = new Date()
+  return {
+    id: `${payload.oid || payload.sub}-${crypto.randomUUID()}`,
+    name: (payload.name as string) || 'Microsoft User',
+    email,
+    emailVerified: true,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
 
 const blockedSignupDomains = env.BLOCKED_SIGNUP_DOMAINS
   ? new Set(env.BLOCKED_SIGNUP_DOMAINS.split(',').map((d) => d.trim().toLowerCase()))
@@ -629,23 +673,12 @@ export const auth = betterAuth({
         }
       }
 
-      if (ctx.path.startsWith('/sign-up')) {
+      if (ctx.path.startsWith('/sign-up') && blockedSignupDomains) {
         const requestEmail = ctx.body?.email?.toLowerCase()
         if (requestEmail) {
-          // Check manually blocked domains
-          if (blockedSignupDomains) {
-            const emailDomain = requestEmail.split('@')[1]
-            if (emailDomain && blockedSignupDomains.has(emailDomain)) {
-              throw new Error('Sign-ups from this email domain are not allowed.')
-            }
-          }
-
-          // Check disposable email domains (full list + MX backend check)
-          if (isDisposableEmailFull(requestEmail)) {
-            throw new Error('Sign-ups from disposable email addresses are not allowed.')
-          }
-          if (await isDisposableMxBackend(requestEmail)) {
-            throw new Error('Sign-ups from disposable email addresses are not allowed.')
+          const emailDomain = requestEmail.split('@')[1]
+          if (emailDomain && blockedSignupDomains.has(emailDomain)) {
+            throw new Error('Sign-ups from this email domain are not allowed.')
           }
         }
       }
@@ -677,6 +710,16 @@ export const auth = betterAuth({
   },
   plugins: [
     nextCookies(),
+    ...(isSignupEmailValidationEnabled ? [emailHarmony()] : []),
+    ...(env.TURNSTILE_SECRET_KEY
+      ? [
+          captcha({
+            provider: 'cloudflare-turnstile',
+            secretKey: env.TURNSTILE_SECRET_KEY,
+            endpoints: ['/sign-up/email', '/sign-in/email'],
+          }),
+        ]
+      : []),
     admin(),
     jwt({
       jwks: {
@@ -1293,29 +1336,7 @@ export const auth = betterAuth({
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/microsoft-ad`,
           getUserInfo: async (tokens) => {
-            try {
-              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
-                headers: { Authorization: `Bearer ${tokens.accessToken}` },
-              })
-              if (!response.ok) {
-                await response.text().catch(() => {})
-                logger.error('Failed to fetch Microsoft user info', { status: response.status })
-                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
-              }
-              const profile = await response.json()
-              const now = new Date()
-              return {
-                id: `${profile.id}-${crypto.randomUUID()}`,
-                name: profile.displayName || 'Microsoft User',
-                email: profile.mail || profile.userPrincipalName,
-                emailVerified: true,
-                createdAt: now,
-                updatedAt: now,
-              }
-            } catch (error) {
-              logger.error('Error in Microsoft getUserInfo', { error })
-              throw error
-            }
+            return getMicrosoftUserInfoFromIdToken(tokens, 'microsoft-ad')
           },
         },
 
@@ -1333,29 +1354,7 @@ export const auth = betterAuth({
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/microsoft-teams`,
           getUserInfo: async (tokens) => {
-            try {
-              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
-                headers: { Authorization: `Bearer ${tokens.accessToken}` },
-              })
-              if (!response.ok) {
-                await response.text().catch(() => {})
-                logger.error('Failed to fetch Microsoft user info', { status: response.status })
-                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
-              }
-              const profile = await response.json()
-              const now = new Date()
-              return {
-                id: `${profile.id}-${crypto.randomUUID()}`,
-                name: profile.displayName || 'Microsoft User',
-                email: profile.mail || profile.userPrincipalName,
-                emailVerified: true,
-                createdAt: now,
-                updatedAt: now,
-              }
-            } catch (error) {
-              logger.error('Error in Microsoft getUserInfo', { error })
-              throw error
-            }
+            return getMicrosoftUserInfoFromIdToken(tokens, 'microsoft-teams')
           },
         },
 
@@ -1373,29 +1372,7 @@ export const auth = betterAuth({
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/microsoft-excel`,
           getUserInfo: async (tokens) => {
-            try {
-              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
-                headers: { Authorization: `Bearer ${tokens.accessToken}` },
-              })
-              if (!response.ok) {
-                await response.text().catch(() => {})
-                logger.error('Failed to fetch Microsoft user info', { status: response.status })
-                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
-              }
-              const profile = await response.json()
-              const now = new Date()
-              return {
-                id: `${profile.id}-${crypto.randomUUID()}`,
-                name: profile.displayName || 'Microsoft User',
-                email: profile.mail || profile.userPrincipalName,
-                emailVerified: true,
-                createdAt: now,
-                updatedAt: now,
-              }
-            } catch (error) {
-              logger.error('Error in Microsoft getUserInfo', { error })
-              throw error
-            }
+            return getMicrosoftUserInfoFromIdToken(tokens, 'microsoft-excel')
           },
         },
         {
@@ -1412,32 +1389,7 @@ export const auth = betterAuth({
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/microsoft-dataverse`,
           getUserInfo: async (tokens) => {
-            // Dataverse access tokens target dynamics.microsoft.com, not graph.microsoft.com,
-            // so we cannot call the Graph API /me endpoint. Instead, we decode the ID token JWT
-            // which is always returned when the openid scope is requested.
-            const idToken = (tokens as Record<string, unknown>).idToken as string | undefined
-            if (!idToken) {
-              logger.error(
-                'Microsoft Dataverse OAuth: no ID token received. Ensure openid scope is requested.'
-              )
-              throw new Error('Microsoft Dataverse OAuth requires an ID token (openid scope)')
-            }
-
-            const parts = idToken.split('.')
-            if (parts.length !== 3) {
-              throw new Error('Microsoft Dataverse OAuth: malformed ID token')
-            }
-
-            const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8'))
-            const now = new Date()
-            return {
-              id: `${payload.oid || payload.sub}-${crypto.randomUUID()}`,
-              name: payload.name || 'Microsoft User',
-              email: payload.preferred_username || payload.email || payload.upn,
-              emailVerified: true,
-              createdAt: now,
-              updatedAt: now,
-            }
+            return getMicrosoftUserInfoFromIdToken(tokens, 'microsoft-dataverse')
           },
         },
         {
@@ -1454,29 +1406,7 @@ export const auth = betterAuth({
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/microsoft-planner`,
           getUserInfo: async (tokens) => {
-            try {
-              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
-                headers: { Authorization: `Bearer ${tokens.accessToken}` },
-              })
-              if (!response.ok) {
-                await response.text().catch(() => {})
-                logger.error('Failed to fetch Microsoft user info', { status: response.status })
-                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
-              }
-              const profile = await response.json()
-              const now = new Date()
-              return {
-                id: `${profile.id}-${crypto.randomUUID()}`,
-                name: profile.displayName || 'Microsoft User',
-                email: profile.mail || profile.userPrincipalName,
-                emailVerified: true,
-                createdAt: now,
-                updatedAt: now,
-              }
-            } catch (error) {
-              logger.error('Error in Microsoft getUserInfo', { error })
-              throw error
-            }
+            return getMicrosoftUserInfoFromIdToken(tokens, 'microsoft-planner')
           },
         },
 
@@ -1494,29 +1424,7 @@ export const auth = betterAuth({
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/outlook`,
           getUserInfo: async (tokens) => {
-            try {
-              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
-                headers: { Authorization: `Bearer ${tokens.accessToken}` },
-              })
-              if (!response.ok) {
-                await response.text().catch(() => {})
-                logger.error('Failed to fetch Microsoft user info', { status: response.status })
-                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
-              }
-              const profile = await response.json()
-              const now = new Date()
-              return {
-                id: `${profile.id}-${crypto.randomUUID()}`,
-                name: profile.displayName || 'Microsoft User',
-                email: profile.mail || profile.userPrincipalName,
-                emailVerified: true,
-                createdAt: now,
-                updatedAt: now,
-              }
-            } catch (error) {
-              logger.error('Error in Microsoft getUserInfo', { error })
-              throw error
-            }
+            return getMicrosoftUserInfoFromIdToken(tokens, 'outlook')
           },
         },
 
@@ -1534,29 +1442,7 @@ export const auth = betterAuth({
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/onedrive`,
           getUserInfo: async (tokens) => {
-            try {
-              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
-                headers: { Authorization: `Bearer ${tokens.accessToken}` },
-              })
-              if (!response.ok) {
-                await response.text().catch(() => {})
-                logger.error('Failed to fetch Microsoft user info', { status: response.status })
-                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
-              }
-              const profile = await response.json()
-              const now = new Date()
-              return {
-                id: `${profile.id}-${crypto.randomUUID()}`,
-                name: profile.displayName || 'Microsoft User',
-                email: profile.mail || profile.userPrincipalName,
-                emailVerified: true,
-                createdAt: now,
-                updatedAt: now,
-              }
-            } catch (error) {
-              logger.error('Error in Microsoft getUserInfo', { error })
-              throw error
-            }
+            return getMicrosoftUserInfoFromIdToken(tokens, 'onedrive')
           },
         },
 
@@ -1574,29 +1460,7 @@ export const auth = betterAuth({
           pkce: true,
           redirectURI: `${getBaseUrl()}/api/auth/oauth2/callback/sharepoint`,
           getUserInfo: async (tokens) => {
-            try {
-              const response = await fetch('https://graph.microsoft.com/v1.0/me', {
-                headers: { Authorization: `Bearer ${tokens.accessToken}` },
-              })
-              if (!response.ok) {
-                await response.text().catch(() => {})
-                logger.error('Failed to fetch Microsoft user info', { status: response.status })
-                throw new Error(`Failed to fetch Microsoft user info: ${response.statusText}`)
-              }
-              const profile = await response.json()
-              const now = new Date()
-              return {
-                id: `${profile.id}-${crypto.randomUUID()}`,
-                name: profile.displayName || 'Microsoft User',
-                email: profile.mail || profile.userPrincipalName,
-                emailVerified: true,
-                createdAt: now,
-                updatedAt: now,
-              }
-            } catch (error) {
-              logger.error('Error in Microsoft getUserInfo', { error })
-              throw error
-            }
+            return getMicrosoftUserInfoFromIdToken(tokens, 'sharepoint')
           },
         },
 

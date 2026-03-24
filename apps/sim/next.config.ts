@@ -90,7 +90,7 @@ const nextConfig: NextConfig = {
   ],
   outputFileTracingIncludes: {
     '/api/tools/stagehand/*': ['./node_modules/ws/**/*'],
-    '/*': ['./node_modules/sharp/**/*', './node_modules/@img/**/*'],
+    '/*': ['./node_modules/sharp/**/*', './node_modules/@img/**/*', './dist/pptx-worker.cjs'],
   },
   experimental: {
     optimizeCss: true,
@@ -120,6 +120,7 @@ const nextConfig: NextConfig = {
     '@t3-oss/env-nextjs',
     '@t3-oss/env-core',
     '@sim/db',
+    'better-auth-harmony',
   ],
   async headers() {
     return [
