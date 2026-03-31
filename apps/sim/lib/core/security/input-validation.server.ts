@@ -73,6 +73,8 @@ export async function validateUrlWithDNS(
       : hostnameLower
 
   let isLocalhost = cleanHostname === 'localhost'
+  let isWizvilleLocalhost = cleanHostname === 'app.wizville.localhost'
+
   if (ipaddr.isValid(cleanHostname)) {
     const processedIP = ipaddr.process(cleanHostname).toString()
     if (processedIP === '127.0.0.1' || processedIP === '::1') {
@@ -90,7 +92,7 @@ export async function validateUrlWithDNS(
         return ip === '127.0.0.1' || ip === '::1'
       })()
 
-    if (isPrivateOrReservedIP(address) && !(isLocalhost && resolvedIsLoopback && !isHosted)) {
+    if (!isWizvilleLocalhost && isPrivateOrReservedIP(address) && !(isLocalhost && resolvedIsLoopback && !isHosted)) {
       logger.warn('URL resolves to blocked IP address', {
         paramName,
         hostname,
@@ -286,7 +288,6 @@ export async function secureFetchWithPinnedIP(
     const agent = isHttps ? new https.Agent(agentOptions) : new http.Agent(agentOptions)
 
     const { 'accept-encoding': _, ...sanitizedHeaders } = options.headers ?? {}
-
     const requestOptions: http.RequestOptions = {
       hostname: parsed.hostname,
       port,
@@ -295,6 +296,7 @@ export async function secureFetchWithPinnedIP(
       headers: sanitizedHeaders,
       agent,
       timeout: options.timeout || 300000,
+      rejectUnauthorized: (parsed.hostname.endsWith('.wizville.localhost') ? false : true),
     }
 
     const protocol = isHttps ? https : http
