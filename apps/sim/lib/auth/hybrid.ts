@@ -134,9 +134,10 @@ export async function checkSessionOrInternalAuth(
     if (authHeader?.startsWith('Bearer ')) {
       const token = authHeader.split(' ')[1]
       const verification = await verifyInternalToken(token)
+      const userId = new URL(request.url).searchParams.get('userId')
 
       if (verification.valid) {
-        return resolveUserFromJwt(verification.userId || null, options)
+        return resolveUserFromJwt(verification.userId || userId || null, options)
       }
     }
 
