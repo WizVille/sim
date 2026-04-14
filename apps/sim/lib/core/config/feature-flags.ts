@@ -118,9 +118,37 @@ export const isOrganizationsEnabled =
 export const isInboxEnabled = isTruthy(env.INBOX_ENABLED)
 
 /**
+ * Is whitelabeling enabled via env var override
+ * This bypasses hosted requirements for self-hosted deployments
+ */
+export const isWhitelabelingEnabled = isTruthy(env.WHITELABELING_ENABLED)
+
+/**
+ * Is audit logs enabled via env var override
+ * This bypasses hosted requirements for self-hosted deployments
+ */
+export const isAuditLogsEnabled = isTruthy(env.AUDIT_LOGS_ENABLED)
+
+/**
  * Is E2B enabled for remote code execution
  */
 export const isE2bEnabled = isTruthy(env.E2B_ENABLED)
+
+/**
+ * Whether Ollama is configured (OLLAMA_URL is set).
+ * When true, models that are not in the static cloud model list and have no
+ * slash-prefixed provider namespace are assumed to be Ollama models
+ * and do not require an API key.
+ */
+export const isOllamaConfigured = Boolean(env.OLLAMA_URL)
+
+/**
+ * Whether Azure OpenAI / Azure Anthropic credentials are pre-configured at the server level
+ * (via AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_ANTHROPIC_ENDPOINT, etc.).
+ * When true, the endpoint, API key, and API version fields are hidden in the Agent block UI.
+ * Set NEXT_PUBLIC_AZURE_CONFIGURED=true in self-hosted deployments on Azure.
+ */
+export const isAzureConfigured = isTruthy(getEnv('NEXT_PUBLIC_AZURE_CONFIGURED'))
 
 /**
  * Are invitations disabled globally
@@ -133,6 +161,18 @@ export const isInvitationsDisabled = isTruthy(env.DISABLE_INVITATIONS)
  * When true, the public API toggle is hidden and public API access is blocked
  */
 export const isPublicApiDisabled = isTruthy(env.DISABLE_PUBLIC_API)
+
+/**
+ * Is Google OAuth login disabled
+ * When true, the Google OAuth login button is hidden even when credentials are configured
+ */
+export const isGoogleAuthDisabled = isTruthy(env.DISABLE_GOOGLE_AUTH)
+
+/**
+ * Is GitHub OAuth login disabled
+ * When true, the GitHub OAuth login button is hidden even when credentials are configured
+ */
+export const isGithubAuthDisabled = isTruthy(env.DISABLE_GITHUB_AUTH)
 
 /**
  * Is React Grab enabled for UI element debugging
@@ -156,6 +196,17 @@ export function getAllowedIntegrationsFromEnv(): string[] | null {
     .map((i) => i.trim().toLowerCase())
     .filter(Boolean)
   return parsed.length > 0 ? parsed : null
+}
+
+/**
+ * Returns the list of blacklisted provider IDs from the environment variable.
+ * If not set or empty, returns an empty array (meaning no providers are blacklisted).
+ */
+export function getBlacklistedProvidersFromEnv(): string[] {
+  if (!env.BLACKLISTED_PROVIDERS) return []
+  return env.BLACKLISTED_PROVIDERS.split(',')
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean)
 }
 
 /**

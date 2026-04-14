@@ -1,4 +1,3 @@
-import { randomUUID } from 'crypto'
 import { db } from '@sim/db'
 import { chat, workflow } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
@@ -7,6 +6,7 @@ import { type NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { addCorsHeaders, validateAuthToken } from '@/lib/core/security/deployment'
 import { generateRequestId } from '@/lib/core/utils/request'
+import { generateId } from '@/lib/core/utils/uuid'
 import { preprocessExecution } from '@/lib/execution/preprocessing'
 import { LoggingSession } from '@/lib/logs/execution/logging-session'
 import { ChatFiles } from '@/lib/uploads'
@@ -103,7 +103,7 @@ export async function POST(
         )
       }
 
-      const executionId = randomUUID()
+      const executionId = generateId()
       const loggingSession = new LoggingSession(
         deployment.workflowId,
         executionId,
@@ -150,7 +150,7 @@ export async function POST(
       return addCorsHeaders(createErrorResponse('No input provided', 400), request)
     }
 
-    const executionId = randomUUID()
+    const executionId = generateId()
 
     const loggingSession = new LoggingSession(deployment.workflowId, executionId, 'chat', requestId)
 
@@ -199,6 +199,7 @@ export async function POST(
       }
 
       const { createStreamingResponse } = await import('@/lib/workflows/streaming/streaming')
+      const { executeWorkflow } = await import('@/lib/workflows/executor/execute-workflow')
       const { SSE_HEADERS } = await import('@/lib/core/utils/sse')
 
       const workflowInput: any = { input, conversationId }
@@ -252,15 +253,31 @@ export async function POST(
 
       const stream = await createStreamingResponse({
         requestId,
-        workflow: workflowForExecution,
-        input: workflowInput,
-        executingUserId: workspaceOwnerId,
         streamConfig: {
           selectedOutputs,
           isSecureMode: true,
           workflowTriggerType: 'chat',
         },
         executionId,
+        executeFn: async ({ onStream, onBlockComplete, abortSignal }) =>
+          executeWorkflow(
+            workflowForExecution,
+            requestId,
+            workflowInput,
+            workspaceOwnerId,
+            {
+              enabled: true,
+              selectedOutputs,
+              isSecureMode: true,
+              workflowTriggerType: 'chat',
+              onStream,
+              onBlockComplete,
+              skipLoggingComplete: true,
+              abortSignal,
+              executionMode: 'stream',
+            },
+            executionId
+          ),
       })
 
       const streamResponse = new NextResponse(stream, {

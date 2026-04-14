@@ -1,4 +1,3 @@
-import { randomUUID } from 'crypto'
 import { db } from '@sim/db'
 import {
   invitation,
@@ -27,6 +26,7 @@ import { isOrgPlan, sqlIsPro } from '@/lib/billing/plan-helpers'
 import { requireStripeClient } from '@/lib/billing/stripe-client'
 import { ENTITLED_SUBSCRIPTION_STATUSES } from '@/lib/billing/subscriptions/utils'
 import { getBaseUrl } from '@/lib/core/utils/urls'
+import { generateId } from '@/lib/core/utils/uuid'
 import { syncWorkspaceEnvCredentials } from '@/lib/credentials/environment'
 import { sendEmail } from '@/lib/messaging/email/mailer'
 
@@ -182,6 +182,20 @@ export async function POST(
       email: orgInvitation.email,
     })
 
+    recordAudit({
+      workspaceId: null,
+      actorId: session.user.id,
+      action: AuditAction.ORG_INVITATION_RESENT,
+      resourceType: AuditResourceType.ORGANIZATION,
+      resourceId: organizationId,
+      actorName: session.user.name ?? undefined,
+      actorEmail: session.user.email ?? undefined,
+      resourceName: org?.name ?? undefined,
+      description: `Resent organization invitation to ${orgInvitation.email}`,
+      metadata: { invitationId, targetEmail: orgInvitation.email, targetRole: orgInvitation.role },
+      request: _request,
+    })
+
     return NextResponse.json({
       success: true,
       message: 'Invitation resent successfully',
@@ -321,7 +335,7 @@ export async function PUT(
 
       if (status === 'accepted') {
         await tx.insert(member).values({
-          id: randomUUID(),
+          id: generateId(),
           userId: session.user.id,
           organizationId,
           role: orgInvitation.role,
@@ -423,7 +437,7 @@ export async function PUT(
 
             if (autoAddGroup) {
               await tx.insert(permissionGroupMember).values({
-                id: randomUUID(),
+                id: generateId(),
                 permissionGroupId: autoAddGroup.id,
                 userId: session.user.id,
                 assignedBy: null,
@@ -497,7 +511,7 @@ export async function PUT(
             }
           } else {
             await tx.insert(permissions).values({
-              id: randomUUID(),
+              id: generateId(),
               entityType: 'workspace',
               entityId: wsInvitation.workspaceId,
               userId: session.user.id,

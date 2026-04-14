@@ -45,6 +45,10 @@ app:
     NODE_ENV: "production"
     NEXT_TELEMETRY_DISABLED: "1"
 
+    # AWS Bedrock - when using IRSA (see serviceAccount below), the default credential chain
+    # resolves automatically. Setting this hides the credential fields in the Agent block UI.
+    NEXT_PUBLIC_BEDROCK_DEFAULT_CREDENTIALS: "true"     # Uncomment if using Bedrock with IRSA
+
     # AWS S3 Cloud Storage Configuration (RECOMMENDED for production)
     # Create S3 buckets in your AWS account and configure IAM permissions
     AWS_REGION: "us-west-2"
@@ -57,6 +61,7 @@ app:
     S3_COPILOT_BUCKET_NAME: "copilot-files"   # Copilot attachments
     S3_PROFILE_PICTURES_BUCKET_NAME: "profile-pictures"  # User avatars
     S3_OG_IMAGES_BUCKET_NAME: "og-images"                 # OpenGraph preview images
+    S3_WORKSPACE_LOGOS_BUCKET_NAME: "workspace-logos"     # Workspace logos
 
 # Realtime service
 realtime:

@@ -529,7 +529,6 @@ export function InviteModal({ open, onOpenChange, workspaceName }: InviteModalPr
                       : 'Enter emails'
                   }
                   placeholderWithTags='Add email'
-                  autoFocus={userPerms.canAdmin}
                   disabled={isSubmitting || !userPerms.canAdmin}
                   fileInputOptions={fileInputOptions}
                 />
@@ -613,8 +612,7 @@ export function InviteModal({ open, onOpenChange, workspaceName }: InviteModalPr
               <span className='font-medium text-[var(--text-primary)]'>
                 {memberToRemove?.email}
               </span>{' '}
-              from this workspace?{' '}
-              <span className='text-[var(--text-error)]'>This action cannot be undone.</span>
+              from this workspace? This action cannot be undone.
             </p>
           </ModalBody>
           <ModalFooter>
@@ -646,7 +644,7 @@ export function InviteModal({ open, onOpenChange, workspaceName }: InviteModalPr
               <span className='font-medium text-[var(--text-primary)]'>
                 {invitationToRemove?.email}
               </span>
-              ? <span className='text-[var(--text-error)]'>This action cannot be undone.</span>
+              ? This action cannot be undone.
             </p>
           </ModalBody>
           <ModalFooter>

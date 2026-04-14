@@ -13,7 +13,7 @@ import { DELETED_WORKFLOW_LABEL } from '@/app/workspace/[workspaceId]/logs/utils
 import { getDisplayValue } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/workflow-block/workflow-block'
 import { getBlock } from '@/blocks'
 import { SELECTOR_TYPES_HYDRATION_REQUIRED, type SubBlockConfig } from '@/blocks/types'
-import { useVariablesStore } from '@/stores/panel/variables/store'
+import { useVariablesStore } from '@/stores/variables/store'
 import type { WorkflowMetadata } from '@/stores/workflows/registry/types'
 
 /** Execution status for blocks in preview mode */
@@ -319,11 +319,11 @@ function WorkflowPreviewBlockInner({ data }: NodeProps<WorkflowPreviewBlockData>
 
       if (effectiveTrigger) {
         const isValidTriggerSubblock = isPureTriggerBlock
-          ? subBlock.mode === 'trigger' || !subBlock.mode
-          : subBlock.mode === 'trigger'
+          ? subBlock.mode === 'trigger' || subBlock.mode === 'trigger-advanced' || !subBlock.mode
+          : subBlock.mode === 'trigger' || subBlock.mode === 'trigger-advanced'
         if (!isValidTriggerSubblock) return false
       } else {
-        if (subBlock.mode === 'trigger') return false
+        if (subBlock.mode === 'trigger' || subBlock.mode === 'trigger-advanced') return false
       }
 
       /** Skip value-dependent visibility checks in lightweight mode */

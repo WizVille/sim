@@ -130,6 +130,7 @@ export const workflowFolder = pgTable(
     sortOrder: integer('sort_order').notNull().default(0),
     createdAt: timestamp('created_at').notNull().defaultNow(),
     updatedAt: timestamp('updated_at').notNull().defaultNow(),
+    archivedAt: timestamp('archived_at'),
   },
   (table) => ({
     userIdx: index('workflow_folder_user_idx').on(table.userId),
@@ -138,6 +139,7 @@ export const workflowFolder = pgTable(
       table.parentId
     ),
     parentSortIdx: index('workflow_folder_parent_sort_idx').on(table.parentId, table.sortOrder),
+    archivedAtIdx: index('workflow_folder_archived_at_idx').on(table.archivedAt),
   })
 )
 
@@ -488,6 +490,9 @@ export const settings = pgTable('settings', {
 
   // Copilot auto-allowed integration tools - array of tool IDs that can run without confirmation
   copilotAutoAllowedTools: jsonb('copilot_auto_allowed_tools').notNull().default('[]'),
+
+  // Workspace navigation
+  lastActiveWorkspaceId: text('last_active_workspace_id'),
 
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
 })
@@ -945,6 +950,19 @@ export const organization = pgTable('organization', {
   slug: text('slug').notNull(),
   logo: text('logo'),
   metadata: json('metadata'),
+  whitelabelSettings: json('whitelabel_settings').$type<{
+    brandName?: string
+    logoUrl?: string
+    primaryColor?: string
+    primaryHoverColor?: string
+    accentColor?: string
+    accentHoverColor?: string
+    supportEmail?: string
+    documentationUrl?: string
+    termsUrl?: string
+    privacyUrl?: string
+    hidePoweredBySim?: boolean
+  }>(),
   orgUsageLimit: decimal('org_usage_limit'),
   storageUsedBytes: bigint('storage_used_bytes', { mode: 'number' }).notNull().default(0),
   departedMemberUsage: decimal('departed_member_usage').notNull().default('0'),
@@ -998,6 +1016,7 @@ export const workspace = pgTable('workspace', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
   color: text('color').notNull().default('#33C482'),
+  logoUrl: text('logo_url'),
   ownerId: text('owner_id')
     .notNull()
     .references(() => user.id, { onDelete: 'cascade' }),
@@ -2273,6 +2292,8 @@ export const usageLogSourceEnum = pgEnum('usage_log_source', [
   'workspace-chat',
   'mcp_copilot',
   'mothership_block',
+  'knowledge-base',
+  'voice-input',
 ])
 
 export const usageLog = pgTable(
@@ -2311,6 +2332,7 @@ export const credentialTypeEnum = pgEnum('credential_type', [
   'oauth',
   'env_workspace',
   'env_personal',
+  'service_account',
 ])
 
 export const credential = pgTable(
@@ -2327,6 +2349,7 @@ export const credential = pgTable(
     accountId: text('account_id').references(() => account.id, { onDelete: 'cascade' }),
     envKey: text('env_key'),
     envOwnerUserId: text('env_owner_user_id').references(() => user.id, { onDelete: 'cascade' }),
+    encryptedServiceAccountKey: text('encrypted_service_account_key'),
     createdBy: text('created_by')
       .notNull()
       .references(() => user.id, { onDelete: 'cascade' }),

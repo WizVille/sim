@@ -16,19 +16,37 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Hoisted mock state - these are available to vi.mock factories
-const { mockIsHosted, mockEnv, mockGetBYOKKey, mockGetToolAsync, mockRateLimiterFns } = vi.hoisted(
-  () => ({
-    mockIsHosted: { value: false },
-    mockEnv: { NEXT_PUBLIC_APP_URL: 'http://localhost:3000' } as Record<string, string | undefined>,
-    mockGetBYOKKey: vi.fn(),
-    mockGetToolAsync: vi.fn(),
-    mockRateLimiterFns: {
-      acquireKey: vi.fn(),
-      preConsumeCapacity: vi.fn(),
-      consumeCapacity: vi.fn(),
-    },
-  })
-)
+const {
+  mockIsHosted,
+  mockEnv,
+  mockGetBYOKKey,
+  mockGetToolAsync,
+  mockRateLimiterFns,
+  mockGetCustomToolById,
+  mockListCustomTools,
+  mockGetCustomToolByIdOrTitle,
+  mockGenerateInternalToken,
+  mockSecureFetchWithPinnedIP,
+  mockValidateUrlWithDNS,
+  mockResolveWorkspaceFileReference,
+} = vi.hoisted(() => ({
+  mockIsHosted: { value: false },
+  mockEnv: { NEXT_PUBLIC_APP_URL: 'http://localhost:3000' } as Record<string, string | undefined>,
+  mockGetBYOKKey: vi.fn(),
+  mockGetToolAsync: vi.fn(),
+  mockRateLimiterFns: {
+    acquireKey: vi.fn(),
+    preConsumeCapacity: vi.fn(),
+    consumeCapacity: vi.fn(),
+  },
+  mockGetCustomToolById: vi.fn(),
+  mockListCustomTools: vi.fn(),
+  mockGetCustomToolByIdOrTitle: vi.fn(),
+  mockGenerateInternalToken: vi.fn(),
+  mockSecureFetchWithPinnedIP: vi.fn(),
+  mockValidateUrlWithDNS: vi.fn(),
+  mockResolveWorkspaceFileReference: vi.fn(),
+}))
 
 // Mock feature flags
 vi.mock('@/lib/core/config/feature-flags', () => ({
@@ -55,10 +73,23 @@ vi.mock('@/lib/api-key/byok', () => ({
   getBYOKKey: (...args: unknown[]) => mockGetBYOKKey(...args),
 }))
 
+vi.mock('@/lib/auth/internal', () => ({
+  generateInternalToken: (...args: unknown[]) => mockGenerateInternalToken(...args),
+}))
+
 vi.mock('@/lib/billing/core/usage-log', () => ({}))
+
+vi.mock('@/lib/core/security/input-validation.server', () => ({
+  secureFetchWithPinnedIP: (...args: unknown[]) => mockSecureFetchWithPinnedIP(...args),
+  validateUrlWithDNS: (...args: unknown[]) => mockValidateUrlWithDNS(...args),
+}))
 
 vi.mock('@/lib/core/rate-limiter/hosted-key', () => ({
   getHostedKeyRateLimiter: () => mockRateLimiterFns,
+}))
+
+vi.mock('@/lib/uploads/contexts/workspace/workspace-file-manager', () => ({
+  resolveWorkspaceFileReference: (...args: unknown[]) => mockResolveWorkspaceFileReference(...args),
 }))
 
 // Mock the tools registry to avoid loading the full 4500+ line registry file.
@@ -163,6 +194,44 @@ vi.mock('@/tools/registry', () => {
       params: {},
       request: { url: '/api/tools/gmail/send', method: 'POST' },
     },
+    test_single_file_tool: {
+      id: 'test_single_file_tool',
+      name: 'Test Single File Tool',
+      description: 'Accepts a single file parameter',
+      version: '1.0.0',
+      params: {
+        attachment: { type: 'file', required: true },
+      },
+      request: {
+        url: '/api/tools/test/single-file',
+        method: 'POST',
+        headers: () => ({ 'Content-Type': 'application/json' }),
+        body: (p: any) => ({ attachment: p.attachment }),
+      },
+      transformResponse: async (response: any) => {
+        const data = await response.json()
+        return { success: true, output: data }
+      },
+    },
+    test_file_array_tool: {
+      id: 'test_file_array_tool',
+      name: 'Test File Array Tool',
+      description: 'Accepts an array of file parameters',
+      version: '1.0.0',
+      params: {
+        attachments: { type: 'file[]', required: true },
+      },
+      request: {
+        url: '/api/tools/test/file-array',
+        method: 'POST',
+        headers: () => ({ 'Content-Type': 'application/json' }),
+        body: (p: any) => ({ attachments: p.attachments }),
+      },
+      transformResponse: async (response: any) => {
+        const data = await response.json()
+        return { success: true, output: data }
+      },
+    },
     google_drive_list: {
       id: 'google_drive_list',
       name: 'Google Drive List',
@@ -183,8 +252,8 @@ vi.mock('@/tools/registry', () => {
   return { tools: mockTools }
 })
 
-// Mock custom tools - define mock data inside factory function
-vi.mock('@/hooks/queries/utils/custom-tool-cache', () => {
+// Mock query client for custom tool cache reads
+vi.mock('@/app/_shell/providers/get-query-client', () => {
   const mockCustomTool = {
     id: 'custom-tool-123',
     title: 'Custom Weather Tool',
@@ -204,15 +273,20 @@ vi.mock('@/hooks/queries/utils/custom-tool-cache', () => {
     },
   }
   return {
-    getCustomTool: (toolId: string) => {
-      if (toolId === 'custom-tool-123') {
-        return mockCustomTool
-      }
-      return undefined
-    },
-    getCustomTools: () => [mockCustomTool],
+    getQueryClient: () => ({
+      getQueryData: (key: string[]) => {
+        if (key[0] === 'customTools') return [mockCustomTool]
+        return undefined
+      },
+    }),
   }
 })
+
+vi.mock('@/lib/workflows/custom-tools/operations', () => ({
+  getCustomToolById: mockGetCustomToolById,
+  listCustomTools: mockListCustomTools,
+  getCustomToolByIdOrTitle: mockGetCustomToolByIdOrTitle,
+}))
 
 vi.mock('@/tools/utils.server', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/tools/utils.server')>()
@@ -307,30 +381,23 @@ describe('Custom Tools', () => {
   })
 
   it('resolves custom tools through the async helper', async () => {
-    setupFetchMock({
-      json: {
-        data: [
-          {
-            id: 'remote-tool-123',
-            title: 'Custom Weather Tool',
-            schema: {
-              function: {
-                name: 'weather_tool',
-                description: 'Get weather information',
-                parameters: {
-                  type: 'object',
-                  properties: {
-                    location: { type: 'string', description: 'City name' },
-                  },
-                  required: ['location'],
-                },
-              },
+    mockGetCustomToolByIdOrTitle.mockResolvedValue({
+      id: 'remote-tool-123',
+      title: 'Custom Weather Tool',
+      schema: {
+        function: {
+          name: 'weather_tool',
+          description: 'Get weather information',
+          parameters: {
+            type: 'object',
+            properties: {
+              location: { type: 'string', description: 'City name' },
             },
+            required: ['location'],
           },
-        ],
+        },
       },
-      status: 200,
-      headers: { 'content-type': 'application/json' },
+      code: '',
     })
 
     const customTool = await getToolAsync('custom_remote-tool-123', {
@@ -462,6 +529,19 @@ describe('Automatic Internal Route Detection', () => {
   beforeEach(() => {
     process.env.NEXT_PUBLIC_APP_URL = 'http://localhost:3000'
     cleanupEnvVars = setupEnvVars({ NEXT_PUBLIC_APP_URL: 'http://localhost:3000' })
+
+    mockValidateUrlWithDNS.mockResolvedValue({ isValid: true, resolvedIP: '93.184.216.34' })
+    mockSecureFetchWithPinnedIP.mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: {
+        get: (name: string) => (name.toLowerCase() === 'content-type' ? 'application/json' : null),
+        toRecord: () => ({ 'content-type': 'application/json' }),
+      },
+      text: async () => JSON.stringify({}),
+      json: async () => ({}),
+    })
   })
 
   afterEach(() => {
@@ -708,6 +788,197 @@ describe('Automatic Internal Route Detection', () => {
     }
 
     Object.assign(tools, originalTools)
+  })
+})
+
+describe('Copilot File Parameter Normalization', () => {
+  let cleanupEnvVars: () => void
+
+  beforeEach(() => {
+    process.env.NEXT_PUBLIC_APP_URL = 'http://localhost:3000'
+    cleanupEnvVars = setupEnvVars({ NEXT_PUBLIC_APP_URL: 'http://localhost:3000' })
+    mockResolveWorkspaceFileReference.mockReset()
+  })
+
+  afterEach(() => {
+    vi.resetAllMocks()
+    cleanupEnvVars()
+  })
+
+  it('resolves canonical file IDs for single-file params during copilot execution', async () => {
+    mockResolveWorkspaceFileReference.mockResolvedValue({
+      id: 'wf_123',
+      name: 'brief.pdf',
+      path: '/api/files/wf_123',
+      size: 512,
+      type: 'application/pdf',
+      key: 'uploads/wf_123',
+    })
+
+    global.fetch = Object.assign(
+      vi.fn().mockImplementation(async (_url, options) => {
+        const body = JSON.parse(options?.body as string)
+        expect(body.attachment).toEqual({
+          id: 'wf_123',
+          name: 'brief.pdf',
+          url: '/api/files/wf_123',
+          size: 512,
+          type: 'application/pdf',
+          key: 'uploads/wf_123',
+          context: 'workspace',
+        })
+
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: new Headers(),
+          json: () => Promise.resolve({ ok: true }),
+          text: () => Promise.resolve(JSON.stringify({ ok: true })),
+          clone: vi.fn().mockReturnThis(),
+        }
+      }),
+      { preconnect: vi.fn() }
+    ) as typeof fetch
+
+    const context = createToolExecutionContext({
+      workspaceId: 'workspace-456',
+      copilotToolExecution: true,
+    } as any)
+
+    const result = await executeTool(
+      'test_single_file_tool',
+      { attachment: 'wf_123' },
+      false,
+      context
+    )
+
+    expect(result.success).toBe(true)
+    expect(mockResolveWorkspaceFileReference).toHaveBeenCalledWith('workspace-456', 'wf_123')
+  })
+
+  it('resolves file-array params from strings and partial file objects, while preserving full file objects', async () => {
+    mockResolveWorkspaceFileReference.mockImplementation(
+      async (_workspaceId: string, fileId: string) => ({
+        id: fileId,
+        name: `${fileId}.txt`,
+        path: `/api/files/${fileId}`,
+        size: 128,
+        type: 'text/plain',
+        key: `uploads/${fileId}`,
+      })
+    )
+
+    const existingFileObject = {
+      id: 'wf_existing',
+      name: 'existing.txt',
+      url: '/api/files/wf_existing',
+      size: 64,
+      type: 'text/plain',
+      key: 'uploads/wf_existing',
+      context: 'workspace',
+    }
+
+    const partialFileObject = {
+      id: 'wf_partial',
+      name: 'partial.txt',
+    }
+
+    global.fetch = Object.assign(
+      vi.fn().mockImplementation(async (_url, options) => {
+        const body = JSON.parse(options?.body as string)
+        expect(body.attachments).toEqual([
+          {
+            id: 'wf_1',
+            name: 'wf_1.txt',
+            url: '/api/files/wf_1',
+            size: 128,
+            type: 'text/plain',
+            key: 'uploads/wf_1',
+            context: 'workspace',
+          },
+          {
+            id: 'wf_partial',
+            name: 'wf_partial.txt',
+            url: '/api/files/wf_partial',
+            size: 128,
+            type: 'text/plain',
+            key: 'uploads/wf_partial',
+            context: 'workspace',
+          },
+          existingFileObject,
+          {
+            id: 'wf_2',
+            name: 'wf_2.txt',
+            url: '/api/files/wf_2',
+            size: 128,
+            type: 'text/plain',
+            key: 'uploads/wf_2',
+            context: 'workspace',
+          },
+        ])
+
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: new Headers(),
+          json: () => Promise.resolve({ ok: true }),
+          text: () => Promise.resolve(JSON.stringify({ ok: true })),
+          clone: vi.fn().mockReturnThis(),
+        }
+      }),
+      { preconnect: vi.fn() }
+    ) as typeof fetch
+
+    const context = createToolExecutionContext({
+      workspaceId: 'workspace-456',
+      copilotToolExecution: true,
+    } as any)
+
+    const result = await executeTool(
+      'test_file_array_tool',
+      { attachments: ['wf_1', partialFileObject, existingFileObject, 'wf_2'] },
+      false,
+      context
+    )
+
+    expect(result.success).toBe(true)
+    expect(mockResolveWorkspaceFileReference).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not resolve file params outside copilot execution', async () => {
+    global.fetch = Object.assign(
+      vi.fn().mockImplementation(async (_url, options) => {
+        const body = JSON.parse(options?.body as string)
+        expect(body.attachment).toBe('wf_123')
+
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: new Headers(),
+          json: () => Promise.resolve({ ok: true }),
+          text: () => Promise.resolve(JSON.stringify({ ok: true })),
+          clone: vi.fn().mockReturnThis(),
+        }
+      }),
+      { preconnect: vi.fn() }
+    ) as typeof fetch
+
+    const context = createToolExecutionContext({
+      workspaceId: 'workspace-456',
+    } as any)
+
+    const result = await executeTool(
+      'test_single_file_tool',
+      { attachment: 'wf_123' },
+      false,
+      context
+    )
+
+    expect(result.success).toBe(true)
+    expect(mockResolveWorkspaceFileReference).not.toHaveBeenCalled()
   })
 })
 
@@ -1144,6 +1415,34 @@ describe('MCP Tool Execution', () => {
     expect(result.success).toBe(false)
     expect(result.error).toContain('Network error')
     expect(result.timing).toBeDefined()
+  })
+
+  it('should embed userId in JWT when executionContext is undefined (agent block path)', async () => {
+    mockGenerateInternalToken.mockResolvedValue('test-token')
+
+    global.fetch = Object.assign(
+      vi.fn().mockImplementation(async () => ({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            success: true,
+            data: { output: { content: [{ type: 'text', text: 'OK' }] } },
+          }),
+      })),
+      { preconnect: vi.fn() }
+    ) as typeof fetch
+
+    await executeTool('mcp-123-test_tool', {
+      query: 'test',
+      _context: {
+        workspaceId: 'workspace-456',
+        workflowId: 'workflow-789',
+        userId: 'user-abc',
+      },
+    })
+
+    expect(mockGenerateInternalToken).toHaveBeenCalledWith('user-abc')
   })
 
   describe('Tool request retries', () => {

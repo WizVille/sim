@@ -1,4 +1,3 @@
-import { randomUUID } from 'crypto'
 import { render } from '@react-email/render'
 import { db } from '@sim/db'
 import {
@@ -16,6 +15,7 @@ import { WorkspaceInvitationEmail } from '@/components/emails'
 import { AuditAction, AuditResourceType, recordAudit } from '@/lib/audit/log'
 import { getSession } from '@/lib/auth'
 import { getBaseUrl } from '@/lib/core/utils/urls'
+import { generateId } from '@/lib/core/utils/uuid'
 import { syncWorkspaceEnvCredentials } from '@/lib/credentials/environment'
 import { sendEmail } from '@/lib/messaging/email/mailer'
 import { getFromEmailAddress } from '@/lib/messaging/email/utils'
@@ -147,7 +147,7 @@ export async function GET(
 
       await db.transaction(async (tx) => {
         await tx.insert(permissions).values({
-          id: randomUUID(),
+          id: generateId(),
           entityType: 'workspace' as const,
           entityId: invitation.workspaceId,
           userId: session.user.id,
@@ -189,7 +189,13 @@ export async function GET(
         actorEmail: session.user.email ?? undefined,
         resourceName: workspaceDetails.name,
         description: `Accepted workspace invitation to "${workspaceDetails.name}"`,
-        metadata: { targetEmail: invitation.email },
+        metadata: {
+          targetEmail: invitation.email,
+          workspaceName: workspaceDetails.name,
+          assignedPermission: invitation.permissions || 'read',
+          invitationId: invitation.id,
+          inviterId: invitation.inviterId,
+        },
         request: req,
       })
 
@@ -272,7 +278,11 @@ export async function DELETE(
       actorName: session.user.name ?? undefined,
       actorEmail: session.user.email ?? undefined,
       description: `Revoked workspace invitation for ${invitation.email}`,
-      metadata: { invitationId, targetEmail: invitation.email },
+      metadata: {
+        invitationId,
+        targetEmail: invitation.email,
+        invitationStatus: invitation.status,
+      },
       request: _request,
     })
 
@@ -325,7 +335,7 @@ export async function POST(
       return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
     }
 
-    const newToken = randomUUID()
+    const newToken = generateId()
     const newExpiresAt = new Date()
     newExpiresAt.setDate(newExpiresAt.getDate() + 7)
 
@@ -359,6 +369,24 @@ export async function POST(
         { status: 500 }
       )
     }
+
+    recordAudit({
+      workspaceId: invitation.workspaceId,
+      actorId: session.user.id,
+      action: AuditAction.INVITATION_RESENT,
+      resourceType: AuditResourceType.WORKSPACE,
+      resourceId: invitation.workspaceId,
+      actorName: session.user.name ?? undefined,
+      actorEmail: session.user.email ?? undefined,
+      resourceName: ws.name,
+      description: `Resent workspace invitation to ${invitation.email}`,
+      metadata: {
+        invitationId,
+        targetEmail: invitation.email,
+        workspaceName: ws.name,
+      },
+      request: _request,
+    })
 
     return NextResponse.json({ success: true })
   } catch (error) {

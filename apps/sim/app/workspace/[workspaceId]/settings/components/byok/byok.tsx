@@ -354,7 +354,6 @@ export function BYOK() {
                   }}
                   placeholder={PROVIDERS.find((p) => p.id === editingProvider)?.placeholder}
                   className='h-9 pr-9'
-                  autoFocus
                   name='byok_api_key'
                   autoComplete='off'
                   autoCorrect='off'
@@ -415,7 +414,8 @@ export function BYOK() {
               API key?{' '}
               <span className='text-[var(--text-error)]'>
                 This workspace will revert to using platform hosted keys.
-              </span>
+              </span>{' '}
+              This action cannot be undone.
             </p>
           </ModalBody>
           <ModalFooter>

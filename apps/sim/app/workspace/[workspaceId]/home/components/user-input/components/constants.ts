@@ -87,6 +87,10 @@ export function mapResourceToContext(resource: MothershipResource): ChatContext 
       return { kind: 'table', tableId: resource.id, label: resource.title }
     case 'file':
       return { kind: 'file', fileId: resource.id, label: resource.title }
+    case 'folder':
+      return { kind: 'folder', folderId: resource.id, label: resource.title }
+    case 'task':
+      return { kind: 'past_chat', chatId: resource.id, label: resource.title }
     default:
       return { kind: 'docs', label: resource.title }
   }
