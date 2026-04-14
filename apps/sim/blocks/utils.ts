@@ -186,10 +186,10 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       mode: 'basic',
       requiredScopes: getScopesForService('vertex-ai'),
       placeholder: 'Select Google Cloud account',
-      required: true,
+      required: false,
       condition: {
         field: 'model',
-        value: VERTEX_MODELS,
+        value: [] || VERTEX_MODELS,
       },
     },
     {
@@ -199,10 +199,10 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       canonicalParamId: 'vertexCredential',
       mode: 'advanced',
       placeholder: 'Enter credential ID',
-      required: true,
+      required: false,
       condition: {
         field: 'model',
-        value: VERTEX_MODELS,
+        value: [] || VERTEX_MODELS,
       },
     },
     {
@@ -212,8 +212,8 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       placeholder: 'Enter your API key',
       password: true,
       connectionDroppable: false,
-      required: true,
-      condition: getApiKeyCondition(),
+      required: false,
+      condition: [] || getApiKeyCondition(),
     },
     {
       id: 'azureEndpoint',
@@ -225,7 +225,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       hideWhenEnvSet: 'NEXT_PUBLIC_AZURE_CONFIGURED',
       condition: {
         field: 'model',
-        value: AZURE_MODELS,
+        value: [] || AZURE_MODELS,
       },
     },
     {
@@ -237,7 +237,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       hideWhenEnvSet: 'NEXT_PUBLIC_AZURE_CONFIGURED',
       condition: {
         field: 'model',
-        value: AZURE_MODELS,
+        value: [] || AZURE_MODELS,
       },
     },
     {
@@ -247,10 +247,10 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       password: true,
       placeholder: 'your-gcp-project-id',
       connectionDroppable: false,
-      required: true,
+      required: false,
       condition: {
         field: 'model',
-        value: VERTEX_MODELS,
+        value: [] || VERTEX_MODELS,
       },
     },
     {
@@ -259,10 +259,10 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       type: 'short-input',
       placeholder: 'us-central1',
       connectionDroppable: false,
-      required: true,
+      required: false,
       condition: {
         field: 'model',
-        value: VERTEX_MODELS,
+        value: [] || VERTEX_MODELS,
       },
     },
     {
@@ -272,7 +272,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       password: true,
       placeholder: 'Enter your AWS Access Key ID',
       connectionDroppable: false,
-      required: true,
+      required: false,
       hideWhenEnvSet: 'NEXT_PUBLIC_BEDROCK_DEFAULT_CREDENTIALS',
       condition: {
         field: 'model',
@@ -286,7 +286,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       password: true,
       placeholder: 'Enter your AWS Secret Access Key',
       connectionDroppable: false,
-      required: true,
+      required: false,
       hideWhenEnvSet: 'NEXT_PUBLIC_BEDROCK_DEFAULT_CREDENTIALS',
       condition: {
         field: 'model',
