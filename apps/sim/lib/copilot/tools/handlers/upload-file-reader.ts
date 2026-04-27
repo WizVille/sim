@@ -1,6 +1,7 @@
 import { db } from '@sim/db'
 import { workspaceFiles } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
+import { toError } from '@sim/utils/errors'
 import { and, eq, isNull } from 'drizzle-orm'
 import { type FileReadResult, readFileRecord } from '@/lib/copilot/vfs/file-reader'
 import { normalizeVfsSegment } from '@/lib/copilot/vfs/normalize-segment'
@@ -22,6 +23,7 @@ function toWorkspaceFileRecord(row: typeof workspaceFiles.$inferSelect): Workspa
     uploadedBy: row.userId,
     deletedAt: row.deletedAt,
     uploadedAt: row.uploadedAt,
+    updatedAt: row.updatedAt,
     storageContext: 'mothership',
   }
 }
@@ -86,7 +88,7 @@ export async function listChatUploads(chatId: string): Promise<WorkspaceFileReco
   } catch (err) {
     logger.warn('Failed to list chat uploads', {
       chatId,
-      error: err instanceof Error ? err.message : String(err),
+      error: toError(err).message,
     })
     return []
   }
@@ -109,7 +111,7 @@ export async function readChatUpload(
     logger.warn('Failed to read chat upload', {
       filename,
       chatId,
-      error: err instanceof Error ? err.message : String(err),
+      error: toError(err).message,
     })
     return null
   }

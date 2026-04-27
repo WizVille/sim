@@ -139,12 +139,18 @@ export interface QueryOptions {
   sort?: Sort
   limit?: number
   offset?: number
+  /**
+   * When true (default), runs a `COUNT(*)` and returns `totalCount` as a number.
+   * Pass `false` to skip the count query (grid UI doesn't need it); `totalCount`
+   * is returned as `null` to signal it was not computed.
+   */
+  includeTotal?: boolean
 }
 
 export interface QueryResult {
   rows: TableRow[]
   rowCount: number
-  totalCount: number
+  totalCount: number | null
   limit: number
   offset: number
 }
@@ -239,6 +245,18 @@ export interface BulkDeleteByIdsResult {
   deletedRowIds: string[]
   requestedCount: number
   missingRowIds: string[]
+}
+
+export interface ReplaceRowsData {
+  tableId: string
+  rows: RowData[]
+  workspaceId: string
+  userId?: string
+}
+
+export interface ReplaceRowsResult {
+  deletedCount: number
+  insertedCount: number
 }
 
 export interface RenameColumnData {

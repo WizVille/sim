@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useLayoutEffect, useRef } from 'react'
+import { useCallback, useLayoutEffect, useMemo, useRef } from 'react'
 import { cn } from '@/lib/core/utils/cn'
 import { MessageActions } from '@/app/workspace/[workspaceId]/components'
 import { ChatMessageAttachments } from '@/app/workspace/[workspaceId]/home/components/chat-message-attachments'
@@ -10,7 +10,10 @@ import {
 } from '@/app/workspace/[workspaceId]/home/components/message-content'
 import { PendingTagIndicator } from '@/app/workspace/[workspaceId]/home/components/message-content/components/special-tags'
 import { QueuedMessages } from '@/app/workspace/[workspaceId]/home/components/queued-messages'
-import { UserInput } from '@/app/workspace/[workspaceId]/home/components/user-input'
+import {
+  UserInput,
+  type UserInputHandle,
+} from '@/app/workspace/[workspaceId]/home/components/user-input'
 import { UserMessageContent } from '@/app/workspace/[workspaceId]/home/components/user-message-content'
 import type {
   ChatMessage,
@@ -19,6 +22,7 @@ import type {
   QueuedMessage,
 } from '@/app/workspace/[workspaceId]/home/types'
 import { useAutoScroll } from '@/hooks/use-auto-scroll'
+import { useProgressiveList } from '@/hooks/use-progressive-list'
 import type { ChatContext } from '@/stores/panel'
 import { MothershipChatSkeleton } from './mothership-chat-skeleton'
 
@@ -36,14 +40,12 @@ interface MothershipChatProps {
   messageQueue: QueuedMessage[]
   onRemoveQueuedMessage: (id: string) => void
   onSendQueuedMessage: (id: string) => Promise<void>
-  onEditQueuedMessage: (id: string) => void
+  onEditQueuedMessage: (id: string) => QueuedMessage | undefined
   userId?: string
   chatId?: string
   onContextAdd?: (context: ChatContext) => void
   onContextRemove?: (context: ChatContext) => void
   onWorkspaceResourceSelect?: (resource: MothershipResource) => void
-  editValue?: string
-  onEditValueConsumed?: () => void
   layout?: 'mothership-view' | 'copilot-view'
   initialScrollBlocked?: boolean
   animateInput?: boolean
@@ -91,8 +93,6 @@ export function MothershipChat({
   onContextAdd,
   onContextRemove,
   onWorkspaceResourceSelect,
-  editValue,
-  onEditValueConsumed,
   layout = 'mothership-view',
   initialScrollBlocked = false,
   animateInput = false,
@@ -105,12 +105,40 @@ export function MothershipChat({
     scrollOnMount: true,
   })
   const hasMessages = messages.length > 0
+  const stagingKey = chatId ?? 'pending-chat'
+  const { staged: stagedMessages, isStaging } = useProgressiveList(messages, stagingKey)
+  const stagedMessageCount = stagedMessages.length
+  const stagedOffset = messages.length - stagedMessages.length
+  const precedingUserContentByIndex = useMemo(() => {
+    const contentByIndex: Array<string | undefined> = []
+    let lastUserContent: string | undefined
+    for (const [index, message] of messages.entries()) {
+      contentByIndex[index] = lastUserContent
+      if (message.role === 'user') {
+        lastUserContent = message.content
+      }
+    }
+    return contentByIndex
+  }, [messages])
   const initialScrollDoneRef = useRef(false)
+  const userInputRef = useRef<UserInputHandle>(null)
   const handleSendQueuedHead = useCallback(() => {
     const topMessage = messageQueue[0]
     if (!topMessage) return
     void onSendQueuedMessage(topMessage.id)
   }, [messageQueue, onSendQueuedMessage])
+  const handleEditQueued = useCallback(
+    (id: string) => {
+      const msg = onEditQueuedMessage(id)
+      if (msg) userInputRef.current?.loadQueuedMessage(msg)
+    },
+    [onEditQueuedMessage]
+  )
+  const handleEditQueuedTail = useCallback(() => {
+    const tail = messageQueue[messageQueue.length - 1]
+    if (!tail) return
+    handleEditQueued(tail.id)
+  }, [messageQueue, handleEditQueued])
 
   useLayoutEffect(() => {
     if (!hasMessages) {
@@ -122,6 +150,11 @@ export function MothershipChat({
     scrollToBottom()
   }, [hasMessages, initialScrollBlocked, scrollToBottom])
 
+  useLayoutEffect(() => {
+    if (!isStaging || initialScrollBlocked || !initialScrollDoneRef.current) return
+    scrollToBottom()
+  }, [isStaging, stagedMessageCount, initialScrollBlocked, scrollToBottom])
+
   return (
     <div className={cn('flex h-full min-h-0 flex-col', className)}>
       <div ref={scrollContainerRef} className={styles.scrollContainer}>
@@ -129,7 +162,8 @@ export function MothershipChat({
           <MothershipChatSkeleton layout={layout} />
         ) : (
           <div className={styles.content}>
-            {messages.map((msg, index) => {
+            {stagedMessages.map((msg, localIndex) => {
+              const index = stagedOffset + localIndex
               if (msg.role === 'user') {
                 const hasAttachments = Boolean(msg.attachments?.length)
                 return (
@@ -165,10 +199,7 @@ export function MothershipChat({
               }
 
               const isLastMessage = index === messages.length - 1
-              const precedingUserMsg = [...messages]
-                .slice(0, index)
-                .reverse()
-                .find((m) => m.role === 'user')
+              const precedingUserContent = precedingUserContentByIndex[index]
 
               return (
                 <div key={msg.id} className={styles.assistantRow}>
@@ -184,7 +215,7 @@ export function MothershipChat({
                       <MessageActions
                         content={msg.content}
                         chatId={chatId}
-                        userQuery={precedingUserMsg?.content}
+                        userQuery={precedingUserContent}
                         requestId={msg.requestId}
                       />
                     </div>
@@ -205,9 +236,10 @@ export function MothershipChat({
             messageQueue={messageQueue}
             onRemove={onRemoveQueuedMessage}
             onSendNow={onSendQueuedMessage}
-            onEdit={onEditQueuedMessage}
+            onEdit={handleEditQueued}
           />
           <UserInput
+            ref={userInputRef}
             onSubmit={onSubmit}
             isSending={isStreamActive}
             onStopGeneration={onStopGeneration}
@@ -215,9 +247,8 @@ export function MothershipChat({
             userId={userId}
             onContextAdd={onContextAdd}
             onContextRemove={onContextRemove}
-            editValue={editValue}
-            onEditValueConsumed={onEditValueConsumed}
             onSendQueuedHead={handleSendQueuedHead}
+            onEditQueuedTail={handleEditQueuedTail}
           />
         </div>
       </div>

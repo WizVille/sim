@@ -23,9 +23,18 @@ export const SUBBLOCK_ID_MIGRATIONS: Record<string, Record<string, string>> = {
   knowledge: {
     knowledgeBaseId: 'knowledgeBaseSelector',
   },
+  dynamodb: {
+    key: 'getKey',
+    filterExpression: 'queryFilterExpression',
+    expressionAttributeNames: 'queryExpressionAttributeNames',
+    expressionAttributeValues: 'queryExpressionAttributeValues',
+    limit: 'queryLimit',
+    conditionExpression: 'updateConditionExpression',
+  },
   ashby: {
     emailType: '_removed_emailType',
     phoneType: '_removed_phoneType',
+    filterCandidateId: '_removed_filterCandidateId',
   },
   rippling: {
     action: '_removed_action',

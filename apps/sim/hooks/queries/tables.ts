@@ -5,7 +5,15 @@
 import { createLogger } from '@sim/logger'
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from '@/components/emcn'
-import type { Filter, RowData, Sort, TableDefinition, TableMetadata, TableRow } from '@/lib/table'
+import type {
+  CsvHeaderMapping,
+  Filter,
+  RowData,
+  Sort,
+  TableDefinition,
+  TableMetadata,
+  TableRow,
+} from '@/lib/table'
 
 const logger = createLogger('TableQueries')
 
@@ -30,11 +38,14 @@ interface TableRowsParams {
   offset: number
   filter?: Filter | null
   sort?: Sort | null
+  /** When `false`, skip the server-side `COUNT(*)` and receive `totalCount: null`. */
+  includeTotal?: boolean
 }
 
 interface TableRowsResponse {
   rows: TableRow[]
-  totalCount: number
+  /** `null` when the request opted out of the count via `includeTotal: false`. */
+  totalCount: number | null
 }
 
 interface RowMutationContext {
@@ -56,12 +67,14 @@ function createRowsParamsKey({
   offset,
   filter,
   sort,
+  includeTotal,
 }: Omit<TableRowsParams, 'workspaceId' | 'tableId'>): string {
   return JSON.stringify({
     limit,
     offset,
     filter: filter ?? null,
     sort: sort ?? null,
+    includeTotal: includeTotal ?? true,
   })
 }
 
@@ -90,6 +103,7 @@ async function fetchTableRows({
   offset,
   filter,
   sort,
+  includeTotal,
   signal,
 }: TableRowsParams & { signal?: AbortSignal }): Promise<TableRowsResponse> {
   const searchParams = new URLSearchParams({
@@ -106,6 +120,10 @@ async function fetchTableRows({
     searchParams.set('sort', JSON.stringify(sort))
   }
 
+  if (includeTotal === false) {
+    searchParams.set('includeTotal', 'false')
+  }
+
   const res = await fetch(`/api/table/${tableId}/rows?${searchParams}`, { signal })
   if (!res.ok) {
     const error = await res.json().catch(() => ({}))
@@ -113,15 +131,15 @@ async function fetchTableRows({
   }
 
   const json: {
-    data?: { rows: TableRow[]; totalCount: number }
+    data?: { rows: TableRow[]; totalCount: number | null }
     rows?: TableRow[]
-    totalCount?: number
+    totalCount?: number | null
   } = await res.json()
 
   const data = json.data || json
   return {
     rows: (data.rows || []) as TableRow[],
-    totalCount: data.totalCount || 0,
+    totalCount: data.totalCount ?? null,
   }
 }
 
@@ -201,9 +219,10 @@ export function useTableRows({
   offset,
   filter,
   sort,
+  includeTotal,
   enabled = true,
 }: TableRowsParams & { enabled?: boolean }) {
-  const paramsKey = createRowsParamsKey({ limit, offset, filter, sort })
+  const paramsKey = createRowsParamsKey({ limit, offset, filter, sort, includeTotal })
 
   return useQuery({
     queryKey: tableKeys.rows(tableId, paramsKey),
@@ -215,6 +234,7 @@ export function useTableRows({
         offset,
         filter,
         sort,
+        includeTotal,
         signal,
       }),
     enabled: Boolean(workspaceId && tableId) && enabled,
@@ -385,7 +405,11 @@ export function useCreateTableRow({ workspaceId, tableId }: RowMutationContext) 
             r.position >= row.position ? { ...r, position: r.position + 1 } : r
           )
           const rows: TableRow[] = [...shifted, row].sort((a, b) => a.position - b.position)
-          return { ...old, rows, totalCount: old.totalCount + 1 }
+          return {
+            ...old,
+            rows,
+            totalCount: old.totalCount === null ? null : old.totalCount + 1,
+          }
         }
       )
     },
@@ -668,6 +692,9 @@ export function useUpdateColumn({ workspaceId, tableId }: RowMutationContext) {
 
       return res.json()
     },
+    onError: (error) => {
+      toast.error(error.message, { duration: 5000 })
+    },
     onSettled: () => {
       invalidateTableSchema(queryClient, workspaceId, tableId)
     },
@@ -776,6 +803,76 @@ export function useUploadCsvToTable() {
     },
     onError: (error) => {
       logger.error('Failed to upload CSV:', error)
+    },
+  })
+}
+
+export type CsvImportMode = 'append' | 'replace'
+
+interface ImportCsvIntoTableParams {
+  workspaceId: string
+  tableId: string
+  file: File
+  mode: CsvImportMode
+  mapping?: CsvHeaderMapping
+}
+
+interface ImportCsvIntoTableResponse {
+  success: boolean
+  data?: {
+    tableId: string
+    mode: CsvImportMode
+    insertedCount?: number
+    deletedCount?: number
+    mappedColumns?: string[]
+    skippedHeaders?: string[]
+    unmappedColumns?: string[]
+    sourceFile?: string
+  }
+}
+
+/**
+ * Upload a CSV file to an existing table in append or replace mode. Supports
+ * an optional explicit header-to-column mapping; when omitted the server
+ * auto-maps headers by sanitized name.
+ */
+export function useImportCsvIntoTable() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({
+      workspaceId,
+      tableId,
+      file,
+      mode,
+      mapping,
+    }: ImportCsvIntoTableParams): Promise<ImportCsvIntoTableResponse> => {
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('workspaceId', workspaceId)
+      formData.append('mode', mode)
+      if (mapping) {
+        formData.append('mapping', JSON.stringify(mapping))
+      }
+
+      const response = await fetch(`/api/table/${tableId}/import-csv`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || 'CSV import failed')
+      }
+
+      return response.json()
+    },
+    onSettled: (_data, _error, variables) => {
+      if (!variables) return
+      invalidateRowCount(queryClient, variables.workspaceId, variables.tableId)
+    },
+    onError: (error) => {
+      logger.error('Failed to import CSV into table:', error)
     },
   })
 }
