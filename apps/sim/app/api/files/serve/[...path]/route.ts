@@ -3,7 +3,7 @@ import { createLogger } from '@sim/logger'
 import { sha256Hex } from '@sim/security/hash'
 import type { NextRequest } from 'next/server'
 import { NextResponse } from 'next/server'
-import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { checkHybridAuth } from '@/lib/auth/hybrid'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { runSandboxTask } from '@/lib/execution/sandbox/run-task'
 import { CopilotFiles, isUsingCloudStorage } from '@/lib/uploads'
@@ -138,7 +138,8 @@ export const GET = withRouteHandler(
 
       const raw = request.nextUrl.searchParams.get('raw') === '1'
 
-      const authResult = await checkSessionOrInternalAuth(request, { requireWorkflowId: false })
+      // const authResult = await checkSessionOrInternalAuth(request, { requireWorkflowId: false })
+      const authResult = await checkHybridAuth(request, { requireWorkflowId: false })
 
       if (!authResult.success || !authResult.userId) {
         logger.warn('Unauthorized file access attempt', {
