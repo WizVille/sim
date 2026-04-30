@@ -23,7 +23,7 @@ export const RATE_LIMIT_WINDOW_MS = Number.parseInt(env.RATE_LIMIT_WINDOW_MS) ||
 export const MANUAL_EXECUTION_LIMIT = Number.parseInt(env.MANUAL_EXECUTION_LIMIT) || 999999
 
 const DEFAULT_RATE_LIMITS = {
-  free: { sync: 50, async: 200, apiEndpoint: 30 },
+  free: { sync: 500, async: 2000, apiEndpoint: 300 },
   pro: { sync: 150, async: 1000, apiEndpoint: 100 },
   team: { sync: 300, async: 2500, apiEndpoint: 200 },
   enterprise: { sync: 600, async: 5000, apiEndpoint: 500 },
