@@ -620,7 +620,7 @@ export const azureOpenAIProvider: ProviderConfig = {
     const userProvidedEndpoint = request.azureEndpoint
     const azureEndpoint = userProvidedEndpoint || env.AZURE_OPENAI_ENDPOINT
 
-    request.azureApiVersion = '2025-04-01-preview'
+    request.azureApiVersion = '2024-12-01-preview'
     request.apiKey = env.AZURE_OPENAI_API_KEY
 
     if (!azureEndpoint) {
@@ -708,8 +708,9 @@ export const azureOpenAIProvider: ProviderConfig = {
     const azureApiVersion =
       request.azureApiVersion || env.AZURE_OPENAI_API_VERSION || '2024-07-01-preview'
     const deploymentName = request.model.replace('azure/', '')
-    const apiUrl = `${azureEndpoint.replace(/\/$/, '')}/openai/v1/responses?api-version=${azureApiVersion}`
+    const apiUrl = `${azureEndpoint.replace(/\/$/, '')}/openai/v1/responses`
 
+    console.log("api2", apiUrl)
     return executeResponsesProviderRequest(
       { ...request, apiKey },
       {
