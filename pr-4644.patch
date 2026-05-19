@@ -1,0 +1,1221 @@
+From fe39f579b5ea0634ac7b697c2392a2ad72460612 Mon Sep 17 00:00:00 2001
+From: RheagalFire <arishalam121@gmail.com>
+Date: Sun, 17 May 2026 23:23:11 +0530
+Subject: [PATCH 1/4] feat: add LiteLLM as AI gateway provider
+
+---
+ apps/sim/components/icons.tsx       |  13 +
+ apps/sim/lib/core/config/env.ts     |   2 +
+ apps/sim/providers/litellm/index.ts | 687 ++++++++++++++++++++++++++++
+ apps/sim/providers/litellm/utils.ts |  14 +
+ apps/sim/providers/models.ts        |  30 +-
+ apps/sim/providers/registry.ts      |   2 +
+ apps/sim/providers/types.ts         |   1 +
+ 7 files changed, 747 insertions(+), 2 deletions(-)
+ create mode 100644 apps/sim/providers/litellm/index.ts
+ create mode 100644 apps/sim/providers/litellm/utils.ts
+
+diff --git a/apps/sim/components/icons.tsx b/apps/sim/components/icons.tsx
+index 95502bf3ff6..6b003031771 100644
+--- a/apps/sim/components/icons.tsx
++++ b/apps/sim/components/icons.tsx
+@@ -4335,6 +4335,19 @@ export function VllmIcon(props: SVGProps<SVGSVGElement>) {
+   )
+ }
+ 
++export function LitellmIcon(props: SVGProps<SVGSVGElement>) {
++  return (
++    <svg {...props} fill='none' viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'>
++      <title>LiteLLM</title>
++      <rect width='24' height='24' rx='4' fill='#1A56DB' />
++      <path
++        d='M6 7h2v10H6V7zm4 0h2v8h4v2h-6V7z'
++        fill='white'
++      />
++    </svg>
++  )
++}
++
+ export function PosthogIcon(props: SVGProps<SVGSVGElement>) {
+   return (
+     <svg
+diff --git a/apps/sim/lib/core/config/env.ts b/apps/sim/lib/core/config/env.ts
+index 7f408439f16..7638e37ece0 100644
+--- a/apps/sim/lib/core/config/env.ts
++++ b/apps/sim/lib/core/config/env.ts
+@@ -121,6 +121,8 @@ export const env = createEnv({
+     OLLAMA_URL:                            z.string().url().optional(),            // Ollama local LLM server URL
+     VLLM_BASE_URL:                         z.string().url().optional(),            // vLLM self-hosted base URL (OpenAI-compatible)
+     VLLM_API_KEY:                          z.string().optional(),                  // Optional bearer token for vLLM
++    LITELLM_BASE_URL:                      z.string().url().optional(),            // LiteLLM proxy base URL (OpenAI-compatible)
++    LITELLM_API_KEY:                       z.string().optional(),                  // Optional bearer token for LiteLLM
+     FIREWORKS_API_KEY:                     z.string().optional(),                  // Optional Fireworks AI API key for model listing
+     COHERE_API_KEY:                        z.string().min(1).optional(),           // Cohere API key for reranker (rerank-v4.0-pro, rerank-v4.0-fast, rerank-v3.5)
+     COHERE_API_KEY_1:                      z.string().min(1).optional(),           // Primary Cohere API key for rotation
+diff --git a/apps/sim/providers/litellm/index.ts b/apps/sim/providers/litellm/index.ts
+new file mode 100644
+index 00000000000..9c1b0528a16
+--- /dev/null
++++ b/apps/sim/providers/litellm/index.ts
+@@ -0,0 +1,687 @@
++import { createLogger } from '@sim/logger'
++import { getErrorMessage, toError } from '@sim/utils/errors'
++import OpenAI from 'openai'
++import type { ChatCompletionCreateParamsStreaming } from 'openai/resources/chat/completions'
++import { env } from '@/lib/core/config/env'
++import type { StreamingExecution } from '@/executor/types'
++import { MAX_TOOL_ITERATIONS } from '@/providers'
++import { formatMessagesForProvider } from '@/providers/attachments'
++import { createReadableStreamFromLiteLLMStream } from '@/providers/litellm/utils'
++import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
++import { enrichLastModelSegmentFromChatCompletions } from '@/providers/trace-enrichment'
++import type {
++  Message,
++  ProviderConfig,
++  ProviderRequest,
++  ProviderResponse,
++  TimeSegment,
++} from '@/providers/types'
++import { ProviderError } from '@/providers/types'
++import {
++  calculateCost,
++  prepareToolExecution,
++  prepareToolsWithUsageControl,
++  sumToolCosts,
++  trackForcedToolUsage,
++} from '@/providers/utils'
++import { useProvidersStore } from '@/stores/providers'
++import { executeTool } from '@/tools'
++
++const logger = createLogger('LiteLLMProvider')
++const LITELLM_VERSION = '1.0.0'
++
++export const litellmProvider: ProviderConfig = {
++  id: 'litellm',
++  name: 'LiteLLM',
++  description: 'LiteLLM proxy with OpenAI-compatible API',
++  version: LITELLM_VERSION,
++  models: getProviderModels('litellm'),
++  defaultModel: getProviderDefaultModel('litellm'),
++
++  async initialize() {
++    if (typeof window !== 'undefined') {
++      logger.info('Skipping LiteLLM initialization on client side to avoid CORS issues')
++      return
++    }
++
++    const baseUrl = (env.LITELLM_BASE_URL || '').replace(/\/$/, '')
++    if (!baseUrl) {
++      logger.info('LITELLM_BASE_URL not configured, skipping initialization')
++      return
++    }
++
++    try {
++      const headers: Record<string, string> = {
++        'Content-Type': 'application/json',
++      }
++
++      if (env.LITELLM_API_KEY) {
++        headers.Authorization = `Bearer ${env.LITELLM_API_KEY}`
++      }
++
++      const response = await fetch(`${baseUrl}/v1/models`, { headers })
++      if (!response.ok) {
++        await response.text().catch(() => {})
++        useProvidersStore.getState().setProviderModels('litellm', [])
++        logger.warn('LiteLLM service is not available. The provider will be disabled.')
++        return
++      }
++
++      const data = (await response.json()) as { data: Array<{ id: string }> }
++      const models = data.data.map((model) => `litellm/${model.id}`)
++
++      this.models = models
++      useProvidersStore.getState().setProviderModels('litellm', models)
++
++      logger.info(`Discovered ${models.length} LiteLLM model(s):`, { models })
++    } catch (error) {
++      logger.warn('LiteLLM model instantiation failed. The provider will be disabled.', {
++        error: getErrorMessage(error, 'Unknown error'),
++      })
++    }
++  },
++
++  executeRequest: async (
++    request: ProviderRequest
++  ): Promise<ProviderResponse | StreamingExecution> => {
++    logger.info('Preparing LiteLLM request', {
++      model: request.model,
++      hasSystemPrompt: !!request.systemPrompt,
++      hasMessages: !!request.messages?.length,
++      hasTools: !!request.tools?.length,
++      toolCount: request.tools?.length || 0,
++      hasResponseFormat: !!request.responseFormat,
++      stream: !!request.stream,
++    })
++
++    const baseUrl = (request.azureEndpoint || env.LITELLM_BASE_URL || '').replace(/\/$/, '')
++    if (!baseUrl) {
++      throw new Error('LITELLM_BASE_URL is required for LiteLLM provider')
++    }
++
++    const apiKey = request.apiKey || env.LITELLM_API_KEY || 'empty'
++    const litellm = new OpenAI({
++      apiKey,
++      baseURL: `${baseUrl}/v1`,
++    })
++
++    const allMessages: Message[] = []
++
++    if (request.systemPrompt) {
++      allMessages.push({
++        role: 'system',
++        content: request.systemPrompt,
++      })
++    }
++
++    if (request.context) {
++      allMessages.push({
++        role: 'user',
++        content: request.context,
++      })
++    }
++
++    if (request.messages) {
++      allMessages.push(...request.messages)
++    }
++    const formattedMessages = formatMessagesForProvider(allMessages, 'litellm') as Message[]
++
++    const tools = request.tools?.length
++      ? request.tools.map((tool) => ({
++          type: 'function',
++          function: {
++            name: tool.id,
++            description: tool.description,
++            parameters: tool.parameters,
++          },
++        }))
++      : undefined
++
++    const payload: any = {
++      model: request.model.replace(/^litellm\//, ''),
++      messages: formattedMessages,
++    }
++
++    if (request.temperature !== undefined) payload.temperature = request.temperature
++    if (request.maxTokens != null) payload.max_completion_tokens = request.maxTokens
++
++    if (request.responseFormat) {
++      payload.response_format = {
++        type: 'json_schema',
++        json_schema: {
++          name: request.responseFormat.name || 'response_schema',
++          schema: request.responseFormat.schema || request.responseFormat,
++          strict: request.responseFormat.strict !== false,
++        },
++      }
++
++      logger.info('Added JSON schema response format to LiteLLM request')
++    }
++
++    let preparedTools: ReturnType<typeof prepareToolsWithUsageControl> | null = null
++    let hasActiveTools = false
++
++    if (tools?.length) {
++      preparedTools = prepareToolsWithUsageControl(tools, request.tools, logger, 'litellm')
++      const { tools: filteredTools, toolChoice } = preparedTools
++
++      if (filteredTools?.length && toolChoice) {
++        payload.tools = filteredTools
++        payload.tool_choice = toolChoice
++        hasActiveTools = true
++
++        logger.info('LiteLLM request configuration:', {
++          toolCount: filteredTools.length,
++          toolChoice:
++            typeof toolChoice === 'string'
++              ? toolChoice
++              : toolChoice.type === 'function'
++                ? `force:${toolChoice.function.name}`
++                : 'unknown',
++          model: payload.model,
++        })
++      }
++    }
++
++    const providerStartTime = Date.now()
++    const providerStartTimeISO = new Date(providerStartTime).toISOString()
++
++    try {
++      if (request.stream && (!tools || tools.length === 0 || !hasActiveTools)) {
++        logger.info('Using streaming response for LiteLLM request')
++
++        const streamingParams: ChatCompletionCreateParamsStreaming = {
++          ...payload,
++          stream: true,
++          stream_options: { include_usage: true },
++        }
++        const streamResponse = await litellm.chat.completions.create(
++          streamingParams,
++          request.abortSignal ? { signal: request.abortSignal } : undefined
++        )
++
++        const streamingResult = {
++          stream: createReadableStreamFromLiteLLMStream(streamResponse, (content, usage) => {
++            let cleanContent = content
++            if (cleanContent && request.responseFormat) {
++              cleanContent = cleanContent.replace(/```json\n?|\n?```/g, '').trim()
++            }
++
++            streamingResult.execution.output.content = cleanContent
++            streamingResult.execution.output.tokens = {
++              input: usage.prompt_tokens,
++              output: usage.completion_tokens,
++              total: usage.total_tokens,
++            }
++
++            const costResult = calculateCost(
++              request.model,
++              usage.prompt_tokens,
++              usage.completion_tokens
++            )
++            streamingResult.execution.output.cost = {
++              input: costResult.input,
++              output: costResult.output,
++              total: costResult.total,
++            }
++
++            const streamEndTime = Date.now()
++            const streamEndTimeISO = new Date(streamEndTime).toISOString()
++
++            if (streamingResult.execution.output.providerTiming) {
++              streamingResult.execution.output.providerTiming.endTime = streamEndTimeISO
++              streamingResult.execution.output.providerTiming.duration =
++                streamEndTime - providerStartTime
++
++              if (streamingResult.execution.output.providerTiming.timeSegments?.[0]) {
++                streamingResult.execution.output.providerTiming.timeSegments[0].endTime =
++                  streamEndTime
++                streamingResult.execution.output.providerTiming.timeSegments[0].duration =
++                  streamEndTime - providerStartTime
++              }
++            }
++          }),
++          execution: {
++            success: true,
++            output: {
++              content: '',
++              model: request.model,
++              tokens: { input: 0, output: 0, total: 0 },
++              toolCalls: undefined,
++              providerTiming: {
++                startTime: providerStartTimeISO,
++                endTime: new Date().toISOString(),
++                duration: Date.now() - providerStartTime,
++                timeSegments: [
++                  {
++                    type: 'model',
++                    name: request.model,
++                    startTime: providerStartTime,
++                    endTime: Date.now(),
++                    duration: Date.now() - providerStartTime,
++                  },
++                ],
++              },
++              cost: { input: 0, output: 0, total: 0 },
++            },
++            logs: [],
++            metadata: {
++              startTime: providerStartTimeISO,
++              endTime: new Date().toISOString(),
++              duration: Date.now() - providerStartTime,
++            },
++          },
++        } as StreamingExecution
++
++        return streamingResult as StreamingExecution
++      }
++
++      const initialCallTime = Date.now()
++
++      const originalToolChoice = payload.tool_choice
++
++      const forcedTools = preparedTools?.forcedTools || []
++      let usedForcedTools: string[] = []
++
++      const checkForForcedToolUsage = (
++        response: any,
++        toolChoice: string | { type: string; function?: { name: string }; name?: string; any?: any }
++      ) => {
++        if (typeof toolChoice === 'object' && response.choices[0]?.message?.tool_calls) {
++          const toolCallsResponse = response.choices[0].message.tool_calls
++          const result = trackForcedToolUsage(
++            toolCallsResponse,
++            toolChoice,
++            logger,
++            'litellm',
++            forcedTools,
++            usedForcedTools
++          )
++          hasUsedForcedTool = result.hasUsedForcedTool
++          usedForcedTools = result.usedForcedTools
++        }
++      }
++
++      let currentResponse = await litellm.chat.completions.create(
++        payload,
++        request.abortSignal ? { signal: request.abortSignal } : undefined
++      )
++      const firstResponseTime = Date.now() - initialCallTime
++
++      let content = currentResponse.choices[0]?.message?.content || ''
++
++      if (content && request.responseFormat) {
++        content = content.replace(/```json\n?|\n?```/g, '').trim()
++      }
++
++      const tokens = {
++        input: currentResponse.usage?.prompt_tokens || 0,
++        output: currentResponse.usage?.completion_tokens || 0,
++        total: currentResponse.usage?.total_tokens || 0,
++      }
++      const toolCalls = []
++      const toolResults: Record<string, unknown>[] = []
++      const currentMessages = [...formattedMessages]
++      let iterationCount = 0
++
++      let modelTime = firstResponseTime
++      let toolsTime = 0
++
++      let hasUsedForcedTool = false
++
++      const timeSegments: TimeSegment[] = [
++        {
++          type: 'model',
++          name: request.model,
++          startTime: initialCallTime,
++          endTime: initialCallTime + firstResponseTime,
++          duration: firstResponseTime,
++        },
++      ]
++
++      checkForForcedToolUsage(currentResponse, originalToolChoice)
++
++      while (iterationCount < MAX_TOOL_ITERATIONS) {
++        if (currentResponse.choices[0]?.message?.content) {
++          content = currentResponse.choices[0].message.content
++          if (request.responseFormat) {
++            content = content.replace(/```json\n?|\n?```/g, '').trim()
++          }
++        }
++
++        const toolCallsInResponse = currentResponse.choices[0]?.message?.tool_calls
++
++        enrichLastModelSegmentFromChatCompletions(
++          timeSegments,
++          currentResponse,
++          toolCallsInResponse,
++          { model: request.model, provider: 'litellm' }
++        )
++
++        if (!toolCallsInResponse || toolCallsInResponse.length === 0) {
++          break
++        }
++
++        logger.info(
++          `Processing ${toolCallsInResponse.length} tool calls (iteration ${iterationCount + 1}/${MAX_TOOL_ITERATIONS})`
++        )
++
++        const toolsStartTime = Date.now()
++
++        const toolExecutionPromises = toolCallsInResponse.map(async (toolCall) => {
++          const toolCallStartTime = Date.now()
++          const toolName = toolCall.function.name
++
++          try {
++            const toolArgs = JSON.parse(toolCall.function.arguments)
++            const tool = request.tools?.find((t) => t.id === toolName)
++
++            if (!tool) return null
++
++            const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
++            const result = await executeTool(toolName, executionParams, {
++              signal: request.abortSignal,
++            })
++            const toolCallEndTime = Date.now()
++
++            return {
++              toolCall,
++              toolName,
++              toolParams,
++              result,
++              startTime: toolCallStartTime,
++              endTime: toolCallEndTime,
++              duration: toolCallEndTime - toolCallStartTime,
++            }
++          } catch (error) {
++            const toolCallEndTime = Date.now()
++            logger.error('Error processing tool call:', { error, toolName })
++
++            return {
++              toolCall,
++              toolName,
++              toolParams: {},
++              result: {
++                success: false,
++                output: undefined,
++                error: getErrorMessage(error, 'Tool execution failed'),
++              },
++              startTime: toolCallStartTime,
++              endTime: toolCallEndTime,
++              duration: toolCallEndTime - toolCallStartTime,
++            }
++          }
++        })
++
++        const executionResults = await Promise.allSettled(toolExecutionPromises)
++
++        currentMessages.push({
++          role: 'assistant',
++          content: null,
++          tool_calls: toolCallsInResponse.map((tc) => ({
++            id: tc.id,
++            type: 'function',
++            function: {
++              name: tc.function.name,
++              arguments: tc.function.arguments,
++            },
++          })),
++        })
++
++        for (const settledResult of executionResults) {
++          if (settledResult.status === 'rejected' || !settledResult.value) continue
++
++          const { toolCall, toolName, toolParams, result, startTime, endTime, duration } =
++            settledResult.value
++
++          timeSegments.push({
++            type: 'tool',
++            name: toolName,
++            startTime: startTime,
++            endTime: endTime,
++            duration: duration,
++            toolCallId: toolCall.id,
++          })
++
++          let resultContent: any
++          if (result.success && result.output) {
++            toolResults.push(result.output)
++            resultContent = result.output
++          } else {
++            resultContent = {
++              error: true,
++              message: result.error || 'Tool execution failed',
++              tool: toolName,
++            }
++          }
++
++          toolCalls.push({
++            name: toolName,
++            arguments: toolParams,
++            startTime: new Date(startTime).toISOString(),
++            endTime: new Date(endTime).toISOString(),
++            duration: duration,
++            result: resultContent,
++            success: result.success,
++          })
++
++          currentMessages.push({
++            role: 'tool',
++            tool_call_id: toolCall.id,
++            content: JSON.stringify(resultContent),
++          })
++        }
++
++        const thisToolsTime = Date.now() - toolsStartTime
++        toolsTime += thisToolsTime
++
++        const nextPayload = {
++          ...payload,
++          messages: currentMessages,
++        }
++
++        if (typeof originalToolChoice === 'object' && hasUsedForcedTool && forcedTools.length > 0) {
++          const remainingTools = forcedTools.filter((tool) => !usedForcedTools.includes(tool))
++
++          if (remainingTools.length > 0) {
++            nextPayload.tool_choice = {
++              type: 'function',
++              function: { name: remainingTools[0] },
++            }
++            logger.info(`Forcing next tool: ${remainingTools[0]}`)
++          } else {
++            nextPayload.tool_choice = 'auto'
++            logger.info('All forced tools have been used, switching to auto tool_choice')
++          }
++        }
++
++        const nextModelStartTime = Date.now()
++
++        currentResponse = await litellm.chat.completions.create(
++          nextPayload,
++          request.abortSignal ? { signal: request.abortSignal } : undefined
++        )
++
++        checkForForcedToolUsage(currentResponse, nextPayload.tool_choice)
++
++        const nextModelEndTime = Date.now()
++        const thisModelTime = nextModelEndTime - nextModelStartTime
++
++        timeSegments.push({
++          type: 'model',
++          name: request.model,
++          startTime: nextModelStartTime,
++          endTime: nextModelEndTime,
++          duration: thisModelTime,
++        })
++
++        modelTime += thisModelTime
++
++        if (currentResponse.choices[0]?.message?.content) {
++          content = currentResponse.choices[0].message.content
++          if (request.responseFormat) {
++            content = content.replace(/```json\n?|\n?```/g, '').trim()
++          }
++        }
++
++        if (currentResponse.usage) {
++          tokens.input += currentResponse.usage.prompt_tokens || 0
++          tokens.output += currentResponse.usage.completion_tokens || 0
++          tokens.total += currentResponse.usage.total_tokens || 0
++        }
++
++        iterationCount++
++      }
++
++      if (iterationCount === MAX_TOOL_ITERATIONS) {
++        enrichLastModelSegmentFromChatCompletions(
++          timeSegments,
++          currentResponse,
++          currentResponse.choices[0]?.message?.tool_calls,
++          { model: request.model, provider: 'litellm' }
++        )
++      }
++
++      if (request.stream) {
++        logger.info('Using streaming for final response after tool processing')
++
++        const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
++
++        const streamingParams: ChatCompletionCreateParamsStreaming = {
++          ...payload,
++          messages: currentMessages,
++          tool_choice: 'auto',
++          stream: true,
++          stream_options: { include_usage: true },
++        }
++        const streamResponse = await litellm.chat.completions.create(
++          streamingParams,
++          request.abortSignal ? { signal: request.abortSignal } : undefined
++        )
++
++        const streamingResult = {
++          stream: createReadableStreamFromLiteLLMStream(streamResponse, (content, usage) => {
++            let cleanContent = content
++            if (cleanContent && request.responseFormat) {
++              cleanContent = cleanContent.replace(/```json\n?|\n?```/g, '').trim()
++            }
++
++            streamingResult.execution.output.content = cleanContent
++            streamingResult.execution.output.tokens = {
++              input: tokens.input + usage.prompt_tokens,
++              output: tokens.output + usage.completion_tokens,
++              total: tokens.total + usage.total_tokens,
++            }
++
++            const streamCost = calculateCost(
++              request.model,
++              usage.prompt_tokens,
++              usage.completion_tokens
++            )
++            const tc = sumToolCosts(toolResults)
++            streamingResult.execution.output.cost = {
++              input: accumulatedCost.input + streamCost.input,
++              output: accumulatedCost.output + streamCost.output,
++              toolCost: tc || undefined,
++              total: accumulatedCost.total + streamCost.total + tc,
++            }
++          }),
++          execution: {
++            success: true,
++            output: {
++              content: '',
++              model: request.model,
++              tokens: {
++                input: tokens.input,
++                output: tokens.output,
++                total: tokens.total,
++              },
++              toolCalls:
++                toolCalls.length > 0
++                  ? {
++                      list: toolCalls,
++                      count: toolCalls.length,
++                    }
++                  : undefined,
++              providerTiming: {
++                startTime: providerStartTimeISO,
++                endTime: new Date().toISOString(),
++                duration: Date.now() - providerStartTime,
++                modelTime: modelTime,
++                toolsTime: toolsTime,
++                firstResponseTime: firstResponseTime,
++                iterations: iterationCount + 1,
++                timeSegments: timeSegments,
++              },
++              cost: {
++                input: accumulatedCost.input,
++                output: accumulatedCost.output,
++                total: accumulatedCost.total,
++              },
++            },
++            logs: [],
++            metadata: {
++              startTime: providerStartTimeISO,
++              endTime: new Date().toISOString(),
++              duration: Date.now() - providerStartTime,
++            },
++          },
++        } as StreamingExecution
++
++        return streamingResult as StreamingExecution
++      }
++
++      const providerEndTime = Date.now()
++      const providerEndTimeISO = new Date(providerEndTime).toISOString()
++      const totalDuration = providerEndTime - providerStartTime
++
++      return {
++        content,
++        model: request.model,
++        tokens,
++        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
++        toolResults: toolResults.length > 0 ? toolResults : undefined,
++        timing: {
++          startTime: providerStartTimeISO,
++          endTime: providerEndTimeISO,
++          duration: totalDuration,
++          modelTime: modelTime,
++          toolsTime: toolsTime,
++          firstResponseTime: firstResponseTime,
++          iterations: iterationCount + 1,
++          timeSegments: timeSegments,
++        },
++      }
++    } catch (error) {
++      const providerEndTime = Date.now()
++      const providerEndTimeISO = new Date(providerEndTime).toISOString()
++      const totalDuration = providerEndTime - providerStartTime
++
++      let errorMessage = toError(error).message
++      let errorType: string | undefined
++      let errorCode: number | undefined
++
++      if (error && typeof error === 'object' && 'error' in error) {
++        const litellmError = error.error as any
++        if (litellmError && typeof litellmError === 'object') {
++          errorMessage = litellmError.message || errorMessage
++          errorType = litellmError.type
++          errorCode = litellmError.code
++        }
++      }
++
++      logger.error('Error in LiteLLM request:', {
++        error: errorMessage,
++        errorType,
++        errorCode,
++        duration: totalDuration,
++      })
++
++      throw new ProviderError(errorMessage, {
++        startTime: providerStartTimeISO,
++        endTime: providerEndTimeISO,
++        duration: totalDuration,
++      })
++    }
++  },
++}
+diff --git a/apps/sim/providers/litellm/utils.ts b/apps/sim/providers/litellm/utils.ts
+new file mode 100644
+index 00000000000..f779f95c703
+--- /dev/null
++++ b/apps/sim/providers/litellm/utils.ts
+@@ -0,0 +1,14 @@
++import type { ChatCompletionChunk } from 'openai/resources/chat/completions'
++import type { CompletionUsage } from 'openai/resources/completions'
++import { createOpenAICompatibleStream } from '@/providers/utils'
++
++/**
++ * Creates a ReadableStream from a LiteLLM streaming response.
++ * Uses the shared OpenAI-compatible streaming utility.
++ */
++export function createReadableStreamFromLiteLLMStream(
++  litellmStream: AsyncIterable<ChatCompletionChunk>,
++  onComplete?: (content: string, usage: CompletionUsage) => void
++): ReadableStream<Uint8Array> {
++  return createOpenAICompatibleStream(litellmStream, 'LiteLLM', onComplete)
++}
+diff --git a/apps/sim/providers/models.ts b/apps/sim/providers/models.ts
+index 53c212c4bc5..48e752b9ed1 100644
+--- a/apps/sim/providers/models.ts
++++ b/apps/sim/providers/models.ts
+@@ -17,6 +17,7 @@ import {
+   FireworksIcon,
+   GeminiIcon,
+   GroqIcon,
++  LitellmIcon,
+   MistralIcon,
+   OllamaIcon,
+   OpenAIIcon,
+@@ -125,6 +126,19 @@ export const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
+     },
+     models: [],
+   },
++  litellm: {
++    id: 'litellm',
++    name: 'LiteLLM',
++    icon: LitellmIcon,
++    description: 'LiteLLM proxy with an OpenAI-compatible API',
++    defaultModel: 'litellm/generic',
++    modelPatterns: [/^litellm\//],
++    capabilities: {
++      temperature: { min: 0, max: 2 },
++      toolUsageControl: true,
++    },
++    models: [],
++  },
+   openai: {
+     id: 'openai',
+     name: 'OpenAI',
+@@ -2766,7 +2780,7 @@ export function getProviderModels(providerId: string): string[] {
+   return PROVIDER_DEFINITIONS[providerId]?.models.map((m) => m.id) || []
+ }
+ 
+-export const DYNAMIC_MODEL_PROVIDERS = ['ollama', 'vllm', 'openrouter', 'fireworks'] as const
++export const DYNAMIC_MODEL_PROVIDERS = ['ollama', 'vllm', 'litellm', 'openrouter', 'fireworks'] as const
+ 
+ function getAllStaticModelIds(): string[] {
+   const ids: string[] = []
+@@ -2820,7 +2834,7 @@ export function suggestModelIdsForUnknownModel(_modelId: string, limit = 5): str
+ 
+ export function getBaseModelProviders(): Record<string, ProviderId> {
+   return Object.entries(PROVIDER_DEFINITIONS)
+-    .filter(([providerId]) => !['ollama', 'vllm', 'openrouter'].includes(providerId))
++    .filter(([providerId]) => !['ollama', 'vllm', 'litellm', 'openrouter'].includes(providerId))
+     .reduce(
+       (map, [providerId, provider]) => {
+         provider.models.forEach((model) => {
+@@ -2997,6 +3011,18 @@ export function updateVLLMModels(models: string[]): void {
+   }))
+ }
+ 
++export function updateLiteLLMModels(models: string[]): void {
++  PROVIDER_DEFINITIONS.litellm.models = models.map((modelId) => ({
++    id: modelId,
++    pricing: {
++      input: 0,
++      output: 0,
++      updatedAt: new Date().toISOString().split('T')[0],
++    },
++    capabilities: {},
++  }))
++}
++
+ export function updateFireworksModels(models: string[]): void {
+   PROVIDER_DEFINITIONS.fireworks.models = models.map((modelId) => ({
+     id: modelId,
+diff --git a/apps/sim/providers/registry.ts b/apps/sim/providers/registry.ts
+index 8b1256c2de7..5aa48d3db3a 100644
+--- a/apps/sim/providers/registry.ts
++++ b/apps/sim/providers/registry.ts
+@@ -9,6 +9,7 @@ import { deepseekProvider } from '@/providers/deepseek'
+ import { fireworksProvider } from '@/providers/fireworks'
+ import { googleProvider } from '@/providers/google'
+ import { groqProvider } from '@/providers/groq'
++import { litellmProvider } from '@/providers/litellm'
+ import { mistralProvider } from '@/providers/mistral'
+ import { ollamaProvider } from '@/providers/ollama'
+ import { openaiProvider } from '@/providers/openai'
+@@ -31,6 +32,7 @@ const providerRegistry: Record<ProviderId, ProviderConfig> = {
+   cerebras: cerebrasProvider,
+   groq: groqProvider,
+   vllm: vllmProvider,
++  litellm: litellmProvider,
+   mistral: mistralProvider,
+   'azure-openai': azureOpenAIProvider,
+   openrouter: openRouterProvider,
+diff --git a/apps/sim/providers/types.ts b/apps/sim/providers/types.ts
+index 007b9b3ead5..dc2f25927d6 100644
+--- a/apps/sim/providers/types.ts
++++ b/apps/sim/providers/types.ts
+@@ -16,6 +16,7 @@ export type ProviderId =
+   | 'openrouter'
+   | 'fireworks'
+   | 'vllm'
++  | 'litellm'
+   | 'bedrock'
+ 
+ export interface ModelPricing {
+
+From 9667e8824614e3d08e1fcae352f27bba35b47d1b Mon Sep 17 00:00:00 2001
+From: RheagalFire <arishalam121@gmail.com>
+Date: Sun, 17 May 2026 23:30:25 +0530
+Subject: [PATCH 2/4] fix: add litellm to attachments, provider store, utils,
+ and block guards
+
+---
+ apps/sim/blocks/utils.ts           |  2 +-
+ apps/sim/providers/attachments.ts  |  4 ++++
+ apps/sim/providers/utils.ts        | 14 ++++++++++++++
+ apps/sim/stores/providers/store.ts |  1 +
+ apps/sim/stores/providers/types.ts |  2 +-
+ 5 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/apps/sim/blocks/utils.ts b/apps/sim/blocks/utils.ts
+index c22596b34cd..ba97f4b733b 100644
+--- a/apps/sim/blocks/utils.ts
++++ b/apps/sim/blocks/utils.ts
+@@ -165,7 +165,7 @@ function shouldRequireApiKeyForModel(model: string): boolean {
+   }
+ 
+   const storeProvider = getProviderFromStore(normalizedModel)
+-  if (storeProvider === 'ollama' || storeProvider === 'vllm') return false
++  if (storeProvider === 'ollama' || storeProvider === 'vllm' || storeProvider === 'litellm') return false
+   if (storeProvider) return true
+ 
+   if (isOllamaConfigured) {
+diff --git a/apps/sim/providers/attachments.ts b/apps/sim/providers/attachments.ts
+index 380b4d8c890..d1b5d48c828 100644
+--- a/apps/sim/providers/attachments.ts
++++ b/apps/sim/providers/attachments.ts
+@@ -24,6 +24,7 @@ export type AttachmentProvider =
+   | 'fireworks'
+   | 'ollama'
+   | 'vllm'
++  | 'litellm'
+   | 'xai'
+   | 'deepseek'
+   | 'cerebras'
+@@ -93,6 +94,7 @@ const PROVIDER_SUPPORTED_LABELS: Record<AttachmentProvider, string> = {
+   fireworks: 'images through image_url message parts on vision models',
+   ollama: 'images through image_url message parts on vision models',
+   vllm: 'images through image_url message parts on multimodal models',
++  litellm: 'images through image_url message parts on multimodal models',
+   xai: 'images through image_url message parts on Grok vision models',
+   deepseek: 'no file attachments in the current API adapter',
+   cerebras: 'no file attachments in the current API adapter',
+@@ -109,6 +111,7 @@ export function getAttachmentProvider(providerId: ProviderId | string): Attachme
+   if (providerId === 'fireworks') return 'fireworks'
+   if (providerId === 'ollama') return 'ollama'
+   if (providerId === 'vllm') return 'vllm'
++  if (providerId === 'litellm') return 'litellm'
+   if (providerId === 'xai') return 'xai'
+   if (providerId === 'deepseek') return 'deepseek'
+   if (providerId === 'cerebras') return 'cerebras'
+@@ -247,6 +250,7 @@ function isMimeTypeSupportedByProvider(
+     case 'fireworks':
+     case 'ollama':
+     case 'vllm':
++    case 'litellm':
+     case 'xai':
+       return isImageMimeType(mimeType)
+     case 'deepseek':
+diff --git a/apps/sim/providers/utils.ts b/apps/sim/providers/utils.ts
+index a646214b148..05efe7f0f9f 100644
+--- a/apps/sim/providers/utils.ts
++++ b/apps/sim/providers/utils.ts
+@@ -132,6 +132,7 @@ function buildProviderMetadata(providerId: ProviderId): ProviderMetadata {
+ export const providers: Record<ProviderId, ProviderMetadata> = {
+   ollama: buildProviderMetadata('ollama'),
+   vllm: buildProviderMetadata('vllm'),
++  litellm: buildProviderMetadata('litellm'),
+   openai: {
+     ...buildProviderMetadata('openai'),
+     computerUseModels: ['computer-use-preview'],
+@@ -167,6 +168,12 @@ export function updateVLLMProviderModels(models: string[]): void {
+   providers.vllm.models = getProviderModelsFromDefinitions('vllm')
+ }
+ 
++export function updateLiteLLMProviderModels(models: string[]): void {
++  const { updateLiteLLMModels } = require('@/providers/models')
++  updateLiteLLMModels(models)
++  providers.litellm.models = getProviderModelsFromDefinitions('litellm')
++}
++
+ export async function updateOpenRouterProviderModels(models: string[]): Promise<void> {
+   const { updateOpenRouterModels } = await import('@/providers/models')
+   updateOpenRouterModels(models)
+@@ -185,6 +192,7 @@ export function getBaseModelProviders(): Record<string, ProviderId> {
+       ([providerId]) =>
+         providerId !== 'ollama' &&
+         providerId !== 'vllm' &&
++        providerId !== 'litellm' &&
+         providerId !== 'openrouter' &&
+         providerId !== 'fireworks'
+     )
+@@ -744,6 +752,12 @@ export function getApiKey(provider: string, model: string, userProvidedKey?: str
+     return userProvidedKey || 'empty'
+   }
+ 
++  const isLitellmModel =
++    provider === 'litellm' || useProvidersStore.getState().providers.litellm?.models.includes(model)
++  if (isLitellmModel) {
++    return userProvidedKey || 'empty'
++  }
++
+   // Bedrock uses its own credentials (bedrockAccessKeyId/bedrockSecretKey), not apiKey
+   const isBedrockModel = provider === 'bedrock' || model.startsWith('bedrock/')
+   if (isBedrockModel) {
+diff --git a/apps/sim/stores/providers/store.ts b/apps/sim/stores/providers/store.ts
+index 4567812e0f8..00896c0ba7c 100644
+--- a/apps/sim/stores/providers/store.ts
++++ b/apps/sim/stores/providers/store.ts
+@@ -9,6 +9,7 @@ export const useProvidersStore = create<ProvidersStore>((set, get) => ({
+     base: { models: [], isLoading: false },
+     ollama: { models: [], isLoading: false },
+     vllm: { models: [], isLoading: false },
++    litellm: { models: [], isLoading: false },
+     openrouter: { models: [], isLoading: false },
+     fireworks: { models: [], isLoading: false },
+   },
+diff --git a/apps/sim/stores/providers/types.ts b/apps/sim/stores/providers/types.ts
+index e76870c04cf..7022529f202 100644
+--- a/apps/sim/stores/providers/types.ts
++++ b/apps/sim/stores/providers/types.ts
+@@ -1,4 +1,4 @@
+-export type ProviderName = 'ollama' | 'vllm' | 'openrouter' | 'fireworks' | 'base'
++export type ProviderName = 'ollama' | 'vllm' | 'litellm' | 'openrouter' | 'fireworks' | 'base'
+ 
+ export interface OpenRouterModelInfo {
+   id: string
+
+From 475820abe0cd5cb573811895e29a0548eb2c7ca7 Mon Sep 17 00:00:00 2001
+From: RheagalFire <arishalam121@gmail.com>
+Date: Mon, 18 May 2026 00:09:58 +0530
+Subject: [PATCH 3/4] fix: add frontend model discovery pipeline for litellm
+ provider
+
+Add API route, contract, query hook case, and ProviderModelsLoader
+entry so litellm models are fetched and synced to the store on
+workspace load, matching the vllm/ollama/openrouter/fireworks pattern.
+
+Also fixes defaultModel to empty string and adds litellm/ prefix
+early-return in blocks/utils.ts (reviewer feedback).
+---
+ .../app/api/providers/litellm/models/route.ts | 70 +++++++++++++++++++
+ .../providers/provider-models-loader.tsx      |  4 ++
+ apps/sim/blocks/utils.ts                      |  2 +-
+ apps/sim/hooks/queries/providers.ts           |  3 +
+ apps/sim/lib/api/contracts/providers.ts       |  9 +++
+ apps/sim/providers/models.ts                  |  2 +-
+ 6 files changed, 88 insertions(+), 2 deletions(-)
+ create mode 100644 apps/sim/app/api/providers/litellm/models/route.ts
+
+diff --git a/apps/sim/app/api/providers/litellm/models/route.ts b/apps/sim/app/api/providers/litellm/models/route.ts
+new file mode 100644
+index 00000000000..bf40b54c424
+--- /dev/null
++++ b/apps/sim/app/api/providers/litellm/models/route.ts
+@@ -0,0 +1,70 @@
++import { createLogger } from '@sim/logger'
++import { getErrorMessage } from '@sim/utils/errors'
++import { type NextRequest, NextResponse } from 'next/server'
++import {
++  providerModelsResponseSchema,
++  vllmUpstreamResponseSchema,
++} from '@/lib/api/contracts/providers'
++import { env } from '@/lib/core/config/env'
++import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
++import { filterBlacklistedModels, isProviderBlacklisted } from '@/providers/utils'
++
++const logger = createLogger('LiteLLMModelsAPI')
++
++export const GET = withRouteHandler(async (_request: NextRequest) => {
++  if (isProviderBlacklisted('litellm')) {
++    logger.info('LiteLLM provider is blacklisted, returning empty models')
++    return NextResponse.json({ models: [] })
++  }
++
++  const baseUrl = (env.LITELLM_BASE_URL || '').replace(/\/$/, '')
++
++  if (!baseUrl) {
++    logger.info('LITELLM_BASE_URL not configured')
++    return NextResponse.json({ models: [] })
++  }
++
++  try {
++    logger.info('Fetching LiteLLM models', { baseUrl })
++
++    const headers: Record<string, string> = {
++      'Content-Type': 'application/json',
++    }
++
++    if (env.LITELLM_API_KEY) {
++      headers.Authorization = `Bearer ${env.LITELLM_API_KEY}`
++    }
++
++    const response = await fetch(`${baseUrl}/v1/models`, {
++      headers,
++      next: { revalidate: 60 },
++    })
++
++    if (!response.ok) {
++      logger.warn('LiteLLM service is not available', {
++        status: response.status,
++        statusText: response.statusText,
++      })
++      return NextResponse.json({ models: [] })
++    }
++
++    const data = vllmUpstreamResponseSchema.parse(await response.json())
++    const allModels = data.data.map((model) => `litellm/${model.id}`)
++    const models = filterBlacklistedModels(allModels)
++
++    logger.info('Successfully fetched LiteLLM models', {
++      count: models.length,
++      filtered: allModels.length - models.length,
++      models,
++    })
++
++    return NextResponse.json(providerModelsResponseSchema.parse({ models }))
++  } catch (error) {
++    logger.error('Failed to fetch LiteLLM models', {
++      error: getErrorMessage(error, 'Unknown error'),
++      baseUrl,
++    })
++
++    return NextResponse.json({ models: [] })
++  }
++})
+diff --git a/apps/sim/app/workspace/[workspaceId]/providers/provider-models-loader.tsx b/apps/sim/app/workspace/[workspaceId]/providers/provider-models-loader.tsx
+index f83d9e63bb0..f2563a2b37c 100644
+--- a/apps/sim/app/workspace/[workspaceId]/providers/provider-models-loader.tsx
++++ b/apps/sim/app/workspace/[workspaceId]/providers/provider-models-loader.tsx
+@@ -6,6 +6,7 @@ import { useParams } from 'next/navigation'
+ import { useProviderModels } from '@/hooks/queries/providers'
+ import {
+   updateFireworksProviderModels,
++  updateLiteLLMProviderModels,
+   updateOllamaProviderModels,
+   updateOpenRouterProviderModels,
+   updateVLLMProviderModels,
+@@ -32,6 +33,8 @@ function useSyncProvider(provider: ProviderName, workspaceId?: string) {
+         updateOllamaProviderModels(data.models)
+       } else if (provider === 'vllm') {
+         updateVLLMProviderModels(data.models)
++      } else if (provider === 'litellm') {
++        updateLiteLLMProviderModels(data.models)
+       } else if (provider === 'openrouter') {
+         void updateOpenRouterProviderModels(data.models)
+         if (data.modelInfo) {
+@@ -61,6 +64,7 @@ export function ProviderModelsLoader() {
+   useSyncProvider('base')
+   useSyncProvider('ollama')
+   useSyncProvider('vllm')
++  useSyncProvider('litellm')
+   useSyncProvider('openrouter')
+   useSyncProvider('fireworks', workspaceId)
+   return null
+diff --git a/apps/sim/blocks/utils.ts b/apps/sim/blocks/utils.ts
+index ba97f4b733b..ff8f043f173 100644
+--- a/apps/sim/blocks/utils.ts
++++ b/apps/sim/blocks/utils.ts
+@@ -160,7 +160,7 @@ function shouldRequireApiKeyForModel(model: string): boolean {
+   ) {
+     return false
+   }
+-  if (normalizedModel.startsWith('vllm/')) {
++  if (normalizedModel.startsWith('vllm/') || normalizedModel.startsWith('litellm/')) {
+     return false
+   }
+ 
+diff --git a/apps/sim/hooks/queries/providers.ts b/apps/sim/hooks/queries/providers.ts
+index c7eaabf5035..902d3b27bc2 100644
+--- a/apps/sim/hooks/queries/providers.ts
++++ b/apps/sim/hooks/queries/providers.ts
+@@ -5,6 +5,7 @@ import { requestJson } from '@/lib/api/client/request'
+ import {
+   getBaseProviderModelsContract,
+   getFireworksProviderModelsContract,
++  getLitellmProviderModelsContract,
+   getOllamaProviderModelsContract,
+   getOpenRouterProviderModelsContract,
+   getVllmProviderModelsContract,
+@@ -54,6 +55,8 @@ async function requestProviderModels(
+       return requestJson(getOllamaProviderModelsContract, { signal })
+     case 'vllm':
+       return requestJson(getVllmProviderModelsContract, { signal })
++    case 'litellm':
++      return requestJson(getLitellmProviderModelsContract, { signal })
+     case 'openrouter':
+       return requestJson(getOpenRouterProviderModelsContract, { signal })
+     case 'fireworks':
+diff --git a/apps/sim/lib/api/contracts/providers.ts b/apps/sim/lib/api/contracts/providers.ts
+index c53d3fedf21..776b1d94c42 100644
+--- a/apps/sim/lib/api/contracts/providers.ts
++++ b/apps/sim/lib/api/contracts/providers.ts
+@@ -207,6 +207,15 @@ export const getOpenRouterProviderModelsContract = defineRouteContract({
+   },
+ })
+ 
++export const getLitellmProviderModelsContract = defineRouteContract({
++  method: 'GET',
++  path: '/api/providers/litellm/models',
++  response: {
++    mode: 'json',
++    schema: providerModelsResponseSchema,
++  },
++})
++
+ export const getFireworksProviderModelsContract = defineRouteContract({
+   method: 'GET',
+   path: '/api/providers/fireworks/models',
+diff --git a/apps/sim/providers/models.ts b/apps/sim/providers/models.ts
+index 48e752b9ed1..a03efbebfb1 100644
+--- a/apps/sim/providers/models.ts
++++ b/apps/sim/providers/models.ts
+@@ -131,7 +131,7 @@ export const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
+     name: 'LiteLLM',
+     icon: LitellmIcon,
+     description: 'LiteLLM proxy with an OpenAI-compatible API',
+-    defaultModel: 'litellm/generic',
++    defaultModel: '',
+     modelPatterns: [/^litellm\//],
+     capabilities: {
+       temperature: { min: 0, max: 2 },
+
+From b4268ec0133971eb952ae9ba59c39c19e15ddcaa Mon Sep 17 00:00:00 2001
+From: RheagalFire <arishalam121@gmail.com>
+Date: Mon, 18 May 2026 04:21:32 +0530
+Subject: [PATCH 4/4] fix: remove azureEndpoint fallback from LiteLLM provider
+
+Copy-paste artifact from vLLM provider. LiteLLM should only use
+LITELLM_BASE_URL, not fall back to azureEndpoint which could cause
+requests to be routed to the wrong server.
+---
+ apps/sim/providers/litellm/index.ts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/apps/sim/providers/litellm/index.ts b/apps/sim/providers/litellm/index.ts
+index 9c1b0528a16..27402ce819c 100644
+--- a/apps/sim/providers/litellm/index.ts
++++ b/apps/sim/providers/litellm/index.ts
+@@ -94,7 +94,7 @@ export const litellmProvider: ProviderConfig = {
+       stream: !!request.stream,
+     })
+ 
+-    const baseUrl = (request.azureEndpoint || env.LITELLM_BASE_URL || '').replace(/\/$/, '')
++    const baseUrl = (env.LITELLM_BASE_URL || '').replace(/\/$/, '')
+     if (!baseUrl) {
+       throw new Error('LITELLM_BASE_URL is required for LiteLLM provider')
+     }
