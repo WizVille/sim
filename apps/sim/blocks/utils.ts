@@ -53,6 +53,8 @@ export function getModelOptions() {
   const vllmModels = providersState.providers.vllm.models
   const openrouterModels = providersState.providers.openrouter.models
   const fireworksModels = providersState.providers.fireworks.models
+  const litellmModels = providersState.providers.litellm.models
+
   const allModels = Array.from(
     new Set([
       ...baseModels,
@@ -60,10 +62,11 @@ export function getModelOptions() {
       ...vllmModels,
       ...openrouterModels,
       ...fireworksModels,
+      ...litellmModels
     ])
   )
 
-  return allModels.filter(m => ['mistral-large-latest', 'mistral-medium-latest', 'mistral-small-latest'].includes(m) || m.startsWith('vertex/') || m.startsWith('gpt') || m == 'azure/gpt-5.4' || m == 'azure/gpt-5.4-mini' || m == 'azure/gpt-5.1' || m == 'azure/gpt-5.2').map((model) => {
+  return allModels.filter(m => ['mistral-large-latest', 'mistral-medium-latest', 'mistral-small-latest'].includes(m) || m.startsWith('vertex/') || m.startsWith('gpt') || m == 'azure/gpt-5.4' || m == 'azure/gpt-5.4-mini' || m == 'azure/gpt-5.1' || m == 'azure/gpt-5.2' || m.startsWith('litellm/')).map((model) => {
     const icon = getProviderIcon(model)
     return { label: model, id: model, ...(icon && { icon }) }
   })
