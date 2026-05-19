@@ -1,17 +1,20 @@
 import { type Context as OtelContext, context as otelContextApi } from '@opentelemetry/api'
 import { db } from '@sim/db'
-import { copilotChats } from '@sim/db/schema'
+import { copilotChats, permissions } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
-import { eq, sql } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
+import { isZodError, validationErrorResponse } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
 import { type ChatLoadResult, resolveOrCreateChat } from '@/lib/copilot/chat/lifecycle'
 import { buildCopilotRequestPayload } from '@/lib/copilot/chat/payload'
 import {
   buildPersistedAssistantMessage,
   buildPersistedUserMessage,
+  withStoppedContentBlock,
 } from '@/lib/copilot/chat/persisted-message'
 import {
   processContextsServer,
@@ -21,6 +24,7 @@ import { finalizeAssistantTurn } from '@/lib/copilot/chat/terminal-state'
 import { generateWorkspaceContext } from '@/lib/copilot/chat/workspace-context'
 import { COPILOT_REQUEST_MODES } from '@/lib/copilot/constants'
 import {
+  CopilotChatFinalizeOutcome,
   CopilotChatPersistOutcome,
   CopilotTransport,
 } from '@/lib/copilot/generated/trace-attribute-values-v1'
@@ -54,10 +58,21 @@ const FileAttachmentSchema = z.object({
   filename: z.string(),
   media_type: z.string(),
   size: z.number(),
+  path: z.string().optional(),
 })
 
 const ResourceAttachmentSchema = z.object({
-  type: z.enum(['workflow', 'table', 'file', 'knowledgebase', 'folder', 'task', 'log', 'generic']),
+  type: z.enum([
+    'workflow',
+    'table',
+    'file',
+    'knowledgebase',
+    'folder',
+    'filefolder',
+    'task',
+    'log',
+    'generic',
+  ]),
   id: z.string().min(1),
   title: z.string().optional(),
   active: z.boolean().optional(),
@@ -69,6 +84,7 @@ const GENERIC_RESOURCE_TITLE: Record<z.infer<typeof ResourceAttachmentSchema>['t
   file: 'File',
   knowledgebase: 'Knowledge Base',
   folder: 'Folder',
+  filefolder: 'File Folder',
   task: 'Task',
   log: 'Log',
   generic: 'Resource',
@@ -88,6 +104,7 @@ const ChatContextSchema = z.object({
     'table',
     'file',
     'folder',
+    'filefolder',
   ]),
   label: z.string(),
   chatId: z.string().optional(),
@@ -100,6 +117,7 @@ const ChatContextSchema = z.object({
   tableId: z.string().optional(),
   fileId: z.string().optional(),
   folderId: z.string().optional(),
+  fileFolderId: z.string().optional(),
 })
 
 const ChatMessageSchema = z.object({
@@ -327,6 +345,7 @@ async function persistUserMessage(params: {
           workspaceId,
           chatId,
           type: 'started',
+          streamId: userMessageId,
         })
       }
 
@@ -408,13 +427,31 @@ function buildOnComplete(params: {
 
     if (!chatId) return
 
-    // On cancel, /chat/stop is the sole DB writer — it persists
-    // partial content AND clears conversationId in one UPDATE. If we
-    // finalize here first the filter misses and content vanishes.
-    // Real errors still finalize so the stream marker clears.
-    if (result.cancelled) return
-
     try {
+      if (result.cancelled) {
+        const finalization = await finalizeAssistantTurn({
+          chatId,
+          userMessageId,
+          assistantMessage: withStoppedContentBlock(
+            buildPersistedAssistantMessage(result, requestId)
+          ),
+          streamMarkerPolicy: 'active-or-cleared',
+        })
+        const shouldPublishCompletion =
+          finalization.updated ||
+          finalization.outcome === CopilotChatFinalizeOutcome.AssistantAlreadyPersisted
+
+        if (notifyWorkspaceStatus && workspaceId && shouldPublishCompletion) {
+          taskPubSub?.publishStatusChanged({
+            workspaceId,
+            chatId,
+            type: 'completed',
+            streamId: userMessageId,
+          })
+        }
+        return
+      }
+
       await finalizeAssistantTurn({
         chatId,
         userMessageId,
@@ -428,12 +465,13 @@ function buildOnComplete(params: {
           workspaceId,
           chatId,
           type: 'completed',
+          streamId: userMessageId,
         })
       }
     } catch (error) {
       logger.error(`[${requestId}] Failed to persist chat messages`, {
         chatId,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: getErrorMessage(error, 'Unknown error'),
       })
     }
   }
@@ -459,12 +497,13 @@ function buildOnError(params: {
           workspaceId,
           chatId,
           type: 'completed',
+          streamId: userMessageId,
         })
       }
     } catch (error) {
       logger.error(`[${requestId}] Failed to finalize errored chat stream`, {
         chatId,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: getErrorMessage(error, 'Unknown error'),
       })
     }
   }
@@ -501,14 +540,12 @@ async function resolveBranch(params: {
     }
 
     const resolvedWorkflowId = resolved.workflowId
-    let resolvedWorkspaceId = requestedWorkspaceId
-    if (!resolvedWorkspaceId) {
-      try {
-        const workflow = await getWorkflowById(resolvedWorkflowId)
-        resolvedWorkspaceId = workflow?.workspaceId ?? undefined
-      } catch {
-        // best effort; downstream calls can still proceed
-      }
+    let resolvedWorkspaceId: string | undefined
+    try {
+      const workflow = await getWorkflowById(resolvedWorkflowId)
+      resolvedWorkspaceId = workflow?.workspaceId ?? requestedWorkspaceId
+    } catch {
+      resolvedWorkspaceId = requestedWorkspaceId
     }
 
     const selectedModel = model || DEFAULT_MODEL
@@ -564,6 +601,22 @@ async function resolveBranch(params: {
     return createBadRequestResponse('workspaceId is required when workflowId is not provided')
   }
 
+  const [permissionRow] = await db
+    .select({ permissionType: permissions.permissionType })
+    .from(permissions)
+    .where(
+      and(
+        eq(permissions.userId, authenticatedUserId),
+        eq(permissions.entityType, 'workspace'),
+        eq(permissions.entityId, requestedWorkspaceId)
+      )
+    )
+    .limit(1)
+
+  if (!permissionRow) {
+    return createBadRequestResponse('Workspace not found or access denied')
+  }
+
   return {
     kind: 'workspace',
     workspaceId: requestedWorkspaceId,
@@ -585,6 +638,7 @@ async function resolveBranch(params: {
           workspaceContext: payloadParams.workspaceContext,
           userPermission: payloadParams.userPermission,
           userTimezone: payloadParams.userTimezone,
+          includeMothershipTools: true,
         },
         { selectedModel: '' }
       ),
@@ -782,7 +836,7 @@ export async function handleUnifiedChatPost(req: NextRequest) {
       const userPermissionPromise = workspaceId
         ? getUserEntityPermissions(authenticatedUserId, 'workspace', workspaceId).catch((error) => {
             logger.warn('Failed to load user permissions', {
-              error: error instanceof Error ? error.message : String(error),
+              error: getErrorMessage(error),
               workspaceId,
             })
             return null
@@ -851,6 +905,8 @@ export async function handleUnifiedChatPost(req: NextRequest) {
           persistedMessagesPromise,
           executionContextPromise,
         ])
+
+      executionContext.userPermission = userPermission ?? undefined
 
       if (persistedMessages) {
         conversationHistory = persistedMessages.filter((message) => {
@@ -979,21 +1035,18 @@ export async function handleUnifiedChatPost(req: NextRequest) {
     }
     otelRoot?.finish('error', error)
 
-    if (error instanceof z.ZodError) {
-      return NextResponse.json(
-        { error: 'Invalid request data', details: error.errors },
-        { status: 400 }
-      )
+    if (isZodError(error)) {
+      return validationErrorResponse(error, 'Invalid request data')
     }
 
     logger.error(`[${requestId}] Error handling unified chat request`, {
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: getErrorMessage(error, 'Unknown error'),
       stack: error instanceof Error ? error.stack : undefined,
     })
 
     return NextResponse.json(
       {
-        error: error instanceof Error ? error.message : 'Internal server error',
+        error: getErrorMessage(error, 'Internal server error'),
       },
       { status: 500 }
     )

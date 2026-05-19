@@ -1,10 +1,16 @@
 import { createLogger, type Logger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import type OpenAI from 'openai'
 import type { ChatCompletionChunk } from 'openai/resources/chat/completions'
 import type { CompletionUsage } from 'openai/resources/completions'
 import { dollarsToCredits } from '@/lib/billing/credits/conversion'
 import { env } from '@/lib/core/config/env'
 import { getBlacklistedProvidersFromEnv, isHosted } from '@/lib/core/config/feature-flags'
+import {
+  normalizeRecord,
+  normalizeStringRecord,
+  normalizeWorkflowVariables,
+} from '@/lib/core/utils/records'
 import {
   buildCanonicalIndex,
   type CanonicalGroup,
@@ -425,11 +431,11 @@ export function extractAndParseJSON(content: string): any {
         contentLength: content.length,
         extractedLength: jsonStr.length,
         cleanedLength: cleaned.length,
-        error: innerError instanceof Error ? innerError.message : 'Unknown error',
+        error: getErrorMessage(innerError, 'Unknown error'),
       })
 
       throw new Error(
-        `Failed to parse JSON after cleanup: ${innerError instanceof Error ? innerError.message : 'Unknown error'}`
+        `Failed to parse JSON after cleanup: ${getErrorMessage(innerError, 'Unknown error')}`
       )
     }
   }
@@ -1166,10 +1172,16 @@ export function prepareToolExecution(
           },
         }
       : {}),
-    ...(request.environmentVariables ? { envVars: request.environmentVariables } : {}),
-    ...(request.workflowVariables ? { workflowVariables: request.workflowVariables } : {}),
-    ...(request.blockData ? { blockData: request.blockData } : {}),
-    ...(request.blockNameMapping ? { blockNameMapping: request.blockNameMapping } : {}),
+    ...(request.environmentVariables
+      ? { envVars: normalizeStringRecord(request.environmentVariables) }
+      : {}),
+    ...(request.workflowVariables
+      ? { workflowVariables: normalizeWorkflowVariables(request.workflowVariables) }
+      : {}),
+    ...(request.blockData ? { blockData: normalizeRecord(request.blockData) } : {}),
+    ...(request.blockNameMapping
+      ? { blockNameMapping: normalizeStringRecord(request.blockNameMapping) }
+      : {}),
     ...(tool.parameters ? { _toolSchema: tool.parameters } : {}),
   }
 

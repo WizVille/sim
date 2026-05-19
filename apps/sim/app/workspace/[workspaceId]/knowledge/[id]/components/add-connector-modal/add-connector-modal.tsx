@@ -1,7 +1,7 @@
 'use client'
 
 import { useMemo, useState } from 'react'
-import { ArrowLeft, ArrowLeftRight, Loader2, Plus, Search } from 'lucide-react'
+import { ArrowLeft, ArrowLeftRight, Plus, Search } from 'lucide-react'
 import { useParams } from 'next/navigation'
 import {
   Button,
@@ -12,14 +12,17 @@ import {
   type ComboboxOption,
   Input,
   Label,
+  Loader,
   Modal,
   ModalBody,
   ModalContent,
+  ModalDescription,
   ModalFooter,
   ModalHeader,
   Tooltip,
 } from '@/components/emcn'
 import { getSubscriptionAccessState } from '@/lib/billing/client'
+import { handleKeyboardActivation } from '@/lib/core/utils/keyboard'
 import { consumeOAuthReturnContext } from '@/lib/credentials/client-state'
 import { getProviderIdFromServiceId, type OAuthProvider } from '@/lib/oauth'
 import { OAuthModal } from '@/app/workspace/[workspaceId]/components/oauth-modal'
@@ -124,6 +127,18 @@ export function AddConnectorModal({
     onConnectorTypeChange?.(type)
   }
 
+  const toggleTagDefinition = (tagId: string) => {
+    setDisabledTagIds((prev) => {
+      const next = new Set(prev)
+      if (prev.has(tagId)) {
+        next.delete(tagId)
+      } else {
+        next.add(tagId)
+      }
+      return next
+    })
+  }
+
   const canSubmit = useMemo(() => {
     if (!connectorConfig) return false
     if (isApiKeyMode) {
@@ -156,10 +171,13 @@ export function AddConnectorModal({
     for (const [key, value] of Object.entries(resolveSourceConfig())) {
       if (value) resolvedConfig[key] = value
     }
-    const finalSourceConfig =
-      disabledTagIds.size > 0
-        ? { ...resolvedConfig, disabledTagIds: Array.from(disabledTagIds) }
-        : resolvedConfig
+    if (disabledTagIds.size > 0) {
+      resolvedConfig.disabledTagIds = Array.from(disabledTagIds)
+    }
+    if (Object.keys(canonicalModes).length > 0) {
+      resolvedConfig._canonicalModes = canonicalModes
+    }
+    const finalSourceConfig = resolvedConfig
 
     createConnector(
       {
@@ -197,24 +215,29 @@ export function AddConnectorModal({
             {step === 'configure' && (
               <Button
                 variant='ghost'
-                className='mr-2 h-6 w-6 p-0'
+                className='mr-2 size-6 p-0'
                 onClick={() => {
                   setStep('select-type')
                   onConnectorTypeChange?.('')
                 }}
               >
-                <ArrowLeft className='h-4 w-4' />
+                <ArrowLeft className='size-4' />
               </Button>
             )}
             {step === 'select-type' ? 'Connect Source' : `Configure ${connectorConfig?.name}`}
           </ModalHeader>
+          <ModalDescription className='sr-only'>
+            {step === 'select-type'
+              ? 'Select a data source to connect to this knowledge base'
+              : `Configure the ${connectorConfig?.name} connector settings`}
+          </ModalDescription>
 
           <ModalBody>
             {step === 'select-type' ? (
               <div className='flex flex-col gap-2'>
                 <div className='flex items-center gap-2 rounded-lg border border-[var(--border)] bg-transparent px-2 py-[5px] transition-colors duration-100 dark:bg-[var(--surface-4)] dark:hover-hover:border-[var(--border-1)] dark:hover-hover:bg-[var(--surface-5)]'>
                   <Search
-                    className='h-[14px] w-[14px] flex-shrink-0 text-[var(--text-tertiary)]'
+                    className='size-[14px] flex-shrink-0 text-[var(--text-tertiary)]'
                     strokeWidth={2}
                   />
                   <Input
@@ -327,10 +350,10 @@ export function AddConnectorModal({
                             <Tooltip.Trigger asChild>
                               <button
                                 type='button'
-                                className='flex h-[18px] w-[18px] items-center justify-center rounded-[3px] text-[var(--text-muted)] transition-colors hover-hover:bg-[var(--surface-3)] hover-hover:text-[var(--text-secondary)]'
+                                className='flex size-[18px] items-center justify-center rounded-[3px] text-[var(--text-muted)] transition-colors hover-hover:bg-[var(--surface-3)] hover-hover:text-[var(--text-secondary)]'
                                 onClick={() => toggleCanonicalMode(canonicalId)}
                               >
-                                <ArrowLeftRight className='h-[12px] w-[12px]' />
+                                <ArrowLeftRight className='size-[12px]' />
                               </button>
                             </Tooltip.Trigger>
                             <Tooltip.Content side='top'>
@@ -384,17 +407,14 @@ export function AddConnectorModal({
                     {connectorConfig.tagDefinitions.map((tagDef) => (
                       <div
                         key={tagDef.id}
-                        className='flex cursor-pointer items-center gap-2 rounded-sm px-0.5 py-0.5 text-small'
-                        onClick={() => {
-                          setDisabledTagIds((prev) => {
-                            const next = new Set(prev)
-                            if (prev.has(tagDef.id)) {
-                              next.delete(tagDef.id)
-                            } else {
-                              next.add(tagDef.id)
-                            }
-                            return next
-                          })
+                        role='checkbox'
+                        aria-checked={!disabledTagIds.has(tagDef.id)}
+                        tabIndex={0}
+                        className='flex cursor-pointer items-center gap-2 rounded-sm p-0.5 text-small'
+                        onClick={() => toggleTagDefinition(tagDef.id)}
+                        onKeyDown={(event) => {
+                          if (event.target !== event.currentTarget) return
+                          handleKeyboardActivation(event, () => toggleTagDefinition(tagDef.id))
                         }}
                       >
                         <Checkbox
@@ -456,8 +476,8 @@ export function AddConnectorModal({
               <Button variant='primary' onClick={handleSubmit} disabled={!canSubmit || isCreating}>
                 {isCreating ? (
                   <>
-                    <Loader2 className='mr-1.5 h-3.5 w-3.5 animate-spin' />
-                    Connecting...
+                    <Loader className='mr-1.5 size-3.5' animate />
+                    Connecting…
                   </>
                 ) : (
                   'Connect & Sync'
@@ -504,7 +524,7 @@ function ConnectorTypeCard({ config, onClick }: ConnectorTypeCardProps) {
       className='flex items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors hover-hover:bg-[var(--surface-3)]'
       onClick={onClick}
     >
-      <Icon className='h-[18px] w-[18px] flex-shrink-0' />
+      <Icon className='size-[18px] flex-shrink-0' />
       <div className='flex min-w-0 flex-col gap-[1px]'>
         <span className='truncate font-medium text-[var(--text-primary)] text-small'>
           {config.name}

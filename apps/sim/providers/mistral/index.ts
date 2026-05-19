@@ -1,12 +1,14 @@
 import { getEnv } from '@/lib/core/config/env'
 import { createLogger } from '@sim/logger'
-import { toError } from '@sim/utils/errors'
+import { getErrorMessage, toError } from '@sim/utils/errors'
 import OpenAI from 'openai'
 import type { ChatCompletionCreateParamsStreaming } from 'openai/resources/chat/completions'
 import type { StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
+import { formatMessagesForProvider } from '@/providers/attachments'
 import { createReadableStreamFromMistralStream } from '@/providers/mistral/utils'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
+import { enrichLastModelSegmentFromChatCompletions } from '@/providers/trace-enrichment'
 import type {
   ProviderConfig,
   ProviderRequest,
@@ -78,6 +80,7 @@ export const mistralProvider: ProviderConfig = {
     if (request.messages) {
       allMessages.push(...request.messages)
     }
+    const formattedMessages = formatMessagesForProvider(allMessages, 'mistral')
 
     const tools = request.tools?.length
       ? request.tools.map((tool) => ({
@@ -92,7 +95,7 @@ export const mistralProvider: ProviderConfig = {
 
     const payload: any = {
       model: request.model,
-      messages: allMessages,
+      messages: formattedMessages,
     }
 
     if (request.temperature !== undefined) payload.temperature = request.temperature
@@ -202,7 +205,7 @@ export const mistralProvider: ProviderConfig = {
                 timeSegments: [
                   {
                     type: 'model',
-                    name: 'Streaming response',
+                    name: request.model,
                     startTime: providerStartTime,
                     endTime: Date.now(),
                     duration: Date.now() - providerStartTime,
@@ -263,7 +266,7 @@ export const mistralProvider: ProviderConfig = {
       }
       const toolCalls = []
       const toolResults: Record<string, unknown>[] = []
-      const currentMessages = [...allMessages]
+      const currentMessages = [...formattedMessages]
       let iterationCount = 0
 
       let modelTime = firstResponseTime
@@ -274,7 +277,7 @@ export const mistralProvider: ProviderConfig = {
       const timeSegments: TimeSegment[] = [
         {
           type: 'model',
-          name: 'Initial response',
+          name: request.model,
           startTime: initialCallTime,
           endTime: initialCallTime + firstResponseTime,
           duration: firstResponseTime,
@@ -289,6 +292,14 @@ export const mistralProvider: ProviderConfig = {
         }
 
         const toolCallsInResponse = currentResponse.choices[0]?.message?.tool_calls
+
+        enrichLastModelSegmentFromChatCompletions(
+          timeSegments,
+          currentResponse,
+          toolCallsInResponse,
+          { model: request.model, provider: 'mistral' }
+        )
+
         if (!toolCallsInResponse || toolCallsInResponse.length === 0) {
           break
         }
@@ -309,7 +320,9 @@ export const mistralProvider: ProviderConfig = {
             if (!tool) return null
 
             const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-            const result = await executeTool(toolName, executionParams)
+            const result = await executeTool(toolName, executionParams, {
+              signal: request.abortSignal,
+            })
             const toolCallEndTime = Date.now()
 
             return {
@@ -332,7 +345,7 @@ export const mistralProvider: ProviderConfig = {
               result: {
                 success: false,
                 output: undefined,
-                error: error instanceof Error ? error.message : 'Tool execution failed',
+                error: getErrorMessage(error, 'Tool execution failed'),
               },
               startTime: toolCallStartTime,
               endTime: toolCallEndTime,
@@ -367,6 +380,7 @@ export const mistralProvider: ProviderConfig = {
             startTime: startTime,
             endTime: endTime,
             duration: duration,
+            toolCallId: toolCall.id,
           })
 
           let resultContent: any
@@ -435,7 +449,7 @@ export const mistralProvider: ProviderConfig = {
 
         timeSegments.push({
           type: 'model',
-          name: `Model response (iteration ${iterationCount + 1})`,
+          name: request.model,
           startTime: nextModelStartTime,
           endTime: nextModelEndTime,
           duration: thisModelTime,
@@ -454,6 +468,15 @@ export const mistralProvider: ProviderConfig = {
         }
 
         iterationCount++
+      }
+
+      if (iterationCount === MAX_TOOL_ITERATIONS) {
+        enrichLastModelSegmentFromChatCompletions(
+          timeSegments,
+          currentResponse,
+          currentResponse.choices[0]?.message?.tool_calls,
+          { model: request.model, provider: 'mistral' }
+        )
       }
 
       if (request.stream) {
@@ -578,3 +601,8 @@ export const mistralProvider: ProviderConfig = {
     }
   },
 }
+
+/**
+ * Enriches the last model segment with per-iteration content from a Chat
+ * Completions response: assistant text, tool calls, finish reason, token usage.
+ */

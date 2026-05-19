@@ -1,7 +1,7 @@
 import { db } from '@sim/db'
 import { knowledgeConnector } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
-import { toError } from '@sim/utils/errors'
+import { getErrorMessage, toError } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { and, eq, isNull } from 'drizzle-orm'
 import { generateInternalToken } from '@/lib/auth/internal'
@@ -18,7 +18,11 @@ import {
   processDocumentAsync,
   updateDocument,
 } from '@/lib/knowledge/documents/service'
-import { generateSearchEmbedding } from '@/lib/knowledge/embeddings'
+import {
+  EMBEDDING_DIMENSIONS,
+  generateSearchEmbedding,
+  getConfiguredEmbeddingModel,
+} from '@/lib/knowledge/embeddings'
 import {
   createKnowledgeBase,
   deleteKnowledgeBase,
@@ -107,8 +111,8 @@ export const knowledgeBaseServerTool: BaseServerTool<KnowledgeBaseArgs, Knowledg
               description: args.description,
               workspaceId,
               userId: context.userId,
-              embeddingModel: 'text-embedding-3-small',
-              embeddingDimension: 1536,
+              embeddingModel: getConfiguredEmbeddingModel(),
+              embeddingDimension: EMBEDDING_DIMENSIONS,
               chunkingConfig: args.chunkingConfig || {
                 maxSize: 1024,
                 minSize: 1,
@@ -220,7 +224,7 @@ export const knowledgeBaseServerTool: BaseServerTool<KnowledgeBaseArgs, Knowledg
 
           const queryEmbedding = await generateSearchEmbedding(
             args.query,
-            undefined,
+            kb.embeddingModel,
             kb.workspaceId
           )
           const queryVector = JSON.stringify(queryEmbedding)
@@ -1018,7 +1022,7 @@ export const knowledgeBaseServerTool: BaseServerTool<KnowledgeBaseArgs, Knowledg
           }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+      const errorMessage = getErrorMessage(error, 'Unknown error occurred')
       logger.error('Error in knowledge_base tool', {
         operation,
         error: errorMessage,

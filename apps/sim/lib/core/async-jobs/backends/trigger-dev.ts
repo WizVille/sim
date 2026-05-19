@@ -1,5 +1,5 @@
 import { createLogger } from '@sim/logger'
-import { runs, tasks } from '@trigger.dev/sdk'
+import { runs, type TriggerOptions, tasks } from '@trigger.dev/sdk'
 import {
   type EnqueueOptions,
   JOB_STATUS,
@@ -20,9 +20,11 @@ const JOB_TYPE_TO_TASK_ID: Record<JobType, string> = {
   'schedule-execution': 'schedule-execution',
   'webhook-execution': 'webhook-execution',
   'resume-execution': 'resume-execution',
+  'workflow-group-cell': 'workflow-group-cell',
   'cleanup-logs': 'cleanup-logs',
   'cleanup-soft-deletes': 'cleanup-soft-deletes',
   'cleanup-tasks': 'cleanup-tasks',
+  'run-data-drain': 'run-data-drain',
 }
 
 /**
@@ -71,10 +73,34 @@ export class TriggerDevJobQueue implements JobQueueBackend {
         : payload
 
     const tags = buildTags(options)
-    const handle = await tasks.trigger(taskId, enrichedPayload, tags.length > 0 ? { tags } : {})
+    const triggerOptions: TriggerOptions = {}
+    if (tags.length > 0) triggerOptions.tags = tags
+    if (options?.concurrencyKey) triggerOptions.concurrencyKey = options.concurrencyKey
+    if (options?.jobId) {
+      triggerOptions.idempotencyKey = options.jobId
+      triggerOptions.idempotencyKeyTTL = '14d'
+    }
+    const handle = await tasks.trigger(taskId, enrichedPayload, triggerOptions)
 
     logger.debug('Enqueued job via trigger.dev', { jobId: handle.id, type, taskId, tags })
     return handle.id
+  }
+
+  async batchEnqueue<TPayload>(
+    type: JobType,
+    items: Array<{ payload: TPayload; options?: EnqueueOptions }>
+  ): Promise<string[]> {
+    if (items.length === 0) return []
+    // tasks.batchTrigger returns only a batchId, not per-item run IDs, so we
+    // can't use it when callers need to track individual runs (e.g. table cell
+    // tasks need per-row jobIds for cancellation). Sequential `tasks.trigger`
+    // gives us per-item IDs and naturally preserves input order in the queue.
+    const ids: string[] = []
+    for (const { payload, options } of items) {
+      const id = await this.enqueue(type, payload, options)
+      ids.push(id)
+    }
+    return ids
   }
 
   async getJob(jobId: string): Promise<Job | null> {
@@ -125,6 +151,23 @@ export class TriggerDevJobQueue implements JobQueueBackend {
   async completeJob(_jobId: string, _output: unknown): Promise<void> {}
 
   async markJobFailed(_jobId: string, _error: string): Promise<void> {}
+
+  async cancelJob(jobId: string): Promise<void> {
+    try {
+      await runs.cancel(jobId)
+      logger.debug('Cancelled trigger.dev run', { jobId })
+    } catch (error) {
+      const isNotFound =
+        (error instanceof Error && error.message.toLowerCase().includes('not found')) ||
+        (error && typeof error === 'object' && 'status' in error && error.status === 404)
+      if (isNotFound) {
+        logger.debug('Cancel target not found in trigger.dev (already finished?)', { jobId })
+        return
+      }
+      logger.error('Failed to cancel trigger.dev run', { jobId, error })
+      throw error
+    }
+  }
 }
 
 /**

@@ -62,13 +62,14 @@ export interface McpSecurityPolicy {
  * Follows JSON Schema specification with description support.
  */
 export interface McpToolSchemaProperty {
-  type: string
+  type?: string | string[]
   description?: string
   items?: McpToolSchemaProperty
   properties?: Record<string, McpToolSchemaProperty>
   required?: string[]
-  enum?: Array<string | number | boolean>
+  enum?: Array<string | number | boolean | null>
   default?: unknown
+  [key: string]: unknown
 }
 
 /**
@@ -80,6 +81,7 @@ export interface McpToolSchema {
   properties?: Record<string, McpToolSchemaProperty>
   required?: string[]
   description?: string
+  [key: string]: unknown
 }
 
 /**
@@ -159,6 +161,14 @@ export interface McpClientOptions {
   config: McpServerConfig
   securityPolicy?: McpSecurityPolicy
   onToolsChanged?: McpToolsChangedCallback
+  /**
+   * Pre-resolved IP address to pin all transport HTTP connections to. When
+   * set, the SDK transport uses a custom fetch backed by an undici Agent with
+   * a fixed DNS lookup, preventing DNS-rebinding (TOCTOU) attacks between
+   * URL validation and connection. Should be supplied by callers that have
+   * just validated the URL via `validateMcpServerSsrf`.
+   */
+  resolvedIP?: string
 }
 
 /**

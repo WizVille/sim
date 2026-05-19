@@ -1,5 +1,15 @@
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { type NextRequest, NextResponse } from 'next/server'
+import {
+  abortMultipartUploadContract,
+  type CompleteMultipartBody,
+  completeMultipartUploadContract,
+  getMultipartPartUrlsContract,
+  initiateMultipartUploadContract,
+  multipartActionSchema,
+} from '@/lib/api/contracts/storage-transfer'
+import { getValidationErrorMessage, parseRequest } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import {
@@ -13,6 +23,7 @@ import {
   type UploadTokenPayload,
   verifyUploadToken,
 } from '@/lib/uploads/core/upload-token'
+import { QUOTA_EXEMPT_STORAGE_CONTEXTS, type StorageConfig } from '@/lib/uploads/shared/types'
 import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 
 const logger = createLogger('MultipartUploadAPI')
@@ -26,33 +37,39 @@ const ALLOWED_UPLOAD_CONTEXTS = new Set<StorageContext>([
   'workspace',
   'profile-pictures',
   'og-images',
-  'logs',
   'workspace-logos',
 ])
 
-interface InitiateMultipartRequest {
-  fileName: string
-  contentType: string
-  fileSize: number
-  workspaceId: string
-  context?: StorageContext
+/**
+ * Unified part identity sent by the client when completing a multipart upload.
+ * `etag` is required for S3 (CompleteMultipartUpload). For Azure the server
+ * derives the block id from `partNumber` via {@link deriveBlobBlockId}.
+ */
+interface ClientCompletedPart {
+  partNumber: number
+  etag?: string
 }
 
-interface TokenBoundRequest {
-  uploadToken: string
-}
+const isClientCompletedParts = (value: unknown): value is ClientCompletedPart[] =>
+  Array.isArray(value) &&
+  value.every(
+    (p) =>
+      p !== null &&
+      typeof p === 'object' &&
+      typeof (p as ClientCompletedPart).partNumber === 'number' &&
+      ((p as ClientCompletedPart).etag === undefined ||
+        typeof (p as ClientCompletedPart).etag === 'string')
+  )
 
-interface GetPartUrlsRequest extends TokenBoundRequest {
-  partNumbers: number[]
-}
+const buildS3CustomConfig = (config: StorageConfig) =>
+  config.bucket && config.region ? { bucket: config.bucket, region: config.region } : undefined
 
-interface CompleteSingleRequest extends TokenBoundRequest {
-  parts: unknown
-}
-
-interface CompleteBatchRequest {
-  uploads: Array<TokenBoundRequest & { parts: unknown }>
-}
+const buildBlobCustomConfig = (config: StorageConfig) => ({
+  containerName: config.containerName!,
+  accountName: config.accountName!,
+  accountKey: config.accountKey,
+  connectionString: config.connectionString,
+})
 
 const verifyTokenForUser = (token: string | undefined, userId: string) => {
   if (!token || typeof token !== 'string') {
@@ -73,7 +90,9 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
     }
     const userId = session.user.id
 
-    const action = request.nextUrl.searchParams.get('action')
+    const actionParam = request.nextUrl.searchParams.get('action')
+    const actionResult = multipartActionSchema.safeParse(actionParam)
+    const action = actionResult.success ? actionResult.data : null
 
     if (!isUsingCloudStorage()) {
       return NextResponse.json(
@@ -86,30 +105,95 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
 
     switch (action) {
       case 'initiate': {
-        const data = (await request.json()) as InitiateMultipartRequest
+        const parsed = await parseRequest(
+          initiateMultipartUploadContract,
+          request,
+          {},
+          {
+            validationErrorResponse: (error) =>
+              NextResponse.json({ error: getValidationErrorMessage(error) }, { status: 400 }),
+          }
+        )
+        if (!parsed.success) return parsed.response
+
+        const data = parsed.data.body
         const { fileName, contentType, fileSize, workspaceId, context = 'knowledge-base' } = data
 
         if (!workspaceId || typeof workspaceId !== 'string') {
           return NextResponse.json({ error: 'workspaceId is required' }, { status: 400 })
         }
 
-        if (!ALLOWED_UPLOAD_CONTEXTS.has(context)) {
+        if (!ALLOWED_UPLOAD_CONTEXTS.has(context as StorageContext)) {
           return NextResponse.json({ error: 'Invalid storage context' }, { status: 400 })
         }
+        const storageContext = context as StorageContext
 
         const permission = await getUserEntityPermissions(userId, 'workspace', workspaceId)
         if (permission !== 'write' && permission !== 'admin') {
           return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
         }
 
-        const config = getStorageConfig(context)
+        const config = getStorageConfig(storageContext)
+
+        if (!QUOTA_EXEMPT_STORAGE_CONTEXTS.has(context as StorageContext)) {
+          const { checkStorageQuota } = await import('@/lib/billing/storage')
+          const quotaCheck = await checkStorageQuota(userId, fileSize ?? 0)
+          if (!quotaCheck.allowed) {
+            return NextResponse.json(
+              { error: quotaCheck.error || 'Storage limit exceeded' },
+              { status: 413 }
+            )
+          }
+        }
+
+        let customKey: string | undefined
+        if (context === 'workspace' || context === 'mothership') {
+          const { MAX_WORKSPACE_FILE_SIZE } = await import('@/lib/uploads/shared/types')
+          if (typeof fileSize === 'number' && fileSize > MAX_WORKSPACE_FILE_SIZE) {
+            return NextResponse.json(
+              { error: `File size exceeds maximum of ${MAX_WORKSPACE_FILE_SIZE} bytes` },
+              { status: 413 }
+            )
+          }
+
+          const { generateWorkspaceFileKey } = await import(
+            '@/lib/uploads/contexts/workspace/workspace-file-manager'
+          )
+          customKey = generateWorkspaceFileKey(workspaceId, fileName)
+        } else if (context === 'execution') {
+          const workflowId = (data as { workflowId?: unknown }).workflowId
+          const executionId = (data as { executionId?: unknown }).executionId
+          if (typeof workflowId !== 'string' || !workflowId.trim()) {
+            return NextResponse.json(
+              { error: 'workflowId is required for execution uploads' },
+              { status: 400 }
+            )
+          }
+          if (typeof executionId !== 'string' || !executionId.trim()) {
+            return NextResponse.json(
+              { error: 'executionId is required for execution uploads' },
+              { status: 400 }
+            )
+          }
+          const { generateExecutionFileKey } = await import(
+            '@/lib/uploads/contexts/execution/utils'
+          )
+          customKey = generateExecutionFileKey({ workspaceId, workflowId, executionId }, fileName)
+        }
 
         let uploadId: string
         let key: string
 
         if (storageProvider === 's3') {
           const { initiateS3MultipartUpload } = await import('@/lib/uploads/providers/s3/client')
-          const result = await initiateS3MultipartUpload({ fileName, contentType, fileSize })
+          const result = await initiateS3MultipartUpload({
+            fileName,
+            contentType,
+            fileSize,
+            customConfig: buildS3CustomConfig(config),
+            customKey,
+            purpose: context,
+          })
           uploadId = result.uploadId
           key = result.key
         } else if (storageProvider === 'blob') {
@@ -118,12 +202,8 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
             fileName,
             contentType,
             fileSize,
-            customConfig: {
-              containerName: config.containerName!,
-              accountName: config.accountName!,
-              accountKey: config.accountKey,
-              connectionString: config.connectionString,
-            },
+            customConfig: buildBlobCustomConfig(config),
+            customKey,
           })
           uploadId = result.uploadId
           key = result.key
@@ -139,18 +219,29 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
           key,
           userId,
           workspaceId,
-          context,
+          context: storageContext,
         })
 
         logger.info(
-          `Initiated ${storageProvider} multipart upload for ${fileName} (context: ${context}, workspace: ${workspaceId}): ${uploadId}`
+          `Initiated ${storageProvider} multipart upload for ${fileName} (context: ${storageContext}, workspace: ${workspaceId}): ${uploadId}`
         )
 
         return NextResponse.json({ uploadId, key, uploadToken })
       }
 
       case 'get-part-urls': {
-        const data = (await request.json()) as GetPartUrlsRequest
+        const parsed = await parseRequest(
+          getMultipartPartUrlsContract,
+          request,
+          {},
+          {
+            validationErrorResponse: (error) =>
+              NextResponse.json({ error: getValidationErrorMessage(error) }, { status: 400 }),
+          }
+        )
+        if (!parsed.success) return parsed.response
+
+        const data = parsed.data.body
         const { partNumbers } = data
 
         const tokenPayload = verifyTokenForUser(data.uploadToken, userId)
@@ -163,17 +254,21 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
 
         if (storageProvider === 's3') {
           const { getS3MultipartPartUrls } = await import('@/lib/uploads/providers/s3/client')
-          const presignedUrls = await getS3MultipartPartUrls(key, uploadId, partNumbers)
+          const presignedUrls = await getS3MultipartPartUrls(
+            key,
+            uploadId,
+            partNumbers,
+            buildS3CustomConfig(config)
+          )
           return NextResponse.json({ presignedUrls })
         }
         if (storageProvider === 'blob') {
           const { getMultipartPartUrls } = await import('@/lib/uploads/providers/blob/client')
-          const presignedUrls = await getMultipartPartUrls(key, partNumbers, {
-            containerName: config.containerName!,
-            accountName: config.accountName!,
-            accountKey: config.accountKey,
-            connectionString: config.connectionString,
-          })
+          const presignedUrls = await getMultipartPartUrls(
+            key,
+            partNumbers,
+            buildBlobCustomConfig(config)
+          )
           return NextResponse.json({ presignedUrls })
         }
 
@@ -184,110 +279,131 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
       }
 
       case 'complete': {
-        const data = (await request.json()) as CompleteSingleRequest | CompleteBatchRequest
+        const parsed = await parseRequest(
+          completeMultipartUploadContract,
+          request,
+          {},
+          {
+            validationErrorResponse: (error) =>
+              NextResponse.json({ error: getValidationErrorMessage(error) }, { status: 400 }),
+          }
+        )
+        if (!parsed.success) return parsed.response
 
-        if ('uploads' in data && Array.isArray(data.uploads)) {
-          const verified = data.uploads.map((upload) => {
-            const payload = verifyTokenForUser(upload.uploadToken, userId)
-            return payload ? { payload, parts: upload.parts } : null
-          })
+        const data: CompleteMultipartBody = parsed.data.body
 
-          if (verified.some((entry) => entry === null)) {
-            return NextResponse.json({ error: 'Invalid or expired upload token' }, { status: 403 })
+        const s3Module =
+          storageProvider === 's3' ? await import('@/lib/uploads/providers/s3/client') : null
+        const blobModule =
+          storageProvider === 'blob' ? await import('@/lib/uploads/providers/blob/client') : null
+
+        const completeOne = async (payload: UploadTokenPayload, parts: ClientCompletedPart[]) => {
+          const { uploadId, key, context } = payload
+          const config = getStorageConfig(context)
+
+          if (storageProvider === 's3' && s3Module) {
+            const { completeS3MultipartUpload } = s3Module
+            const s3Parts = parts.map((p) => {
+              if (!p.etag) {
+                throw new Error(`Missing etag for S3 part ${p.partNumber}`)
+              }
+              return { ETag: p.etag, PartNumber: p.partNumber }
+            })
+            const result = await completeS3MultipartUpload(
+              key,
+              uploadId,
+              s3Parts,
+              buildS3CustomConfig(config)
+            )
+            return {
+              success: true as const,
+              location: result.location,
+              path: result.path,
+              key: result.key,
+            }
           }
 
-          const verifiedEntries = verified.filter(
-            (entry): entry is { payload: UploadTokenPayload; parts: unknown } => entry !== null
-          )
+          if (storageProvider === 'blob' && blobModule) {
+            const { completeMultipartUpload, deriveBlobBlockId } = blobModule
+            const blobParts = parts.map((p) => ({
+              partNumber: p.partNumber,
+              blockId: deriveBlobBlockId(p.partNumber),
+            }))
+            const result = await completeMultipartUpload(
+              key,
+              blobParts,
+              buildBlobCustomConfig(config)
+            )
+            return {
+              success: true as const,
+              location: result.location,
+              path: result.path,
+              key: result.key,
+            }
+          }
+
+          throw new Error(`Unsupported storage provider: ${storageProvider}`)
+        }
+
+        if ('uploads' in data && Array.isArray(data.uploads)) {
+          const verified: Array<{ payload: UploadTokenPayload; parts: ClientCompletedPart[] }> = []
+          for (const upload of data.uploads) {
+            const payload = verifyTokenForUser(upload.uploadToken, userId)
+            if (!payload) {
+              return NextResponse.json(
+                { error: 'Invalid or expired upload token' },
+                { status: 403 }
+              )
+            }
+            if (!isClientCompletedParts(upload.parts)) {
+              return NextResponse.json(
+                { error: 'Invalid parts payload: expected [{ partNumber, etag? }]' },
+                { status: 400 }
+              )
+            }
+            verified.push({ payload, parts: upload.parts })
+          }
 
           const results = await Promise.all(
-            verifiedEntries.map(async ({ payload, parts }) => {
-              const { uploadId, key, context } = payload
-              const config = getStorageConfig(context)
-
-              if (storageProvider === 's3') {
-                const { completeS3MultipartUpload } = await import(
-                  '@/lib/uploads/providers/s3/client'
-                )
-                const result = await completeS3MultipartUpload(key, uploadId, parts as any)
-                return {
-                  success: true,
-                  location: result.location,
-                  path: result.path,
-                  key: result.key,
-                }
-              }
-              if (storageProvider === 'blob') {
-                const { completeMultipartUpload } = await import(
-                  '@/lib/uploads/providers/blob/client'
-                )
-                const result = await completeMultipartUpload(key, parts as any, {
-                  containerName: config.containerName!,
-                  accountName: config.accountName!,
-                  accountKey: config.accountKey,
-                  connectionString: config.connectionString,
-                })
-                return {
-                  success: true,
-                  location: result.location,
-                  path: result.path,
-                  key: result.key,
-                }
-              }
-
-              throw new Error(`Unsupported storage provider: ${storageProvider}`)
-            })
+            verified.map(({ payload, parts }) => completeOne(payload, parts))
           )
 
-          logger.info(`Completed ${verifiedEntries.length} multipart uploads`)
+          logger.info(`Completed ${verified.length} multipart uploads`)
           return NextResponse.json({ results })
         }
 
-        const single = data as CompleteSingleRequest
+        const single = data
         const tokenPayload = verifyTokenForUser(single.uploadToken, userId)
         if (!tokenPayload) {
           return NextResponse.json({ error: 'Invalid or expired upload token' }, { status: 403 })
         }
-
-        const { uploadId, key, context } = tokenPayload
-        const config = getStorageConfig(context)
-
-        if (storageProvider === 's3') {
-          const { completeS3MultipartUpload } = await import('@/lib/uploads/providers/s3/client')
-          const result = await completeS3MultipartUpload(key, uploadId, single.parts as any)
-          logger.info(`Completed S3 multipart upload for key ${key} (context: ${context})`)
-          return NextResponse.json({
-            success: true,
-            location: result.location,
-            path: result.path,
-            key: result.key,
-          })
-        }
-        if (storageProvider === 'blob') {
-          const { completeMultipartUpload } = await import('@/lib/uploads/providers/blob/client')
-          const result = await completeMultipartUpload(key, single.parts as any, {
-            containerName: config.containerName!,
-            accountName: config.accountName!,
-            accountKey: config.accountKey,
-            connectionString: config.connectionString,
-          })
-          logger.info(`Completed Azure multipart upload for key ${key} (context: ${context})`)
-          return NextResponse.json({
-            success: true,
-            location: result.location,
-            path: result.path,
-            key: result.key,
-          })
+        if (!isClientCompletedParts(single.parts)) {
+          return NextResponse.json(
+            { error: 'Invalid parts payload: expected [{ partNumber, etag? }]' },
+            { status: 400 }
+          )
         }
 
-        return NextResponse.json(
-          { error: `Unsupported storage provider: ${storageProvider}` },
-          { status: 400 }
+        const result = await completeOne(tokenPayload, single.parts)
+        logger.info(
+          `Completed ${storageProvider} multipart upload for key ${tokenPayload.key} (context: ${tokenPayload.context})`
         )
+        return NextResponse.json(result)
       }
 
       case 'abort': {
-        const data = (await request.json()) as TokenBoundRequest
+        const parsed = await parseRequest(
+          abortMultipartUploadContract,
+          request,
+          {},
+          {
+            validationErrorResponse: (error) =>
+              NextResponse.json({ error: getValidationErrorMessage(error) }, { status: 400 }),
+          }
+        )
+        if (!parsed.success) return parsed.response
+
+        const data = parsed.data.body
         const tokenPayload = verifyTokenForUser(data.uploadToken, userId)
         if (!tokenPayload) {
           return NextResponse.json({ error: 'Invalid or expired upload token' }, { status: 403 })
@@ -298,16 +414,11 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
 
         if (storageProvider === 's3') {
           const { abortS3MultipartUpload } = await import('@/lib/uploads/providers/s3/client')
-          await abortS3MultipartUpload(key, uploadId)
+          await abortS3MultipartUpload(key, uploadId, buildS3CustomConfig(config))
           logger.info(`Aborted S3 multipart upload for key ${key} (context: ${context})`)
         } else if (storageProvider === 'blob') {
           const { abortMultipartUpload } = await import('@/lib/uploads/providers/blob/client')
-          await abortMultipartUpload(key, {
-            containerName: config.containerName!,
-            accountName: config.accountName!,
-            accountKey: config.accountKey,
-            connectionString: config.connectionString,
-          })
+          await abortMultipartUpload(key, buildBlobCustomConfig(config))
           logger.info(`Aborted Azure multipart upload for key ${key} (context: ${context})`)
         } else {
           return NextResponse.json(
@@ -328,7 +439,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
   } catch (error) {
     logger.error('Multipart upload error:', error)
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Multipart upload failed' },
+      { error: getErrorMessage(error, 'Multipart upload failed') },
       { status: 500 }
     )
   }

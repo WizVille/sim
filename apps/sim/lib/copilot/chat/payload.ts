@@ -1,11 +1,13 @@
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
+import { LRUCache } from 'lru-cache'
 import { getHighestPrioritySubscription } from '@/lib/billing/core/subscription'
 import { isPaid } from '@/lib/billing/plan-helpers'
 import { getToolEntry } from '@/lib/copilot/tool-executor/router'
 import { getCopilotToolDescription } from '@/lib/copilot/tools/descriptions'
 import { isHosted } from '@/lib/core/config/feature-flags'
-import { createMcpToolId } from '@/lib/mcp/utils'
+import { registerCache } from '@/lib/monitoring/cache-registry'
+import { buildMothershipToolsForRequest } from '@/lib/mothership/settings/runtime'
 import { trackChatUpload } from '@/lib/uploads/contexts/workspace/workspace-file-manager'
 import { tools } from '@/tools/registry'
 import { getLatestVersionTools, stripVersionSuffix } from '@/tools/utils'
@@ -13,13 +15,12 @@ import { getLatestVersionTools, stripVersionSuffix } from '@/tools/utils'
 const logger = createLogger('CopilotChatPayload')
 const TOOL_SCHEMA_CACHE_TTL_MS = 30_000
 
-type ToolSchemaCacheEntry = {
-  expiresAt: number
-  value?: ToolSchema[]
-  promise?: Promise<ToolSchema[]>
-}
+const toolSchemaCache = new LRUCache<string, Promise<ToolSchema[]>>({
+  max: 200,
+  ttl: TOOL_SCHEMA_CACHE_TTL_MS,
+})
 
-const toolSchemaCache = new Map<string, ToolSchemaCacheEntry>()
+registerCache('toolSchemaCache', () => toolSchemaCache.size)
 
 interface BuildPayloadParams {
   message: string
@@ -40,6 +41,7 @@ interface BuildPayloadParams {
   workspaceContext?: string
   userPermission?: string
   userTimezone?: string
+  includeMothershipTools?: boolean
 }
 
 export interface ToolSchema {
@@ -48,6 +50,7 @@ export interface ToolSchema {
   input_schema: Record<string, unknown>
   defer_loading?: boolean
   executeLocally?: boolean
+  params?: Record<string, unknown>
   oauth?: { required: boolean; provider: string }
 }
 
@@ -72,13 +75,10 @@ export async function buildIntegrationToolSchemas(
   workspaceId?: string
 ): Promise<ToolSchema[]> {
   const cacheKey = `${userId}:${workspaceId ?? ''}:${options.schemaSurface ?? 'copilot'}`
-  const now = Date.now()
+
   const cached = toolSchemaCache.get(cacheKey)
-  if (cached?.value && cached.expiresAt > now) {
-    return cached.value.map((tool) => ({ ...tool, input_schema: { ...tool.input_schema } }))
-  }
-  if (cached?.promise) {
-    const tools = await cached.promise
+  if (cached) {
+    const tools = await cached
     return tools.map((tool) => ({ ...tool, input_schema: { ...tool.input_schema } }))
   }
 
@@ -151,7 +151,7 @@ export async function buildIntegrationToolSchemas(
               fallbackName: strippedName,
               appendEmailTagline: shouldAppendEmailTagline,
             }),
-            input_schema: userSchema as unknown as Record<string, unknown>,
+            input_schema: { ...userSchema },
             defer_loading: true,
             executeLocally:
               catalogEntry?.clientExecutable === true || catalogEntry?.route === 'client',
@@ -185,18 +185,10 @@ export async function buildIntegrationToolSchemas(
       )
     }
 
-    toolSchemaCache.set(cacheKey, {
-      value: integrationTools,
-      expiresAt: Date.now() + TOOL_SCHEMA_CACHE_TTL_MS,
-    })
-
     return integrationTools
   })()
 
-  toolSchemaCache.set(cacheKey, {
-    expiresAt: now + TOOL_SCHEMA_CACHE_TTL_MS,
-    promise,
-  })
+  toolSchemaCache.set(cacheKey, promise)
 
   const integrationTools = await promise
   return integrationTools.map((tool) => ({ ...tool, input_schema: { ...tool.input_schema } }))
@@ -238,7 +230,7 @@ export async function buildCopilotRequestPayload(
       const filename = (f.filename ?? f.name ?? 'file') as string
       const mediaType = (f.media_type ?? f.mimeType ?? 'application/octet-stream') as string
       try {
-        await trackChatUpload(
+        const { displayName } = await trackChatUpload(
           params.workspaceId,
           userId,
           chatId,
@@ -248,13 +240,13 @@ export async function buildCopilotRequestPayload(
           f.size
         )
         const lines = [
-          `File "${filename}" (${mediaType}, ${f.size} bytes) uploaded.`,
-          `Read with: read("uploads/${filename}")`,
-          `To save permanently: materialize_file(fileName: "${filename}")`,
+          `File "${displayName}" (${mediaType}, ${f.size} bytes) uploaded.`,
+          `Read with: read("uploads/${displayName}")`,
+          `To save permanently: materialize_file(fileName: "${displayName}")`,
         ]
-        if (filename.endsWith('.json')) {
+        if (displayName.endsWith('.json')) {
           lines.push(
-            `To import as a workflow: materialize_file(fileName: "${filename}", operation: "import")`
+            `To import as a workflow: materialize_file(fileName: "${displayName}", operation: "import")`
           )
         }
         uploadContexts.push({
@@ -274,6 +266,8 @@ export async function buildCopilotRequestPayload(
   const allContexts = [...(contexts ?? []), ...uploadContexts]
 
   let integrationTools: ToolSchema[] = []
+  let mothershipTools: ToolSchema[] = []
+  let workspaceContext = params.workspaceContext
 
   const payloadLogger = logger.withMetadata({ messageId: userMessageId })
 
@@ -285,32 +279,23 @@ export async function buildCopilotRequestPayload(
       params.workspaceId
     )
 
-    // Discover MCP tools from workspace servers and include as deferred tools
-    if (params.workspaceId) {
+    if (params.includeMothershipTools && params.workspaceId) {
       try {
-        const { mcpService } = await import('@/lib/mcp/service')
-        const mcpTools = await mcpService.discoverTools(userId, params.workspaceId)
-        for (const mcpTool of mcpTools) {
-          integrationTools.push({
-            name: createMcpToolId(mcpTool.serverId, mcpTool.name),
-            description: mcpTool.description || `MCP tool: ${mcpTool.name} (${mcpTool.serverName})`,
-            input_schema: mcpTool.inputSchema as unknown as Record<string, unknown>,
-            executeLocally: false,
-          })
-        }
-        if (mcpTools.length > 0) {
-          logger.error(
-            userMessageId
-              ? `Added MCP tools to copilot payload [messageId:${userMessageId}]`
-              : 'Added MCP tools to copilot payload',
-            { count: mcpTools.length }
-          )
+        const runtimeTools = await buildMothershipToolsForRequest({
+          workspaceId: params.workspaceId,
+          userId,
+        })
+        mothershipTools = runtimeTools.tools
+        if (runtimeTools.catalogContext) {
+          workspaceContext = [workspaceContext, runtimeTools.catalogContext]
+            .filter(Boolean)
+            .join('\n\n')
         }
       } catch (error) {
         logger.warn(
           userMessageId
-            ? `Failed to discover MCP tools for copilot [messageId:${userMessageId}]`
-            : 'Failed to discover MCP tools for copilot',
+            ? `Failed to build Mothership tools [messageId:${userMessageId}]`
+            : 'Failed to build Mothership tools',
           {
             error: toError(error).message,
           }
@@ -334,8 +319,9 @@ export async function buildCopilotRequestPayload(
     ...(typeof prefetch === 'boolean' ? { prefetch } : {}),
     ...(implicitFeedback ? { implicitFeedback } : {}),
     ...(integrationTools.length > 0 ? { integrationTools } : {}),
+    ...(mothershipTools.length > 0 ? { mothershipTools } : {}),
     ...(commands && commands.length > 0 ? { commands } : {}),
-    ...(params.workspaceContext ? { workspaceContext: params.workspaceContext } : {}),
+    ...(workspaceContext ? { workspaceContext } : {}),
     ...(params.userPermission ? { userPermission: params.userPermission } : {}),
     ...(params.userTimezone ? { userTimezone: params.userTimezone } : {}),
     isHosted,

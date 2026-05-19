@@ -26,6 +26,7 @@ export interface ExecutionMetadata {
   enforceCredentialAccess?: boolean
   pendingBlocks?: string[]
   resumeFromSnapshot?: boolean
+  resumeTerminalNoop?: boolean
   credentialAccountUserId?: string
   workflowStateOverride?: {
     blocks: Record<string, any>
@@ -34,6 +35,8 @@ export interface ExecutionMetadata {
     parallels?: Record<string, any>
     deploymentVersionId?: string
   }
+  largeValueExecutionIds?: string[]
+  allowLargeValueWorkflowScope?: boolean
   callChain?: string[]
   correlation?: AsyncExecutionCorrelation
   executionMode?: 'sync' | 'stream' | 'async'
@@ -54,6 +57,7 @@ export interface SerializableExecutionState {
   activeExecutionPath: string[]
   pendingQueue?: string[]
   remainingEdges?: Edge[]
+  resumeTerminalNoop?: boolean
   dagIncomingEdges?: Record<string, string[]>
   completedPauseContexts?: string[]
 }
@@ -133,13 +137,16 @@ export interface ExecutionCallbacks {
     blockId: string,
     childWorkflowInstanceId: string,
     iterationContext?: IterationContext,
-    executionOrder?: number
-  ) => void
+    executionOrder?: number,
+    childWorkflowContext?: ChildWorkflowContext
+  ) => Promise<void>
 }
 
 export interface ContextExtensions {
   workspaceId?: string
   executionId?: string
+  largeValueExecutionIds?: string[]
+  allowLargeValueWorkflowScope?: boolean
   userId?: string
   stream?: boolean
   selectedOutputs?: string[]
@@ -200,8 +207,9 @@ export interface ContextExtensions {
     blockId: string,
     childWorkflowInstanceId: string,
     iterationContext?: IterationContext,
-    executionOrder?: number
-  ) => void
+    executionOrder?: number,
+    childWorkflowContext?: ChildWorkflowContext
+  ) => Promise<void>
 
   /**
    * Run-from-block configuration. When provided, executor runs in partial
@@ -225,7 +233,7 @@ export interface WorkflowInput {
   [key: string]: unknown
 }
 
-export interface BlockStateReader {
+interface BlockStateReader {
   getBlockOutput(blockId: string, currentNodeId?: string): NormalizedBlockOutput | undefined
   hasExecuted(blockId: string): boolean
 }

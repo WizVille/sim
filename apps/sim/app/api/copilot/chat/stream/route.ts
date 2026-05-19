@@ -1,7 +1,10 @@
-import { context as otelContext, trace } from '@opentelemetry/api'
+import { type Context, context as otelContext, type Span, trace } from '@opentelemetry/api'
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { sleep } from '@sim/utils/helpers'
 import { type NextRequest, NextResponse } from 'next/server'
+import { copilotChatStreamContract } from '@/lib/api/contracts/copilot'
+import { parseRequest } from '@/lib/api/server'
 import { getLatestRunForStream } from '@/lib/copilot/async-runs/repository'
 import {
   MothershipStreamV1CompletionStatus,
@@ -119,10 +122,9 @@ export const GET = withRouteHandler(async (request: NextRequest) => {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const url = new URL(request.url)
-  const streamId = url.searchParams.get('streamId') || ''
-  const afterCursor = url.searchParams.get('after') || ''
-  const batchMode = url.searchParams.get('batch') === 'true'
+  const parsed = await parseRequest(copilotChatStreamContract, request, {})
+  if (!parsed.success) return parsed.response
+  const { streamId, after: afterCursor, batch: batchMode } = parsed.data.query
 
   if (!streamId) {
     return NextResponse.json({ error: 'streamId is required' }, { status: 400 })
@@ -192,13 +194,13 @@ async function handleResumeRequestBody({
   afterCursor: string
   batchMode: boolean
   authenticatedUserId: string
-  rootSpan: import('@opentelemetry/api').Span
-  rootContext: import('@opentelemetry/api').Context
+  rootSpan: Span
+  rootContext: Context
 }) {
   const run = await getLatestRunForStream(streamId, authenticatedUserId).catch((err) => {
     logger.warn('Failed to fetch latest run for stream', {
       streamId,
-      error: err instanceof Error ? err.message : String(err),
+      error: getErrorMessage(err),
     })
     return null
   })
@@ -223,7 +225,7 @@ async function handleResumeRequestBody({
       readFilePreviewSessions(streamId).catch((error) => {
         logger.warn('Failed to read preview sessions for stream batch', {
           streamId,
-          error: error instanceof Error ? error.message : String(error),
+          error: getErrorMessage(error),
         })
         return []
       }),
@@ -247,6 +249,7 @@ async function handleResumeRequestBody({
       events: batchEvents,
       previewSessions,
       status: run.status,
+      ...(run.chatId ? { chatId: run.chatId } : {}),
     })
   }
 
@@ -393,7 +396,7 @@ async function handleResumeRequestBody({
           (err) => {
             logger.warn('Failed to poll latest run for stream', {
               streamId,
-              error: err instanceof Error ? err.message : String(err),
+              error: getErrorMessage(err),
             })
             return null
           }
@@ -450,7 +453,7 @@ async function handleResumeRequestBody({
       if (!controllerClosed && !request.signal.aborted) {
         logger.warn('Stream replay failed', {
           streamId,
-          error: error instanceof Error ? error.message : String(error),
+          error: getErrorMessage(error),
         })
         emitTerminalIfMissing(MothershipStreamV1CompletionStatus.error, {
           message: 'The stream replay failed before completion.',

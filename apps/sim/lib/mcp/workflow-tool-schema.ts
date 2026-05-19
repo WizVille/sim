@@ -8,7 +8,8 @@ import type { McpToolSchema } from './types'
  * Extended property definition for workflow tool schemas.
  * More specific than the generic McpToolSchema properties.
  */
-export interface McpToolProperty {
+interface McpToolProperty {
+  [key: string]: unknown
   type: string
   description?: string
   items?: McpToolProperty
@@ -23,7 +24,7 @@ export interface McpToolInputSchema extends McpToolSchema {
   properties: Record<string, McpToolProperty>
 }
 
-export interface McpToolDefinition {
+interface McpToolDefinition {
   name: string
   description: string
   inputSchema: McpToolInputSchema
@@ -56,7 +57,7 @@ function fieldTypeToZod(fieldType: string | undefined, isRequired: boolean): z.Z
       zodType = z.boolean()
       break
     case 'object':
-      zodType = z.record(z.any())
+      zodType = z.record(z.string(), z.any())
       break
     case 'array':
       zodType = z.array(z.any())
@@ -80,7 +81,7 @@ export function generateToolZodSchema(inputFormat: InputFormatField[]): z.ZodRaw
     return undefined
   }
 
-  const shape: z.ZodRawShape = {}
+  const shape: Record<string, z.ZodTypeAny> = {}
 
   for (const field of inputFormat) {
     if (!field.name) continue

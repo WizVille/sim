@@ -1,14 +1,24 @@
-import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { db } from '@sim/db'
 import { workflowMcpServer, workflowMcpTool } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
 import { and, eq, isNull } from 'drizzle-orm'
 import type { NextRequest } from 'next/server'
+import {
+  updateWorkflowMcpServerBodySchema,
+  workflowMcpServerParamsSchema,
+} from '@/lib/api/contracts/workflow-mcp-servers'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { getParsedBody, withMcpAuth } from '@/lib/mcp/middleware'
-import { mcpPubSub } from '@/lib/mcp/pubsub'
-import { createMcpErrorResponse, createMcpSuccessResponse } from '@/lib/mcp/utils'
+import {
+  performDeleteWorkflowMcpServer,
+  performUpdateWorkflowMcpServer,
+} from '@/lib/mcp/orchestration'
+import {
+  createMcpErrorResponse,
+  createMcpSuccessResponse,
+  mcpOrchestrationStatus,
+} from '@/lib/mcp/utils'
 
 const logger = createLogger('WorkflowMcpServerAPI')
 
@@ -25,7 +35,7 @@ export const GET = withRouteHandler(
   withMcpAuth<RouteParams>('read')(
     async (request: NextRequest, { userId, workspaceId, requestId }, { params }) => {
       try {
-        const { id: serverId } = await params
+        const { id: serverId } = workflowMcpServerParamsSchema.parse(await params)
 
         logger.info(`[${requestId}] Getting workflow MCP server: ${serverId}`)
 
@@ -83,66 +93,40 @@ export const PATCH = withRouteHandler(
       { params }
     ) => {
       try {
-        const { id: serverId } = await params
-        const body = getParsedBody(request) || (await request.json())
+        const { id: serverId } = workflowMcpServerParamsSchema.parse(await params)
+        const rawBody = getParsedBody(request) ?? (await request.json())
+        const parsedBody = updateWorkflowMcpServerBodySchema.safeParse(rawBody)
+
+        if (!parsedBody.success) {
+          return createMcpErrorResponse(parsedBody.error, 'Invalid request format', 400)
+        }
+
+        const body = parsedBody.data
 
         logger.info(`[${requestId}] Updating workflow MCP server: ${serverId}`)
 
-        const [existingServer] = await db
-          .select({ id: workflowMcpServer.id })
-          .from(workflowMcpServer)
-          .where(
-            and(
-              eq(workflowMcpServer.id, serverId),
-              eq(workflowMcpServer.workspaceId, workspaceId),
-              isNull(workflowMcpServer.deletedAt)
-            )
-          )
-          .limit(1)
-
-        if (!existingServer) {
-          return createMcpErrorResponse(new Error('Server not found'), 'Server not found', 404)
-        }
-
-        const updateData: Record<string, unknown> = {
-          updatedAt: new Date(),
-        }
-
-        if (body.name !== undefined) {
-          updateData.name = body.name.trim()
-        }
-        if (body.description !== undefined) {
-          updateData.description = body.description?.trim() || null
-        }
-        if (body.isPublic !== undefined) {
-          updateData.isPublic = body.isPublic
-        }
-
-        const [updatedServer] = await db
-          .update(workflowMcpServer)
-          .set(updateData)
-          .where(and(eq(workflowMcpServer.id, serverId), isNull(workflowMcpServer.deletedAt)))
-          .returning()
-
-        logger.info(`[${requestId}] Successfully updated workflow MCP server: ${serverId}`)
-
-        recordAudit({
+        const result = await performUpdateWorkflowMcpServer({
+          serverId,
           workspaceId,
-          actorId: userId,
+          userId,
           actorName: userName,
           actorEmail: userEmail,
-          action: AuditAction.MCP_SERVER_UPDATED,
-          resourceType: AuditResourceType.MCP_SERVER,
-          resourceId: serverId,
-          resourceName: updatedServer.name,
-          description: `Updated workflow MCP server "${updatedServer.name}"`,
-          metadata: {
-            serverName: updatedServer.name,
-            isPublic: updatedServer.isPublic,
-            updatedFields: Object.keys(updateData).filter((k) => k !== 'updatedAt'),
-          },
-          request,
+          name: body.name,
+          description: body.description,
+          isPublic: body.isPublic,
         })
+        if (!result.success || !result.server) {
+          const status = mcpOrchestrationStatus(result.errorCode)
+          return createMcpErrorResponse(
+            new Error(result.error || 'Failed to update workflow MCP server'),
+            result.error || 'Failed to update workflow MCP server',
+            status
+          )
+        }
+
+        const updatedServer = result.server
+
+        logger.info(`[${requestId}] Successfully updated workflow MCP server: ${serverId}`)
 
         return createMcpSuccessResponse({ server: updatedServer })
       } catch (error) {
@@ -164,38 +148,27 @@ export const DELETE = withRouteHandler(
       { params }
     ) => {
       try {
-        const { id: serverId } = await params
+        const { id: serverId } = workflowMcpServerParamsSchema.parse(await params)
 
         logger.info(`[${requestId}] Deleting workflow MCP server: ${serverId}`)
 
-        const [deletedServer] = await db
-          .delete(workflowMcpServer)
-          .where(
-            and(eq(workflowMcpServer.id, serverId), eq(workflowMcpServer.workspaceId, workspaceId))
-          )
-          .returning()
-
-        if (!deletedServer) {
-          return createMcpErrorResponse(new Error('Server not found'), 'Server not found', 404)
-        }
-
-        logger.info(`[${requestId}] Successfully deleted workflow MCP server: ${serverId}`)
-
-        mcpPubSub?.publishWorkflowToolsChanged({ serverId, workspaceId })
-
-        recordAudit({
+        const result = await performDeleteWorkflowMcpServer({
+          serverId,
           workspaceId,
-          actorId: userId,
+          userId,
           actorName: userName,
           actorEmail: userEmail,
-          action: AuditAction.MCP_SERVER_REMOVED,
-          resourceType: AuditResourceType.MCP_SERVER,
-          resourceId: serverId,
-          resourceName: deletedServer.name,
-          description: `Unpublished workflow MCP server "${deletedServer.name}"`,
-          metadata: { serverName: deletedServer.name },
-          request,
         })
+        if (!result.success || !result.server) {
+          return createMcpErrorResponse(
+            new Error(result.error || 'Server not found'),
+            result.error || 'Server not found',
+            mcpOrchestrationStatus(result.errorCode)
+          )
+        }
+        const deletedServer = result.server
+
+        logger.info(`[${requestId}] Successfully deleted workflow MCP server: ${serverId}`)
 
         return createMcpSuccessResponse({ message: `Server ${serverId} deleted successfully` })
       } catch (error) {

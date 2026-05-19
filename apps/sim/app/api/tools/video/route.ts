@@ -1,13 +1,16 @@
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { sleep } from '@sim/utils/helpers'
 import { generateId } from '@sim/utils/id'
 import { type NextRequest, NextResponse } from 'next/server'
+import { videoProviders, videoToolContract } from '@/lib/api/contracts/tools/media/video'
+import { getValidationErrorMessage, parseRequest, validationErrorResponse } from '@/lib/api/server'
 import { checkInternalAuth } from '@/lib/auth/hybrid'
 import { getMaxExecutionTimeout } from '@/lib/core/execution-limits'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { downloadFileFromStorage } from '@/lib/uploads/utils/file-utils.server'
+import { assertToolFileAccess } from '@/app/api/files/authorization'
 import type { UserFile } from '@/executor/types'
-import type { VideoRequestBody } from '@/tools/video/types'
 
 const logger = createLogger('VideoProxyAPI')
 
@@ -20,22 +23,31 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
 
   try {
     const authResult = await checkInternalAuth(request, { requireWorkflowId: false })
-    if (!authResult.success) {
+    if (!authResult.success || !authResult.userId) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const body: VideoRequestBody = await request.json()
+    const parsed = await parseRequest(
+      videoToolContract,
+      request,
+      {},
+      {
+        validationErrorResponse: (error) => {
+          logger.warn(`[${requestId}] Invalid video request:`, error.issues)
+          return validationErrorResponse(
+            error,
+            getValidationErrorMessage(error, 'Invalid request data')
+          )
+        },
+      }
+    )
+    if (!parsed.success) return parsed.response
+
+    const body = parsed.data.body
     const { provider, apiKey, model, prompt, duration, aspectRatio, resolution } = body
 
-    if (!provider || !apiKey || !prompt) {
-      return NextResponse.json(
-        { error: 'Missing required fields: provider, apiKey, and prompt' },
-        { status: 400 }
-      )
-    }
-
-    const validProviders = ['runway', 'veo', 'luma', 'minimax', 'falai']
-    if (!validProviders.includes(provider)) {
+    const validProviders = videoProviders
+    if (!validProviders.includes(provider as (typeof videoProviders)[number])) {
       return NextResponse.json(
         { error: `Invalid provider. Must be one of: ${validProviders.join(', ')}` },
         { status: 400 }
@@ -89,6 +101,16 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
     let height: number | undefined
     let jobId: string | undefined
     let actualDuration: number | undefined
+
+    if (body.visualReference) {
+      const denied = await assertToolFileAccess(
+        body.visualReference.key,
+        authResult.userId,
+        requestId,
+        logger
+      )
+      if (denied) return denied
+    }
 
     try {
       if (provider === 'runway') {
@@ -184,15 +206,22 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
       }
     } catch (error) {
       logger.error(`[${requestId}] Video generation failed:`, error)
-      const errorMessage = error instanceof Error ? error.message : 'Video generation failed'
+      const errorMessage = getErrorMessage(error, 'Video generation failed')
       return NextResponse.json({ error: errorMessage }, { status: 500 })
     }
 
-    const hasExecutionContext = body.workspaceId && body.workflowId && body.executionId
+    const executionContext =
+      body.workspaceId && body.workflowId && body.executionId
+        ? {
+            workspaceId: body.workspaceId,
+            workflowId: body.workflowId,
+            executionId: body.executionId,
+          }
+        : null
 
     logger.info(`[${requestId}] Storing video file, size: ${videoBuffer.length} bytes`)
 
-    if (hasExecutionContext) {
+    if (executionContext) {
       const { uploadExecutionFile } = await import('@/lib/uploads/contexts/execution')
       const timestamp = Date.now()
       const fileName = `video-${provider}-${timestamp}.mp4`
@@ -200,11 +229,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
       let videoFile
       try {
         videoFile = await uploadExecutionFile(
-          {
-            workspaceId: body.workspaceId!,
-            workflowId: body.workflowId!,
-            executionId: body.executionId!,
-          },
+          executionContext,
           videoBuffer,
           fileName,
           'video/mp4',
@@ -218,9 +243,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
         })
       } catch (error) {
         logger.error(`[${requestId}] Failed to upload video file:`, error)
-        throw new Error(
-          `Failed to store video: ${error instanceof Error ? error.message : 'Unknown error'}`
-        )
+        throw new Error(`Failed to store video: ${getErrorMessage(error, 'Unknown error')}`)
       }
 
       return NextResponse.json({
@@ -251,9 +274,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
       videoUrl = `${getBaseUrl()}${fileInfo.path}`
     } catch (error) {
       logger.error(`[${requestId}] Failed to upload video file (fallback):`, error)
-      throw new Error(
-        `Failed to store video: ${error instanceof Error ? error.message : 'Unknown error'}`
-      )
+      throw new Error(`Failed to store video: ${getErrorMessage(error, 'Unknown error')}`)
     }
 
     logger.info(`[${requestId}] Video generation completed successfully`)
@@ -269,7 +290,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
     })
   } catch (error) {
     logger.error(`[${requestId}] Video proxy error:`, error)
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+    const errorMessage = getErrorMessage(error, 'Unknown error')
     return NextResponse.json({ error: errorMessage }, { status: 500 })
   }
 })

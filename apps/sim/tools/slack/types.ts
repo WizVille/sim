@@ -400,11 +400,6 @@ export const USER_OUTPUT_PROPERTIES = {
     optional: true,
   },
   is_app_user: { type: 'boolean', description: 'Whether user is an app user', optional: true },
-  is_stranger: {
-    type: 'boolean',
-    description: 'Whether user is from different workspace',
-    optional: true,
-  },
   deleted: { type: 'boolean', description: 'Whether the user is deactivated' },
   color: { type: 'string', description: 'User color for display', optional: true },
   timezone: {
@@ -484,8 +479,6 @@ export const USERS_OUTPUT: OutputProperty = {
  */
 export const CANVAS_OUTPUT_PROPERTIES = {
   canvas_id: { type: 'string', description: 'Unique canvas identifier' },
-  channel: { type: 'string', description: 'Channel where canvas was created' },
-  title: { type: 'string', description: 'Canvas title' },
 } as const satisfies Record<string, OutputProperty>
 
 /**
@@ -683,7 +676,7 @@ export const REACTION_METADATA_OUTPUT_PROPERTIES = {
   reaction: { type: 'string', description: 'Emoji reaction name' },
 } as const satisfies Record<string, OutputProperty>
 
-export interface SlackBaseParams {
+interface SlackBaseParams {
   authMethod: 'oauth' | 'bot_token'
   accessToken: string
   botToken: string
@@ -693,7 +686,6 @@ export interface SlackMessageParams extends SlackBaseParams {
   destinationType?: 'channel' | 'dm'
   channel?: string
   dmUserId?: string
-  userId?: string
   text: string
   threadTs?: string
   blocks?: string
@@ -711,7 +703,6 @@ export interface SlackMessageReaderParams extends SlackBaseParams {
   destinationType?: 'channel' | 'dm'
   channel?: string
   dmUserId?: string
-  userId?: string
   limit?: number
   oldest?: string
   latest?: string
@@ -750,16 +741,19 @@ export interface SlackListChannelsParams extends SlackBaseParams {
   includePrivate?: boolean
   excludeArchived?: boolean
   limit?: number
+  cursor?: string
 }
 
 export interface SlackListMembersParams extends SlackBaseParams {
   channel: string
   limit?: number
+  cursor?: string
 }
 
 export interface SlackListUsersParams extends SlackBaseParams {
   includeDeleted?: boolean
   limit?: number
+  cursor?: string
 }
 
 export interface SlackGetUserParams extends SlackBaseParams {
@@ -883,23 +877,21 @@ export interface SlackMessageResponse extends ToolResponse {
 export interface SlackCanvasResponse extends ToolResponse {
   output: {
     canvas_id: string
-    channel: string
-    title: string
   }
 }
 
-export interface SlackReaction {
+interface SlackReaction {
   name: string
   count: number
   users: string[]
 }
 
-export interface SlackMessageEdited {
+interface SlackMessageEdited {
   user: string
   ts: string
 }
 
-export interface SlackAttachment {
+interface SlackAttachment {
   id?: number
   fallback?: string
   text?: string
@@ -922,13 +914,13 @@ export interface SlackAttachment {
   ts?: string
 }
 
-export interface SlackBlock {
+interface SlackBlock {
   type: string
   block_id?: string
   [key: string]: any // Blocks can have various properties depending on type
 }
 
-export interface SlackMessage {
+interface SlackMessage {
   // Core properties
   type: string
   ts: string
@@ -1038,7 +1030,7 @@ export interface SlackRemoveReactionResponse extends ToolResponse {
   }
 }
 
-export interface SlackChannel {
+interface SlackChannel {
   id: string
   name: string
   is_channel?: boolean
@@ -1063,6 +1055,7 @@ export interface SlackListChannelsResponse extends ToolResponse {
     ids: string[]
     names: string[]
     count: number
+    nextCursor: string | null
   }
 }
 
@@ -1070,11 +1063,13 @@ export interface SlackListMembersResponse extends ToolResponse {
   output: {
     members: string[]
     count: number
+    nextCursor: string | null
   }
 }
 
-export interface SlackUser {
+interface SlackUser {
   id: string
+  team_id?: string | null
   name: string
   real_name: string
   display_name: string
@@ -1090,20 +1085,23 @@ export interface SlackUser {
   is_primary_owner?: boolean
   is_restricted?: boolean
   is_ultra_restricted?: boolean
+  is_app_user?: boolean
   deleted: boolean
-  timezone?: string
-  timezone_label?: string
-  timezone_offset?: number
-  avatar?: string
-  avatar_24?: string
-  avatar_48?: string
-  avatar_72?: string
-  avatar_192?: string
-  avatar_512?: string
+  color?: string | null
+  timezone?: string | null
+  timezone_label?: string | null
+  timezone_offset?: number | null
+  avatar?: string | null
+  avatar_24?: string | null
+  avatar_48?: string | null
+  avatar_72?: string | null
+  avatar_192?: string | null
+  avatar_512?: string | null
   status_text?: string
   status_emoji?: string
-  status_expiration?: number
-  updated?: number
+  status_expiration?: number | null
+  updated?: number | null
+  has_2fa?: boolean
 }
 
 export interface SlackListUsersResponse extends ToolResponse {
@@ -1112,6 +1110,7 @@ export interface SlackListUsersResponse extends ToolResponse {
     ids: string[]
     names: string[]
     count: number
+    nextCursor: string | null
   }
 }
 
@@ -1213,14 +1212,14 @@ export interface SlackCanvasFile {
   canvas_creator_id?: string | null
 }
 
-export interface SlackCanvasPaging {
+interface SlackCanvasPaging {
   count: number
   total: number
   page: number
   pages: number
 }
 
-export interface SlackCanvasSection {
+interface SlackCanvasSection {
   id: string
 }
 
@@ -1249,7 +1248,7 @@ export interface SlackDeleteCanvasResponse extends ToolResponse {
   }
 }
 
-export interface SlackView {
+interface SlackView {
   id: string
   team_id?: string | null
   type: string

@@ -53,6 +53,7 @@ export function SelectorCombobox({
   const {
     data: options = [],
     isLoading,
+    hasMore,
     error,
   } = useSelectorOptions(selectorKey, {
     context: selectorContext,
@@ -67,6 +68,7 @@ export function SelectorCombobox({
     Boolean(activeValue) &&
     Boolean(missingOptionLabel) &&
     !isLoading &&
+    !hasMore &&
     !optionMap.get(activeValue!)
   const selectedLabel = activeValue
     ? hasMissingOption
@@ -170,10 +172,10 @@ export function SelectorCombobox({
               <Button
                 type='button'
                 variant='ghost'
-                className='-translate-y-1/2 absolute top-1/2 right-[28px] z-10 h-6 w-6 p-0'
+                className='-translate-y-1/2 absolute top-1/2 right-[28px] z-10 size-6 p-0'
                 onClick={handleClear}
               >
-                <X className='h-4 w-4 opacity-50 hover-hover:opacity-100' />
+                <X className='size-4 opacity-50 hover-hover:opacity-100' />
               </Button>
             )}
           </div>

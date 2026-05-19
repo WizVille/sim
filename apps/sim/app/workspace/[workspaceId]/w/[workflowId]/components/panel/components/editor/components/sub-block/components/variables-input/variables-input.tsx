@@ -13,6 +13,7 @@ import {
 } from '@/components/emcn'
 import { Trash } from '@/components/emcn/icons/trash'
 import { cn } from '@/lib/core/utils/cn'
+import { handleKeyboardActivation } from '@/lib/core/utils/keyboard'
 import { formatDisplayText } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/formatted-text'
 import {
   checkTagTrigger,
@@ -22,6 +23,7 @@ import { useSubBlockValue } from '@/app/workspace/[workspaceId]/w/[workflowId]/c
 import { useAccessibleReferencePrefixes } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks/use-accessible-reference-prefixes'
 import { useVariablesStore } from '@/stores/variables/store'
 import type { Variable } from '@/stores/variables/types'
+import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
 
 interface VariableAssignment {
   id: string
@@ -89,6 +91,17 @@ export function VariablesInput({
   const workflowVariables = useVariablesStore((s) => s.variables)
   const accessiblePrefixes = useAccessibleReferencePrefixes(blockId)
 
+  /**
+   * Gate destructive cleanup on the active workflow being fully hydrated. Without this gate,
+   * a brief render frame where the variables store has not yet hydrated for the current
+   * workflow would treat all assignments as orphaned and persist an empty array — destroying
+   * legitimate references. Only trust `currentWorkflowVariables` once hydration says it owns
+   * this workflow's data.
+   */
+  const isHydratedForWorkflow = useWorkflowRegistry(
+    (s) => s.hydration.phase === 'ready' && s.hydration.workflowId === workflowId
+  )
+
   const [showTags, setShowTags] = useState(false)
   const [cursorPosition, setCursorPosition] = useState(0)
   const [activeFieldId, setActiveFieldId] = useState<string | null>(null)
@@ -133,6 +146,11 @@ export function VariablesInput({
 
   useEffect(() => {
     if (isReadOnly || assignments.length === 0) return
+    // Only purge stale `variableId` references after the variables store is authoritative
+    // for this workflow. Otherwise a transient empty store on mount would wipe valid
+    // assignments — see the duplicate-of-duplicate regression where this destroyed
+    // remapped variable references on the second copy.
+    if (!isHydratedForWorkflow) return
 
     const currentVariableIds = new Set(currentWorkflowVariables.map((v) => v.id))
     const validAssignments = assignments.filter((assignment) => {
@@ -145,7 +163,7 @@ export function VariablesInput({
     } else if (validAssignments.length !== assignments.length) {
       setStoreValue(validAssignments.length > 0 ? validAssignments : [])
     }
-  }, [currentWorkflowVariables, assignments, isReadOnly, setStoreValue])
+  }, [currentWorkflowVariables, assignments, isReadOnly, isHydratedForWorkflow, setStoreValue])
 
   const addAssignment = () => {
     if (isReadOnly || allVariablesAssigned) return
@@ -297,7 +315,7 @@ export function VariablesInput({
     return (
       <div className='flex flex-col items-center justify-center rounded-md border border-border/40 bg-muted/20 py-8 text-center'>
         <svg
-          className='mb-3 h-10 w-10 text-muted-foreground/40'
+          className='mb-3 size-10 text-muted-foreground/40'
           fill='none'
           viewBox='0 0 24 24'
           stroke='currentColor'
@@ -339,8 +357,14 @@ export function VariablesInput({
                 )}
               >
                 <div
+                  role='button'
+                  tabIndex={0}
                   className='flex cursor-pointer items-center justify-between rounded-t-[4px] bg-[var(--surface-4)] px-2.5 py-[5px]'
                   onClick={() => toggleCollapse(assignment.id)}
+                  onKeyDown={(event) => {
+                    if (event.target !== event.currentTarget) return
+                    handleKeyboardActivation(event, () => toggleCollapse(assignment.id))
+                  }}
                 >
                   <div className='flex min-w-0 flex-1 items-center gap-2'>
                     <span className='block truncate font-medium text-[var(--text-tertiary)] text-sm'>
@@ -352,26 +376,29 @@ export function VariablesInput({
                       </Badge>
                     )}
                   </div>
-                  <div
-                    className='flex items-center gap-2 pl-2'
-                    onClick={(e) => e.stopPropagation()}
-                  >
+                  <div className='flex items-center gap-2 pl-2'>
                     <Button
                       variant='ghost'
-                      onClick={addAssignment}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        addAssignment()
+                      }}
                       disabled={isReadOnly || allVariablesAssigned}
                       className='h-auto p-0'
                     >
-                      <Plus className='h-[14px] w-[14px]' />
+                      <Plus className='size-[14px]' />
                       <span className='sr-only'>Add Variable</span>
                     </Button>
                     <Button
                       variant='ghost'
-                      onClick={() => removeAssignment(assignment.id)}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        removeAssignment(assignment.id)
+                      }}
                       disabled={isReadOnly}
                       className='h-auto p-0 text-[var(--text-error)] hover-hover:text-[var(--text-error)]'
                     >
-                      <Trash className='h-[14px] w-[14px]' />
+                      <Trash className='size-[14px]' />
                       <span className='sr-only'>Delete Variable</span>
                     </Button>
                   </div>

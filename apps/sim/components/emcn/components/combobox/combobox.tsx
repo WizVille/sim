@@ -15,8 +15,9 @@ import {
   useState,
 } from 'react'
 import { cva, type VariantProps } from 'class-variance-authority'
-import { Check, ChevronDown, Loader2, Search } from 'lucide-react'
+import { Check, ChevronDown, Search } from 'lucide-react'
 import { cn } from '@/lib/core/utils/cn'
+import { Loader } from '../../icons'
 import { Input } from '../input/input'
 import { Popover, PopoverAnchor, PopoverContent, PopoverScrollArea } from '../popover/popover'
 
@@ -73,7 +74,7 @@ export type ComboboxOptionGroup = {
   items: ComboboxOption[]
 }
 
-export interface ComboboxProps
+interface ComboboxProps
   extends Omit<HTMLAttributes<HTMLDivElement>, 'onChange'>,
     VariantProps<typeof comboboxVariants> {
   /** Available options for selection */
@@ -546,9 +547,7 @@ const Combobox = memo(
                           overlayContent
                         ) : (
                           <>
-                            {SelectedIcon && (
-                              <SelectedIcon className='mr-2 h-3 w-3 flex-shrink-0' />
-                            )}
+                            {SelectedIcon && <SelectedIcon className='mr-2 size-3 flex-shrink-0' />}
                             <span className='truncate text-[var(--text-primary)]'>
                               {selectedOption?.label}
                             </span>
@@ -556,8 +555,10 @@ const Combobox = memo(
                         )}
                       </div>
                     )}
-                    <div
-                      className='-translate-y-1/2 absolute top-1/2 right-[4px] z-10 flex h-6 w-6 cursor-pointer items-center justify-center'
+                    <button
+                      type='button'
+                      aria-label={open ? 'Close options' : 'Open options'}
+                      className='-translate-y-1/2 absolute top-1/2 right-[4px] z-10 flex size-6 cursor-pointer items-center justify-center border-0 bg-transparent p-0'
                       onMouseDown={handleChevronClick}
                     >
                       <ChevronDown
@@ -566,7 +567,7 @@ const Combobox = memo(
                           open && 'rotate-180'
                         )}
                       />
-                    </div>
+                    </button>
                   </div>
                 ) : (
                   <div
@@ -641,7 +642,7 @@ const Combobox = memo(
             >
               {searchable && (
                 <div className='flex items-center px-2.5 pt-2 pb-1'>
-                  <Search className='mr-[7px] ml-[1px] h-[13px] w-[13px] shrink-0 text-[var(--text-muted)]' />
+                  <Search className='mr-[7px] ml-[1px] size-[13px] shrink-0 text-[var(--text-muted)]' />
                   <input
                     ref={searchInputRef}
                     className='w-full bg-transparent font-base text-[var(--text-primary)] text-small placeholder:text-[var(--text-muted)] focus:outline-none'
@@ -664,7 +665,7 @@ const Combobox = memo(
                         e.key === 'Enter' ||
                         e.key === 'Escape'
                       ) {
-                        handleKeyDown(e as unknown as KeyboardEvent<HTMLDivElement>)
+                        handleKeyDown(e)
                       }
                     }}
                   />
@@ -689,9 +690,9 @@ const Combobox = memo(
                 <div ref={dropdownRef} role='listbox' id={listboxId}>
                   {isLoading ? (
                     <div className='flex items-center justify-center py-3.5'>
-                      <Loader2 className='h-[16px] w-[16px] animate-spin text-[var(--text-muted)]' />
+                      <Loader className='size-[16px] text-[var(--text-muted)]' animate />
                       <span className='ml-2 font-base text-[var(--text-muted)] text-caption'>
-                        Loading options...
+                        Loading options…
                       </span>
                     </div>
                   ) : error ? (
@@ -755,14 +756,14 @@ const Combobox = memo(
                                 {option.iconElement
                                   ? option.iconElement
                                   : OptionIcon && (
-                                      <OptionIcon className='h-[14px] w-[14px] flex-shrink-0' />
+                                      <OptionIcon className='size-[14px] flex-shrink-0' />
                                     )}
                                 <span className='flex-1 truncate text-[var(--text-primary)]'>
                                   {option.label}
                                 </span>
                                 {option.suffixElement}
                                 {multiSelect && isSelected && (
-                                  <Check className='ml-2 h-[12px] w-[12px] flex-shrink-0 text-[var(--text-primary)]' />
+                                  <Check className='ml-2 size-[12px] flex-shrink-0 text-[var(--text-primary)]' />
                                 )}
                               </div>
                             )
@@ -828,15 +829,13 @@ const Combobox = memo(
                           >
                             {option.iconElement
                               ? option.iconElement
-                              : OptionIcon && (
-                                  <OptionIcon className='h-[14px] w-[14px] flex-shrink-0' />
-                                )}
+                              : OptionIcon && <OptionIcon className='size-[14px] flex-shrink-0' />}
                             <span className='flex-1 truncate text-[var(--text-primary)]'>
                               {option.label}
                             </span>
                             {option.suffixElement}
                             {multiSelect && isSelected && (
-                              <Check className='ml-2 h-[12px] w-[12px] flex-shrink-0 text-[var(--text-primary)]' />
+                              <Check className='ml-2 size-[12px] flex-shrink-0 text-[var(--text-primary)]' />
                             )}
                           </div>
                         )
@@ -855,4 +854,4 @@ const Combobox = memo(
 
 Combobox.displayName = 'Combobox'
 
-export { Combobox, comboboxVariants }
+export { Combobox }

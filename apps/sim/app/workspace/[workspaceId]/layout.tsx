@@ -1,7 +1,8 @@
+import { redirect } from 'next/navigation'
 import { ToastProvider } from '@/components/emcn'
 import { getSession } from '@/lib/auth'
+import { ImpersonationBanner } from '@/app/workspace/[workspaceId]/components/impersonation-banner'
 import { NavTour } from '@/app/workspace/[workspaceId]/components/product-tour'
-import { ImpersonationBanner } from '@/app/workspace/[workspaceId]/impersonation-banner'
 import { GlobalCommandsProvider } from '@/app/workspace/[workspaceId]/providers/global-commands-provider'
 import { ProviderModelsLoader } from '@/app/workspace/[workspaceId]/providers/provider-models-loader'
 import { SettingsLoader } from '@/app/workspace/[workspaceId]/providers/settings-loader'
@@ -13,8 +14,11 @@ import { getOrgWhitelabelSettings } from '@/ee/whitelabeling/org-branding'
 
 export default async function WorkspaceLayout({ children }: { children: React.ReactNode }) {
   const session = await getSession()
+  if (!session?.user) {
+    redirect('/login')
+  }
   // The organization plugin is conditionally spread so TS can't infer activeOrganizationId on the base session type.
-  const orgId = (session?.session as { activeOrganizationId?: string } | null)?.activeOrganizationId
+  const orgId = (session.session as { activeOrganizationId?: string } | null)?.activeOrganizationId
   const initialOrgSettings = orgId ? await getOrgWhitelabelSettings(orgId) : null
 
   return (

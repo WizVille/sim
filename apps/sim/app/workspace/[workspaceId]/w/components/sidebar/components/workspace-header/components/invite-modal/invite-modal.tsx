@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createLogger } from '@sim/logger'
-import { useParams, useRouter } from 'next/navigation'
+import { useParams } from 'next/navigation'
 import {
   Button,
   type FileInputOptions,
@@ -10,6 +10,7 @@ import {
   Modal,
   ModalBody,
   ModalContent,
+  ModalDescription,
   ModalFooter,
   ModalHeader,
   TagInput,
@@ -47,7 +48,6 @@ export function InviteModal({
   inviteDisabledReason = null,
   organizationId = null,
 }: InviteModalProps) {
-  const router = useRouter()
   const formRef = useRef<HTMLFormElement>(null)
   const [emailItems, setEmailItems] = useState<TagItem[]>([])
   const [userPermissions, setUserPermissions] = useState<UserPermissions[]>([])
@@ -80,7 +80,9 @@ export function InviteModal({
   const { data: pendingInvitations = [], isLoading: isPendingInvitationsLoading } =
     usePendingInvitations(open ? workspaceId : undefined)
 
-  const { data: organizationBillingData } = useOrganizationBilling(organizationId ?? '')
+  const { data: organizationBillingData } = useOrganizationBilling(organizationId ?? '', {
+    enabled: open,
+  })
 
   const batchSendInvitations = useBatchSendWorkspaceInvitations()
   const cancelInvitation = useCancelWorkspaceInvitation()
@@ -99,14 +101,8 @@ export function InviteModal({
   const hasSeatData = !!organizationId && totalSeats > 0
   const exceedsSeatCapacity =
     hasSeatData && userPerms.canAdmin && validEmails.length > availableSeats
-  const isAtSeatCapacity = hasSeatData && userPerms.canAdmin && availableSeats === 0
-  const isOutOfSeats = exceedsSeatCapacity || isAtSeatCapacity
-  const seatLimitReason = hasSeatData
-    ? availableSeats === 0
-      ? `No available seats. Using ${usedSeats} of ${totalSeats}.`
-      : exceedsSeatCapacity
-        ? `Only ${availableSeats} seat${availableSeats === 1 ? '' : 's'} available.`
-        : null
+  const seatLimitReason = exceedsSeatCapacity
+    ? `Only ${availableSeats} internal seat${availableSeats === 1 ? '' : 's'} available. External workspace invites do not require seats.`
     : null
 
   const isSubmitting = batchSendInvitations.isPending
@@ -235,7 +231,7 @@ export function InviteModal({
     }))
 
     updatePermissionsMutation.mutate(
-      { workspaceId, updates },
+      { workspaceId, organizationId: organizationId ?? undefined, updates },
       {
         onSuccess: (data) => {
           if (data.users && data.total !== undefined) {
@@ -253,6 +249,7 @@ export function InviteModal({
     userPerms.canAdmin,
     hasPendingChanges,
     workspaceId,
+    organizationId,
     existingUserPermissionChanges,
     updatePermissions,
     updatePermissionsMutation,
@@ -284,7 +281,7 @@ export function InviteModal({
     }
 
     removeMember.mutate(
-      { userId: memberToRemove.userId, workspaceId },
+      { userId: memberToRemove.userId, workspaceId, organizationId },
       {
         onSuccess: () => {
           if (workspacePermissions) {
@@ -318,6 +315,7 @@ export function InviteModal({
     workspacePermissions,
     updatePermissions,
     removeMember,
+    organizationId,
   ])
 
   const handleRemoveMemberCancel = useCallback(() => {
@@ -334,7 +332,7 @@ export function InviteModal({
     setErrorMessage(null)
 
     cancelInvitation.mutate(
-      { invitationId: invitationToRemove.invitationId, workspaceId },
+      { invitationId: invitationToRemove.invitationId, workspaceId, organizationId },
       {
         onSuccess: () => {
           setInvitationToRemove(null)
@@ -346,7 +344,7 @@ export function InviteModal({
         },
       }
     )
-  }, [invitationToRemove, workspaceId, userPerms.canAdmin, cancelInvitation])
+  }, [invitationToRemove, workspaceId, userPerms.canAdmin, cancelInvitation, organizationId])
 
   const handleRemoveInvitationCancel = useCallback(() => {
     setInvitationToRemove(null)
@@ -421,22 +419,11 @@ export function InviteModal({
     [workspaceId, userPerms.canAdmin, resendCooldowns, resendingInvitationIds, resendInvitation]
   )
 
-  const handleUpgradeRedirect = useCallback(() => {
-    if (!workspaceId) return
-    onOpenChange(false)
-    router.push(`/workspace/${workspaceId}/settings/subscription`)
-  }, [onOpenChange, router, workspaceId])
-
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault()
 
       setErrorMessage(null)
-
-      if (isOutOfSeats) {
-        handleUpgradeRedirect()
-        return
-      }
 
       if (!canInviteMembers || validEmails.length === 0 || !workspaceId) {
         return
@@ -451,7 +438,7 @@ export function InviteModal({
       })
 
       batchSendInvitations.mutate(
-        { workspaceId, invitations },
+        { workspaceId, organizationId, invitations },
         {
           onSuccess: (result) => {
             if (result.failed.length > 0) {
@@ -474,10 +461,9 @@ export function InviteModal({
     },
     [
       canInviteMembers,
-      isOutOfSeats,
-      handleUpgradeRedirect,
       validEmails,
       workspaceId,
+      organizationId,
       userPermissions,
       batchSendInvitations,
     ]
@@ -504,6 +490,7 @@ export function InviteModal({
         email: inv.email,
         permissionType: inv.permissionType,
         isPendingInvitation: true,
+        isExternal: inv.isExternal,
         invitationId: inv.invitationId,
       })),
     [pendingInvitations]
@@ -529,6 +516,9 @@ export function InviteModal({
           autoComplete='off'
         >
           <ModalBody>
+            <ModalDescription className='sr-only'>
+              Invite members to this workspace by email and manage their permissions
+            </ModalDescription>
             <div className='space-y-3'>
               <div>
                 <Label
@@ -584,7 +574,7 @@ export function InviteModal({
               {inviteDisabledReason && (
                 <p className='mt-1 text-[var(--text-muted)] text-caption'>{inviteDisabledReason}</p>
               )}
-              {isOutOfSeats && seatLimitReason && (
+              {seatLimitReason && (
                 <p className='mt-1 text-[var(--text-muted)] text-caption'>{seatLimitReason}</p>
               )}
               {errorMessage && (
@@ -641,10 +631,6 @@ export function InviteModal({
               type='button'
               variant='primary'
               onClick={() => {
-                if (isOutOfSeats) {
-                  handleUpgradeRedirect()
-                  return
-                }
                 formRef.current?.requestSubmit()
               }}
               disabled={
@@ -653,7 +639,7 @@ export function InviteModal({
                 isSubmitting ||
                 isSaving ||
                 !workspaceId ||
-                (!isOutOfSeats && !hasNewInvites)
+                !hasNewInvites
               }
               className='ml-auto'
             >
@@ -663,9 +649,7 @@ export function InviteModal({
                   ? 'Admin Access Required'
                   : isSubmitting
                     ? 'Inviting...'
-                    : isOutOfSeats
-                      ? 'Upgrade to invite'
-                      : 'Invite'}
+                    : 'Invite'}
             </Button>
           </ModalFooter>
         </form>
@@ -676,13 +660,13 @@ export function InviteModal({
         <ModalContent size='sm'>
           <ModalHeader>Remove Member</ModalHeader>
           <ModalBody>
-            <p className='text-[var(--text-secondary)]'>
+            <ModalDescription className='text-[var(--text-secondary)]'>
               Are you sure you want to remove{' '}
               <span className='font-medium text-[var(--text-primary)]'>
                 {memberToRemove?.email}
               </span>{' '}
               from this workspace? This action cannot be undone.
-            </p>
+            </ModalDescription>
           </ModalBody>
           <ModalFooter>
             <Button
@@ -708,13 +692,13 @@ export function InviteModal({
         <ModalContent size='sm'>
           <ModalHeader>Cancel Invitation</ModalHeader>
           <ModalBody>
-            <p className='text-[var(--text-secondary)]'>
+            <ModalDescription className='text-[var(--text-secondary)]'>
               Are you sure you want to cancel the invitation for{' '}
               <span className='font-medium text-[var(--text-primary)]'>
                 {invitationToRemove?.email}
               </span>
               ? This action cannot be undone.
-            </p>
+            </ModalDescription>
           </ModalBody>
           <ModalFooter>
             <Button

@@ -16,7 +16,12 @@ import type {
   SearchConfig,
   SortConfig,
 } from '@/app/workspace/[workspaceId]/components'
-import { ownerCell, Resource, timeCell } from '@/app/workspace/[workspaceId]/components'
+import {
+  EMPTY_CELL_PLACEHOLDER,
+  ownerCell,
+  Resource,
+  timeCell,
+} from '@/app/workspace/[workspaceId]/components'
 import { BaseTagsModal } from '@/app/workspace/[workspaceId]/knowledge/[id]/components'
 import {
   CreateBaseModal,
@@ -43,19 +48,19 @@ interface KnowledgeBaseWithDocCount extends KnowledgeBaseData {
 
 const COLUMNS: ResourceColumn[] = [
   { id: 'name', header: 'Name' },
-  { id: 'documents', header: 'Documents' },
-  { id: 'tokens', header: 'Tokens' },
-  { id: 'connectors', header: 'Connectors' },
+  { id: 'documents', header: 'Documents', widthMultiplier: 0.6 },
+  { id: 'tokens', header: 'Tokens', widthMultiplier: 0.6 },
+  { id: 'connectors', header: 'Connectors', widthMultiplier: 0.7 },
   { id: 'created', header: 'Created' },
   { id: 'owner', header: 'Owner' },
   { id: 'updated', header: 'Last Updated' },
 ]
 
-const DATABASE_ICON = <Database className='h-[14px] w-[14px]' />
+const DATABASE_ICON = <Database className='size-[14px]' />
 
 function connectorCell(connectorTypes?: string[]): ResourceCell {
   if (!connectorTypes || connectorTypes.length === 0) {
-    return { label: '—' }
+    return { label: EMPTY_CELL_PLACEHOLDER }
   }
 
   const entries = connectorTypes
@@ -64,7 +69,7 @@ function connectorCell(connectorTypes?: string[]): ResourceCell {
       Boolean(e.def?.icon)
     )
 
-  if (entries.length === 0) return { label: '—' }
+  if (entries.length === 0) return { label: EMPTY_CELL_PLACEHOLDER }
 
   return {
     content: (
@@ -75,7 +80,7 @@ function connectorCell(connectorTypes?: string[]): ResourceCell {
             <Tooltip.Root key={type}>
               <Tooltip.Trigger asChild>
                 <span className='flex-shrink-0'>
-                  <Icon className='h-3.5 w-3.5' />
+                  <Icon className='size-3.5' />
                 </span>
               </Tooltip.Trigger>
               <Tooltip.Content>{def.name}</Tooltip.Content>
@@ -422,10 +427,10 @@ export function Knowledge() {
             src={m.image}
             alt={m.name}
             referrerPolicy='no-referrer'
-            className='h-[14px] w-[14px] rounded-full border border-[var(--border)] object-cover'
+            className='size-[14px] rounded-full border border-[var(--border)] object-cover'
           />
         ) : (
-          <span className='flex h-[14px] w-[14px] items-center justify-center rounded-full border border-[var(--border)] bg-[var(--surface-3)] font-medium text-[8px] text-[var(--text-secondary)]'>
+          <span className='flex size-[14px] items-center justify-center rounded-full border border-[var(--border)] bg-[var(--surface-3)] font-medium text-[8px] text-[var(--text-secondary)]'>
             {m.name.charAt(0).toUpperCase()}
           </span>
         ),

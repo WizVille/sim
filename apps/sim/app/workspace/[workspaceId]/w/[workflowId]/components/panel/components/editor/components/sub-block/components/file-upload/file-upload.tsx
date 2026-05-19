@@ -1,15 +1,26 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
+import { generateShortId } from '@sim/utils/id'
+import { randomFloat } from '@sim/utils/random'
+import { useQueryClient } from '@tanstack/react-query'
 import { X } from 'lucide-react'
 import { useParams } from 'next/navigation'
 import { Button, Combobox } from '@/components/emcn/components'
 import { Progress } from '@/components/ui/progress'
+import { isApiClientError } from '@/lib/api/client/errors'
+import { requestJson } from '@/lib/api/client/request'
+import { fileDeleteContract } from '@/lib/api/contracts/storage-transfer'
 import { cn } from '@/lib/core/utils/cn'
 import { getExtensionFromMimeType } from '@/lib/uploads/utils/file-utils'
 import { useSubBlockValue } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-value'
-import { useWorkspaceFiles } from '@/hooks/queries/workspace-files'
+import {
+  useUploadWorkspaceFile,
+  useWorkspaceFiles,
+  workspaceFilesKeys,
+} from '@/hooks/queries/workspace-files'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
 import { useWorkflowStore } from '@/stores/workflows/workflow/store'
 
@@ -69,39 +80,34 @@ function SingleFileSelector({
   isDeleting,
 }: SingleFileSelectorProps) {
   const displayLabel = `${truncateMiddle(file.name, 20, 12)} (${formatFileSize(file.size)})`
-  const [localInputValue, setLocalInputValue] = useState(displayLabel)
+  const [searchQuery, setSearchQuery] = useState('')
   const [isEditing, setIsEditing] = useState(false)
-
-  // Sync display label when file changes
-  useEffect(() => {
-    if (!isEditing) {
-      setLocalInputValue(displayLabel)
-    }
-  }, [displayLabel, isEditing])
+  // When not editing, always show the file's display label. When editing, show the user's query.
+  const comboboxValue = isEditing ? searchQuery : displayLabel
 
   return (
     <div className='relative w-full'>
       <Combobox
         options={options}
-        value={localInputValue}
+        value={comboboxValue}
         selectedValue={selectedValue}
         onChange={(newValue) => {
           // Check if user selected an option
           const matched = options.find((opt) => opt.value === newValue || opt.label === newValue)
           if (matched) {
             setIsEditing(false)
-            setLocalInputValue(displayLabel)
+            setSearchQuery('')
             onInputChange(matched.value)
             return
           }
           // User is typing to search
           setIsEditing(true)
-          setLocalInputValue(newValue)
+          setSearchQuery(newValue)
         }}
         onOpenChange={(open) => {
           if (!open) {
             setIsEditing(false)
-            setLocalInputValue(displayLabel)
+            setSearchQuery('')
           }
           onOpenChange(open)
         }}
@@ -117,14 +123,14 @@ function SingleFileSelector({
       <Button
         type='button'
         variant='ghost'
-        className='-translate-y-1/2 absolute top-1/2 right-[28px] z-10 h-6 w-6 p-0'
+        className='-translate-y-1/2 absolute top-1/2 right-[28px] z-10 size-6 p-0'
         onClick={onClear}
         disabled={isDeleting}
       >
         {isDeleting ? (
-          <div className='h-4 w-4 animate-spin rounded-full border-[1.5px] border-current border-t-transparent' />
+          <div className='size-4 animate-spin rounded-full border-[1.5px] border-current border-t-transparent' />
         ) : (
-          <X className='h-4 w-4 opacity-50 hover-hover:opacity-100' />
+          <X className='size-4 opacity-50 hover-hover:opacity-100' />
         )}
       </Button>
     </div>
@@ -157,7 +163,7 @@ export function FileUpload({
 
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const { activeWorkflowId } = useWorkflowRegistry()
+  const activeWorkflowId = useWorkflowRegistry((state) => state.activeWorkflowId)
   const params = useParams()
   const workspaceId = params?.workspaceId as string
 
@@ -166,6 +172,9 @@ export function FileUpload({
     isLoading: loadingWorkspaceFiles,
     refetch: refetchWorkspaceFiles,
   } = useWorkspaceFiles(isPreview ? '' : workspaceId)
+
+  const uploadFileMutation = useUploadWorkspaceFile()
+  const queryClient = useQueryClient()
 
   const value = isPreview ? previewValue : storeValue
 
@@ -287,7 +296,7 @@ export function FileUpload({
     }
 
     const uploading = validFiles.map((file) => ({
-      id: `upload-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+      id: `upload-${Date.now()}-${generateShortId(7)}`,
       name: file.name,
       size: file.size,
     }))
@@ -302,7 +311,7 @@ export function FileUpload({
 
       progressInterval = setInterval(() => {
         setUploadProgress((prev) => {
-          const newProgress = prev + Math.random() * 10
+          const newProgress = prev + randomFloat() * 10
           return newProgress > 90 ? 90 : newProgress
         })
       }, 200)
@@ -312,56 +321,25 @@ export function FileUpload({
 
       for (const file of validFiles) {
         try {
-          const formData = new FormData()
-          formData.append('file', file)
-          formData.append('context', 'workspace')
-
-          if (workspaceId) {
-            formData.append('workspaceId', workspaceId)
-          }
-
-          const response = await fetch('/api/files/upload', {
-            method: 'POST',
-            body: formData,
+          const data = await uploadFileMutation.mutateAsync({
+            workspaceId,
+            file,
+            skipToast: true,
+            skipInvalidation: true,
           })
 
-          const data = await response.json()
-
-          if (!response.ok) {
-            const errorMessage = data.error || `Failed to upload file: ${response.status}`
-            uploadErrors.push(`${file.name}: ${errorMessage}`)
-
-            setUploadError(errorMessage)
-
-            if (data.isDuplicate || response.status === 409) {
-              setTimeout(() => setUploadError(null), 5000)
-            }
-            continue
-          }
-
-          if (data.success === false) {
-            const errorMessage = data.error || 'Upload failed'
-            uploadErrors.push(`${file.name}: ${errorMessage}`)
-
-            setUploadError(errorMessage)
-
-            if (data.isDuplicate) {
-              setTimeout(() => setUploadError(null), 5000)
-            }
-            continue
-          }
-
           uploadedFiles.push({
-            name: file.name,
-            path: data.file?.url || data.url, // Workspace: data.file.url, Non-workspace: data.url
-            key: data.file?.key || data.key, // Storage key for proper file access
-            size: file.size,
-            type: file.type,
+            name: data.file.name,
+            path: data.file.url,
+            key: data.file.key,
+            size: data.file.size,
+            type: data.file.type,
           })
         } catch (error) {
           logger.error(`Error uploading ${file.name}:`, error)
-          const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+          const errorMessage = getErrorMessage(error, 'Unknown error')
           uploadErrors.push(`${file.name}: ${errorMessage}`)
+          setUploadError(errorMessage)
         }
       }
 
@@ -377,6 +355,7 @@ export function FileUpload({
 
         if (workspaceId) {
           void refetchWorkspaceFiles()
+          void queryClient.invalidateQueries({ queryKey: workspaceFilesKeys.storageInfo() })
         }
 
         if (uploadedFiles.length === 1) {
@@ -421,10 +400,7 @@ export function FileUpload({
         useWorkflowStore.getState().triggerUpdate()
       }
     } catch (error) {
-      logger.error(
-        error instanceof Error ? error.message : 'Failed to upload file(s)',
-        activeWorkflowId
-      )
+      logger.error(getErrorMessage(error, 'Failed to upload file(s)'), activeWorkflowId)
     } finally {
       if (progressInterval) {
         clearInterval(progressInterval)
@@ -490,18 +466,15 @@ export function FileUpload({
         (decodedPath.includes(`/${workspaceId}/`) || decodedPath.includes(`${workspaceId}/`))
 
       if (!isWorkspaceFile) {
-        const response = await fetch('/api/files/delete', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ filePath: file.path }),
-        })
-
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({ error: response.statusText }))
-          const errorMessage = errorData.error || `Failed to delete file: ${response.status}`
-          throw new Error(errorMessage)
+        try {
+          await requestJson(fileDeleteContract, {
+            body: { filePath: file.path },
+          })
+        } catch (err) {
+          if (isApiClientError(err)) {
+            throw new Error(err.message || `Failed to delete file: ${err.status}`)
+          }
+          throw err
         }
       }
 
@@ -515,10 +488,7 @@ export function FileUpload({
 
       useWorkflowStore.getState().triggerUpdate()
     } catch (error) {
-      logger.error(
-        error instanceof Error ? error.message : 'Failed to remove file',
-        activeWorkflowId
-      )
+      logger.error(getErrorMessage(error, 'Failed to remove file'), activeWorkflowId)
     } finally {
       setDeletingFiles((prev) => {
         const updated = { ...prev }
@@ -544,14 +514,14 @@ export function FileUpload({
         <Button
           type='button'
           variant='ghost'
-          className='-translate-y-1/2 absolute top-1/2 right-[4px] h-6 w-6 p-0'
+          className='-translate-y-1/2 absolute top-1/2 right-[4px] size-6 p-0'
           onClick={(e) => handleRemoveFile(file, e)}
           disabled={isDeleting}
         >
           {isDeleting ? (
-            <div className='h-4 w-4 animate-spin rounded-full border-[1.5px] border-current border-t-transparent' />
+            <div className='size-4 animate-spin rounded-full border-[1.5px] border-current border-t-transparent' />
           ) : (
-            <X className='h-4 w-4 opacity-50' />
+            <X className='size-4 opacity-50' />
           )}
         </Button>
       </div>
@@ -568,8 +538,8 @@ export function FileUpload({
           <span className='text-[var(--text-primary)]'>{file.name}</span>
           <span className='ml-2 text-[var(--text-muted)]'>({formatFileSize(file.size)})</span>
         </div>
-        <div className='flex h-5 w-5 shrink-0 items-center justify-center'>
-          <div className='h-3.5 w-3.5 animate-spin rounded-full border-[1.5px] border-current border-t-transparent' />
+        <div className='flex size-5 shrink-0 items-center justify-center'>
+          <div className='size-3.5 animate-spin rounded-full border-[1.5px] border-current border-t-transparent' />
         </div>
       </div>
     )
@@ -658,7 +628,7 @@ export function FileUpload({
   }
 
   return (
-    <div className='w-full' onClick={(e) => e.stopPropagation()}>
+    <div role='presentation' className='w-full' onClick={(e) => e.stopPropagation()}>
       <input
         type='file'
         ref={fileInputRef}

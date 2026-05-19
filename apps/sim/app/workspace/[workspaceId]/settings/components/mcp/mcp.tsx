@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { ChevronDown, Plus, Search } from 'lucide-react'
 import { useParams } from 'next/navigation'
 import {
@@ -10,11 +11,14 @@ import {
   Modal,
   ModalBody,
   ModalContent,
+  ModalDescription,
   ModalFooter,
   ModalHeader,
   Tooltip,
 } from '@/components/emcn'
 import { Input } from '@/components/ui'
+import { requestJson } from '@/lib/api/client/request'
+import { getWorkflowStateContract } from '@/lib/api/contracts/workflows'
 import { cn } from '@/lib/core/utils/cn'
 import {
   getIssueBadgeLabel,
@@ -24,6 +28,8 @@ import {
 } from '@/lib/mcp/tool-validation'
 import type { McpTransport } from '@/lib/mcp/types'
 import {
+  type McpServer,
+  type McpTool,
   useAllowedMcpDomains,
   useCreateMcpServer,
   useDeleteMcpServer,
@@ -37,34 +43,10 @@ import {
 import { useAvailableEnvVarKeys } from '@/hooks/use-available-env-vars'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
 import { useSubBlockStore } from '@/stores/workflows/subblock/store'
+import type { BlockState } from '@/stores/workflows/workflow/types'
 import { McpServerFormModal, McpServerSkeleton } from './components'
 
 const logger = createLogger('McpSettings')
-
-interface McpToolSchema {
-  type: 'object'
-  properties?: Record<string, unknown>
-  required?: string[]
-}
-
-interface McpTool {
-  name: string
-  description?: string
-  serverId: string
-  inputSchema?: McpToolSchema
-}
-
-interface McpServer {
-  id: string
-  name?: string
-  transport?: string
-  url?: string
-  headers?: Record<string, string>
-  enabled?: boolean
-  connectionStatus?: 'connected' | 'disconnected' | 'error'
-  lastError?: string | null
-  lastConnected?: string
-}
 
 function formatTransportLabel(transport: string): string {
   return transport
@@ -295,14 +277,16 @@ export function MCP({ initialServerId }: MCPProps) {
         if (activeWorkflowId && result.updatedWorkflowIds?.includes(activeWorkflowId)) {
           logger.info(`Active workflow ${activeWorkflowId} was updated, reloading subblock values`)
           try {
-            const response = await fetch(`/api/workflows/${activeWorkflowId}`)
-            if (response.ok) {
-              const { data: workflowData } = await response.json()
-              if (workflowData?.state?.blocks) {
-                useSubBlockStore
-                  .getState()
-                  .initializeFromWorkflow(activeWorkflowId, workflowData.state.blocks)
-              }
+            const { data: workflowData } = await requestJson(getWorkflowStateContract, {
+              params: { id: activeWorkflowId },
+            })
+            if (workflowData?.state?.blocks) {
+              useSubBlockStore
+                .getState()
+                .initializeFromWorkflow(
+                  activeWorkflowId,
+                  workflowData.state.blocks as Record<string, BlockState>
+                )
             }
           } catch (reloadError) {
             logger.warn('Failed to reload workflow subblock values:', reloadError)
@@ -625,7 +609,7 @@ export function MCP({ initialServerId }: MCPProps) {
         <div className='flex items-center gap-2'>
           <div className='flex flex-1 items-center gap-2 rounded-lg border border-[var(--border)] bg-transparent px-2 py-1.5 transition-colors duration-100 dark:bg-[var(--surface-4)] dark:hover-hover:border-[var(--border-1)] dark:hover-hover:bg-[var(--surface-5)]'>
             <Search
-              className='h-[14px] w-[14px] flex-shrink-0 text-[var(--text-tertiary)]'
+              className='size-[14px] flex-shrink-0 text-[var(--text-tertiary)]'
               strokeWidth={2}
             />
             <Input
@@ -636,7 +620,7 @@ export function MCP({ initialServerId }: MCPProps) {
             />
           </div>
           <Button onClick={() => setShowAddModal(true)} variant='primary' disabled={serversLoading}>
-            <Plus className='mr-1.5 h-[13px] w-[13px]' />
+            <Plus className='mr-1.5 size-[13px]' />
             Add
           </Button>
         </div>
@@ -645,7 +629,7 @@ export function MCP({ initialServerId }: MCPProps) {
           {error ? (
             <div className='flex h-full flex-col items-center justify-center gap-2'>
               <p className='text-[var(--error)] text-xs leading-tight dark:text-[var(--error)]'>
-                {error instanceof Error ? error.message : 'Failed to load MCP servers'}
+                {getErrorMessage(error, 'Failed to load MCP servers')}
               </p>
             </div>
           ) : serversLoading ? (
@@ -707,11 +691,11 @@ export function MCP({ initialServerId }: MCPProps) {
         <ModalContent size='sm'>
           <ModalHeader>Delete MCP Server</ModalHeader>
           <ModalBody>
-            <p className='text-[var(--text-secondary)]'>
+            <ModalDescription className='text-[var(--text-secondary)]'>
               Are you sure you want to delete{' '}
               <span className='font-medium text-[var(--text-primary)]'>{serverToDelete?.name}</span>
               ? This action cannot be undone.
-            </p>
+            </ModalDescription>
           </ModalBody>
           <ModalFooter>
             <Button variant='default' onClick={() => setShowDeleteDialog(false)}>

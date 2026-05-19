@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { getErrorMessage } from '@sim/utils/errors'
 import { isEqual } from 'es-toolkit'
 import { useReactFlow } from 'reactflow'
 import { useStoreWithEqualityFn } from 'zustand/traditional'
@@ -134,7 +135,7 @@ export const ComboBox = memo(function ComboBox({
       const options = await fetchOptions(blockId)
       setFetchedOptions(options)
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to fetch options'
+      const errorMessage = getErrorMessage(error, 'Failed to fetch options')
       setFetchError(errorMessage)
       setFetchedOptions([])
     } finally {
@@ -450,7 +451,7 @@ export const ComboBox = memo(function ComboBox({
     const displayLabel = inputValue
     return (
       <div className='flex w-full items-center truncate [scrollbar-width:none]'>
-        {SelectedIcon && <SelectedIcon className='mr-2 h-3 w-3 flex-shrink-0' />}
+        {SelectedIcon && <SelectedIcon className='mr-2 size-3 flex-shrink-0' />}
         <div className='truncate'>
           {formatDisplayText(displayLabel, {
             accessiblePrefixes,

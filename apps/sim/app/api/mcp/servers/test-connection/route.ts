@@ -1,6 +1,7 @@
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
 import type { NextRequest } from 'next/server'
+import { mcpServerTestBodySchema } from '@/lib/api/contracts/mcp'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { McpClient } from '@/lib/mcp/client'
 import {
@@ -25,15 +26,6 @@ export const dynamic = 'force-dynamic'
  */
 function isUrlBasedTransport(transport: McpTransport): boolean {
   return transport === 'streamable-http'
-}
-
-interface TestConnectionRequest {
-  name: string
-  transport: McpTransport
-  url?: string
-  headers?: Record<string, string>
-  timeout?: number
-  workspaceId: string
 }
 
 interface TestConnectionResult {
@@ -69,7 +61,14 @@ function sanitizeConnectionError(error: unknown): string {
 export const POST = withRouteHandler(
   withMcpAuth('write')(async (request: NextRequest, { userId, workspaceId, requestId }) => {
     try {
-      const body: TestConnectionRequest = getParsedBody(request) || (await request.json())
+      const rawBody = getParsedBody(request) ?? (await request.json())
+      const parsedBody = mcpServerTestBodySchema.safeParse(rawBody)
+
+      if (!parsedBody.success) {
+        return createMcpErrorResponse(parsedBody.error, 'Invalid request format', 400)
+      }
+
+      const body = parsedBody.data
 
       logger.info(`[${requestId}] Testing MCP server connection:`, {
         name: body.name,
@@ -77,14 +76,6 @@ export const POST = withRouteHandler(
         url: body.url ? `${body.url.substring(0, 50)}...` : undefined, // Partial URL for security
         workspaceId,
       })
-
-      if (!body.name || !body.transport) {
-        return createMcpErrorResponse(
-          new Error('Missing required fields: name and transport are required'),
-          'Missing required fields',
-          400
-        )
-      }
 
       if (isUrlBasedTransport(body.transport) && !body.url) {
         return createMcpErrorResponse(
@@ -104,6 +95,9 @@ export const POST = withRouteHandler(
       }
 
       try {
+        // Initial pre-resolution check; the authoritative resolved IP is
+        // captured after env-var resolution below and used to pin the
+        // connection against DNS rebinding.
         await validateMcpServerSsrf(body.url)
       } catch (e) {
         if (e instanceof McpDnsResolutionError) {
@@ -149,8 +143,9 @@ export const POST = withRouteHandler(
         throw e
       }
 
+      let resolvedIP: string | null
       try {
-        await validateMcpServerSsrf(testConfig.url)
+        resolvedIP = await validateMcpServerSsrf(testConfig.url)
       } catch (e) {
         if (e instanceof McpDnsResolutionError) {
           return createMcpErrorResponse(e, e.message, 502)
@@ -171,7 +166,11 @@ export const POST = withRouteHandler(
       let client: McpClient | null = null
 
       try {
-        client = new McpClient(testConfig, testSecurityPolicy)
+        client = new McpClient({
+          config: testConfig,
+          securityPolicy: testSecurityPolicy,
+          resolvedIP: resolvedIP ?? undefined,
+        })
         await client.connect()
 
         result.negotiatedVersion = client.getNegotiatedVersion()

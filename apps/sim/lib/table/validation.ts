@@ -24,7 +24,7 @@ export interface ValidateRowOptions {
 }
 
 /** Error information for a single row in batch validation. */
-export interface BatchRowError {
+interface BatchRowError {
   row: number
   errors: string[]
 }
@@ -276,7 +276,7 @@ export function getUniqueColumns(schema: TableSchema): ColumnDefinition[] {
 export function validateUniqueConstraints(
   data: RowData,
   schema: TableSchema,
-  existingRows: { id: string; data: RowData }[],
+  existingRows: { id: string; data: RowData; position?: number }[],
   excludeRowId?: string
 ): ValidationResult {
   const errors: string[] = []
@@ -297,8 +297,10 @@ export function validateUniqueConstraints(
     })
 
     if (duplicate) {
+      const rowLabel =
+        typeof duplicate.position === 'number' ? `row ${duplicate.position + 1}` : duplicate.id
       errors.push(
-        `Column "${column.name}" must be unique. Value "${value}" already exists in row ${duplicate.id}`
+        `Column "${column.name}" must be unique. Value "${value}" already exists in ${rowLabel}`
       )
     }
   }
@@ -364,14 +366,14 @@ export async function checkUniqueConstraintsDb(
       : baseCondition
 
     const conflictingRow = await db
-      .select({ id: userTableRows.id })
+      .select({ id: userTableRows.id, position: userTableRows.position })
       .from(userTableRows)
       .where(whereClause)
       .limit(1)
 
     if (conflictingRow.length > 0) {
       errors.push(
-        `Column "${condition.column.name}" must be unique. Value "${condition.value}" already exists in row ${conflictingRow[0].id}`
+        `Column "${condition.column.name}" must be unique. Value "${condition.value}" already exists in row ${conflictingRow[0].position + 1}`
       )
     }
   }
@@ -380,13 +382,25 @@ export async function checkUniqueConstraintsDb(
 }
 
 /**
+ * Minimal executor surface needed by unique-constraint checks. Both `db` and a
+ * drizzle transaction (`trx`) satisfy this, letting callers run the lookup
+ * inside an open transaction so it observes uncommitted prior-batch inserts.
+ */
+type UniqueCheckExecutor = Pick<typeof db, 'select'>
+
+/**
  * Checks unique constraints for a batch of rows using targeted database queries.
  * Validates both against existing database rows and within the batch itself.
+ *
+ * Pass a transaction as `executor` when running inside an open tx so the lookup
+ * sees rows inserted by earlier batches in the same transaction; otherwise the
+ * default `db` connection only observes committed state.
  */
 export async function checkBatchUniqueConstraintsDb(
   tableId: string,
   rows: RowData[],
-  schema: TableSchema
+  schema: TableSchema,
+  executor: UniqueCheckExecutor = db
 ): Promise<{ valid: boolean; errors: Array<{ row: number; errors: string[] }> }> {
   const uniqueColumns = getUniqueColumns(schema)
   const rowErrors: Array<{ row: number; errors: string[] }> = []
@@ -458,10 +472,11 @@ export async function checkBatchUniqueConstraintsDb(
       return sql`(${userTableRows.data}->${sql.raw(`'${columnName}'`)})::jsonb = ${normalizedValue}::jsonb`
     })
 
-    const conflictingRows = await db
+    const conflictingRows = await executor
       .select({
         id: userTableRows.id,
         data: userTableRows.data,
+        position: userTableRows.position,
       })
       .from(userTableRows)
       .where(and(eq(userTableRows.tableId, tableId), or(...valueConditions)))
@@ -492,7 +507,7 @@ export async function checkBatchUniqueConstraintsDb(
             rowErrors.push(rowError)
           }
 
-          const errorMsg = `Column "${columnName}" must be unique. Value "${rowValue}" already exists in row ${conflict.id}`
+          const errorMsg = `Column "${columnName}" must be unique. Value "${rowValue}" already exists in row ${conflict.position + 1}`
           if (!rowError.errors.includes(errorMsg)) {
             rowError.errors.push(errorMsg)
           }

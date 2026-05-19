@@ -15,6 +15,7 @@ import {
   inputValidationMockFns,
   type MockFetchResponse,
 } from '@sim/testing'
+import { sleep } from '@sim/utils/helpers'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Hoisted mock state - these are available to vi.mock factories
@@ -267,6 +268,38 @@ vi.mock('@/tools/registry', () => {
       params: {},
       request: { url: '/api/tools/serper/search', method: 'GET' },
     },
+    notion_add_database_row: {
+      id: 'notion_add_database_row',
+      name: 'Add Notion Database Row',
+      description: 'Add a new row to a Notion database with specified properties',
+      version: '1.0.0',
+      params: {},
+      request: { url: 'https://api.notion.com/v1/pages', method: 'POST' },
+    },
+    notion_add_database_row_v2: {
+      id: 'notion_add_database_row_v2',
+      name: 'Add Notion Database Row',
+      description: 'Add a new row to a Notion database with specified properties',
+      version: '2.0.0',
+      params: {},
+      request: { url: 'https://api.notion.com/v1/pages', method: 'POST' },
+    },
+    notion_update_page: {
+      id: 'notion_update_page',
+      name: 'Notion Page Updater',
+      description: 'Update properties of a Notion page',
+      version: '1.0.0',
+      params: {},
+      request: { url: 'https://api.notion.com/v1/pages/x', method: 'PATCH' },
+    },
+    notion_update_page_v2: {
+      id: 'notion_update_page_v2',
+      name: 'Notion Page Updater',
+      description: 'Update properties of a Notion page',
+      version: '2.0.0',
+      params: {},
+      request: { url: 'https://api.notion.com/v1/pages/x', method: 'PATCH' },
+    },
   }
   return { tools: mockTools }
 })
@@ -388,6 +421,19 @@ describe('Tools Registry', () => {
     expect(gmailTool?.name).toBe('Gmail Read')
   })
 
+  it.each([
+    ['notion_add_database_row', 'notion_add_database_row_v2'],
+    ['notion_update_page', 'notion_update_page_v2'],
+  ])('getTool resolves both the legacy and v2 ids for %s', (legacyId, v2Id) => {
+    const legacy = getTool(legacyId)
+    expect(legacy).toBeDefined()
+    expect(legacy?.id).toBe(legacyId)
+
+    const v2 = getTool(v2Id)
+    expect(v2).toBeDefined()
+    expect(v2?.id).toBe(v2Id)
+  })
+
   it('getTool should return undefined for non-existent tool', () => {
     const nonExistentTool = getTool('non_existent_tool')
     expect(nonExistentTool).toBeUndefined()
@@ -399,11 +445,20 @@ describe('Custom Tools', () => {
     expect(getTool('custom_remote-tool-123', 'workspace-1')).toBeUndefined()
   })
 
+  it('returns the legacy notion_add_database_row tool through the async helper', async () => {
+    const legacy = await getToolAsync('notion_add_database_row')
+    expect(legacy).toBeDefined()
+    expect(legacy?.id).toBe('notion_add_database_row')
+  })
+
   it('resolves custom tools through the async helper', async () => {
     mockGetCustomToolByIdOrTitle.mockResolvedValue({
       id: 'remote-tool-123',
+      workspaceId: 'workspace-1',
+      userId: 'user-1',
       title: 'Custom Weather Tool',
       schema: {
+        type: 'function',
         function: {
           name: 'weather_tool',
           description: 'Get weather information',
@@ -417,6 +472,8 @@ describe('Custom Tools', () => {
         },
       },
       code: '',
+      createdAt: new Date('2024-01-01T00:00:00.000Z'),
+      updatedAt: new Date('2024-01-01T00:00:00.000Z'),
     })
 
     const customTool = await getToolAsync('custom_remote-tool-123', {
@@ -475,7 +532,7 @@ describe('executeTool Function', () => {
         code: 'return 1',
         timeout: 5000,
       },
-      true
+      { skipPostProcess: true }
     )
 
     expect(result.success).toBe(true)
@@ -504,7 +561,7 @@ describe('executeTool Function', () => {
         code: 'return { result: "hello world" }',
         language: 'javascript',
       },
-      true
+      { skipPostProcess: true }
     ) // Skip proxy
 
     tools.function_execute = originalFunctionTool
@@ -526,13 +583,85 @@ describe('executeTool Function', () => {
     vi.restoreAllMocks()
   })
 
+  it('aborts the internal fetch when the caller signal is aborted', async () => {
+    const originalFunctionTool = { ...tools.function_execute }
+    tools.function_execute = {
+      ...tools.function_execute,
+      transformResponse: vi.fn().mockResolvedValue({ success: true, output: {} }),
+    }
+
+    let observedSignal: AbortSignal | undefined
+    global.fetch = Object.assign(
+      vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+        observedSignal = init.signal as AbortSignal
+        return new Promise((_resolve, reject) => {
+          observedSignal!.addEventListener('abort', () => {
+            const err = new Error('aborted')
+            err.name = 'AbortError'
+            reject(err)
+          })
+        })
+      }),
+      { preconnect: vi.fn() }
+    ) as typeof fetch
+
+    const callerController = new AbortController()
+    const resultPromise = executeTool(
+      'function_execute',
+      { code: 'return 1', timeout: 5000 },
+      { skipPostProcess: true, signal: callerController.signal }
+    )
+
+    await sleep(1)
+    callerController.abort()
+    const result = await resultPromise
+
+    expect(observedSignal?.aborted).toBe(true)
+    expect(result.success).toBe(false)
+    expect(result.error).not.toMatch(/timed out/i)
+
+    tools.function_execute = originalFunctionTool
+  })
+
+  it('aborts immediately when the caller signal is already aborted at call time', async () => {
+    const originalFunctionTool = { ...tools.function_execute }
+    tools.function_execute = {
+      ...tools.function_execute,
+      transformResponse: vi.fn().mockResolvedValue({ success: true, output: {} }),
+    }
+
+    let observedAborted = false
+    global.fetch = Object.assign(
+      vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+        observedAborted = (init.signal as AbortSignal).aborted
+        const err = new Error('aborted')
+        err.name = 'AbortError'
+        throw err
+      }),
+      { preconnect: vi.fn() }
+    ) as typeof fetch
+
+    const controller = new AbortController()
+    controller.abort()
+    const result = await executeTool(
+      'function_execute',
+      { code: 'return 1', timeout: 5000 },
+      { skipPostProcess: true, signal: controller.signal }
+    )
+
+    expect(observedAborted).toBe(true)
+    expect(result.success).toBe(false)
+
+    tools.function_execute = originalFunctionTool
+  })
+
   it('should add timing information to results', async () => {
     const result = await executeTool(
       'http_request',
       {
         url: 'https://api.example.com/data',
       },
-      true
+      { skipPostProcess: true }
     )
 
     expect(result.timing).toBeDefined()
@@ -606,7 +735,7 @@ describe('Automatic Internal Route Detection', () => {
       { preconnect: vi.fn() }
     ) as typeof fetch
 
-    const result = await executeTool('test_internal_tool', {}, false)
+    const result = await executeTool('test_internal_tool', {})
 
     expect(result.success).toBe(true)
     expect(result.output.result).toBe('Internal route success')
@@ -868,8 +997,7 @@ describe('Copilot File Parameter Normalization', () => {
     const result = await executeTool(
       'test_single_file_tool',
       { attachment: 'wf_123' },
-      false,
-      context
+      { executionContext: context }
     )
 
     expect(result.success).toBe(true)
@@ -958,8 +1086,7 @@ describe('Copilot File Parameter Normalization', () => {
     const result = await executeTool(
       'test_file_array_tool',
       { attachments: ['wf_1', partialFileObject, existingFileObject, 'wf_2'] },
-      false,
-      context
+      { executionContext: context }
     )
 
     expect(result.success).toBe(true)
@@ -992,8 +1119,7 @@ describe('Copilot File Parameter Normalization', () => {
     const result = await executeTool(
       'test_single_file_tool',
       { attachment: 'wf_123' },
-      false,
-      context
+      { executionContext: context }
     )
 
     expect(result.success).toBe(true)
@@ -1023,7 +1149,7 @@ describe('Copilot OAuth Credential Enforcement', () => {
       copilotToolExecution: true,
     } as any)
 
-    const result = await executeTool('gmail_read', { maxResults: 5 }, false, context)
+    const result = await executeTool('gmail_read', { maxResults: 5 }, { executionContext: context })
 
     expect(result.success).toBe(false)
     expect(result.error).toContain('credentialId')
@@ -1067,7 +1193,7 @@ describe('Centralized Error Handling', () => {
     const result = await executeTool(
       'function_execute',
       { code: 'return { result: "test" }' },
-      true
+      { skipPostProcess: true }
     )
 
     expect(result.success).toBe(false)
@@ -1168,7 +1294,7 @@ describe('Centralized Error Handling', () => {
     const result = await executeTool(
       'function_execute',
       { code: 'return { result: "test" }' },
-      true
+      { skipPostProcess: true }
     )
 
     expect(result.success).toBe(false)
@@ -1198,7 +1324,7 @@ describe('Centralized Error Handling', () => {
     const result = await executeTool(
       'function_execute',
       { code: 'return { result: "test" }' },
-      true
+      { skipPostProcess: true }
     )
 
     expect(result.success).toBe(false)
@@ -1227,7 +1353,7 @@ describe('Centralized Error Handling', () => {
     const result = await executeTool(
       'function_execute',
       { code: 'return { result: "test" }' },
-      true
+      { skipPostProcess: true }
     )
 
     expect(result.success).toBe(false)
@@ -1305,7 +1431,11 @@ describe('MCP Tool Execution', () => {
 
     const mockContext = createToolExecutionContext()
 
-    const result = await executeTool('mcp-123-list_files', { path: '/test' }, false, mockContext)
+    const result = await executeTool(
+      'mcp-123-list_files',
+      { path: '/test' },
+      { executionContext: mockContext }
+    )
 
     expect(result.success).toBe(true)
     expect(result.output).toBeDefined()
@@ -1335,7 +1465,11 @@ describe('MCP Tool Execution', () => {
 
     const mockContext2 = createToolExecutionContext()
 
-    await executeTool('mcp-timestamp123-complex-tool-name', { param: 'value' }, false, mockContext2)
+    await executeTool(
+      'mcp-timestamp123-complex-tool-name',
+      { param: 'value' },
+      { executionContext: mockContext2 }
+    )
   })
 
   it('should handle MCP block arguments format', async () => {
@@ -1366,8 +1500,7 @@ describe('MCP Tool Execution', () => {
         server: 'mcp-123',
         tool: 'read_file',
       },
-      false,
-      mockContext3
+      { executionContext: mockContext3 }
     )
   })
 
@@ -1403,8 +1536,7 @@ describe('MCP Tool Execution', () => {
         workspaceId: 'workspace-456',
         requestId: 'req-123',
       },
-      false,
-      mockContext4
+      { executionContext: mockContext4 }
     )
   })
 
@@ -1428,8 +1560,7 @@ describe('MCP Tool Execution', () => {
     const result = await executeTool(
       'mcp-123-nonexistent_tool',
       { param: 'value' },
-      false,
-      mockContext5
+      { executionContext: mockContext5 }
     )
 
     expect(result.success).toBe(false)
@@ -1447,7 +1578,11 @@ describe('MCP Tool Execution', () => {
   it('should handle invalid MCP tool ID format', async () => {
     const mockContext6 = createToolExecutionContext()
 
-    const result = await executeTool('invalid-mcp-id', { param: 'value' }, false, mockContext6)
+    const result = await executeTool(
+      'invalid-mcp-id',
+      { param: 'value' },
+      { executionContext: mockContext6 }
+    )
 
     expect(result.success).toBe(false)
     expect(result.error).toContain('Tool not found')
@@ -1460,7 +1595,11 @@ describe('MCP Tool Execution', () => {
 
     const mockContext7 = createToolExecutionContext()
 
-    const result = await executeTool('mcp-123-test_tool', { param: 'value' }, false, mockContext7)
+    const result = await executeTool(
+      'mcp-123-test_tool',
+      { param: 'value' },
+      { executionContext: mockContext7 }
+    )
 
     expect(result.success).toBe(false)
     expect(result.error).toContain('Network error')
@@ -1771,7 +1910,7 @@ describe('Hosted Key Injection', () => {
     ) as typeof fetch
 
     const mockContext = createToolExecutionContext()
-    await executeTool('test_no_hosting', {}, false, mockContext)
+    await executeTool('test_no_hosting', {}, { executionContext: mockContext })
 
     // BYOK should not be called since there's no hosting config
     expect(mockGetBYOKKey).not.toHaveBeenCalled()
@@ -1834,7 +1973,7 @@ describe('Hosted Key Injection', () => {
     ) as typeof fetch
 
     const mockContext = createToolExecutionContext()
-    await executeTool('test_with_hosting', {}, false, mockContext)
+    await executeTool('test_with_hosting', {}, { executionContext: mockContext })
 
     // With isHosted=false, BYOK won't be called - this is expected behavior
     // The test documents the current behavior
@@ -2063,7 +2202,7 @@ describe('Rate Limiting and Retry Logic', () => {
     ) as typeof fetch
 
     const mockContext = createToolExecutionContext()
-    const resultPromise = executeTool('test_rate_limit', {}, false, mockContext)
+    const resultPromise = executeTool('test_rate_limit', {}, { executionContext: mockContext })
 
     // Advance timers to skip retry delays (1s + 2s exponential backoff)
     await vi.advanceTimersByTimeAsync(10000)
@@ -2124,7 +2263,11 @@ describe('Rate Limiting and Retry Logic', () => {
     ) as typeof fetch
 
     const mockContext = createToolExecutionContext()
-    const resultPromise = executeTool('test_persistent_rate_limit', {}, false, mockContext)
+    const resultPromise = executeTool(
+      'test_persistent_rate_limit',
+      {},
+      { executionContext: mockContext }
+    )
 
     // Advance timers to skip retry delays (1s + 2s + 4s exponential backoff)
     await vi.advanceTimersByTimeAsync(15000)
@@ -2187,7 +2330,7 @@ describe('Rate Limiting and Retry Logic', () => {
     ) as typeof fetch
 
     const mockContext = createToolExecutionContext()
-    const result = await executeTool('test_no_retry', {}, false, mockContext)
+    const result = await executeTool('test_no_retry', {}, { executionContext: mockContext })
 
     // Should fail immediately without retries
     expect(result.success).toBe(false)
@@ -2243,7 +2386,7 @@ describe('stripInternalFields Safety', () => {
       { preconnect: vi.fn() }
     ) as typeof fetch
 
-    const result = await executeTool('test_string_output', {}, true)
+    const result = await executeTool('test_string_output', {}, { skipPostProcess: true })
 
     expect(result.success).toBe(true)
     expect(result.output).toBe(stringOutput)
@@ -2285,7 +2428,7 @@ describe('stripInternalFields Safety', () => {
       { preconnect: vi.fn() }
     ) as typeof fetch
 
-    const result = await executeTool('test_array_output', {}, true)
+    const result = await executeTool('test_array_output', {}, { skipPostProcess: true })
 
     expect(result.success).toBe(true)
     expect(Array.isArray(result.output)).toBe(true)
@@ -2325,7 +2468,7 @@ describe('stripInternalFields Safety', () => {
       { preconnect: vi.fn() }
     ) as typeof fetch
 
-    const result = await executeTool('test_strip_internal', {}, true)
+    const result = await executeTool('test_strip_internal', {}, { skipPostProcess: true })
 
     expect(result.success).toBe(true)
     expect(result.output.result).toBe('ok')
@@ -2428,7 +2571,7 @@ describe('Cost Field Handling', () => {
     const mockContext = createToolExecutionContext({
       userId: 'user-123',
     } as any)
-    const result = await executeTool('test_cost_per_request', {}, false, mockContext)
+    const result = await executeTool('test_cost_per_request', {}, { executionContext: mockContext })
 
     expect(result.success).toBe(true)
     // Note: In test environment, hosted key injection may not work due to env mocking complexity.
@@ -2493,8 +2636,7 @@ describe('Cost Field Handling', () => {
     const result = await executeTool(
       'test_no_hosted_cost',
       { apiKey: 'user-api-key' },
-      false,
-      mockContext
+      { executionContext: mockContext }
     )
 
     expect(result.success).toBe(true)
@@ -2561,8 +2703,7 @@ describe('Cost Field Handling', () => {
     const result = await executeTool(
       'test_custom_pricing_cost',
       { mode: 'advanced' },
-      false,
-      mockContext
+      { executionContext: mockContext }
     )
 
     expect(result.success).toBe(true)

@@ -1,11 +1,13 @@
 import { memo, useCallback, useEffect, useMemo, useRef } from 'react'
 import { createLogger } from '@sim/logger'
+import { truncate } from '@sim/utils/string'
 import { isEqual } from 'es-toolkit'
 import { useParams } from 'next/navigation'
 import { Handle, type NodeProps, Position, useUpdateNodeInternals } from 'reactflow'
 import { useStoreWithEqualityFn } from 'zustand/traditional'
 import { Badge, Tooltip } from '@/components/emcn'
 import { cn } from '@/lib/core/utils/cn'
+import { handleKeyboardActivation } from '@/lib/core/utils/keyboard'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import { createMcpToolId } from '@/lib/mcp/shared'
 import { getProviderIdFromServiceId } from '@/lib/oauth'
@@ -263,7 +265,7 @@ export const getDisplayValue = (value: unknown): string => {
     const firstMessage = parsedValue[0]
     if (!firstMessage?.content || firstMessage.content.trim() === '') return '-'
     const content = firstMessage.content.trim()
-    return content.length > 50 ? `${content.slice(0, 50)}...` : content
+    return truncate(content, 50)
   }
 
   if (isVariableAssignmentsArray(parsedValue)) {
@@ -924,6 +926,7 @@ export const WorkflowBlock = memo(function WorkflowBlock({
   const { mutate: deployChildWorkflow, isPending: isDeploying } = useDeployWorkflow()
 
   const userPermissions = useUserPermissionsContext()
+  const canEditWorkflow = userPermissions.canEdit && !data.isWorkflowLocked
 
   const currentStoreBlock = currentWorkflow.getBlockById(id)
 
@@ -980,7 +983,7 @@ export const WorkflowBlock = memo(function WorkflowBlock({
       {}
     )
 
-    const effectiveAdvanced = userPermissions.canEdit
+    const effectiveAdvanced = canEditWorkflow
       ? displayAdvancedMode
       : displayAdvancedMode || hasAdvancedValues(config.subBlocks, rawValues, canonicalIndex)
     const effectiveTrigger = displayTriggerMode
@@ -1055,7 +1058,7 @@ export const WorkflowBlock = memo(function WorkflowBlock({
     currentWorkflow.isDiffMode,
     currentBlock,
     canonicalModeOverrides,
-    userPermissions.canEdit,
+    canEditWorkflow,
     canonicalIndex,
     hiddenByReactiveCondition,
     blockSubBlockValues,
@@ -1075,16 +1078,10 @@ export const WorkflowBlock = memo(function WorkflowBlock({
       },
       {}
     )
-    return userPermissions.canEdit
+    return canEditWorkflow
       ? displayAdvancedMode
       : displayAdvancedMode || hasAdvancedValues(config.subBlocks, rawValues, canonicalIndex)
-  }, [
-    subBlockState,
-    displayAdvancedMode,
-    config.subBlocks,
-    canonicalIndex,
-    userPermissions.canEdit,
-  ])
+  }, [subBlockState, displayAdvancedMode, config.subBlocks, canonicalIndex, canEditWorkflow])
 
   /**
    * Determine if block has content below the header (subblocks or error row).
@@ -1185,7 +1182,10 @@ export const WorkflowBlock = memo(function WorkflowBlock({
     <div className='group relative'>
       <div
         ref={contentRef}
+        role='button'
+        tabIndex={0}
         onClick={handleClick}
+        onKeyDown={(event) => handleKeyboardActivation(event, handleClick)}
         className={cn(
           'workflow-drag-handle relative z-[20] w-[250px] cursor-grab select-none rounded-lg border border-[var(--border-1)] bg-[var(--surface-2)] [&:active]:cursor-grabbing'
         )}
@@ -1197,7 +1197,7 @@ export const WorkflowBlock = memo(function WorkflowBlock({
         )}
 
         {!data.isPreview && !data.isEmbedded && (
-          <ActionBar blockId={id} blockType={type} disabled={!userPermissions.canEdit} />
+          <ActionBar blockId={id} blockType={type} disabled={!canEditWorkflow} />
         )}
 
         {shouldShowDefaultHandles && (
@@ -1227,12 +1227,12 @@ export const WorkflowBlock = memo(function WorkflowBlock({
         >
           <div className='relative z-10 flex min-w-0 flex-1 items-center gap-2.5'>
             <div
-              className='flex h-[24px] w-[24px] flex-shrink-0 items-center justify-center rounded-md'
+              className='flex size-[24px] flex-shrink-0 items-center justify-center rounded-md'
               style={{
                 background: isEnabled ? config.bgColor : 'gray',
               }}
             >
-              <config.icon className='h-[16px] w-[16px] text-white' />
+              <config.icon className='size-[16px] text-white' />
             </div>
             <span
               className={cn(

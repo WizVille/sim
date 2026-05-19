@@ -52,7 +52,7 @@ export interface ModelCapabilities {
   memory?: boolean
 }
 
-export interface ModelDefinition {
+interface ModelDefinition {
   id: string
   pricing: ModelPricing
   capabilities: ModelCapabilities
@@ -576,7 +576,6 @@ export const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
           updatedAt: '2026-04-16',
         },
         capabilities: {
-          temperature: { min: 0, max: 1 },
           nativeStructuredOutputs: true,
           maxOutputTokens: 128000,
           thinking: {
@@ -1600,6 +1599,21 @@ export const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
       toolUsageControl: true,
     },
     models: [
+      {
+        id: 'grok-4.3',
+        pricing: {
+          input: 1.25,
+          cachedInput: 0.2,
+          output: 2.5,
+          updatedAt: '2026-05-05',
+        },
+        capabilities: {
+          temperature: { min: 0, max: 1 },
+        },
+        contextWindow: 1000000,
+        releaseDate: '2026-04-30',
+        recommended: true,
+      },
       {
         id: 'grok-4-latest',
         pricing: {
@@ -3023,10 +3037,31 @@ export const EMBEDDING_MODEL_PRICING: Record<string, ModelPricing> = {
     output: 0.0,
     updatedAt: '2026-04-01',
   },
+  'gemini-embedding-001': {
+    input: 0.15, // $0.15 per 1M tokens
+    output: 0.0,
+    updatedAt: '2026-04-29',
+  },
 }
 
 export function getEmbeddingModelPricing(modelId: string): ModelPricing | null {
   return EMBEDDING_MODEL_PRICING[modelId] || null
+}
+
+/**
+ * Cohere rerank pricing in USD per single search unit (one query × ≤100 docs).
+ * Sim caps every rerank request to ≤100 documents, so each call = 1 unit.
+ */
+export const RERANK_MODEL_PRICING: Record<string, { perSearchUnit: number; updatedAt: string }> = {
+  'rerank-v4.0-pro': { perSearchUnit: 0.0025, updatedAt: '2026-04-29' },
+  'rerank-v4.0-fast': { perSearchUnit: 0.002, updatedAt: '2026-04-29' },
+  'rerank-v3.5': { perSearchUnit: 0.002, updatedAt: '2026-04-29' },
+}
+
+export function getRerankModelPricing(
+  modelId: string
+): { perSearchUnit: number; updatedAt: string } | null {
+  return RERANK_MODEL_PRICING[modelId] || null
 }
 
 export function getModelsWithReasoningEffort(): string[] {

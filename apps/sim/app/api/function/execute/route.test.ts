@@ -49,90 +49,6 @@ vi.mock('@/lib/core/config/feature-flags', () => featureFlagsMock)
 import { validateProxyUrl } from '@/lib/core/security/input-validation'
 import { POST } from '@/app/api/function/execute/route'
 
-/**
- * Creates a fake isolated-vm execution result by evaluating code
- * in a sandboxed context, mimicking the real executeInIsolatedVM behavior.
- */
-function createIsolatedVmImplementation() {
-  return async (req: {
-    code: string
-    params: Record<string, unknown>
-    envVars: Record<string, unknown>
-    contextVariables: Record<string, unknown>
-  }) => {
-    const { code, params, envVars, contextVariables } = req
-    const stdoutChunks: string[] = []
-
-    const mockConsole = {
-      log: (...args: unknown[]) => {
-        stdoutChunks.push(
-          `${args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')}\n`
-        )
-      },
-      error: (...args: unknown[]) => {
-        stdoutChunks.push(
-          'ERROR: ' +
-            args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ') +
-            '\n'
-        )
-      },
-      warn: (...args: unknown[]) => mockConsole.log('WARN:', ...args),
-      info: (...args: unknown[]) => mockConsole.log(...args),
-    }
-
-    try {
-      const escapePattern = /this\.constructor\.constructor|\.constructor\s*\(/
-      if (escapePattern.test(code)) {
-        return { result: undefined, stdout: '' }
-      }
-
-      const context: Record<string, unknown> = {
-        console: mockConsole,
-        params,
-        environmentVariables: envVars,
-        ...contextVariables,
-        process: undefined,
-        require: undefined,
-        module: undefined,
-        exports: undefined,
-        __dirname: undefined,
-        __filename: undefined,
-        fetch: async () => {
-          throw new Error('fetch not implemented in test mock')
-        },
-      }
-
-      const paramNames = Object.keys(context)
-      const paramValues = Object.values(context)
-
-      const wrappedCode = `
-        return (async () => {
-          ${code}
-        })();
-      `
-
-      const fn = new Function(...paramNames, wrappedCode)
-      const result = await fn(...paramValues)
-
-      return {
-        result,
-        stdout: stdoutChunks.join(''),
-      }
-    } catch (error: unknown) {
-      const err = error as Error
-      return {
-        result: null,
-        stdout: stdoutChunks.join(''),
-        error: {
-          message: err.message || String(error),
-          name: err.name || 'Error',
-          stack: err.stack,
-        },
-      }
-    }
-  }
-}
-
 describe('Function Execute API Route', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -143,7 +59,7 @@ describe('Function Execute API Route', () => {
       authType: 'internal_jwt',
     })
 
-    mockExecuteInIsolatedVM.mockImplementation(createIsolatedVmImplementation())
+    mockExecuteInIsolatedVM.mockResolvedValue({ result: 'test', stdout: '' })
 
     mockExecuteInE2B.mockResolvedValue({
       result: 'e2b success',
@@ -183,7 +99,9 @@ describe('Function Execute API Route', () => {
       expect(data.output.result).toBe('test')
     })
 
-    it.concurrent('should prevent VM escape via constructor chain', async () => {
+    it('should prevent VM escape via constructor chain', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({ result: undefined, stdout: '' })
+
       const req = createMockRequest('POST', {
         code: 'return this.constructor.constructor("return process")().env',
       })
@@ -191,7 +109,7 @@ describe('Function Execute API Route', () => {
       const response = await POST(req)
       const data = await response.json()
 
-      if (response.status === 500) {
+      if (response.status === 422 || response.status === 500) {
         expect(data.success).toBe(false)
       } else {
         const result = data.output?.result
@@ -219,7 +137,9 @@ describe('Function Execute API Route', () => {
       }
     })
 
-    it.concurrent('should not expose process object', async () => {
+    it('should not expose process object', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({ result: 'undefined', stdout: '' })
+
       const req = createMockRequest('POST', {
         code: 'return typeof process',
       })
@@ -231,7 +151,9 @@ describe('Function Execute API Route', () => {
       expect(data.output.result).toBe('undefined')
     })
 
-    it.concurrent('should not expose require function', async () => {
+    it('should not expose require function', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({ result: 'undefined', stdout: '' })
+
       const req = createMockRequest('POST', {
         code: 'return typeof require',
       })
@@ -279,7 +201,9 @@ describe('Function Execute API Route', () => {
       expect(data.output).toHaveProperty('executionTime')
     })
 
-    it.concurrent('should return computed result for multi-line code', async () => {
+    it('should return computed result for multi-line code', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({ result: 10, stdout: '' })
+
       const req = createMockRequest('POST', {
         code: 'const a = 1;\nconst b = 2;\nconst c = 3;\nconst d = 4;\nreturn a + b + c + d;',
         timeout: 5000,
@@ -301,8 +225,7 @@ describe('Function Execute API Route', () => {
       const response = await POST(req)
       const data = await response.json()
 
-      expect(response.status).toBe(500)
-      expect(data.success).toBe(false)
+      expect(response.status).toBe(400)
       expect(data).toHaveProperty('error')
     })
 
@@ -466,7 +389,7 @@ describe('Function Execute API Route', () => {
 
       const response = await POST(req)
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(400)
     })
 
     it.concurrent('should handle timeout parameter', async () => {
@@ -496,6 +419,12 @@ describe('Function Execute API Route', () => {
 
   describe('Enhanced Error Handling', () => {
     it('should provide detailed syntax error with line content', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        error: { message: 'Unexpected end of input', name: 'SyntaxError' },
+      })
+
       const req = createMockRequest('POST', {
         code: 'const obj = {\n  name: "test",\n  description: "This has a missing closing quote\n};\nreturn obj;',
         timeout: 5000,
@@ -504,12 +433,21 @@ describe('Function Execute API Route', () => {
       const response = await POST(req)
       const data = await response.json()
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(422)
       expect(data.success).toBe(false)
       expect(data.error).toBeTruthy()
     })
 
     it('should provide detailed runtime error with line and column', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        error: {
+          message: "Cannot read properties of null (reading 'someMethod')",
+          name: 'TypeError',
+        },
+      })
+
       const req = createMockRequest('POST', {
         code: 'const obj = null;\nreturn obj.someMethod();',
         timeout: 5000,
@@ -518,13 +456,19 @@ describe('Function Execute API Route', () => {
       const response = await POST(req)
       const data = await response.json()
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(422)
       expect(data.success).toBe(false)
       expect(data.error).toContain('Type Error')
       expect(data.error).toContain('Cannot read properties of null')
     })
 
     it('should handle ReferenceError with enhanced details', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        error: { message: 'undefinedVariable is not defined', name: 'ReferenceError' },
+      })
+
       const req = createMockRequest('POST', {
         code: 'const x = 42;\nreturn undefinedVariable + x;',
         timeout: 5000,
@@ -533,13 +477,49 @@ describe('Function Execute API Route', () => {
       const response = await POST(req)
       const data = await response.json()
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(422)
       expect(data.success).toBe(false)
       expect(data.error).toContain('Reference Error')
       expect(data.error).toContain('undefinedVariable is not defined')
     })
 
+    it('should show original source code when resolved block references cause syntax errors', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        error: {
+          message: 'Unexpected identifier "globalThis"',
+          name: 'SyntaxError',
+          line: 1,
+          column: 7,
+          lineContent: 'retur globalThis["__blockRef_0"]',
+        },
+      })
+
+      const req = createMockRequest('POST', {
+        code: 'retur globalThis["__blockRef_0"]',
+        sourceCode: 'retur <start.reqerror>',
+        contextVariables: { __blockRef_0: 'value' },
+        timeout: 5000,
+      })
+
+      const response = await POST(req)
+      const data = await response.json()
+
+      expect(response.status).toBe(422)
+      expect(data.success).toBe(false)
+      expect(data.error).toContain('Line 1: `retur <start.reqerror>`')
+      expect(data.error).not.toContain('globalThis')
+      expect(data.debug.lineContent).toBe('retur <start.reqerror>')
+    })
+
     it('should handle thrown errors gracefully', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        error: { message: 'Custom error message', name: 'Error' },
+      })
+
       const req = createMockRequest('POST', {
         code: 'throw new Error("Custom error message");',
         timeout: 5000,
@@ -548,12 +528,18 @@ describe('Function Execute API Route', () => {
       const response = await POST(req)
       const data = await response.json()
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(422)
       expect(data.success).toBe(false)
       expect(data.error).toContain('Custom error message')
     })
 
-    it.concurrent('should provide helpful suggestions for common syntax errors', async () => {
+    it('should provide helpful suggestions for common syntax errors', async () => {
+      mockExecuteInIsolatedVM.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        error: { message: 'Unexpected end of input', name: 'SyntaxError' },
+      })
+
       const req = createMockRequest('POST', {
         code: 'const obj = {\n  name: "test"\n// Missing closing brace',
         timeout: 5000,
@@ -562,7 +548,7 @@ describe('Function Execute API Route', () => {
       const response = await POST(req)
       const data = await response.json()
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(422)
       expect(data.success).toBe(false)
       expect(data.error).toBeTruthy()
     })

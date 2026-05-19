@@ -1,13 +1,15 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createLogger } from '@sim/logger'
-import { Check, Eye, EyeOff, Loader2 } from 'lucide-react'
+import { getErrorMessage } from '@sim/utils/errors'
+import { Check, Eye, EyeOff } from 'lucide-react'
 import {
   ButtonGroup,
   ButtonGroupItem,
   Input,
   Label,
+  Loader,
   Skeleton,
   TagInput,
   type TagItem,
@@ -78,8 +80,8 @@ export function FormDeploy({
   const [inputFields, setInputFields] = useState<{ name: string; type: string }[]>([])
   const [showPasswordField, setShowPasswordField] = useState(false)
   const [fieldConfigs, setFieldConfigs] = useState<FieldConfig[]>([])
+  const fieldConfigsInitializedRef = useRef(false)
   const [errors, setErrors] = useState<FormErrors>({})
-  const [isIdentifierValid, setIsIdentifierValid] = useState(false)
 
   const { data: existingForm, isLoading } = useFormByWorkflow(workflowId)
   const createFormMutation = useCreateForm()
@@ -91,12 +93,8 @@ export function FormDeploy({
   const {
     isChecking: isCheckingIdentifier,
     error: identifierError,
-    isValid: identifierValidationPassed,
+    isValid: isIdentifierValid,
   } = useIdentifierValidation(identifier, existingForm?.identifier, !!existingForm)
-
-  useEffect(() => {
-    setIsIdentifierValid(identifierValidationPassed)
-  }, [identifierValidationPassed])
 
   const setError = (field: keyof FormErrors, message: string) => {
     setErrors((prev) => ({ ...prev, [field]: message }))
@@ -146,6 +144,10 @@ export function FormDeploy({
   }, [existingForm, isLoading])
 
   useEffect(() => {
+    fieldConfigsInitializedRef.current = false
+  }, [workflowId])
+
+  useEffect(() => {
     const blocks = Object.values(useWorkflowStore.getState().blocks)
     const startBlock = blocks.find((b) => isInputDefinitionTrigger(b.type))
 
@@ -154,7 +156,8 @@ export function FormDeploy({
       if (inputFormat && Array.isArray(inputFormat)) {
         setInputFields(inputFormat)
 
-        if (fieldConfigs.length === 0) {
+        if (!fieldConfigsInitializedRef.current) {
+          fieldConfigsInitializedRef.current = true
           setFieldConfigs(
             inputFormat.map((f: { name: string; type?: string }) => ({
               name: f.name,
@@ -169,7 +172,7 @@ export function FormDeploy({
         }
       }
     }
-  }, [workflowId, fieldConfigs.length])
+  }, [workflowId])
 
   const allowedEmails = emailItems.filter((item) => item.isValid).map((item) => item.value)
 
@@ -267,7 +270,7 @@ export function FormDeploy({
           onDeploymentComplete?.()
         }
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'An error occurred'
+        const message = getErrorMessage(err, 'An error occurred')
         logger.error('Error deploying form:', err)
 
         if (message.toLowerCase().includes('identifier')) {
@@ -373,20 +376,20 @@ export function FormDeploy({
                 placeholder='my-form'
                 className={cn(
                   'rounded-none border-0 pl-0 shadow-none',
-                  (isCheckingIdentifier || (identifierValidationPassed && identifier)) && 'pr-8'
+                  (isCheckingIdentifier || (isIdentifierValid && identifier)) && 'pr-8'
                 )}
               />
               {isCheckingIdentifier ? (
                 <div className='-translate-y-1/2 absolute top-1/2 right-2'>
-                  <Loader2 className='h-4 w-4 animate-spin text-[var(--text-tertiary)]' />
+                  <Loader className='size-4 text-[var(--text-tertiary)]' animate />
                 </div>
               ) : (
-                identifierValidationPassed &&
+                isIdentifierValid &&
                 identifier && (
                   <Tooltip.Root>
                     <Tooltip.Trigger asChild>
                       <div className='-translate-y-1/2 absolute top-1/2 right-2'>
-                        <Check className='h-4 w-4 text-[var(--brand-accent)]' />
+                        <Check className='size-4 text-[var(--brand-accent)]' />
                       </div>
                     </Tooltip.Trigger>
                     <Tooltip.Content>
@@ -478,7 +481,7 @@ export function FormDeploy({
                 onClick={() => setShowPasswordField(!showPasswordField)}
                 className='-translate-y-1/2 absolute top-1/2 right-[8px] text-[var(--text-secondary)]'
               >
-                {showPasswordField ? <EyeOff className='h-4 w-4' /> : <Eye className='h-4 w-4' />}
+                {showPasswordField ? <EyeOff className='size-4' /> : <Eye className='size-4' />}
               </button>
             </div>
             {errors.password && (
