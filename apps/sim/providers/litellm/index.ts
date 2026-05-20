@@ -137,9 +137,17 @@ export const litellmProvider: ProviderConfig = {
         }))
       : undefined
 
+    let sessionId = 'sim'
+    try {
+      sessionId = `sim-${request?.callChain?.[0] ?? Date.now()}`
+    } catch (e) {
+      sessionId = `sim-${Date.now()}`
+    }
+
     const payload: any = {
       model: request.model.replace(/^litellm\//, ''),
       messages: formattedMessages,
+      metadata: { user_id: sessionId }
     }
 
     if (request.temperature !== undefined) payload.temperature = request.temperature
