@@ -22,6 +22,7 @@ function getAllowedOrigins(): string[] {
     getBaseUrl(),
     'http://localhost:3000',
     'http://localhost:3001',
+    'http://localhost:3003',
     ...(env.ALLOWED_ORIGINS?.split(',') || []),
   ].filter((url): url is string => Boolean(url))
 

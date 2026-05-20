@@ -162,7 +162,7 @@ export const workflowStateSchema = z.object({
   metadata: z
     .object({
       name: z.string().optional(),
-      description: z.string().optional(),
+      description: z.string().optional().default(""),
     })
     .optional(),
 })
