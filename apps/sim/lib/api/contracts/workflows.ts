@@ -162,7 +162,7 @@ export const workflowStateSchema = z.object({
   metadata: z
     .object({
       name: z.string().optional(),
-      description: z.string().optional().default(""),
+      description: z.string().nullable().optional(),
     })
     .optional(),
 })
@@ -236,7 +236,7 @@ export const createWorkflowBodySchema = z.object({
 export const createWorkflowResponseSchema = z.object({
   id: z.string(),
   name: z.string(),
-  description: z.string(),
+  description: z.string().default(''),
   color: z.string(),
   workspaceId: z.string(),
   folderId: z.string().nullable().optional(),
