@@ -71,7 +71,7 @@ export function getModelOptions() {
     ])
   ).filter(m => !m.includes('fallback'))
 
-  return allModels.filter(m => ['mistral-large-latest', 'mistral-medium-latest', 'mistral-small-latest'].includes(m) || m.startsWith('vertex/') || m.startsWith('gpt') || m == 'azure/gpt-5.4' || m == 'azure/gpt-5.4-mini' || m == 'azure/gpt-5.1' || m == 'azure/gpt-5.2' || m.startsWith('litellm/')).map((model) => {
+  return litellmModels.map((model) => {
     const icon = getProviderIcon(model)
     return { label: model, id: model, ...(icon && { icon }) }
   })
