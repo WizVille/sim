@@ -16,9 +16,11 @@ import { cn } from '@/lib/core/utils/cn'
 import { EnvVarDropdown } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/env-var-dropdown'
 import { formatDisplayText } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/formatted-text'
 import { TagDropdown } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/tag-dropdown/tag-dropdown'
+import { getActiveWorkflowSearchHighlight } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/workflow-search-highlight'
 import { useSubBlockInput } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-input'
 import { useSubBlockValue } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-value'
 import type { WandControlHandlers } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/sub-block'
+import { useActiveSearchTarget } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/providers/active-search-target-provider'
 import { useAccessibleReferencePrefixes } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks/use-accessible-reference-prefixes'
 import { useWand } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks/use-wand'
 import type { SubBlockConfig } from '@/blocks/types'
@@ -87,6 +89,7 @@ export function MessagesInput({
   disabled = false,
   wandControlRef,
 }: MessagesInputProps) {
+  const activeSearchTarget = useActiveSearchTarget()
   const [messages, setMessages] = useSubBlockValue<Message[]>(blockId, subBlockId, false)
   const [localMessages, setLocalMessages] = useState<Message[]>([{ role: 'user', content: '' }])
   const messageIdsRef = useRef<string[]>([generateShortId()])
@@ -581,6 +584,11 @@ export function MessagesInput({
             const textareaRefObject = {
               current: textareaRefs.current[fieldId] ?? null,
             } as React.RefObject<HTMLTextAreaElement>
+            const workflowSearchHighlight = getActiveWorkflowSearchHighlight({
+              activeSearchTarget,
+              subBlockId,
+              valuePath: [index, 'content'],
+            })
 
             return (
               <>
@@ -619,7 +627,7 @@ export function MessagesInput({
                         {!isPreview && !disabled && (
                           <ChevronDown
                             className={cn(
-                              'h-3 w-3 flex-shrink-0 transition-transform duration-100',
+                              'size-3 flex-shrink-0 transition-transform duration-100',
                               openPopoverIndex === index && 'rotate-180'
                             )}
                           />
@@ -756,6 +764,7 @@ export function MessagesInput({
                     {formatDisplayText(message.content, {
                       accessiblePrefixes,
                       highlightAll: !accessiblePrefixes,
+                      workflowSearchHighlight,
                     })}
                     {message.content.endsWith('\n') && '\u200B'}
                   </div>

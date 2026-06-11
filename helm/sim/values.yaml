@@ -110,11 +110,20 @@ app:
     REDIS_URL: ""           # OPTIONAL - Redis connection string for caching/sessions; can also come from app secret or External Secrets
     
     # Email & Communication
+    # Configure one provider — the mailer auto-detects in priority order:
+    # Resend → AWS SES → SMTP → Azure Communication Services.
     EMAIL_VERIFICATION_ENABLED: ""                        # Set to "true" to enable email verification for user registration and login (default "false" via envDefaults)
     RESEND_API_KEY: ""                                    # Resend API key for transactional emails
     FROM_EMAIL_ADDRESS: ""                                # Complete from address (e.g., "Sim <noreply@domain.com>" or "DoNotReply@domain.com")
     EMAIL_DOMAIN: ""                                      # Domain for sending emails (fallback when FROM_EMAIL_ADDRESS not set)
-    
+    AWS_SES_REGION: ""                                    # AWS region for SES (e.g., "us-east-1"); credentials resolved via the standard AWS provider chain (env, IRSA, instance profile)
+    SMTP_HOST: ""                                         # SMTP server hostname (alternative to Resend/SES)
+    SMTP_PORT: ""                                         # SMTP server port (465 for TLS, 587 for STARTTLS, 25 for plain)
+    SMTP_USER: ""                                         # SMTP username (optional — omit for unauthenticated relays like MailHog)
+    SMTP_PASS: ""                                         # SMTP password (optional — omit for unauthenticated relays)
+    SMTP_SECURE: ""                                       # Set to "true" to force TLS on connect; defaults to true when SMTP_PORT=465
+
+
     # OAuth Integration Credentials (leave empty if not using)
     GOOGLE_CLIENT_ID: ""                                  # Google OAuth client ID
     GOOGLE_CLIENT_SECRET: ""                              # Google OAuth client secret
@@ -207,6 +216,10 @@ app:
     # Set to "true" AFTER running the SSO registration script
     SSO_ENABLED: ""                                       # Enable SSO authentication ("true" to enable)
     NEXT_PUBLIC_SSO_ENABLED: ""                           # Show SSO login button in UI ("true" to enable)
+    # SSO_TRUSTED_PROVIDER_IDS: comma-separated SSO provider IDs to trust for automatic account linking when a
+    # user signs in via SSO and an account with the same email already exists. Only needed for IdPs that do NOT
+    # assert email_verified (trustEmailVerified already handles those that do). Resolved at startup — restart after editing.
+    SSO_TRUSTED_PROVIDER_IDS: ""
 
     # Enterprise Feature Overrides (self-hosted)
     CREDENTIAL_SETS_ENABLED: ""                           # Enable credential sets (email polling) on self-hosted ("true" to enable)
@@ -251,6 +264,8 @@ app:
     S3_PROFILE_PICTURES_BUCKET_NAME: ""                   # S3 bucket for user profile pictures
     S3_OG_IMAGES_BUCKET_NAME: ""                          # S3 bucket for OpenGraph preview images
     S3_WORKSPACE_LOGOS_BUCKET_NAME: ""                    # S3 bucket for workspace logos
+    S3_ENDPOINT: ""                                       # Custom endpoint for S3-compatible storage (Cloudflare R2, MinIO, Backblaze B2). Leave empty for AWS S3
+    S3_FORCE_PATH_STYLE: ""                               # Set to "true" for path-style addressing (MinIO/Ceph RGW). Leave empty for AWS S3 and R2
 
     # Azure Blob Storage Configuration (optional - for file storage)
     # If configured, files will be stored in Azure Blob instead of local storage
@@ -1150,6 +1165,15 @@ cronjobs:
       successfulJobsHistoryLimit: 3
       failedJobsHistoryLimit: 1
 
+    hubspotWebhookPoll:
+      enabled: true
+      name: hubspot-webhook-poll
+      schedule: "*/1 * * * *"
+      path: "/api/webhooks/poll/hubspot"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 1
+
     renewSubscriptions:
       enabled: true
       name: renew-subscriptions
@@ -1159,11 +1183,20 @@ cronjobs:
       successfulJobsHistoryLimit: 3
       failedJobsHistoryLimit: 1
 
-    inactivityAlertPoll:
+    reconcileBillingSeats:
       enabled: true
-      name: inactivity-alert-poll
+      name: reconcile-billing-seats
+      schedule: "0 * * * *"
+      path: "/api/cron/reconcile-billing-seats"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 1
+
+    workspaceEventsPoll:
+      enabled: true
+      name: workspace-events-poll
       schedule: "*/15 * * * *"
-      path: "/api/notifications/poll"
+      path: "/api/workspace-events/poll"
       concurrencyPolicy: Forbid
       successfulJobsHistoryLimit: 3
       failedJobsHistoryLimit: 1

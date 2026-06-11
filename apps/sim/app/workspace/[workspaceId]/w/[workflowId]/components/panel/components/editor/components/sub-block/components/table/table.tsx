@@ -4,13 +4,17 @@ import { generateId } from '@sim/utils/id'
 import { useParams } from 'next/navigation'
 import { Button } from '@/components/emcn'
 import { Trash } from '@/components/emcn/icons/trash'
-import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/core/utils/cn'
 import { EnvVarDropdown } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/env-var-dropdown'
 import { formatDisplayText } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/formatted-text'
 import { TagDropdown } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/tag-dropdown/tag-dropdown'
+import {
+  getActiveWorkflowSearchHighlight,
+  getWorkflowSearchLabelHighlight,
+} from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/workflow-search-highlight'
 import { useSubBlockInput } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-input'
 import { useSubBlockValue } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-value'
+import { useActiveSearchTarget } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/providers/active-search-target-provider'
 import { useAccessibleReferencePrefixes } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks/use-accessible-reference-prefixes'
 
 const logger = createLogger('Table')
@@ -44,6 +48,7 @@ interface TableCellProps {
   overlayRefs: React.MutableRefObject<Map<string, HTMLDivElement>>
   accessiblePrefixes: ReturnType<typeof useAccessibleReferencePrefixes>
   workspaceId: string
+  subBlockId: string
 }
 
 function TableCell({
@@ -61,7 +66,9 @@ function TableCell({
   overlayRefs,
   accessiblePrefixes,
   workspaceId,
+  subBlockId,
 }: TableCellProps) {
+  const activeSearchTarget = useActiveSearchTarget()
   // Defensive programming: ensure row.cells exists and has the expected structure
   const hasValidCells = row.cells && typeof row.cells === 'object'
   if (!hasValidCells) logger.warn('Table row has malformed cells data:', row)
@@ -70,6 +77,12 @@ function TableCell({
 
   const cellValue = cells[column] || ''
   const cellKey = `${rowIndex}-${column}`
+  const workflowSearchHighlight = getActiveWorkflowSearchHighlight({
+    activeSearchTarget,
+    blockId,
+    subBlockId,
+    valuePath: [rowIndex, 'cells', column],
+  })
 
   // Get field state and handlers for this cell
   const fieldState = inputController.fieldHelpers.getFieldState(cellKey)
@@ -123,10 +136,11 @@ function TableCell({
       )}
     >
       <div className='relative w-full'>
-        <Input
+        <input
           ref={(el) => {
             if (el) inputRefs.current.set(cellKey, el)
           }}
+          type='text'
           value={cellValue}
           placeholder={column}
           onChange={handlers.onChange}
@@ -137,7 +151,10 @@ function TableCell({
           onFocus={handlers.onFocus}
           disabled={isPreview || disabled}
           autoComplete='off'
-          className='w-full border-0 bg-transparent px-2.5 py-2 font-medium text-sm text-transparent leading-[21px] caret-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus-visible:ring-0 focus-visible:ring-offset-0'
+          autoCorrect='off'
+          autoCapitalize='off'
+          spellCheck='false'
+          className='w-full bg-transparent px-2.5 py-2 font-medium text-sm text-transparent leading-[21px] caret-[var(--text-primary)] outline-none placeholder:text-[var(--text-muted)] disabled:cursor-not-allowed disabled:opacity-50'
         />
         <div
           ref={(el) => {
@@ -150,6 +167,7 @@ function TableCell({
             {formatDisplayText(cellValue, {
               accessiblePrefixes,
               highlightAll: !accessiblePrefixes,
+              workflowSearchHighlight,
             })}
           </div>
         </div>
@@ -198,6 +216,7 @@ export function Table({
   previewValue,
   disabled = false,
 }: TableProps) {
+  const activeSearchTarget = useActiveSearchTarget()
   const params = useParams()
   const workspaceId = params.workspaceId as string
   const [storeValue, setStoreValue] = useSubBlockValue<WorkflowTableRow[]>(blockId, subBlockId)
@@ -311,17 +330,26 @@ export function Table({
   const renderHeader = () => (
     <thead className='bg-transparent'>
       <tr className='border-[var(--border-1)] border-b bg-transparent'>
-        {columns.map((column, index) => (
-          <th
-            key={column}
-            className={cn(
-              'bg-transparent px-2.5 py-[5px] text-left font-medium text-[var(--text-tertiary)] text-sm',
-              index < columns.length - 1 && 'border-[var(--border-1)] border-r'
-            )}
-          >
-            {column}
-          </th>
-        ))}
+        {columns.map((column, index) => {
+          const workflowSearchHighlight = getWorkflowSearchLabelHighlight({
+            activeSearchTarget,
+            blockId,
+            subBlockId,
+            valuePath: ['columns', index],
+            label: column,
+          })
+          return (
+            <th
+              key={column}
+              className={cn(
+                'bg-transparent px-2.5 py-[5px] text-left font-medium text-[var(--text-tertiary)] text-sm',
+                index < columns.length - 1 && 'border-[var(--border-1)] border-r'
+              )}
+            >
+              {formatDisplayText(column, { workflowSearchHighlight })}
+            </th>
+          )
+        })}
       </tr>
     </thead>
   )
@@ -369,6 +397,7 @@ export function Table({
                     overlayRefs={overlayRefs}
                     accessiblePrefixes={accessiblePrefixes}
                     workspaceId={workspaceId}
+                    subBlockId={subBlockId}
                   />
                 ))}
                 {renderDeleteButton(rowIndex)}

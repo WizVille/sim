@@ -19,7 +19,12 @@ import {
   checkTagTrigger,
   TagDropdown,
 } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/tag-dropdown/tag-dropdown'
+import {
+  getActiveWorkflowSearchHighlight,
+  getWorkflowSearchLabelHighlight,
+} from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/workflow-search-highlight'
 import { useSubBlockValue } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-value'
+import { useActiveSearchTarget } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/providers/active-search-target-provider'
 import { useAccessibleReferencePrefixes } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks/use-accessible-reference-prefixes'
 import { useVariablesStore } from '@/stores/variables/store'
 import type { Variable } from '@/stores/variables/types'
@@ -85,6 +90,7 @@ export function VariablesInput({
   previewValue,
   disabled = false,
 }: VariablesInputProps) {
+  const activeSearchTarget = useActiveSearchTarget()
   const params = useParams()
   const workflowId = params.workflowId as string
   const [storeValue, setStoreValue] = useSubBlockValue<VariableAssignment[]>(blockId, subBlockId)
@@ -164,6 +170,15 @@ export function VariablesInput({
       setStoreValue(validAssignments.length > 0 ? validAssignments : [])
     }
   }, [currentWorkflowVariables, assignments, isReadOnly, isHydratedForWorkflow, setStoreValue])
+
+  useEffect(() => {
+    if (activeSearchTarget?.subBlockId !== subBlockId) return
+    const [assignmentIndex] = activeSearchTarget.valuePath
+    if (typeof assignmentIndex !== 'number') return
+    const assignment = assignments[assignmentIndex]
+    if (!assignment || !collapsedAssignments[assignment.id]) return
+    setCollapsedAssignments((prev) => ({ ...prev, [assignment.id]: false }))
+  }, [activeSearchTarget, assignments, collapsedAssignments, subBlockId])
 
   const addAssignment = () => {
     if (isReadOnly || allVariablesAssigned) return
@@ -346,6 +361,27 @@ export function VariablesInput({
           {assignments.map((assignment, index) => {
             const collapsed = collapsedAssignments[assignment.id] || false
             const availableVars = getAvailableVariablesFor(assignment.id)
+            const valueSearchHighlight = getActiveWorkflowSearchHighlight({
+              activeSearchTarget,
+              blockId,
+              subBlockId,
+              valuePath: [index, 'value'],
+            })
+            const variableLabel = assignment.variableName
+            const variableLabelHighlight = getWorkflowSearchLabelHighlight({
+              activeSearchTarget,
+              blockId,
+              subBlockId,
+              valuePath: [index, 'variableName'],
+              label: variableLabel,
+            })
+            const booleanLabelHighlight = getWorkflowSearchLabelHighlight({
+              activeSearchTarget,
+              blockId,
+              subBlockId,
+              valuePath: [index, 'value'],
+              label: assignment.value ?? '',
+            })
 
             return (
               <div
@@ -368,7 +404,11 @@ export function VariablesInput({
                 >
                   <div className='flex min-w-0 flex-1 items-center gap-2'>
                     <span className='block truncate font-medium text-[var(--text-tertiary)] text-sm'>
-                      {assignment.variableName || `Variable ${index + 1}`}
+                      {assignment.variableName
+                        ? formatDisplayText(assignment.variableName, {
+                            workflowSearchHighlight: variableLabelHighlight,
+                          })
+                        : `Variable ${index + 1}`}
                     </span>
                     {assignment.variableName && (
                       <Badge variant='type' size='sm'>
@@ -414,6 +454,15 @@ export function VariablesInput({
                         onChange={(value) => handleVariableSelect(assignment.id, value)}
                         placeholder='Select a variable...'
                         disabled={isReadOnly}
+                        overlayContent={
+                          variableLabelHighlight ? (
+                            <span className='truncate text-[var(--text-primary)]'>
+                              {formatDisplayText(variableLabel, {
+                                workflowSearchHighlight: variableLabelHighlight,
+                              })}
+                            </span>
+                          ) : undefined
+                        }
                       />
                     </div>
 
@@ -428,6 +477,15 @@ export function VariablesInput({
                           }
                           placeholder='Select value'
                           disabled={isReadOnly}
+                          overlayContent={
+                            booleanLabelHighlight ? (
+                              <span className='truncate text-[var(--text-primary)]'>
+                                {formatDisplayText(assignment.value ?? '', {
+                                  workflowSearchHighlight: booleanLabelHighlight,
+                                })}
+                              </span>
+                            ) : undefined
+                          }
                         />
                       ) : assignment.type === 'object' || assignment.type === 'array' ? (
                         <div className='relative'>
@@ -490,6 +548,7 @@ export function VariablesInput({
                               {formatDisplayText(assignment.value || '', {
                                 accessiblePrefixes,
                                 highlightAll: !accessiblePrefixes,
+                                workflowSearchHighlight: valueSearchHighlight,
                               })}
                             </div>
                           </div>
@@ -557,7 +616,15 @@ export function VariablesInput({
                             >
                               {formatDisplayText(
                                 assignment.value || '',
-                                accessiblePrefixes ? { accessiblePrefixes } : { highlightAll: true }
+                                accessiblePrefixes
+                                  ? {
+                                      accessiblePrefixes,
+                                      workflowSearchHighlight: valueSearchHighlight,
+                                    }
+                                  : {
+                                      highlightAll: true,
+                                      workflowSearchHighlight: valueSearchHighlight,
+                                    }
                               )}
                             </div>
                           </div>

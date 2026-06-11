@@ -3,6 +3,9 @@ import { Badge, Button, Combobox, type ComboboxOption, Label, Trash } from '@/co
 import { cn } from '@/lib/core/utils/cn'
 import { handleKeyboardActivation } from '@/lib/core/utils/keyboard'
 import type { SortRule } from '@/lib/table/query-builder/constants'
+import { formatDisplayText } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/formatted-text'
+import { getWorkflowSearchLabelHighlight } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/workflow-search-highlight'
+import { useActiveSearchTarget } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/providers/active-search-target-provider'
 
 interface SortRuleRowProps {
   rule: SortRule
@@ -10,6 +13,8 @@ interface SortRuleRowProps {
   columns: ComboboxOption[]
   directionOptions: ComboboxOption[]
   isReadOnly: boolean
+  blockId: string
+  subBlockId: string
   onAdd: () => void
   onRemove: (id: string) => void
   onUpdate: (id: string, field: keyof SortRule, value: string) => void
@@ -22,11 +27,14 @@ export function SortRuleRow({
   columns,
   directionOptions,
   isReadOnly,
+  blockId,
+  subBlockId,
   onAdd,
   onRemove,
   onUpdate,
   onToggleCollapse,
 }: SortRuleRowProps) {
+  const activeSearchTarget = useActiveSearchTarget()
   const getDirectionLabel = (value: string) => {
     const option = directionOptions.find((dir) => dir.value === value)
     return option?.label || value
@@ -36,6 +44,15 @@ export function SortRuleRow({
     const option = columns.find((col) => col.value === value)
     return option?.label || value
   }
+
+  const getLabelHighlight = (field: 'column' | 'direction', label: string) =>
+    getWorkflowSearchLabelHighlight({
+      activeSearchTarget,
+      blockId,
+      subBlockId,
+      valuePath: [index, field],
+      label,
+    })
 
   const renderHeader = () => (
     <div
@@ -50,11 +67,20 @@ export function SortRuleRow({
     >
       <div className='flex min-w-0 flex-1 items-center gap-2'>
         <span className='block truncate font-medium text-[var(--text-tertiary)] text-sm'>
-          {rule.collapsed && rule.column ? getColumnLabel(rule.column) : `Sort ${index + 1}`}
+          {rule.collapsed && rule.column
+            ? formatDisplayText(getColumnLabel(rule.column), {
+                workflowSearchHighlight: getLabelHighlight('column', getColumnLabel(rule.column)),
+              })
+            : `Sort ${index + 1}`}
         </span>
         {rule.collapsed && rule.column && (
           <Badge variant='type' size='sm'>
-            {getDirectionLabel(rule.direction)}
+            {formatDisplayText(getDirectionLabel(rule.direction), {
+              workflowSearchHighlight: getLabelHighlight(
+                'direction',
+                getDirectionLabel(rule.direction)
+              ),
+            })}
           </Badge>
         )}
       </div>
@@ -90,6 +116,15 @@ export function SortRuleRow({
           onChange={(v) => onUpdate(rule.id, 'column', v)}
           disabled={isReadOnly}
           placeholder='Select column'
+          overlayContent={
+            getLabelHighlight('column', getColumnLabel(rule.column)) ? (
+              <span className='truncate text-[var(--text-primary)]'>
+                {formatDisplayText(getColumnLabel(rule.column), {
+                  workflowSearchHighlight: getLabelHighlight('column', getColumnLabel(rule.column)),
+                })}
+              </span>
+            ) : undefined
+          }
         />
       </div>
 
@@ -101,6 +136,18 @@ export function SortRuleRow({
           onChange={(v) => onUpdate(rule.id, 'direction', v as 'asc' | 'desc')}
           disabled={isReadOnly}
           placeholder='Select direction'
+          overlayContent={
+            getLabelHighlight('direction', getDirectionLabel(rule.direction)) ? (
+              <span className='truncate text-[var(--text-primary)]'>
+                {formatDisplayText(getDirectionLabel(rule.direction), {
+                  workflowSearchHighlight: getLabelHighlight(
+                    'direction',
+                    getDirectionLabel(rule.direction)
+                  ),
+                })}
+              </span>
+            ) : undefined
+          }
         />
       </div>
     </div>

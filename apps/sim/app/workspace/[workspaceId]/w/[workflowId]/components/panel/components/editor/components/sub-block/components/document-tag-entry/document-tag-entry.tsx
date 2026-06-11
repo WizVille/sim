@@ -17,9 +17,11 @@ import { handleKeyboardActivation } from '@/lib/core/utils/keyboard'
 import { FIELD_TYPE_LABELS, getPlaceholderForFieldType } from '@/lib/knowledge/constants'
 import { formatDisplayText } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/formatted-text'
 import { TagDropdown } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/tag-dropdown/tag-dropdown'
+import { getActiveWorkflowSearchHighlight } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/workflow-search-highlight'
 import { useDependsOnGate } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-depends-on-gate'
 import { useSubBlockInput } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-input'
 import { useSubBlockValue } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-value'
+import { useActiveSearchTarget } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/providers/active-search-target-provider'
 import { useAccessibleReferencePrefixes } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks/use-accessible-reference-prefixes'
 import type { SubBlockConfig } from '@/blocks/types'
 import { useKnowledgeBaseTagDefinitions } from '@/hooks/kb/use-knowledge-base-tag-definitions'
@@ -62,6 +64,7 @@ export function DocumentTagEntry({
   previewValue,
   previewContextValues,
 }: DocumentTagEntryProps) {
+  const activeSearchTarget = useActiveSearchTarget()
   const [storeValue, setStoreValue] = useSubBlockValue<string>(blockId, subBlock.id)
   const accessiblePrefixes = useAccessibleReferencePrefixes(blockId)
   const valueInputRefs = useRef<Record<string, HTMLInputElement>>({})
@@ -297,6 +300,12 @@ export function DocumentTagEntry({
     const fieldValue = tag.value || ''
     const cellKey = `${tag.id}-value`
     const placeholder = getPlaceholderForFieldType(tag.fieldType)
+    const tagIndex = tags.findIndex((candidate) => candidate.id === tag.id)
+    const workflowSearchHighlight = getActiveWorkflowSearchHighlight({
+      activeSearchTarget,
+      subBlockId: subBlock.id,
+      valuePath: [tagIndex, 'value'],
+    })
 
     const fieldState = inputController.fieldHelpers.getFieldState(cellKey)
     const handlers = inputController.fieldHelpers.createFieldHandlers(
@@ -346,7 +355,9 @@ export function DocumentTagEntry({
           <div className='w-full whitespace-pre' style={{ minWidth: 'fit-content' }}>
             {formatDisplayText(
               fieldValue,
-              accessiblePrefixes ? { accessiblePrefixes } : { highlightAll: true }
+              accessiblePrefixes
+                ? { accessiblePrefixes, workflowSearchHighlight }
+                : { highlightAll: true, workflowSearchHighlight }
             )}
           </div>
         </div>

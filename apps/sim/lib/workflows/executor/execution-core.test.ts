@@ -72,19 +72,26 @@ vi.mock('@/lib/workflows/triggers/triggers', () => ({
 vi.mock('@/lib/workflows/utils', () => workflowsUtilsMock)
 
 vi.mock('@/executor', () => ({
-  Executor: vi.fn().mockImplementation((args) => {
-    executorConstructorMock(args)
-    return {
-      execute: executorExecuteMock,
-      executeFromBlock: executorExecuteMock,
+  Executor: vi.fn().mockImplementation(
+    class {
+      constructor(args: unknown) {
+        executorConstructorMock(args)
+        // biome-ignore lint/correctness/noConstructorReturn: vitest 4 constructs mocks via Reflect.construct; returning the instance overrides `new Executor(...)`
+        return {
+          execute: executorExecuteMock,
+          executeFromBlock: executorExecuteMock,
+        }
+      }
     }
-  }),
+  ),
 }))
 
 vi.mock('@/serializer', () => ({
-  Serializer: vi.fn().mockImplementation(() => ({
-    serializeWorkflow: serializeWorkflowMock,
-  })),
+  Serializer: vi.fn().mockImplementation(
+    class {
+      serializeWorkflow = serializeWorkflowMock
+    }
+  ),
 }))
 
 import {
@@ -212,6 +219,49 @@ describe('executeWorkflowCore terminal finalization sequencing', () => {
       'Fetch',
       'api',
       expect.any(String)
+    )
+  })
+
+  it('starts logging with the workflow state that will be executed', async () => {
+    const executedWorkflowState = {
+      blocks: {
+        loop: { id: 'loop', type: 'loop', name: 'Loop', subBlocks: {} },
+        parallel: {
+          id: 'parallel',
+          type: 'parallel',
+          name: 'Parallel',
+          subBlocks: {},
+          data: { parentId: 'loop', extent: 'parent' },
+        },
+      },
+      edges: [],
+      loops: { loop: { id: 'loop', nodes: ['parallel'], iterations: 1, loopType: 'for' } },
+      parallels: { parallel: { id: 'parallel', nodes: [], count: 1 } },
+    }
+    executorExecuteMock.mockResolvedValue({
+      success: true,
+      status: 'completed',
+      output: { done: true },
+      logs: [],
+      metadata: { duration: 123, startTime: 'start', endTime: 'end' },
+    })
+
+    await executeWorkflowCore({
+      snapshot: {
+        ...createSnapshot(),
+        metadata: {
+          ...createSnapshot().metadata,
+          workflowStateOverride: executedWorkflowState,
+        },
+      } as any,
+      callbacks: {},
+      loggingSession: loggingSession as any,
+    })
+
+    expect(safeStartMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowState: executedWorkflowState,
+      })
     )
   })
 

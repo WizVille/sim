@@ -21,6 +21,7 @@ import {
 } from '@/lib/knowledge/documents/service'
 import { StorageService } from '@/lib/uploads'
 import { deleteFile } from '@/lib/uploads/core/storage-service'
+import { deleteFileMetadata } from '@/lib/uploads/server/metadata'
 import { extractStorageKey } from '@/lib/uploads/utils/file-utils'
 import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
 import { knowledgeConnectorSync } from '@/background/knowledge-connector-sync'
@@ -125,6 +126,27 @@ async function completeSyncLog(
       docsFailed: result.docsFailed,
     })
     .where(eq(knowledgeConnectorSyncLog.id, syncLogId))
+}
+
+/**
+ * Decides whether deletion reconciliation may run for a sync.
+ *
+ * Reconciliation hard-deletes every stored document absent from the listing,
+ * so it must only run against a complete source set:
+ * - never on incremental syncs (they list only changed documents)
+ * - never when the engine truncated pagination (`listingTruncated`) — a forced
+ *   fullSync cannot fix truncation, so it cannot override it
+ * - not when a connector capped its listing (`listingCapped`), unless a forced
+ *   fullSync deliberately overrides the cap to reconcile the capped scope
+ */
+export function shouldReconcileDeletions(
+  isIncremental: boolean | undefined,
+  syncContext: Record<string, unknown> | undefined,
+  fullSync: boolean | undefined
+): boolean {
+  if (isIncremental) return false
+  if (syncContext?.listingTruncated) return false
+  return !syncContext?.listingCapped || Boolean(fullSync)
 }
 
 /**
@@ -314,7 +336,7 @@ export async function executeSync(
   }
 
   const kbRows = await db
-    .select({ userId: knowledgeBase.userId })
+    .select({ userId: knowledgeBase.userId, workspaceId: knowledgeBase.workspaceId })
     .from(knowledgeBase)
     .where(and(eq(knowledgeBase.id, connector.knowledgeBaseId), isNull(knowledgeBase.deletedAt)))
     .limit(1)
@@ -336,6 +358,9 @@ export async function executeSync(
   }
 
   const userId = kbRows[0].userId
+  // Resolved once per sync and threaded into add/updateDocument so every synced
+  // kb/ object records a trusted ownership binding without an N+1 KB lookup.
+  const kbOwner: KnowledgeBaseOwner = { workspaceId: kbRows[0].workspaceId, userId }
   const sourceConfig = connector.sourceConfig as Record<string, unknown>
 
   const lockResult = await db
@@ -409,6 +434,22 @@ export async function executeSync(
 
       cursor = page.nextCursor
       hasMore = page.hasMore
+    }
+
+    if (hasMore) {
+      /**
+       * Pagination stopped before source exhaustion (MAX_PAGES or a missing
+       * cursor), so the listing is incomplete. `listingTruncated` blocks
+       * deletion reconciliation absolutely — unlike connector-set
+       * `listingCapped`, it cannot be overridden by a forced fullSync, since
+       * re-running one truncates identically.
+       */
+      syncContext.listingCapped = true
+      syncContext.listingTruncated = true
+      logger.warn('Pagination ended before source exhaustion; skipping deletion reconciliation', {
+        connectorId,
+        docsSoFar: externalDocs.length,
+      })
     }
 
     logger.info(`Fetched ${externalDocs.length} documents from ${connectorConfig.name}`, {
@@ -584,6 +625,7 @@ export async function executeSync(
               connectorId,
               connector.connectorType,
               op.extDoc,
+              kbOwner,
               sourceConfig
             )
           }
@@ -593,6 +635,7 @@ export async function executeSync(
             connectorId,
             connector.connectorType,
             op.extDoc,
+            kbOwner,
             sourceConfig
           )
         })
@@ -629,9 +672,7 @@ export async function executeSync(
       }
     }
 
-    // Reconcile deletions for non-incremental syncs that returned ALL docs.
-    // Skip when listing was capped (maxFiles/maxThreads) — unseen docs may still exist in the source.
-    if (!isIncremental && (!syncContext?.listingCapped || options?.fullSync)) {
+    if (shouldReconcileDeletions(isIncremental, syncContext, options?.fullSync)) {
       const removedIds = existingDocs
         .filter((d) => d.externalId && !seenExternalIds.has(d.externalId))
         .map((d) => d.id)
@@ -880,6 +921,26 @@ export async function executeSync(
   }
 }
 
+/** Owning workspace + user for a knowledge base, resolved once per sync. */
+interface KnowledgeBaseOwner {
+  workspaceId: string | null
+  userId: string
+}
+
+/**
+ * Build the storage `metadata` that records a trusted ownership binding for a
+ * synced `kb/` object. Returns `undefined` for legacy null-workspace KBs (no
+ * workspace-scoped ownership to bind), which `uploadFile` treats as "no binding".
+ */
+function kbOwnershipMetadata(
+  kbOwner: KnowledgeBaseOwner,
+  originalName: string
+): { workspaceId: string; userId: string; originalName: string } | undefined {
+  return kbOwner.workspaceId
+    ? { workspaceId: kbOwner.workspaceId, userId: kbOwner.userId, originalName }
+    : undefined
+}
+
 /**
  * Upload content to storage as a .txt file, create a document record,
  * and trigger processing via the existing pipeline.
@@ -889,6 +950,7 @@ async function addDocument(
   connectorId: string,
   connectorType: string,
   extDoc: ExternalDocument,
+  kbOwner: KnowledgeBaseOwner,
   sourceConfig?: Record<string, unknown>
 ): Promise<DocumentData> {
   const documentId = generateId()
@@ -903,6 +965,7 @@ async function addDocument(
     context: 'knowledge-base',
     customKey,
     preserveKey: true,
+    metadata: kbOwnershipMetadata(kbOwner, `${safeTitle}.txt`),
   })
 
   const fileUrl = `${getInternalApiBaseUrl()}${fileInfo.path}?context=knowledge-base`
@@ -925,6 +988,7 @@ async function addDocument(
         knowledgeBaseId,
         filename: extDoc.title,
         fileUrl,
+        storageKey: fileInfo.key,
         fileSize: contentBuffer.length,
         mimeType: 'text/plain',
         chunkCount: 0,
@@ -945,6 +1009,7 @@ async function addDocument(
     const storageKey = extractStorageKey(urlPath)
     if (storageKey && storageKey !== urlPath) {
       await deleteFile({ key: storageKey, context: 'knowledge-base' }).catch(() => undefined)
+      await deleteFileMetadata(storageKey).catch(() => undefined)
     }
     throw error
   }
@@ -968,6 +1033,7 @@ async function updateDocument(
   connectorId: string,
   connectorType: string,
   extDoc: ExternalDocument,
+  kbOwner: KnowledgeBaseOwner,
   sourceConfig?: Record<string, unknown>
 ): Promise<DocumentData> {
   // Fetch old file URL before uploading replacement
@@ -989,6 +1055,7 @@ async function updateDocument(
     context: 'knowledge-base',
     customKey,
     preserveKey: true,
+    metadata: kbOwnershipMetadata(kbOwner, `${safeTitle}.txt`),
   })
 
   const fileUrl = `${getInternalApiBaseUrl()}${fileInfo.path}?context=knowledge-base`
@@ -1011,6 +1078,7 @@ async function updateDocument(
         .set({
           filename: extDoc.title,
           fileUrl,
+          storageKey: fileInfo.key,
           fileSize: contentBuffer.length,
           contentHash: extDoc.contentHash,
           sourceUrl: extDoc.sourceUrl ?? null,
@@ -1037,17 +1105,19 @@ async function updateDocument(
     const storageKey = extractStorageKey(urlPath)
     if (storageKey && storageKey !== urlPath) {
       await deleteFile({ key: storageKey, context: 'knowledge-base' }).catch(() => undefined)
+      await deleteFileMetadata(storageKey).catch(() => undefined)
     }
     throw error
   }
 
-  // Clean up old storage file
+  // Clean up old storage file and its ownership binding
   if (oldFileUrl) {
     try {
       const urlPath = new URL(oldFileUrl, 'http://localhost').pathname
       const storageKey = extractStorageKey(urlPath)
       if (storageKey && storageKey !== urlPath) {
         await deleteFile({ key: storageKey, context: 'knowledge-base' })
+        await deleteFileMetadata(storageKey)
       }
     } catch (error) {
       logger.warn('Failed to delete old storage file', {

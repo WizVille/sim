@@ -24,6 +24,8 @@ export const TABLE_LIMITS = {
   MAX_BATCH_INSERT_SIZE: 1000,
   /** Maximum rows per bulk update/delete operation */
   MAX_BULK_OPERATION_SIZE: 1000,
+  /** Maximum rows a single clipboard copy/cut serializes; beyond this the user is steered to Export. */
+  MAX_COPY_ROWS: 50000,
 } as const
 
 /**
@@ -105,6 +107,13 @@ export const COLUMN_TYPES = ['string', 'number', 'boolean', 'date', 'json'] as c
 export const NAME_PATTERN = /^[a-z_][a-z0-9_]*$/i
 
 export const USER_TABLE_ROWS_SQL_NAME = 'user_table_rows'
+
+/**
+ * CSV/TSV uploads at or above this size import in the background (direct-to-storage
+ * upload + async worker) instead of being POSTed through the server. Kept safely under
+ * the Next.js proxy request-body cap (10MB) so a synchronous upload is never truncated.
+ */
+export const CSV_ASYNC_IMPORT_THRESHOLD_BYTES = 8 * 1024 * 1024
 
 const TABLE_NAME_ADJECTIVES = [
   'Radiant',

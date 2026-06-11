@@ -1,6 +1,7 @@
 import { getErrorMessage } from '@sim/utils/errors'
+import { Users } from '@/components/emcn/icons'
 import { ApolloIcon } from '@/components/icons'
-import type { BlockConfig } from '@/blocks/types'
+import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
 import type { ApolloResponse } from '@/tools/apollo/types'
 
@@ -11,10 +12,9 @@ export const ApolloBlock: BlockConfig<ApolloResponse> = {
   authMode: AuthMode.ApiKey,
   longDescription:
     'Integrates Apollo.io into the workflow. Search for people and companies, enrich contact data, manage your CRM contacts and accounts, add contacts to sequences, and create tasks.',
-  docsLink: 'https://docs.sim.ai/tools/apollo',
+  docsLink: 'https://docs.sim.ai/integrations/apollo',
   category: 'tools',
   integrationType: IntegrationType.Sales,
-  tags: ['enrichment', 'sales-engagement'],
   bgColor: '#EBF212',
   icon: ApolloIcon,
   subBlocks: [
@@ -224,11 +224,10 @@ export const ApolloBlock: BlockConfig<ApolloResponse> = {
       required: true,
     },
     {
-      id: 'organizations',
-      title: 'Organizations (JSON Array)',
+      id: 'domains',
+      title: 'Domains (JSON Array)',
       type: 'code',
-      placeholder:
-        '[{"name": "Company A", "domain": "companya.com"}, {"name": "Company B", "domain": "companyb.com"}]',
+      placeholder: '["apollo.io", "stripe.com"]',
       condition: { field: 'operation', value: 'organization_bulk_enrich' },
       required: true,
     },
@@ -586,6 +585,14 @@ export const ApolloBlock: BlockConfig<ApolloResponse> = {
       title: 'Uniform Owner ID (used with Account IDs)',
       type: 'short-input',
       placeholder: 'Apollo user ID',
+      condition: { field: 'operation', value: 'account_bulk_update' },
+      mode: 'advanced',
+    },
+    {
+      id: 'account_bulk_update_account_stage_id',
+      title: 'Uniform Account Stage ID (used with Account IDs)',
+      type: 'short-input',
+      placeholder: 'Apollo account stage ID',
       condition: { field: 'operation', value: 'account_bulk_update' },
       mode: 'advanced',
     },
@@ -1027,6 +1034,7 @@ Return ONLY the timestamp string in ISO 8601 format - no explanations, no quotes
             'account_stage_ids',
             'account_label_ids',
             'people',
+            'domains',
             'organizations',
             'contacts',
             'accounts',
@@ -1075,6 +1083,29 @@ Return ONLY the timestamp string in ISO 8601 format - no explanations, no quotes
           }
         }
 
+        if (params.operation === 'organization_bulk_enrich') {
+          // Back-compat: workflows saved before the `organizations` → `domains` rename stored an
+          // array of { name, domain? } objects (or plain strings) under `organizations`. Derive
+          // `domains` from it so those workflows keep running without manual migration.
+          if (parsedParams.domains === undefined && parsedParams.organizations !== undefined) {
+            const legacy = parsedParams.organizations
+            if (Array.isArray(legacy)) {
+              const derived = legacy
+                .map((item) => {
+                  if (typeof item === 'string') return item
+                  if (item && typeof item === 'object' && 'domain' in item) {
+                    const domain = (item as Record<string, unknown>).domain
+                    return typeof domain === 'string' ? domain : undefined
+                  }
+                  return undefined
+                })
+                .filter((domain): domain is string => typeof domain === 'string' && domain !== '')
+              if (derived.length > 0) parsedParams.domains = derived
+            }
+          }
+          parsedParams.organizations = undefined
+        }
+
         if (params.operation === 'contact_bulk_update') {
           const { ids, attributes } = splitBulkUpdateInput(parsedParams.contacts)
           if (attributes) {
@@ -1103,8 +1134,12 @@ Return ONLY the timestamp string in ISO 8601 format - no explanations, no quotes
           if (rest.account_bulk_update_owner_id) {
             parsedParams.owner_id = rest.account_bulk_update_owner_id
           }
+          if (rest.account_bulk_update_account_stage_id) {
+            parsedParams.account_stage_id = rest.account_bulk_update_account_stage_id
+          }
           parsedParams.account_bulk_update_name = undefined
           parsedParams.account_bulk_update_owner_id = undefined
+          parsedParams.account_bulk_update_account_stage_id = undefined
         }
 
         if (params.operation === 'contact_create') {
@@ -1168,7 +1203,280 @@ Return ONLY the timestamp string in ISO 8601 format - no explanations, no quotes
     operation: { type: 'string', description: 'Apollo operation to perform' },
   },
   outputs: {
-    success: { type: 'boolean', description: 'Whether the operation was successful' },
-    output: { type: 'json', description: 'Output data from the Apollo operation' },
+    people: {
+      type: 'json',
+      description:
+        'Array of people (people_search): [{id, first_name, last_name, name, title, email, organization_name, linkedin_url, phone_numbers}]',
+    },
+    person: {
+      type: 'json',
+      description:
+        'Enriched person (people_enrich): {id, first_name, last_name, name, title, email, organization_name, linkedin_url, phone_numbers}',
+    },
+    matches: {
+      type: 'json',
+      description: 'Array of enriched people (people_bulk_enrich), null entries indicate no match',
+    },
+    organizations: {
+      type: 'json',
+      description:
+        'Array of organizations (organization_search, organization_bulk_enrich): [{id, name, website_url, linkedin_url, industry, phone, employees, founded_year}]',
+    },
+    organization: {
+      type: 'json',
+      description:
+        'Enriched organization (organization_enrich): {id, name, website_url, linkedin_url, industry, phone, employees, founded_year}',
+    },
+    contact: {
+      type: 'json',
+      description:
+        'Contact (contact_create, contact_update): {id, first_name, last_name, email, title, account_id, owner_id, created_at}',
+    },
+    contacts: {
+      type: 'json',
+      description: 'Array of contacts (contact_search)',
+    },
+    created_contacts: {
+      type: 'json',
+      description: 'Newly created contacts (contact_bulk_create)',
+    },
+    existing_contacts: {
+      type: 'json',
+      description: 'Existing contacts (contact_bulk_create with dedupe)',
+    },
+    account: {
+      type: 'json',
+      description:
+        'Account (account_create, account_update): {id, name, domain, website_url, phone, owner_id, account_stage_id, created_at}',
+    },
+    accounts: {
+      type: 'json',
+      description: 'Array of accounts (account_search)',
+    },
+    created_accounts: {
+      type: 'json',
+      description: 'Newly created accounts (account_bulk_create)',
+    },
+    existing_accounts: {
+      type: 'json',
+      description: 'Existing accounts (account_bulk_create with dedupe)',
+    },
+    failed_accounts: {
+      type: 'json',
+      description: 'Accounts that failed (account_bulk_create)',
+    },
+    account_ids: {
+      type: 'json',
+      description: 'IDs of updated accounts (account_bulk_update)',
+    },
+    entity_progress_job: {
+      type: 'json',
+      description: 'Async job descriptor (contact_bulk_update, account_bulk_update async path)',
+    },
+    opportunity: {
+      type: 'json',
+      description:
+        'Opportunity (opportunity_create, opportunity_update, opportunity_get): {id, name, account_id, amount, opportunity_stage_id, owner_id, closed_date, is_closed, is_won, currency, created_at}',
+    },
+    opportunities: {
+      type: 'json',
+      description: 'Array of opportunities (opportunity_search)',
+    },
+    sequences: {
+      type: 'json',
+      description:
+        'Array of sequences (sequence_search): [{id, name, active, num_steps, num_contacts, created_at}]',
+    },
+    added: {
+      type: 'json',
+      description:
+        'Contacts added to sequence (sequence_add): [{id, first_name, last_name, email, status}]',
+    },
+    skipped: {
+      type: 'json',
+      description: 'Contacts skipped by sequence add (sequence_add)',
+    },
+    skipped_contact_ids: {
+      type: 'json',
+      description: 'Skipped contact IDs (sequence_add): array of IDs or {id: reason} map',
+    },
+    emailer_campaign: {
+      type: 'json',
+      description: 'Emailer campaign details (sequence_add): {id, name}',
+    },
+    sequence_id: {
+      type: 'string',
+      description: 'Sequence ID contacts were added to (sequence_add)',
+    },
+    tasks: {
+      type: 'json',
+      description:
+        'Array of tasks (task_create, task_search): [{id, user_id, contact_id, type, priority, status, due_at, note, created_at}]',
+    },
+    email_accounts: {
+      type: 'json',
+      description:
+        'Linked email accounts (email_accounts): [{id, email, type, active, default, linked_at}]',
+    },
+    pagination: {
+      type: 'json',
+      description: 'Pagination info (contact_search, account_search, task_search)',
+    },
+    page: { type: 'number', description: 'Current page (search operations)' },
+    per_page: { type: 'number', description: 'Results per page (search operations)' },
+    total_entries: {
+      type: 'number',
+      description: 'Total entries matching search (search operations)',
+    },
+    total_added: { type: 'number', description: 'Contacts added (sequence_add)' },
+    total_skipped: { type: 'number', description: 'Contacts skipped (sequence_add)' },
+    total_submitted: {
+      type: 'number',
+      description: 'Total submitted (contact_bulk_create, account_bulk_create)',
+    },
+    created: {
+      type: 'boolean',
+      description: 'Created flag for single-item create operations',
+    },
+    updated: { type: 'boolean', description: 'Updated flag for single-item update operations' },
+    found: { type: 'boolean', description: 'Found flag (opportunity_get)' },
+    enriched: {
+      type: 'boolean',
+      description: 'Enriched flag (people_enrich, organization_enrich)',
+    },
+    message: { type: 'string', description: 'Message (bulk_update operations)' },
+    job_id: { type: 'string', description: 'Async job ID (bulk_update operations)' },
+    total: {
+      type: 'number',
+      description: 'Total count (organization_bulk_enrich requested domains; email_accounts count)',
+    },
+    total_requested_enrichments: {
+      type: 'number',
+      description: 'Total requested enrichments (people_bulk_enrich)',
+    },
+    unique_enriched_records: {
+      type: 'number',
+      description: 'Unique enriched records (people_bulk_enrich)',
+    },
+    unique_domains: {
+      type: 'number',
+      description: 'Unique domains processed (organization_bulk_enrich)',
+    },
+    missing_records: {
+      type: 'number',
+      description: 'Missing records (people_bulk_enrich, organization_bulk_enrich)',
+    },
+    credits_consumed: {
+      type: 'number',
+      description: 'Credits consumed (people_bulk_enrich)',
+    },
   },
 }
+
+export const ApolloBlockMeta = {
+  tags: ['enrichment', 'sales-engagement'],
+  templates: [
+    {
+      icon: Users,
+      title: 'Lead enrichment pipeline',
+      prompt:
+        'Build a workflow that watches my leads table for new entries, enriches each lead with company size, funding, tech stack, and decision-maker contacts using Apollo and web search, then updates the table with the enriched information.',
+      modules: ['tables', 'agent', 'workflows'],
+      category: 'sales',
+      tags: ['sales', 'crm', 'automation', 'research'],
+    },
+    {
+      icon: ApolloIcon,
+      title: 'Prospect researcher',
+      prompt:
+        'Create an agent that takes a company name, deep-researches them across the web and Apollo, finds key decision-makers, recent news, funding rounds, and pain points, then compiles a prospect brief I can review before outreach.',
+      modules: ['agent', 'files', 'workflows'],
+      category: 'sales',
+      tags: ['sales', 'research'],
+    },
+    {
+      icon: ApolloIcon,
+      title: 'ICP account builder',
+      prompt:
+        'Build a workflow that runs an Apollo organization search for accounts matching my ideal customer profile — industry, headcount, and tech stack — creates each as an Apollo account, and writes the new target list to a table for the SDR team.',
+      modules: ['tables', 'agent', 'workflows'],
+      category: 'sales',
+      tags: ['sales', 'crm', 'automation'],
+    },
+    {
+      icon: Users,
+      title: 'Buying committee mapper',
+      prompt:
+        'Create a workflow that takes a target account, runs an Apollo people search across the relevant titles, enriches each contact with verified email and role, and writes a mapped buying committee to a table so reps know exactly who to engage.',
+      modules: ['tables', 'agent', 'workflows'],
+      category: 'sales',
+      tags: ['sales', 'research', 'crm'],
+    },
+    {
+      icon: ApolloIcon,
+      title: 'Inbound lead enricher to HubSpot',
+      prompt:
+        'Build a workflow that on a new inbound signup enriches the person and their company with Apollo, scores fit against my ICP, and creates or updates the matching contact and company in HubSpot with the enriched fields.',
+      modules: ['agent', 'workflows'],
+      category: 'sales',
+      tags: ['sales', 'crm', 'automation'],
+      alsoIntegrations: ['hubspot'],
+    },
+    {
+      icon: ApolloIcon,
+      title: 'Pipeline opportunity tracker',
+      prompt:
+        'Create a scheduled workflow that searches Apollo opportunities by stage, summarizes new and at-risk deals with an agent, logs the snapshot to a pipeline table, and posts a daily deal-movement digest to the sales Slack channel.',
+      modules: ['scheduled', 'tables', 'agent', 'workflows'],
+      category: 'sales',
+      tags: ['sales', 'reporting', 'crm'],
+      alsoIntegrations: ['slack'],
+    },
+    {
+      icon: Users,
+      title: 'CRM contact freshness sweep',
+      prompt:
+        'Build a scheduled workflow that pulls contacts from my CRM, bulk-enriches them through Apollo to refresh titles, emails, and company data, and bulk-updates the records so the database stays accurate for outbound.',
+      modules: ['scheduled', 'agent', 'workflows'],
+      category: 'sales',
+      tags: ['sales', 'crm', 'automation', 'enrichment'],
+    },
+  ],
+  skills: [
+    {
+      name: 'build-prospect-list',
+      description:
+        'Search Apollo for people matching an ideal customer profile and produce a targeted prospect list. Use for outbound prospecting and territory building.',
+      content:
+        '# Build Prospect List\n\nFind decision-makers that match an ICP and assemble a clean prospect list.\n\n## Steps\n1. Translate the ICP into an Apollo people search — job titles, seniorities, locations, and company size or industry filters.\n2. Run the search, paging through results up to the requested count.\n3. For each person capture name, title, company, verified email status, and LinkedIn URL.\n4. Write the deduplicated prospects to a table for review or sequencing.\n\n## Output\nReport how many prospects matched and the filters used. Flag any with unverified or missing emails.',
+    },
+    {
+      name: 'enrich-contacts',
+      description:
+        'Enrich one or many contacts through Apollo to refresh titles, emails, phones, and company data. Use to keep CRM records accurate before outreach.',
+      content:
+        '# Enrich Contacts\n\nFill in or refresh missing contact data using Apollo enrichment.\n\n## Steps\n1. Gather the contacts to enrich — a single person, or a batch for bulk enrich.\n2. Provide the strongest identifiers available (email, name plus company domain).\n3. Run people enrich or bulk enrich, optionally revealing personal emails or phone numbers.\n4. Merge the returned fields back onto each record, keeping existing values when enrichment returns nothing.\n\n## Output\nReport how many records were enriched versus left unmatched, and which fields were newly filled. Note any credits consumed.',
+    },
+    {
+      name: 'sync-leads-to-crm',
+      description:
+        'Create or update Apollo contacts and accounts from an inbound lead, then map them into your CRM. Use to route new signups into pipeline.',
+      content:
+        '# Sync Leads to CRM\n\nTurn an inbound lead into structured Apollo records.\n\n## Steps\n1. Take the lead details and enrich the person and their company through Apollo.\n2. Create or update the matching Apollo account for the company.\n3. Create or update the contact, linking it to the account and setting owner and stage.\n4. Pass the enriched fields to the connected CRM to create or update the matching records.\n\n## Output\nReport whether each record was created or updated, with the resulting contact and account IDs.',
+    },
+    {
+      name: 'add-prospects-to-sequence',
+      description:
+        'Search for matching contacts and add them to an Apollo email sequence. Use to launch or top up outbound campaigns.',
+      content:
+        '# Add Prospects to Sequence\n\nEnroll the right contacts into an outbound sequence.\n\n## Steps\n1. Identify the target sequence by name or ID, and confirm the sending email account.\n2. Gather the contact IDs to enroll — from a prior search or a provided list.\n3. Add the contacts to the sequence with the chosen sending account and initial status.\n4. Review which contacts were added versus skipped.\n\n## Output\nReport totals added and skipped, and the reason for each skip (already enrolled, unverified, missing ownership).',
+    },
+    {
+      name: 'pipeline-deal-digest',
+      description:
+        'Search Apollo opportunities by stage and summarize new and at-risk deals into a digest. Use for recurring pipeline reviews.',
+      content:
+        '# Pipeline Deal Digest\n\nSummarize opportunity movement for a sales pipeline review.\n\n## Steps\n1. Search Apollo opportunities filtered by the stages you care about.\n2. For each deal capture name, amount, stage, owner, and close date.\n3. Group deals into new, advancing, and at-risk (stalled or past close date).\n4. Write a concise digest grouped by category.\n\n## Output\nA short digest: deal counts and total value per stage, with at-risk deals called out by name, owner, and reason.',
+    },
+  ],
+} as const satisfies BlockMeta

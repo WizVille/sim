@@ -1,13 +1,18 @@
 'use client'
 
+import { Sparkles } from 'lucide-react'
 import {
-  Button,
+  ChipChevronDown,
+  chipContentIconClass,
+  chipContentLabelClass,
+  chipVariants,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
+  Plus,
 } from '@/components/emcn'
-import { Plus } from '@/components/emcn/icons'
 import { isWorkflowColumnsEnabledClient } from '@/lib/core/config/feature-flags'
 import type { ColumnDefinition } from '@/lib/table'
 import { COLUMN_TYPE_OPTIONS } from '../column-config-sidebar'
@@ -19,8 +24,6 @@ const VISIBLE_COLUMN_TYPE_OPTIONS = isWorkflowColumnsEnabledClient
 const CELL_HEADER =
   'border-[var(--border)] border-r border-b bg-[var(--bg)] px-2 py-[7px] text-left align-middle'
 
-const HEADER_ADD_COLUMN_ICON = <Plus className='mr-1.5 size-[14px] text-[var(--text-icon)]' />
-
 interface NewColumnDropdownProps {
   /** `'header'` renders the page-header trigger (subtle Button); `'inline-header'` renders
    *  the in-table column-header `<th>` trigger. Same dropdown content either way. */
@@ -28,27 +31,30 @@ interface NewColumnDropdownProps {
   disabled: boolean
   onPickType: (type: ColumnDefinition['type']) => void
   onPickWorkflow: () => void
+  onPickEnrichment: () => void
 }
 
 /**
  * "+ New column" dropdown — the single entry point for creating a column.
- * Lists every column type plus "Workflow"; picking a type opens the right
- * sidebar pre-seeded.
+ * Lists every column type plus "Workflow" and "Enrichments"; picking a type
+ * opens the right sidebar pre-seeded.
  */
 export function NewColumnDropdown({
   trigger,
   disabled,
   onPickType,
   onPickWorkflow,
+  onPickEnrichment,
 }: NewColumnDropdownProps) {
   const menu = (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         {trigger === 'header' ? (
-          <Button variant='subtle' className='px-2 py-1 text-caption' disabled={disabled}>
-            {HEADER_ADD_COLUMN_ICON}
-            New column
-          </Button>
+          <button type='button' className={chipVariants()} disabled={disabled}>
+            <Plus className={chipContentIconClass} />
+            <span className={chipContentLabelClass}>New column</span>
+            <ChipChevronDown />
+          </button>
         ) : (
           <button
             type='button'
@@ -61,6 +67,15 @@ export function NewColumnDropdown({
         )}
       </DropdownMenuTrigger>
       <DropdownMenuContent align='start' side='bottom' sideOffset={4}>
+        {isWorkflowColumnsEnabledClient && (
+          <>
+            <DropdownMenuItem onSelect={onPickEnrichment}>
+              <Sparkles className='size-[14px] text-[var(--text-icon)]' />
+              Enrichments
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
         {VISIBLE_COLUMN_TYPE_OPTIONS.map((option) => {
           const Icon = option.icon
           const onSelect =

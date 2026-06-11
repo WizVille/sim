@@ -57,6 +57,13 @@ export interface UseTableReturn {
    * need the complete row set behind this.
    */
   ensureAllRowsLoaded: () => Promise<TableRow[]>
+  /**
+   * Pages until the cache holds at least `maxRows` rows (or no more pages
+   * exist), then returns the first `maxRows` from cache plus whether more
+   * remain. Unlike {@link ensureAllRowsLoaded} it stops early, so size-bound
+   * ops (clipboard copy) don't drain an entire large table. Filter/sort-aware.
+   */
+  ensureRowsLoadedUpTo: (maxRows: number) => Promise<{ rows: TableRow[]; hasMore: boolean }>
 }
 
 /**
@@ -119,6 +126,42 @@ export function useTable({ workspaceId, tableId, queryOptions }: UseTableParams)
     return queryClient.getQueryData(opts.queryKey)?.pages.flatMap((p) => p.rows) ?? []
   }, [workspaceId, tableId, queryOptions.filter, queryOptions.sort, queryClient, fetchNextPage])
 
+  const ensureRowsLoadedUpTo = useCallback(
+    async (maxRows: number): Promise<{ rows: TableRow[]; hasMore: boolean }> => {
+      if (!workspaceId || !tableId) return { rows: [], hasMore: false }
+
+      const opts = tableRowsInfiniteOptions({
+        workspaceId,
+        tableId,
+        pageSize: TABLE_LIMITS.MAX_QUERY_LIMIT,
+        filter: queryOptions.filter,
+        sort: queryOptions.sort,
+      })
+
+      // Load one past the cap so `hasMore` is exact: a full final page only
+      // *might* have a successor, so we confirm by loading row `maxRows + 1`
+      // rather than inferring truncation from page fullness.
+      while (true) {
+        const data = queryClient.getQueryData(opts.queryKey)
+        const loaded = data?.pages.reduce((sum, p) => sum + p.rows.length, 0) ?? 0
+        if (loaded > maxRows) break
+        const lastPage = data?.pages[data.pages.length - 1]
+        if (!lastPage || lastPage.rows.length < TABLE_LIMITS.MAX_QUERY_LIMIT) break
+        const result = await fetchNextPage()
+        if (result.status === 'error') {
+          throw result.error ?? new Error('Failed to load table rows')
+        }
+      }
+
+      const all = queryClient.getQueryData(opts.queryKey)?.pages.flatMap((p) => p.rows) ?? []
+      return {
+        rows: all.length > maxRows ? all.slice(0, maxRows) : all,
+        hasMore: all.length > maxRows,
+      }
+    },
+    [workspaceId, tableId, queryOptions.filter, queryOptions.sort, queryClient, fetchNextPage]
+  )
+
   const fetchNextPageWrapped = useCallback(async () => {
     const result = await fetchNextPage()
     if (result.status === 'error') {
@@ -146,8 +189,16 @@ export function useTable({ workspaceId, tableId, queryOptions }: UseTableParams)
   const columnSourceInfo = useMemo<Map<string, ColumnSourceInfo>>(() => {
     const map = new Map<string, ColumnSourceInfo>()
     for (const group of tableWorkflowGroups) {
+      // Enrichment groups have no workflow blocks; their output columns render
+      // with the standard column-type icon (the meta-header already carries the
+      // enrichment's icon), so we skip building source info for them.
+      if (group.type === 'enrichment') continue
       const state = workflowStates.get(group.workflowId)
       const blocks = (state as { blocks?: Record<string, FlattenOutputsBlockInput> } | null)?.blocks
+      // `useWorkflowStates` only fetches the live draft, so we can only judge
+      // "block missing" for live-mode groups. A deployed-mode group runs a
+      // different graph we don't load client-side — don't risk a false badge.
+      const isLiveMode = group.deploymentMode !== 'deployed'
       for (const out of group.outputs) {
         const block = blocks?.[out.blockId]
         const blockConfig = block?.type ? getBlock(block.type) : undefined
@@ -155,7 +206,10 @@ export function useTable({ workspaceId, tableId, queryOptions }: UseTableParams)
           ? { icon: blockConfig.icon, color: blockConfig.bgColor || '#2F55FF' }
           : undefined
         const blockName = block?.name?.trim() || undefined
-        map.set(out.columnName, { blockIconInfo, blockName })
+        // Flag a missing source block only once the workflow state has loaded
+        // (truthy `blocks`), so a still-loading workflow never flashes the badge.
+        const blockMissing = Boolean(isLiveMode && blocks && out.blockId && !block)
+        map.set(out.columnName, { blockIconInfo, blockName, blockMissing })
       }
     }
     return map
@@ -176,5 +230,6 @@ export function useTable({ workspaceId, tableId, queryOptions }: UseTableParams)
     workflowStates,
     columnSourceInfo,
     ensureAllRowsLoaded,
+    ensureRowsLoadedUpTo,
   }
 }

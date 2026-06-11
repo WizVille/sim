@@ -6,6 +6,7 @@ import type {
   TableRow as TableRowType,
   WorkflowGroup,
 } from '@/lib/table'
+import { getColumnId } from '@/lib/table/column-keys'
 import { areGroupDepsSatisfied, areOutputsFilled } from '@/lib/table/deps'
 import type { DeletedRowSnapshot } from '@/stores/table/types'
 import type { DisplayColumn } from './types'
@@ -46,11 +47,17 @@ export function rowSelectionCoversAll(sel: RowSelection, rows: TableRowType[]): 
 export function checkboxColLayout(
   maxRows: number,
   hasWorkflowCols: boolean
-): { colWidth: number; numDivWidth: number } {
+): { colWidth: number; numRegionWidth: number } {
   const digits = maxRows > 0 ? Math.floor(Math.log10(maxRows)) + 1 : 1
-  const numDivWidth = Math.max(20, digits * 8 + 4)
-  const colWidth = Math.max(32, numDivWidth + 8) + (hasWorkflowCols ? 16 : 0)
-  return { colWidth, numDivWidth }
+  const numWidth = Math.max(20, digits * 8 + 4)
+  // Region the number/checkbox is centered within (digit width + 12px breathing
+  // room, min 32). The select-all header checkbox centers in the same region so it
+  // lines up with the per-row checkboxes.
+  const numRegionWidth = Math.max(32, numWidth + 12)
+  // Workflow tables add a 20px run/stop button (+6px gap, +4px pad) to the right of
+  // the region; the checkbox stays centered in the space that remains.
+  const colWidth = numRegionWidth + (hasWorkflowCols ? 30 : 0)
+  return { colWidth, numRegionWidth }
 }
 
 export interface CellCoord {
@@ -103,10 +110,10 @@ export function expandToDisplayColumns(
       const startIdx = out.length
       for (let k = 0; k < size; k++) {
         const child = columns[i + k]
-        const output = group?.outputs.find((o) => o.columnName === child.name)
+        const output = group?.outputs.find((o) => o.columnName === getColumnId(child))
         out.push({
           ...child,
-          key: child.name,
+          key: getColumnId(child),
           outputBlockId: output?.blockId,
           outputPath: output?.path,
           groupSize: size,
@@ -119,7 +126,7 @@ export function expandToDisplayColumns(
     } else {
       out.push({
         ...column,
-        key: column.name,
+        key: getColumnId(column),
         groupSize: 1,
         groupStartColIndex: out.length,
         headerLabel: column.name,
@@ -189,7 +196,19 @@ export function resolveCellExec(
   if (areOutputsFilled(group, row)) return undefined
   if (!areGroupDepsSatisfied(group, row)) return undefined
   for (const d of activeDispatches) {
+    // Capped dispatches run only the first N eligible rows ahead of the
+    // cursor, and this per-row resolver can't tell which rows fall within the
+    // budget — rendering every ahead-of-cursor row as Queued would massively
+    // over-count. The dispatcher's real per-row pending stamps (arriving via
+    // cell SSE) cover the actual rows instead.
+    if (d.limit) continue
     if (!d.scope.groupIds.includes(group.id)) continue
+    // Auto-fire dispatches (row writes / schema changes) scope every group but
+    // the dispatcher honors `autoRun: false` per-cell ('autoRun-off'), so those
+    // cells never actually run — don't optimistically paint them Queued. Manual
+    // runs (Run all / Run column) bypass autoRun and DO run them, so keep the
+    // overlay's Queued there.
+    if (!d.isManualRun && group.autoRun === false) continue
     if (d.scope.rowIds && !d.scope.rowIds.includes(row.id)) continue
     if (row.position <= d.cursor) continue
     return {
@@ -287,7 +306,12 @@ export function computeNormalizedSelection(
 export function collectRowSnapshots(rows: Iterable<TableRowType>): DeletedRowSnapshot[] {
   const snapshots: DeletedRowSnapshot[] = []
   for (const row of rows) {
-    snapshots.push({ rowId: row.id, data: { ...row.data }, position: row.position })
+    snapshots.push({
+      rowId: row.id,
+      data: { ...row.data },
+      position: row.position,
+      orderKey: row.orderKey,
+    })
   }
   return snapshots
 }

@@ -1,8 +1,5 @@
-import { db } from '@sim/db'
-import { tableRowExecutions, userTableRows } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
-import { and, eq, inArray, sql } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
 import {
   type BatchInsertTableRowsBodyInput,
@@ -14,30 +11,24 @@ import {
 } from '@/lib/api/contracts/tables'
 import { parseRequest } from '@/lib/api/server'
 import { isZodError, validationErrorResponse } from '@/lib/api/server/validation'
-import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { type AuthTypeValue, checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
-import type {
-  Filter,
-  RowData,
-  RowExecutionMetadata,
-  RowExecutions,
-  Sort,
-  TableSchema,
-} from '@/lib/table'
+import type { Filter, RowData, Sort, TableSchema } from '@/lib/table'
 import {
   batchInsertRows,
   batchUpdateRows,
   deleteRowsByFilter,
   deleteRowsByIds,
   insertRow,
-  USER_TABLE_ROWS_SQL_NAME,
   updateRowsByFilter,
   validateBatchRows,
   validateRowData,
   validateRowSize,
 } from '@/lib/table'
-import { buildFilterClause, buildSortClause, TableQueryValidationError } from '@/lib/table/sql'
+import { queryRows } from '@/lib/table/service'
+import { TableQueryValidationError } from '@/lib/table/sql'
+import { rowWireTranslators } from '@/app/api/table/row-wire'
 import { accessError, checkAccess } from '@/app/api/table/utils'
 
 const logger = createLogger('TableRowsAPI')
@@ -50,7 +41,8 @@ async function handleBatchInsert(
   requestId: string,
   tableId: string,
   validated: BatchInsertTableRowsBodyInput,
-  userId: string
+  userId: string,
+  authType: AuthTypeValue | undefined
 ): Promise<NextResponse> {
   const accessResult = await checkAccess(tableId, userId, 'write')
   if (!accessResult.ok) return accessError(accessResult, requestId, tableId)
@@ -64,10 +56,13 @@ async function handleBatchInsert(
     return NextResponse.json({ error: 'Invalid workspace ID' }, { status: 400 })
   }
 
+  const wire = rowWireTranslators(authType, table.schema as TableSchema)
+  const rows = (validated.rows as RowData[]).map((row) => wire.dataIn(row))
+
   // Validate rows before calling service (service also validates, but route-level
   // validation returns structured HTTP responses)
   const validation = await validateBatchRows({
-    rows: validated.rows as RowData[],
+    rows,
     schema: table.schema as TableSchema,
     tableId,
   })
@@ -77,10 +72,11 @@ async function handleBatchInsert(
     const insertedRows = await batchInsertRows(
       {
         tableId,
-        rows: validated.rows as RowData[],
+        rows,
         workspaceId: validated.workspaceId,
         userId,
         positions: validated.positions,
+        orderKeys: validated.orderKeys,
       },
       table,
       requestId
@@ -91,8 +87,9 @@ async function handleBatchInsert(
       data: {
         rows: insertedRows.map((r) => ({
           id: r.id,
-          data: r.data,
+          data: wire.dataOut(r.data),
           position: r.position,
+          orderKey: r.orderKey ?? undefined,
           createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt,
           updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : r.updatedAt,
         })),
@@ -137,7 +134,7 @@ export const POST = withRouteHandler(
       const body = parsed.data.body
 
       if ('rows' in body) {
-        return handleBatchInsert(requestId, tableId, body, authResult.userId)
+        return handleBatchInsert(requestId, tableId, body, authResult.userId, authResult.authType)
       }
 
       const validated = body
@@ -154,7 +151,8 @@ export const POST = withRouteHandler(
         return NextResponse.json({ error: 'Invalid workspace ID' }, { status: 400 })
       }
 
-      const rowData = validated.data as RowData
+      const wire = rowWireTranslators(authResult.authType, table.schema as TableSchema)
+      const rowData = wire.dataIn(validated.data as RowData)
 
       // Validate at route level for structured HTTP error responses
       const validation = await validateRowData({
@@ -172,6 +170,8 @@ export const POST = withRouteHandler(
           workspaceId: validated.workspaceId,
           userId: authResult.userId,
           position: validated.position,
+          afterRowId: validated.afterRowId,
+          beforeRowId: validated.beforeRowId,
         },
         table,
         requestId
@@ -182,11 +182,13 @@ export const POST = withRouteHandler(
         data: {
           row: {
             id: row.id,
-            data: row.data,
+            data: wire.dataOut(row.data),
             position: row.position,
+            orderKey: row.orderKey ?? undefined,
             createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt,
             updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : row.updatedAt,
           },
+
           message: 'Row inserted successfully',
         },
       })
@@ -268,113 +270,37 @@ export const GET = withRouteHandler(
         return NextResponse.json({ error: 'Invalid workspace ID' }, { status: 400 })
       }
 
-      const baseConditions = [
-        eq(userTableRows.tableId, tableId),
-        eq(userTableRows.workspaceId, validated.workspaceId),
-      ]
-
-      const schema = table.schema as TableSchema
-
-      if (validated.filter) {
-        const filterClause = buildFilterClause(
-          validated.filter as Filter,
-          USER_TABLE_ROWS_SQL_NAME,
-          schema.columns
-        )
-        if (filterClause) {
-          baseConditions.push(filterClause)
-        }
-      }
-
-      let query = db
-        .select({
-          id: userTableRows.id,
-          data: userTableRows.data,
-          position: userTableRows.position,
-          createdAt: userTableRows.createdAt,
-          updatedAt: userTableRows.updatedAt,
-        })
-        .from(userTableRows)
-        .where(and(...baseConditions))
-
-      if (validated.sort) {
-        const sortClause = buildSortClause(validated.sort, USER_TABLE_ROWS_SQL_NAME, schema.columns)
-        if (sortClause) {
-          query = query.orderBy(sortClause) as typeof query
-        } else {
-          query = query.orderBy(userTableRows.position) as typeof query
-        }
-      } else {
-        query = query.orderBy(userTableRows.position) as typeof query
-      }
-
-      let totalCount: number | null = null
-      if (validated.includeTotal) {
-        const [{ count }] = await db
-          .select({ count: sql<number>`count(*)` })
-          .from(userTableRows)
-          .where(and(...baseConditions))
-        totalCount = Number(count)
-      }
-
-      const rows = await query.limit(validated.limit).offset(validated.offset)
-
-      // Sidecar: fetch per-(row, group) execution state and group into a map
-      // so the response preserves the legacy `row.executions[groupId]` wire
-      // shape. One indexed-IN scan against table_row_executions.
-      const executionsByRow = new Map<string, RowExecutions>()
-      if (rows.length > 0) {
-        const execRows = await db
-          .select()
-          .from(tableRowExecutions)
-          .where(
-            inArray(
-              tableRowExecutions.rowId,
-              rows.map((r) => r.id)
-            )
-          )
-        for (const e of execRows) {
-          const existing = executionsByRow.get(e.rowId) ?? {}
-          const meta: RowExecutionMetadata = {
-            status: e.status as RowExecutionMetadata['status'],
-            executionId: e.executionId ?? null,
-            jobId: e.jobId ?? null,
-            workflowId: e.workflowId,
-            error: e.error ?? null,
-            ...(e.runningBlockIds && e.runningBlockIds.length > 0
-              ? { runningBlockIds: e.runningBlockIds }
-              : {}),
-            ...(e.blockErrors && Object.keys(e.blockErrors as Record<string, string>).length > 0
-              ? { blockErrors: e.blockErrors as Record<string, string> }
-              : {}),
-            ...(e.cancelledAt ? { cancelledAt: e.cancelledAt.toISOString() } : {}),
-          }
-          existing[e.groupId] = meta
-          executionsByRow.set(e.rowId, existing)
-        }
-      }
-
-      logger.info(
-        `[${requestId}] Queried ${rows.length} rows from table ${tableId} (total: ${totalCount ?? 'n/a'})`
+      const wire = rowWireTranslators(authResult.authType, table.schema as TableSchema)
+      const result = await queryRows(
+        table,
+        {
+          filter: validated.filter ? wire.filterIn(validated.filter as Filter) : undefined,
+          sort: validated.sort ? wire.sortIn(validated.sort) : undefined,
+          limit: validated.limit,
+          offset: validated.offset,
+          includeTotal: validated.includeTotal,
+        },
+        requestId
       )
 
       return NextResponse.json({
         success: true,
         data: {
-          rows: rows.map((r) => ({
+          rows: result.rows.map((r) => ({
             id: r.id,
-            data: r.data,
-            executions: executionsByRow.get(r.id) ?? {},
+            data: wire.dataOut(r.data),
+            executions: r.executions,
             position: r.position,
+            orderKey: r.orderKey ?? undefined,
             createdAt:
               r.createdAt instanceof Date ? r.createdAt.toISOString() : String(r.createdAt),
             updatedAt:
               r.updatedAt instanceof Date ? r.updatedAt.toISOString() : String(r.updatedAt),
           })),
-          rowCount: rows.length,
-          totalCount,
-          limit: validated.limit,
-          offset: validated.offset,
+          rowCount: result.rowCount,
+          totalCount: result.totalCount,
+          limit: result.limit,
+          offset: result.offset,
         },
       })
     } catch (error) {
@@ -425,7 +351,10 @@ export const PUT = withRouteHandler(
         return NextResponse.json({ error: 'Invalid workspace ID' }, { status: 400 })
       }
 
-      const sizeValidation = validateRowSize(validated.data as RowData)
+      const wire = rowWireTranslators(authResult.authType, table.schema as TableSchema)
+      const patchData = wire.dataIn(validated.data as RowData)
+
+      const sizeValidation = validateRowSize(patchData)
       if (!sizeValidation.valid) {
         return NextResponse.json(
           { error: 'Invalid row data', details: sizeValidation.errors },
@@ -436,9 +365,10 @@ export const PUT = withRouteHandler(
       const result = await updateRowsByFilter(
         table,
         {
-          filter: validated.filter as Filter,
-          data: validated.data as RowData,
+          filter: wire.filterIn(validated.filter as Filter),
+          data: patchData,
           limit: validated.limit,
+          actorUserId: authResult.userId,
         },
         requestId
       )
@@ -546,10 +476,11 @@ export const DELETE = withRouteHandler(
         })
       }
 
+      const wire = rowWireTranslators(authResult.authType, table.schema as TableSchema)
       const result = await deleteRowsByFilter(
         table,
         {
-          filter: validated.filter as Filter,
+          filter: wire.filterIn(validated.filter as Filter),
           limit: validated.limit,
         },
         requestId
@@ -625,6 +556,7 @@ export const PATCH = withRouteHandler(
           tableId,
           updates: validated.updates as Array<{ rowId: string; data: RowData }>,
           workspaceId: validated.workspaceId,
+          actorUserId: authResult.userId,
         },
         table,
         requestId

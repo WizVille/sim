@@ -27,11 +27,16 @@ vi.mock('@/lib/auth/hybrid', () => hybridAuthMock)
 vi.mock('@/app/api/knowledge/utils', () => knowledgeApiUtilsMock)
 vi.mock('@sim/audit', () => auditMock)
 
+vi.mock('@/lib/billing/calculations/usage-monitor', () => ({
+  checkActorUsageLimits: vi.fn().mockResolvedValue({ isExceeded: false }),
+}))
+
 vi.mock('@/lib/knowledge/documents/service', () => ({
   createDocumentRecords: vi.fn(),
   deleteDocument: vi.fn(),
   getProcessingConfig: vi.fn().mockReturnValue({ maxConcurrentDocuments: 1, batchSize: 1 }),
   processDocumentsWithQueue: vi.fn(),
+  KnowledgeBaseFileOwnershipError: class KnowledgeBaseFileOwnershipError extends Error {},
 }))
 
 import { createDocumentRecords, processDocumentsWithQueue } from '@/lib/knowledge/documents/service'

@@ -28,6 +28,7 @@ import {
   type SQL,
   sql,
 } from 'drizzle-orm'
+import { checkActorUsageLimits } from '@/lib/billing/calculations/usage-monitor'
 import { recordUsage } from '@/lib/billing/core/usage-log'
 import { checkAndBillOverageThreshold } from '@/lib/billing/threshold-billing'
 import type { ChunkingStrategy, StrategyOptions } from '@/lib/chunkers/types'
@@ -47,6 +48,7 @@ import {
 import type { ProcessedDocumentTags } from '@/lib/knowledge/types'
 import { estimateTokenCount } from '@/lib/tokenization/estimators'
 import { deleteFile } from '@/lib/uploads/core/storage-service'
+import { deleteFileMetadata, getFileMetadataByKeys } from '@/lib/uploads/server/metadata'
 import { extractStorageKey } from '@/lib/uploads/utils/file-utils'
 import type {
   DocumentProcessingPayload,
@@ -55,6 +57,90 @@ import type {
 import { calculateCost } from '@/providers/utils'
 
 const logger = createLogger('DocumentService')
+
+/**
+ * Thrown when a knowledge-base document's `fileUrl` references an internal `kb/`
+ * storage object that is not owned by the target knowledge base's workspace.
+ * Routes map this to a 403.
+ */
+export class KnowledgeBaseFileOwnershipError extends Error {
+  constructor(public readonly storageKey: string) {
+    super('Document file is not owned by this knowledge base')
+    this.name = 'KnowledgeBaseFileOwnershipError'
+  }
+}
+
+/**
+ * Guard document `fileUrl`s at creation time. When a URL points at an internal
+ * `kb/` storage object, require that the target knowledge base owns the object,
+ * resolved from the trusted `workspace_files` binding:
+ *
+ * - Workspace KB (`kbWorkspaceId` set): the binding's `workspaceId` must match.
+ * - Personal KB (`kbWorkspaceId` null): the binding's `userId` must be the KB
+ *   owner. A key bound to another tenant is rejected; an unbound key (legacy /
+ *   never reserved) passes since it carries no cross-tenant ownership.
+ *
+ * External `http(s)`/`data:` URLs (ingestion sources) and non-`kb/` internal keys
+ * pass through unchanged. This blocks a user from asserting ownership of another
+ * tenant's `kb/` key via a planted `fileUrl` — including in a personal KB, which
+ * otherwise could be moved into a workspace to launder the binding. All
+ * referenced bindings are resolved in one query (no N+1 inside the `FOR UPDATE`
+ * window). Single-document callers pass a one-element array.
+ */
+async function assertKnowledgeBaseFileUrlsOwnership(
+  fileUrls: string[],
+  kbWorkspaceId: string | null,
+  kbUserId: string,
+  requestId: string,
+  executor: DbExecutor = db
+): Promise<void> {
+  const keys = [
+    ...new Set(
+      fileUrls
+        .map((url) => getKnowledgeBaseStorageKey(url))
+        .filter((key): key is string => typeof key === 'string' && key.startsWith('kb/'))
+    ),
+  ]
+  if (keys.length === 0) {
+    return
+  }
+
+  // Read bindings on the caller's transaction so the security check shares the
+  // same connection/lock context as the FOR UPDATE'd insert that follows.
+  const bindings = await getFileMetadataByKeys(keys, 'knowledge-base', executor)
+  const bindingByKey = new Map(bindings.map((binding) => [binding.key, binding]))
+
+  for (const key of keys) {
+    const binding = bindingByKey.get(key)
+
+    if (kbWorkspaceId) {
+      if (!binding || binding.workspaceId !== kbWorkspaceId) {
+        logger.warn(`[${requestId}] Rejected document referencing unowned knowledge-base file`, {
+          storageKey: key,
+          kbWorkspaceId,
+          bindingWorkspaceId: binding?.workspaceId ?? null,
+        })
+        throw new KnowledgeBaseFileOwnershipError(key)
+      }
+      continue
+    }
+
+    // Personal KB: reject a key whose binding belongs to a different user. An
+    // unbound key carries no ownership and is allowed (legacy personal files).
+    if (binding && binding.userId !== kbUserId) {
+      logger.warn(
+        `[${requestId}] Rejected personal-KB document referencing another tenant's file`,
+        {
+          storageKey: key,
+          kbUserId,
+          bindingUserId: binding.userId,
+          bindingWorkspaceId: binding.workspaceId ?? null,
+        }
+      )
+      throw new KnowledgeBaseFileOwnershipError(key)
+    }
+  }
+}
 
 const TIMEOUTS = {
   OVERALL_PROCESSING: envNumber(env.KB_CONFIG_MAX_DURATION, 600) * 1000,
@@ -434,6 +520,7 @@ export async function processDocumentAsync(
         chunkingConfig: knowledgeBase.chunkingConfig,
         embeddingModel: knowledgeBase.embeddingModel,
         billedAccountUserId: workspaceTable.billedAccountUserId,
+        uploadedBy: document.uploadedBy,
         tag1: document.tag1,
         tag2: document.tag2,
         tag3: document.tag3,
@@ -517,9 +604,31 @@ export async function processDocumentAsync(
     if (!ctx.workspaceId) {
       throw new Error(`Knowledge base ${knowledgeBaseId} is missing workspace billing context`)
     }
-    const billingUserId = ctx.billedAccountUserId
+    // Bill the uploader when known; connector/cron-synced docs (and pre-migration
+    // rows) have no uploader and fall back to the workspace billed account.
+    const billingUserId = ctx.uploadedBy ?? ctx.billedAccountUserId
     if (!billingUserId) {
-      throw new Error(`Workspace ${ctx.workspaceId} is missing billed account`)
+      throw new Error(
+        `Workspace ${ctx.workspaceId} is missing billed account and document has no uploader`
+      )
+    }
+
+    // Authoritative usage gate covering every indexing path (connector/cron/
+    // retry/copilot plus the HTTP routes). Mark the document failed with the limit
+    // message — surfaced in the KB UI — rather than incurring embedding cost.
+    const usageGate = await checkActorUsageLimits(billingUserId, ctx.workspaceId)
+    if (usageGate.isExceeded) {
+      logger.warn(`[${documentId}] Usage limit reached — skipping document indexing`)
+      await db
+        .update(document)
+        .set({
+          processingStatus: 'failed',
+          processingError:
+            usageGate.message ?? 'Usage limit exceeded. Please upgrade your plan to continue.',
+          processingCompletedAt: new Date(),
+        })
+        .where(eq(document.id, documentId))
+      return
     }
     let totalEmbeddingTokens = 0
     let embeddingIsBYOK = false
@@ -702,12 +811,10 @@ export async function processDocumentAsync(
                 source: 'knowledge-base',
                 description: embeddingModelName,
                 cost,
+                sourceReference: `knowledge-document:${documentId}:${startTime}`,
                 metadata: { inputTokens: totalEmbeddingTokens, outputTokens: 0 },
               },
             ],
-            additionalStats: {
-              totalTokensUsed: sql`total_tokens_used + ${totalEmbeddingTokens}`,
-            },
           })
           await checkAndBillOverageThreshold(billingUserId)
         } else {
@@ -764,13 +871,18 @@ export async function createDocumentRecords(
     tag7?: string
   }>,
   knowledgeBaseId: string,
-  requestId: string
+  requestId: string,
+  uploadedBy: string | null = null
 ): Promise<DocumentData[]> {
   return await db.transaction(async (tx) => {
     await tx.execute(sql`SELECT 1 FROM knowledge_base WHERE id = ${knowledgeBaseId} FOR UPDATE`)
 
     const kb = await tx
-      .select({ id: knowledgeBase.id })
+      .select({
+        id: knowledgeBase.id,
+        workspaceId: knowledgeBase.workspaceId,
+        userId: knowledgeBase.userId,
+      })
       .from(knowledgeBase)
       .where(and(eq(knowledgeBase.id, knowledgeBaseId), isNull(knowledgeBase.deletedAt)))
       .limit(1)
@@ -778,6 +890,15 @@ export async function createDocumentRecords(
     if (kb.length === 0) {
       throw new Error('Knowledge base not found')
     }
+
+    const kbWorkspaceId = kb[0].workspaceId
+    await assertKnowledgeBaseFileUrlsOwnership(
+      documents.map((docData) => docData.fileUrl),
+      kbWorkspaceId,
+      kb[0].userId,
+      requestId,
+      tx
+    )
 
     // One load per batch (was N+1); skip entirely if no doc carries tags.
     const hasTaggedDocs = documents.some((d) => d.documentTagsData)
@@ -814,6 +935,7 @@ export async function createDocumentRecords(
         knowledgeBaseId,
         filename: docData.filename,
         fileUrl: docData.fileUrl,
+        storageKey: getKnowledgeBaseStorageKey(docData.fileUrl),
         fileSize: docData.fileSize,
         mimeType: docData.mimeType,
         chunkCount: 0,
@@ -822,6 +944,7 @@ export async function createDocumentRecords(
         processingStatus: 'pending' as const,
         enabled: true,
         uploadedAt: now,
+        uploadedBy,
         tag1: processedTags.tag1 ?? docData.tag1 ?? null,
         tag2: processedTags.tag2 ?? docData.tag2 ?? null,
         tag3: processedTags.tag3 ?? docData.tag3 ?? null,
@@ -1244,7 +1367,8 @@ export async function createSingleDocument(
     tag7?: string
   },
   knowledgeBaseId: string,
-  requestId: string
+  requestId: string,
+  uploadedBy: string | null = null
 ): Promise<{
   id: string
   knowledgeBaseId: string
@@ -1309,6 +1433,7 @@ export async function createSingleDocument(
     knowledgeBaseId,
     filename: documentData.filename,
     fileUrl: documentData.fileUrl,
+    storageKey: getKnowledgeBaseStorageKey(documentData.fileUrl),
     fileSize: documentData.fileSize,
     mimeType: documentData.mimeType,
     chunkCount: 0,
@@ -1316,6 +1441,7 @@ export async function createSingleDocument(
     characterCount: 0,
     enabled: true,
     uploadedAt: now,
+    uploadedBy,
     ...processedTags,
   }
 
@@ -1323,7 +1449,11 @@ export async function createSingleDocument(
     await tx.execute(sql`SELECT 1 FROM knowledge_base WHERE id = ${knowledgeBaseId} FOR UPDATE`)
 
     const kb = await tx
-      .select({ id: knowledgeBase.id })
+      .select({
+        id: knowledgeBase.id,
+        workspaceId: knowledgeBase.workspaceId,
+        userId: knowledgeBase.userId,
+      })
       .from(knowledgeBase)
       .where(and(eq(knowledgeBase.id, knowledgeBaseId), isNull(knowledgeBase.deletedAt)))
       .limit(1)
@@ -1331,6 +1461,14 @@ export async function createSingleDocument(
     if (kb.length === 0) {
       throw new Error('Knowledge base not found')
     }
+
+    await assertKnowledgeBaseFileUrlsOwnership(
+      [documentData.fileUrl],
+      kb[0].workspaceId,
+      kb[0].userId,
+      requestId,
+      tx
+    )
 
     await tx.insert(document).values(newDocument)
 
@@ -1850,18 +1988,63 @@ function getKnowledgeBaseStorageKey(fileUrl: string | null): string | null {
 }
 
 export async function deleteDocumentStorageFiles(
-  documentsToDelete: Array<{ id: string; fileUrl: string | null }>,
+  documentsToDelete: Array<{ id: string; fileUrl: string | null; workspaceId?: string | null }>,
   requestId: string
 ): Promise<void> {
+  const entries = documentsToDelete.map((doc) => ({
+    doc,
+    storageKey: getKnowledgeBaseStorageKey(doc.fileUrl),
+  }))
+
+  // Resolve all kb/ ownership bindings in one query (avoids an N+1 across the
+  // delete fan-out below).
+  const kbKeys = [
+    ...new Set(
+      entries
+        .map((entry) => entry.storageKey)
+        .filter((key): key is string => typeof key === 'string' && key.startsWith('kb/'))
+    ),
+  ]
+  const ownerByKey = new Map<string, string | null>()
+  if (kbKeys.length > 0) {
+    const bindings = await getFileMetadataByKeys(kbKeys, 'knowledge-base')
+    for (const binding of bindings) {
+      ownerByKey.set(binding.key, binding.workspaceId)
+    }
+  }
+
   await Promise.allSettled(
-    documentsToDelete.map(async (doc) => {
-      const storageKey = getKnowledgeBaseStorageKey(doc.fileUrl)
+    entries.map(async ({ doc, storageKey }) => {
       if (!storageKey) {
         return
       }
 
+      // Only delete a kb/ object when its trusted ownership binding confirms the
+      // deleting document's workspace owns it. Prevents deleting another tenant's
+      // object via a document with a planted fileUrl.
+      if (storageKey.startsWith('kb/')) {
+        const bindingWorkspaceId = ownerByKey.get(storageKey)
+        if (!bindingWorkspaceId) {
+          logger.warn(`[${requestId}] Skipping storage delete: no ownership binding for key`, {
+            documentId: doc.id,
+            storageKey,
+          })
+          return
+        }
+        if (!doc.workspaceId || bindingWorkspaceId !== doc.workspaceId) {
+          logger.warn(`[${requestId}] Skipping storage delete: ownership binding mismatch`, {
+            documentId: doc.id,
+            storageKey,
+            bindingWorkspaceId,
+            documentWorkspaceId: doc.workspaceId ?? null,
+          })
+          return
+        }
+      }
+
       try {
         await deleteFile({ key: storageKey, context: 'knowledge-base' })
+        await deleteFileMetadata(storageKey)
       } catch (error) {
         logger.warn(`[${requestId}] Failed to delete document storage file`, {
           documentId: doc.id,
@@ -1940,8 +2123,10 @@ export async function hardDeleteDocuments(
     .select({
       id: document.id,
       fileUrl: document.fileUrl,
+      workspaceId: knowledgeBase.workspaceId,
     })
     .from(document)
+    .innerJoin(knowledgeBase, eq(document.knowledgeBaseId, knowledgeBase.id))
     .where(inArray(document.id, ids))
 
   if (documentsToDelete.length === 0) {

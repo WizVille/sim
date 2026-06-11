@@ -1,17 +1,16 @@
 import { db } from '@sim/db'
-import { permissions, userStats, workflowFolder, workflow as workflowTable } from '@sim/db/schema'
+import { permissions, workflowFolder, workflow as workflowTable } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { generateId } from '@sim/utils/id'
 import { authorizeWorkflowByWorkspacePermission } from '@sim/workflow-authz'
 import { and, asc, eq, inArray, isNull, max, min, sql } from 'drizzle-orm'
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/auth'
+import { ensureWorkflowAliasBacking } from '@/lib/copilot/vfs/workflow-alias-backing'
 import { materializeInlineExecutionValue } from '@/lib/execution/payloads/inline-materialization.server'
 import type { ExecutionMaterializationContext } from '@/lib/execution/payloads/materialization.server'
-import { getNextWorkflowColor } from '@/lib/workflows/colors'
 import { buildDefaultWorkflowArtifacts } from '@/lib/workflows/defaults'
 import { saveWorkflowToNormalizedTables } from '@/lib/workflows/persistence/utils'
-import { getWorkspaceBilledAccountUserId } from '@/lib/workspaces/utils'
 import type { ExecutionResult } from '@/executor/types'
 
 const logger = createLogger('WorkflowUtils')
@@ -108,6 +107,7 @@ export type WorkflowResolutionResult =
   | {
       status: 'resolved'
       workflowId: string
+      workspaceId: string
       workflowName?: string
     }
   | {
@@ -143,7 +143,18 @@ export async function resolveWorkflowIdForUser(
       }
     }
     const wf = await getWorkflowById(workflowId)
-    return { status: 'resolved', workflowId, workflowName: wf?.name || undefined }
+    if (!wf?.workspaceId) {
+      return {
+        status: 'not_found',
+        message: 'No workflows found. Create a workflow first or provide a valid workflowId.',
+      }
+    }
+    return {
+      status: 'resolved',
+      workflowId,
+      workspaceId: wf.workspaceId,
+      workflowName: wf.name || undefined,
+    }
   }
 
   const workspaceIds = await db
@@ -162,13 +173,18 @@ export async function resolveWorkflowIdForUser(
     }
   }
 
-  const workflows = await db
+  const workflowRows = await db
     .select()
     .from(workflowTable)
     .where(
       and(inArray(workflowTable.workspaceId, allowedWorkspaceIds), isNull(workflowTable.archivedAt))
     )
     .orderBy(asc(workflowTable.sortOrder), asc(workflowTable.createdAt), asc(workflowTable.id))
+
+  const workflows = workflowRows.filter(
+    (workflow): workflow is (typeof workflowRows)[number] & { workspaceId: string } =>
+      workflow.workspaceId !== null
+  )
 
   if (workflows.length === 0) {
     return {
@@ -189,6 +205,7 @@ export async function resolveWorkflowIdForUser(
       return {
         status: 'resolved',
         workflowId: match.id,
+        workspaceId: match.workspaceId,
         workflowName: match.name || undefined,
       }
     }
@@ -213,6 +230,7 @@ export async function resolveWorkflowIdForUser(
     return {
       status: 'resolved',
       workflowId: workflows[0].id,
+      workspaceId: workflows[0].workspaceId,
       workflowName: workflows[0].name || undefined,
     }
   }
@@ -244,53 +262,6 @@ export async function updateWorkflowRunCounts(workflowId: string, runs = 1) {
         lastRunAt: new Date(),
       })
       .where(eq(workflowTable.id, workflowId))
-
-    let activityUserId: string | null = null
-    if (workflow.workspaceId) {
-      try {
-        activityUserId = await getWorkspaceBilledAccountUserId(workflow.workspaceId)
-      } catch (error) {
-        logger.warn(`Error resolving billed account for workspace ${workflow.workspaceId}`, {
-          workflowId,
-          error,
-        })
-      }
-    }
-
-    if (activityUserId) {
-      try {
-        const existing = await db
-          .select()
-          .from(userStats)
-          .where(eq(userStats.userId, activityUserId))
-          .limit(1)
-
-        if (existing.length === 0) {
-          logger.warn('User stats record not found - should be created during onboarding', {
-            userId: activityUserId,
-            workflowId,
-          })
-        } else {
-          await db
-            .update(userStats)
-            .set({
-              lastActive: new Date(),
-            })
-            .where(eq(userStats.userId, activityUserId))
-        }
-      } catch (error) {
-        logger.error(`Error updating userStats lastActive for userId ${activityUserId}:`, error)
-        // Don't rethrow - we want to continue even if this fails
-      }
-    } else {
-      logger.warn(
-        'Skipping userStats lastActive update: unable to resolve workspace billed account',
-        {
-          workflowId,
-          workspaceId: workflow.workspaceId,
-        }
-      )
-    }
 
     return {
       success: true,
@@ -400,19 +371,11 @@ export interface CreateWorkflowInput {
   workspaceId: string
   name: string
   description?: string | null
-  color?: string
   folderId?: string | null
 }
 
 export async function createWorkflowRecord(params: CreateWorkflowInput) {
-  const {
-    userId,
-    workspaceId,
-    name,
-    description = null,
-    color = getNextWorkflowColor(),
-    folderId = null,
-  } = params
+  const { userId, workspaceId, name, description = null, folderId = null } = params
   const workflowId = generateId()
   const now = new Date()
 
@@ -475,7 +438,6 @@ export async function createWorkflowRecord(params: CreateWorkflowInput) {
     sortOrder,
     name,
     description,
-    color,
     lastSynced: now,
     createdAt: now,
     updatedAt: now,
@@ -490,17 +452,18 @@ export async function createWorkflowRecord(params: CreateWorkflowInput) {
     throw new Error(saveResult.error || 'Failed to save workflow state')
   }
 
+  await ensureWorkflowAliasBacking({ workspaceId, userId, workflowId, workflowName: name })
+
   return { workflowId, name, workspaceId, folderId, sortOrder, createdAt: now, updatedAt: now }
 }
 
 export async function updateWorkflowRecord(
   workflowId: string,
-  updates: { name?: string; description?: string; color?: string; folderId?: string | null }
+  updates: { name?: string; description?: string; folderId?: string | null }
 ) {
   const setData: Record<string, unknown> = { updatedAt: new Date() }
   if (updates.name !== undefined) setData.name = updates.name
   if (updates.description !== undefined) setData.description = updates.description
-  if (updates.color !== undefined) setData.color = updates.color
   if (updates.folderId !== undefined) setData.folderId = updates.folderId
   await db.update(workflowTable).set(setData).where(eq(workflowTable.id, workflowId))
 }

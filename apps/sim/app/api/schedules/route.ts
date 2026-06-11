@@ -133,7 +133,6 @@ async function handleWorkspaceSchedules(requestId: string, userId: string, works
       .select({
         schedule: workflowSchedule,
         workflowName: workflow.name,
-        workflowColor: workflow.color,
       })
       .from(workflowSchedule)
       .innerJoin(workflow, eq(workflow.id, workflowSchedule.workflowId))
@@ -176,12 +175,10 @@ async function handleWorkspaceSchedules(requestId: string, userId: string, works
     ...workflowRows.map((r) => ({
       ...r.schedule,
       workflowName: r.workflowName,
-      workflowColor: r.workflowColor,
     })),
     ...jobRows.map((r) => ({
       ...r.schedule,
       workflowName: null,
-      workflowColor: null,
     })),
   ]
 
@@ -220,8 +217,8 @@ export const POST = withRouteHandler(async (req: NextRequest) => {
     const { workspaceId, title, prompt, cronExpression, timezone, lifecycle, maxRuns, startDate } =
       parsed.data.body
 
-    const hasPermission = await verifyWorkspaceMembership(session.user.id, workspaceId)
-    if (!hasPermission) {
+    const permission = await verifyWorkspaceMembership(session.user.id, workspaceId)
+    if (permission !== 'admin' && permission !== 'write') {
       return NextResponse.json({ error: 'Not authorized' }, { status: 403 })
     }
 

@@ -19,6 +19,7 @@ export const env = createEnv({
   server: {
     // Core Database & Authentication
     DATABASE_URL:                          z.string().url(),                       // Primary database connection string
+    DATABASE_REPLICA_URL:                  z.string().url().optional(),            // Read-replica connection string; opt-in reads fall back to the primary when unset
     BETTER_AUTH_URL:                       z.string().url(),                       // Base URL for Better Auth service
     BETTER_AUTH_SECRET:                    z.string().min(32),                     // Secret key for Better Auth JWT signing
     DISABLE_REGISTRATION:                  z.boolean().optional(),                 // Flag to disable new user registration
@@ -27,12 +28,15 @@ export const env = createEnv({
     ALLOWED_LOGIN_EMAILS:                  z.string().optional(),                  // Comma-separated list of allowed email addresses for login
     ALLOWED_LOGIN_DOMAINS:                 z.string().optional(),                  // Comma-separated list of allowed email domains for login
     BLOCKED_SIGNUP_DOMAINS:                z.string().optional(),                  // Comma-separated list of email domains blocked from signing up (e.g., "gmail.com,yahoo.com")
+    SIGNUP_MX_VALIDATION_ENABLED:          z.boolean().optional(),                 // Opt-in: validate the email's MX backend at signup (blocks no-MX domains and denylisted shared spam backends). Off by default; enable on hosted/abuse-targeted deployments.
+    BLOCKED_EMAIL_MX_HOSTS:                z.string().optional(),                  // Comma-separated MX-host substrings blocked from signing up; matched against the domain's resolved MX backend to catch throwaway domains that share a mail backend. No defaults — operators supply their own list. Only used when SIGNUP_MX_VALIDATION_ENABLED is set.
     TRUSTED_ORIGINS:                       z.string().optional(),                  // Comma-separated additional origins to trust for auth (e.g., "https://app.example.com,https://www.example.com"). Merged into Better Auth trustedOrigins.
     TURNSTILE_SECRET_KEY:                  z.string().min(1).optional(),           // Cloudflare Turnstile secret key for captcha verification
     SIGNUP_EMAIL_VALIDATION_ENABLED:       z.boolean().optional(),                 // Enable disposable email blocking via better-auth-harmony (55K+ domains)
     ENCRYPTION_KEY:                        z.string().min(32),                     // Key for encrypting sensitive data
     API_ENCRYPTION_KEY:                    z.string().min(32).optional(),          // Dedicated key for encrypting API keys (optional for OSS)
     INTERNAL_API_SECRET:                   z.string().min(32),                     // Secret for internal API authentication
+    INTERNAL_JWT_SECRET:                   z.string().min(32).optional(),          // Dedicated signing key for internal JWTs (falls back to INTERNAL_API_SECRET); separating limits blast radius if one leaks
 
     // Copilot
     COPILOT_API_KEY:                       z.string().min(1).optional(),           // Secret for internal sim agent API authentication
@@ -66,6 +70,7 @@ export const env = createEnv({
     ENTERPRISE_TIER_COST_LIMIT:            z.number().optional(),                  // Cost limit for enterprise tier users
     ENTERPRISE_STORAGE_LIMIT_GB:           z.number().optional().default(500),     // Default storage limit in GB for enterprise tier (can be overridden per org)
     BILLING_ENABLED:                       z.boolean().optional(),                 // Enable billing enforcement and usage tracking
+    TABLES_FRACTIONAL_ORDERING:            z.boolean().optional(),                 // Order table rows by fractional order_key (O(1) insert/delete) instead of integer position
 
     // Table feature limits (per plan). Apply when billing is disabled (free tier defaults) or for billed plans.
     FREE_TABLES_LIMIT:                     z.number().optional(),                  // Max user tables per workspace on free tier (default: 3)
@@ -99,6 +104,12 @@ export const env = createEnv({
     PERSONAL_EMAIL_FROM:                   z.string().min(1).optional(),           // From address for personalized emails
     EMAIL_DOMAIN:                          z.string().min(1).optional(),           // Domain for sending emails (fallback when FROM_EMAIL_ADDRESS not set)
     AZURE_ACS_CONNECTION_STRING:           z.string().optional(),                  // Azure Communication Services connection string
+    AWS_SES_REGION:                        z.string().min(1).optional(),           // AWS region for SES (credentials resolved via default SDK provider chain)
+    SMTP_HOST:                             z.string().min(1).optional(),           // SMTP server hostname
+    SMTP_PORT:                             z.coerce.number().int().min(1).max(65535).optional(),
+    SMTP_USER:                             z.string().min(1).optional(),           // SMTP username
+    SMTP_PASS:                             z.string().min(1).optional(),           // SMTP password
+    SMTP_SECURE:                           z.boolean().optional(),                 // Force TLS on connect (defaults to true on port 465); read via envBoolean to handle string values from process.env
 
     // SMS & Messaging
     TWILIO_ACCOUNT_SID:                    z.string().min(1).optional(),           // Twilio Account SID for SMS sending
@@ -124,6 +135,8 @@ export const env = createEnv({
     LITELLM_BASE_URL:                      z.string().url().optional(),            // LiteLLM proxy base URL (OpenAI-compatible)
     LITELLM_API_KEY:                       z.string().optional(),                  // Optional bearer token for LiteLLM
     FIREWORKS_API_KEY:                     z.string().optional(),                  // Optional Fireworks AI API key for model listing
+    TOGETHER_API_KEY:                      z.string().optional(),                  // Optional Together AI API key for model listing and inference
+    BASETEN_API_KEY:                       z.string().optional(),                  // Optional Baseten API key for model listing and inference
     COHERE_API_KEY:                        z.string().min(1).optional(),           // Cohere API key for reranker (rerank-v4.0-pro, rerank-v4.0-fast, rerank-v3.5)
     COHERE_API_KEY_1:                      z.string().min(1).optional(),           // Primary Cohere API key for rotation
     COHERE_API_KEY_2:                      z.string().min(1).optional(),           // Additional Cohere API key for load balancing
@@ -188,6 +201,12 @@ export const env = createEnv({
     TRIGGER_DEV_ENABLED:                   z.boolean().optional(),                 // Toggle to enable/disable Trigger.dev for async jobs
     CRON_SECRET:                           z.string().optional(),                  // Secret for authenticating cron job requests
     JOB_RETENTION_DAYS:                    z.string().optional().default('1'),     // Days to retain job logs/data
+    SCHEDULE_EXECUTION_CONCURRENCY_LIMIT:  z.string().optional().default('50'),
+    SCHEDULE_ENQUEUE_BUDGET_MULTIPLIER:    z.string().optional().default('2'),
+    SCHEDULE_JITTER_MAX_MS:                z.string().optional().default('30000'),
+    SCHEDULE_INFRA_RETRY_BASE_MS:          z.string().optional().default('60000'),
+    SCHEDULE_INFRA_RETRY_MAX_MS:           z.string().optional().default('300000'),
+    SCHEDULE_INFRA_RETRY_MAX_ATTEMPTS:     z.string().optional().default('10'),
 
     // Cloud Storage - AWS S3
     AWS_REGION:                            z.string().optional(),                  // AWS region for S3 buckets
@@ -202,6 +221,12 @@ export const env = createEnv({
     S3_PROFILE_PICTURES_BUCKET_NAME:       z.string().optional(),                  // S3 bucket for profile pictures
     S3_OG_IMAGES_BUCKET_NAME:              z.string().optional(),                  // S3 bucket for OpenGraph images
     S3_WORKSPACE_LOGOS_BUCKET_NAME:        z.string().optional(),                  // S3 bucket for workspace logos
+    S3_ENDPOINT:                           z.string().optional(),                  // Custom endpoint for S3-compatible storage (Cloudflare R2, MinIO, Backblaze B2). Leave unset for AWS S3
+    S3_FORCE_PATH_STYLE:                   z.string().optional(),                  // Force path-style addressing (MinIO/Ceph RGW). Defaults to false (AWS S3, R2). Coerced via envBoolean at the consumption site
+
+    // Dynamic config - AWS AppConfig (hosted source of truth for signup/login gating lists; unset => env-var fallback)
+    APPCONFIG_APPLICATION:                 z.string().optional(),                  // AppConfig application id/name. On hosted deployments, when set with APPCONFIG_ENVIRONMENT, gating lists come from AppConfig instead of env vars
+    APPCONFIG_ENVIRONMENT:                 z.string().optional(),                  // AppConfig environment id/name. Profile name is an app-side constant ('access-control'), not an env var
 
     // Cloud Storage - Azure Blob
     AZURE_ACCOUNT_NAME:                    z.string().optional(),                  // Azure storage account name
@@ -219,6 +244,8 @@ export const env = createEnv({
 
     // Admission & Burst Protection
     ADMISSION_GATE_MAX_INFLIGHT:           z.string().optional().default('500'),   // Max concurrent in-flight execution requests per pod
+    API_MAX_JSON_BODY_BYTES:               z.string().optional().default('52428800'),// Default max JSON request body size for contract routes (50 MB)
+    CHAT_MAX_REQUEST_BYTES:                z.string().optional().default('230686720'),// Max request body size for the public deployed-chat endpoint (220 MB; covers 15 base64 file attachments)
 
     // Rate Limiting Configuration
     RATE_LIMIT_WINDOW_MS:                  z.string().optional().default('60000'), // Rate limit window duration in milliseconds (default: 1 minute)
@@ -356,6 +383,7 @@ export const env = createEnv({
     E2B_ENABLED:                           z.string().optional(),                  // Enable E2B remote code execution
     E2B_API_KEY:                           z.string().optional(),                  // E2B API key for sandbox creation
     MOTHERSHIP_E2B_TEMPLATE_ID:             z.string().optional(),                  // Custom E2B template with pre-installed CLI tools for shell execution
+    MOTHERSHIP_E2B_DOC_TEMPLATE_ID:         z.string().optional(),                  // Dedicated E2B template with python-pptx/docx/openpyxl/reportlab for document generation; when set (and E2B enabled), docs compile via Python instead of the JS isolated-vm path
 
     // Credential Sets (Email Polling) - for self-hosted deployments
     CREDENTIAL_SETS_ENABLED:               z.boolean().optional(),                 // Enable credential sets on self-hosted (bypasses plan requirements)
@@ -375,6 +403,7 @@ export const env = createEnv({
     // Invitations - for self-hosted deployments
     DISABLE_INVITATIONS:                   z.boolean().optional(),                 // Disable workspace invitations globally (for self-hosted deployments)
     DISABLE_PUBLIC_API:                    z.boolean().optional(),                 // Disable public API access globally (for self-hosted deployments)
+    MOTHERSHIP_BETA_FEATURES:              z.boolean().optional(),                 // Enable beta Mothership planning/changelog artifact surfaces
 
     // Development Tools
     REACT_GRAB_ENABLED:                    z.boolean().optional(),                 // Enable React Grab for UI element debugging in Cursor/AI agents (dev only)
@@ -388,6 +417,7 @@ export const env = createEnv({
     SSO_DOMAIN:                            z.string().optional(),                  // [REQUIRED] SSO email domain
     SSO_USER_EMAIL:                        z.string().optional(),                  // [REQUIRED] User email for SSO registration
     SSO_ORGANIZATION_ID:                   z.string().optional(),                  // Organization ID for SSO registration (optional)
+    SSO_TRUSTED_PROVIDER_IDS:              z.string().optional(),                  // Comma-separated SSO provider IDs to trust for automatic account linking when an existing account shares the same email. Use for IdPs that do not assert email_verified. Merged into Better Auth accountLinking.trustedProviders.
 
     // SSO Mapping Configuration (optional - sensible defaults provided)
     SSO_MAPPING_ID:                        z.string().optional(),                  // Custom ID claim mapping (default: sub for OIDC, nameidentifier for SAML)
@@ -549,11 +579,33 @@ export { getEnv }
 export function envNumber(
   value: number | string | undefined | null,
   fallback: number,
-  options: { min?: number } = {}
+  options: { min?: number; integer?: boolean } = {}
 ): number {
   const min = options.min ?? 0
-  if (typeof value === 'number' && Number.isFinite(value) && value >= min) return value
+  if (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= min &&
+    (!options.integer || Number.isInteger(value))
+  ) {
+    return value
+  }
   if (value === undefined || value === null || value === '') return fallback
   const parsed = Number(value)
-  return Number.isFinite(parsed) && parsed >= min ? parsed : fallback
+  return Number.isFinite(parsed) && parsed >= min && (!options.integer || Number.isInteger(parsed))
+    ? parsed
+    : fallback
+}
+
+/**
+ * Coerce an env-derived value to a boolean. Returns `undefined` when unset
+ * so callers can apply context-aware defaults. Required because
+ * `Boolean("false") === true`, so `z.coerce.boolean()` would silently flip
+ * the meaning of `MY_FLAG=false`.
+ */
+export function envBoolean(value: boolean | string | undefined | null): boolean | undefined {
+  if (typeof value === 'boolean') return value
+  if (value === undefined || value === null || value === '') return undefined
+  const normalized = String(value).trim().toLowerCase()
+  return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on'
 }

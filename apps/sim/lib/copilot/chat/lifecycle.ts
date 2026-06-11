@@ -1,11 +1,12 @@
 import { db } from '@sim/db'
-import { copilotChats } from '@sim/db/schema'
+import { copilotChats, copilotMessages } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import {
   authorizeWorkflowByWorkspacePermission,
   getActiveWorkflowRecord,
 } from '@sim/workflow-authz'
-import { and, eq } from 'drizzle-orm'
+import { and, asc, eq, isNull, sql } from 'drizzle-orm'
+import { type PersistedMessage, stripToolResultOutput } from '@/lib/copilot/chat/persisted-message'
 import {
   assertActiveWorkspaceAccess,
   checkWorkspaceAccess,
@@ -35,21 +36,57 @@ const copilotChatAuthColumns = {
 } as const
 
 /**
- * Column set for chat-detail callers that need the conversation transcript but
- * not the copilot-only TOAST-able fields (`previewYaml`, `planArtifact`,
- * `config`) or unused metadata (`model`, `pinned`, `lastSeenAt`). Selecting
- * only these columns avoids the Postgres detoast cost on the dropped fields,
- * which dominates latency for chats with large message histories.
+ * Column set for chat-detail callers that need chat metadata. The conversation
+ * transcript is no longer selected from `copilot_chats.messages` (JSONB) —
+ * reads now source it from the normalized `copilot_messages` table via
+ * `loadCopilotChatMessages`, which avoids detoasting the large messages blob on
+ * every load. The copilot-only TOAST-able fields (`previewYaml`,
+ * `planArtifact`, `config`) and unused metadata (`model`, `pinned`,
+ * `lastSeenAt`) remain excluded.
  */
 const copilotChatDetailColumns = {
   ...copilotChatAuthColumns,
   title: copilotChats.title,
-  messages: copilotChats.messages,
   conversationId: copilotChats.conversationId,
   resources: copilotChats.resources,
   createdAt: copilotChats.createdAt,
   updatedAt: copilotChats.updatedAt,
 } as const
+
+/**
+ * Column set for the legacy copilot chat detail endpoint. Extends
+ * `copilotChatDetailColumns` with `model`, `planArtifact`, and `config` — the
+ * fields the legacy `transformChat` response shape includes. Still drops
+ * `previewYaml` (JSONB), `pinned`, and `lastSeenAt`.
+ */
+const copilotChatLegacyDetailColumns = {
+  ...copilotChatDetailColumns,
+  model: copilotChats.model,
+  planArtifact: copilotChats.planArtifact,
+  config: copilotChats.config,
+} as const
+
+/**
+ * Load a chat's transcript from the normalized `copilot_messages` table in
+ * canonical order (`seq` first, then `created_at`/`id` as a deterministic
+ * tiebreak; `NULLS LAST` so any not-yet-sequenced row sorts after sequenced
+ * ones). Each row's `content` is the full message object — identical in shape
+ * to a legacy JSONB array element — so the downstream normalize/transcript
+ * pipeline is unchanged.
+ */
+export async function loadCopilotChatMessages(chatId: string): Promise<PersistedMessage[]> {
+  const rows = await db
+    .select({ content: copilotMessages.content })
+    .from(copilotMessages)
+    .where(and(eq(copilotMessages.chatId, chatId), isNull(copilotMessages.deletedAt)))
+    .orderBy(
+      sql`${copilotMessages.seq} asc nulls last`,
+      asc(copilotMessages.createdAt),
+      asc(copilotMessages.id)
+    )
+  // Also strip on read: rows written before the backfill still carry outputs.
+  return rows.map((row) => stripToolResultOutput(row.content as PersistedMessage))
+}
 
 type CopilotChatAuthRow = Pick<
   typeof copilotChats.$inferSelect,
@@ -64,12 +101,17 @@ export type CopilotChatDetailRow = Pick<
   | 'workspaceId'
   | 'type'
   | 'title'
-  | 'messages'
   | 'conversationId'
   | 'resources'
   | 'createdAt'
   | 'updatedAt'
->
+> & {
+  /** Transcript assembled from `copilot_messages` (no longer a chat-row column). */
+  messages: unknown[]
+}
+
+export type CopilotChatLegacyDetailRow = CopilotChatDetailRow &
+  Pick<typeof copilotChats.$inferSelect, 'model' | 'planArtifact' | 'config'>
 
 async function authorizeCopilotChatRow<T extends CopilotChatAuthRow>(
   chat: T | undefined,
@@ -130,20 +172,25 @@ export async function getAccessibleCopilotChatAuth(
 }
 
 /**
- * Load the full copilot chat row after authorization. Use this only when the
- * caller actually consumes copilot-only TOAST-able columns (`previewYaml`,
- * `planArtifact`, `config`) or other extended metadata — for example the
- * legacy copilot chat detail endpoint. Mothership chats and other consumers
- * that only need the transcript should prefer `getAccessibleCopilotChatWithMessages`.
+ * Load a copilot chat row for the legacy chat detail endpoint, including the
+ * transcript plus `model`, `planArtifact`, and `config`. Drops `previewYaml`
+ * (JSONB), `pinned`, and `lastSeenAt` — none of which the endpoint returns.
  */
-export async function getAccessibleCopilotChat(chatId: string, userId: string) {
+export async function getAccessibleCopilotChat(
+  chatId: string,
+  userId: string
+): Promise<CopilotChatLegacyDetailRow | null> {
   const [chat] = await db
-    .select()
+    .select(copilotChatLegacyDetailColumns)
     .from(copilotChats)
     .where(and(eq(copilotChats.id, chatId), eq(copilotChats.userId, userId)))
     .limit(1)
 
-  return authorizeCopilotChatRow(chat, chatId, userId)
+  const authorized = await authorizeCopilotChatRow(chat, chatId, userId)
+  if (!authorized) return null
+
+  const messages = await loadCopilotChatMessages(chatId)
+  return { ...authorized, messages }
 }
 
 /**
@@ -164,7 +211,11 @@ export async function getAccessibleCopilotChatWithMessages(
     .where(and(eq(copilotChats.id, chatId), eq(copilotChats.userId, userId)))
     .limit(1)
 
-  return authorizeCopilotChatRow(chat, chatId, userId)
+  const authorized = await authorizeCopilotChatRow(chat, chatId, userId)
+  if (!authorized) return null
+
+  const messages = await loadCopilotChatMessages(chatId)
+  return { ...authorized, messages }
 }
 
 /**
@@ -241,7 +292,6 @@ export async function resolveOrCreateChat(params: {
       type: type ?? 'copilot',
       title: null,
       model,
-      messages: [],
       lastSeenAt: now,
     })
     .returning(copilotChatDetailColumns)
@@ -258,7 +308,7 @@ export async function resolveOrCreateChat(params: {
 
   return {
     chatId: newChat.id,
-    chat: newChat,
+    chat: { ...newChat, messages: [] },
     conversationHistory: [],
     isNew: true,
   }

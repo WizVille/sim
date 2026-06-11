@@ -18,8 +18,10 @@ import { FIELD_TYPE_LABELS, getPlaceholderForFieldType } from '@/lib/knowledge/c
 import { type FilterFieldType, getOperatorsForFieldType } from '@/lib/knowledge/filters/types'
 import { formatDisplayText } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/formatted-text'
 import { TagDropdown } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/tag-dropdown/tag-dropdown'
+import { getActiveWorkflowSearchHighlight } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/workflow-search-highlight'
 import { useDependsOnGate } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-depends-on-gate'
 import { useSubBlockInput } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-input'
+import { useActiveSearchTarget } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/providers/active-search-target-provider'
 import { useAccessibleReferencePrefixes } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks/use-accessible-reference-prefixes'
 import type { SubBlockConfig } from '@/blocks/types'
 import { useKnowledgeBaseTagDefinitions } from '@/hooks/kb/use-knowledge-base-tag-definitions'
@@ -66,6 +68,7 @@ export function KnowledgeTagFilters({
   previewValue,
   previewContextValues,
 }: KnowledgeTagFiltersProps) {
+  const activeSearchTarget = useActiveSearchTarget()
   const [storeValue, setStoreValue] = useSubBlockValue<string | null>(blockId, subBlock.id)
   const emitTagSelection = useTagSelection(blockId, subBlock.id)
   const valueInputRefs = useRef<Record<string, HTMLInputElement>>({})
@@ -292,6 +295,12 @@ export function KnowledgeTagFilters({
     const fieldValue = field === 'tagValue' ? filter.tagValue : filter.valueTo || ''
     const cellKey = `${filter.id}-${field}`
     const placeholder = getPlaceholderForFieldType(filter.fieldType)
+    const filterIndex = filters.findIndex((candidate) => candidate.id === filter.id)
+    const workflowSearchHighlight = getActiveWorkflowSearchHighlight({
+      activeSearchTarget,
+      subBlockId: subBlock.id,
+      valuePath: [filterIndex, field],
+    })
 
     const fieldState = inputController.fieldHelpers.getFieldState(cellKey)
     const handlers = inputController.fieldHelpers.createFieldHandlers(
@@ -341,7 +350,9 @@ export function KnowledgeTagFilters({
           <div className='w-full whitespace-pre' style={{ minWidth: 'fit-content' }}>
             {formatDisplayText(
               fieldValue,
-              accessiblePrefixes ? { accessiblePrefixes } : { highlightAll: true }
+              accessiblePrefixes
+                ? { accessiblePrefixes, workflowSearchHighlight }
+                : { highlightAll: true, workflowSearchHighlight }
             )}
           </div>
         </div>

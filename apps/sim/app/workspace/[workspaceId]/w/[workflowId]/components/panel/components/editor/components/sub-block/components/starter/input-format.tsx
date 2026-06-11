@@ -16,18 +16,18 @@ import {
   getCodeEditorProps,
   highlight,
   Input,
+  Label,
   languages,
 } from '@/components/emcn'
-import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/core/utils/cn'
 import { handleKeyboardActivation } from '@/lib/core/utils/keyboard'
-import { WORKFLOW_SEARCH_HIGHLIGHT_CLASS } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/constants'
 import { formatDisplayText } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/formatted-text'
 import { TagDropdown } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/tag-dropdown/tag-dropdown'
+import { getActiveWorkflowSearchHighlight } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/workflow-search-highlight'
 import { useSubBlockInput } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-input'
 import { useSubBlockValue } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-value'
+import { useActiveSearchTarget } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/providers/active-search-target-provider'
 import { useAccessibleReferencePrefixes } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks/use-accessible-reference-prefixes'
-import type { ActiveSearchTarget } from '@/stores/panel/editor/store'
 
 interface Field {
   id: string
@@ -52,7 +52,6 @@ interface FieldFormatProps {
   valuePlaceholder?: string
   descriptionPlaceholder?: string
   config?: any
-  activeSearchTarget?: ActiveSearchTarget | null
 }
 
 /**
@@ -107,8 +106,8 @@ export function FieldFormat({
   showDescription = false,
   valuePlaceholder = 'Enter default value',
   descriptionPlaceholder = 'Describe this field',
-  activeSearchTarget,
 }: FieldFormatProps) {
+  const activeSearchTarget = useActiveSearchTarget()
   const [storeValue, setStoreValue] = useSubBlockValue<Field[]>(blockId, subBlockId)
   const valueInputRefs = useRef<Record<string, HTMLInputElement | HTMLTextAreaElement>>({})
   const nameInputRefs = useRef<Record<string, HTMLInputElement>>({})
@@ -132,16 +131,7 @@ export function FieldFormat({
   const fields: Field[] = Array.isArray(value) && value.length > 0 ? value : [createDefaultField()]
   const isReadOnly = isPreview || disabled
 
-  const isNestedSearchHighlighted = (fieldIndex: number, fieldKey: keyof Field) =>
-    activeSearchTarget?.subBlockId === subBlockId &&
-    activeSearchTarget.valuePath[0] === fieldIndex &&
-    activeSearchTarget.valuePath.at(-1) === fieldKey
-
-  const renderFieldLabel = (label: string, highlighted: boolean) => (
-    <Label className='text-small'>
-      {highlighted ? <mark className={WORKFLOW_SEARCH_HIGHLIGHT_CLASS}>{label}</mark> : label}
-    </Label>
-  )
+  const renderFieldLabel = (label: string) => <Label>{label}</Label>
 
   /**
    * Adds a new field to the list
@@ -245,6 +235,13 @@ export function FieldFormat({
   const renderNameInput = (field: Field) => {
     const nameFieldKey = getNameFieldKey(field.id)
     const fieldValue = field.name ?? ''
+    const fieldIndex = fields.findIndex((candidate) => candidate.id === field.id)
+    const workflowSearchHighlight = getActiveWorkflowSearchHighlight({
+      activeSearchTarget,
+      blockId,
+      subBlockId,
+      valuePath: [fieldIndex, 'name'],
+    })
     const fieldState = inputController.fieldHelpers.getFieldState(nameFieldKey)
     const handlers = inputController.fieldHelpers.createFieldHandlers(
       nameFieldKey,
@@ -300,7 +297,9 @@ export function FieldFormat({
           >
             {formatDisplayText(
               fieldValue,
-              accessiblePrefixes ? { accessiblePrefixes } : { highlightAll: true }
+              accessiblePrefixes
+                ? { accessiblePrefixes, workflowSearchHighlight }
+                : { highlightAll: true, workflowSearchHighlight }
             )}
           </div>
         </div>
@@ -383,6 +382,13 @@ export function FieldFormat({
     }
 
     const fieldValue = field.value ?? ''
+    const fieldIndex = fields.findIndex((candidate) => candidate.id === field.id)
+    const workflowSearchHighlight = getActiveWorkflowSearchHighlight({
+      activeSearchTarget,
+      blockId,
+      subBlockId,
+      valuePath: [fieldIndex, 'value'],
+    })
     const fieldState = inputController.fieldHelpers.getFieldState(field.id)
     const handlers = inputController.fieldHelpers.createFieldHandlers(
       field.id,
@@ -558,7 +564,9 @@ export function FieldFormat({
           >
             {formatDisplayText(
               fieldValue,
-              accessiblePrefixes ? { accessiblePrefixes } : { highlightAll: true }
+              accessiblePrefixes
+                ? { accessiblePrefixes, workflowSearchHighlight }
+                : { highlightAll: true, workflowSearchHighlight }
             )}
           </div>
         </div>
@@ -581,13 +589,13 @@ export function FieldFormat({
             <ExpandableContent>
               <div className='flex flex-col gap-2 rounded-b-[4px] border-[var(--border-1)] border-t bg-[var(--surface-2)] px-2.5 pt-1.5 pb-2.5'>
                 <div className='flex flex-col gap-1.5'>
-                  {renderFieldLabel('Name', isNestedSearchHighlighted(index, 'name'))}
+                  {renderFieldLabel('Name')}
                   <div className='relative'>{renderNameInput(field)}</div>
                 </div>
 
                 {showType && (
                   <div className='flex flex-col gap-1.5'>
-                    {renderFieldLabel('Type', isNestedSearchHighlighted(index, 'type'))}
+                    {renderFieldLabel('Type')}
                     <Combobox
                       options={TYPE_OPTIONS}
                       value={field.type}
@@ -599,22 +607,53 @@ export function FieldFormat({
 
                 {showDescription && (
                   <div className='flex flex-col gap-1.5'>
-                    {renderFieldLabel(
-                      'Description',
-                      isNestedSearchHighlighted(index, 'description')
-                    )}
-                    <Input
-                      value={field.description ?? ''}
-                      onChange={(e) => updateField(field.id, 'description', e.target.value)}
-                      placeholder={descriptionPlaceholder}
-                      disabled={isReadOnly}
-                    />
+                    {renderFieldLabel('Description')}
+                    <div className='relative'>
+                      <Input
+                        value={field.description ?? ''}
+                        onChange={(e) => updateField(field.id, 'description', e.target.value)}
+                        placeholder={descriptionPlaceholder}
+                        disabled={isReadOnly}
+                        className='text-transparent caret-foreground placeholder:text-muted-foreground/50'
+                      />
+                      <div
+                        className={cn(
+                          'pointer-events-none absolute inset-0 flex items-center overflow-hidden px-3 text-sm',
+                          isReadOnly && 'opacity-50'
+                        )}
+                      >
+                        <span className='truncate'>
+                          {formatDisplayText(
+                            field.description ?? '',
+                            accessiblePrefixes
+                              ? {
+                                  accessiblePrefixes,
+                                  workflowSearchHighlight: getActiveWorkflowSearchHighlight({
+                                    activeSearchTarget,
+                                    blockId,
+                                    subBlockId,
+                                    valuePath: [index, 'description'],
+                                  }),
+                                }
+                              : {
+                                  highlightAll: true,
+                                  workflowSearchHighlight: getActiveWorkflowSearchHighlight({
+                                    activeSearchTarget,
+                                    blockId,
+                                    subBlockId,
+                                    valuePath: [index, 'description'],
+                                  }),
+                                }
+                          )}
+                        </span>
+                      </div>
+                    </div>
                   </div>
                 )}
 
                 {showValue && (
                   <div className='flex flex-col gap-1.5'>
-                    {renderFieldLabel('Value', isNestedSearchHighlighted(index, 'value'))}
+                    {renderFieldLabel('Value')}
                     <div className='relative'>{renderValueInput(field)}</div>
                   </div>
                 )}

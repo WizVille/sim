@@ -9,6 +9,7 @@ import type { RowExecutionMetadata } from '@/lib/table'
 import { StatusBadge } from '@/app/workspace/[workspaceId]/logs/utils'
 import { storageToDisplay } from '../../../utils'
 import type { DisplayColumn } from '../types'
+import { SimResourceCell, type SimResourceType } from './sim-resource-cell'
 
 export type CellRenderKind =
   // Workflow-output cells
@@ -20,11 +21,20 @@ export type CellRenderKind =
   | { kind: 'cancelled' }
   | { kind: 'error' }
   | { kind: 'waiting'; labels: string[] }
+  | { kind: 'not-found' }
+  | { kind: 'no-output' }
   // Plain typed cells
   | { kind: 'boolean'; checked: boolean }
   | { kind: 'json'; text: string }
   | { kind: 'date'; text: string }
   | { kind: 'url'; text: string; href: string; domain: string }
+  | {
+      kind: 'sim-resource'
+      workspaceId: string
+      resourceType: SimResourceType
+      resourceId: string
+      href: string
+    }
   | { kind: 'text'; text: string }
   // Universal fallback
   | { kind: 'empty' }
@@ -34,6 +44,12 @@ interface ResolveCellRenderInput {
   exec: RowExecutionMetadata | undefined
   column: DisplayColumn
   waitingOnLabels: string[] | undefined
+  /** Column is an enrichment-group output — a completed-but-empty cell renders
+   *  "Not found" rather than a blank, since the enrichment ran and matched nothing. */
+  isEnrichmentOutput?: boolean
+  /** Current workspace id — a URL pointing to a resource in this workspace
+   *  renders as a tagged-resource chip rather than a plain external link. */
+  currentWorkspaceId?: string
 }
 
 export function resolveCellRender({
@@ -41,8 +57,11 @@ export function resolveCellRender({
   exec,
   column,
   waitingOnLabels,
+  isEnrichmentOutput,
+  currentWorkspaceId,
 }: ResolveCellRenderInput): CellRenderKind {
   const isNull = value === null || value === undefined
+  const isEmpty = isNull || value === ''
 
   if (column.workflowGroupId) {
     const blockId = column.outputBlockId
@@ -57,8 +76,15 @@ export function resolveCellRender({
     if (inFlight && blockRunning) return { kind: 'running' }
 
     // Value wins over pending-upstream: a finished column stays finished even
-    // while other blocks in the group are still running.
-    if (!isNull) return { kind: 'value', text: stringifyValue(value) }
+    // while other blocks in the group are still running. An empty string is not
+    // a value — it falls through so a completed enrichment can show "Not found".
+    // A value that's wholly a resource/URL string renders as a chip/link (any
+    // column type — workflow output is free-form); otherwise the plain `value`
+    // kind keeps the typewriter reveal for streaming text.
+    if (!isEmpty) {
+      const text = stringifyValue(value)
+      return resolveLinkKind(text, currentWorkspaceId) ?? { kind: 'value', text }
+    }
 
     if (inFlight && !(groupHasBlockErrors && !blockRunning)) {
       // A `pending` cell whose jobId starts with `paused-` is mid-pause
@@ -79,6 +105,11 @@ export function resolveCellRender({
     }
     if (exec?.status === 'cancelled') return { kind: 'cancelled' }
     if (exec?.status === 'error') return { kind: 'error' }
+    // Enrichment ran to completion but matched nothing → "Not found".
+    if (isEnrichmentOutput && exec?.status === 'completed') return { kind: 'not-found' }
+    // Workflow output: the group's run completed but this block produced no
+    // value for the cell → grey "No output" (distinct from a never-run blank).
+    if (exec?.status === 'completed') return { kind: 'no-output' }
     return { kind: 'empty' }
   }
 
@@ -88,9 +119,7 @@ export function resolveCellRender({
   if (column.type === 'date') return { kind: 'date', text: String(value) }
   if (column.type === 'string') {
     const text = stringifyValue(value)
-    const urlInfo = extractUrlInfo(text)
-    if (urlInfo) return { kind: 'url', text, href: urlInfo.href, domain: urlInfo.domain }
-    return { kind: 'text', text }
+    return resolveLinkKind(text, currentWorkspaceId) ?? { kind: 'text', text }
   }
   return { kind: 'text', text: stringifyValue(value) }
 }
@@ -99,6 +128,45 @@ function stringifyValue(value: unknown): string {
   if (typeof value === 'string') return value
   if (value === null || value === undefined) return ''
   return JSON.stringify(value)
+}
+
+/** Returns a `sim-resource` cell kind when `text` is a URL pointing to a
+ *  resource in the current workspace, else null. Shared by plain string cells
+ *  and workflow-output value cells so both surface in-workspace resource links
+ *  as tagged chips. */
+function resolveSimResourceKind(
+  text: string,
+  currentWorkspaceId: string | undefined
+): Extract<CellRenderKind, { kind: 'sim-resource' }> | null {
+  if (!currentWorkspaceId) return null
+  const resource = extractSimResourceInfo(text)
+  if (!resource || resource.workspaceId !== currentWorkspaceId) return null
+  return {
+    kind: 'sim-resource',
+    workspaceId: resource.workspaceId,
+    resourceType: resource.resourceType,
+    resourceId: resource.resourceId,
+    href: resource.href,
+  }
+}
+
+/**
+ * Promotes a cell value that is wholly a resource/URL string to a chip
+ * (in-workspace resource) or a favicon link, else null. Shared by plain string
+ * cells and workflow-output value cells. Workflow outputs apply this regardless
+ * of `column.type` (their type defaults to `json`, so gating on `string` would
+ * miss URL outputs); a stringified object never matches the whole-string URL
+ * check, so it stays JSON/text.
+ */
+function resolveLinkKind(
+  text: string,
+  currentWorkspaceId: string | undefined
+): Extract<CellRenderKind, { kind: 'sim-resource' } | { kind: 'url' }> | null {
+  const simKind = resolveSimResourceKind(text, currentWorkspaceId)
+  if (simKind) return simKind
+  const urlInfo = extractUrlInfo(text)
+  if (urlInfo) return { kind: 'url', text, href: urlInfo.href, domain: urlInfo.domain }
+  return null
 }
 
 const BARE_DOMAIN_RE = /^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/
@@ -120,6 +188,43 @@ function extractUrlInfo(text: string): { href: string; domain: string } | null {
     return { href: `https://${trimmed}`, domain: trimmed }
   }
   return null
+}
+
+/** Maps a workspace route section to the sim resource kind it addresses. */
+const SIM_RESOURCE_SECTIONS: Record<string, SimResourceType> = {
+  w: 'workflow',
+  tables: 'table',
+  knowledge: 'knowledge',
+  files: 'file',
+}
+
+/**
+ * Recognizes a `/workspace/{id}/{section}/{resourceId}` URL (absolute or
+ * relative) pointing to a sim resource and returns its descriptor. The href is
+ * the pathname so the link stays within the current deployment. Returns null
+ * for anything that isn't a single-segment resource route.
+ */
+function extractSimResourceInfo(
+  text: string
+): { workspaceId: string; resourceType: SimResourceType; resourceId: string; href: string } | null {
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  let pathname: string
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      pathname = new URL(trimmed).pathname
+    } catch {
+      return null
+    }
+  } else if (trimmed.startsWith('/')) {
+    pathname = trimmed.split(/[?#]/)[0]
+  } else {
+    return null
+  }
+  const match = pathname.match(/^\/workspace\/([^/]+)\/(w|tables|knowledge|files)\/([^/]+)\/?$/)
+  if (!match) return null
+  const [, workspaceId, section, resourceId] = match
+  return { workspaceId, resourceType: SIM_RESOURCE_SECTIONS[section], resourceId, href: pathname }
 }
 
 interface CellRenderProps {
@@ -250,7 +355,7 @@ export function CellRender({ kind, isEditing }: CellRenderProps): React.ReactEle
             target='_blank'
             rel='noopener noreferrer'
             className={cn(
-              'min-w-0 overflow-clip text-ellipsis text-[var(--text-primary)] underline underline-offset-2 hover:opacity-70',
+              'min-w-0 overflow-clip text-ellipsis text-[var(--text-primary)] underline underline-offset-2 transition-colors hover-hover:text-[var(--text-secondary)]',
               isEditing && 'pointer-events-none'
             )}
             onClick={(e) => e.stopPropagation()}
@@ -259,6 +364,17 @@ export function CellRender({ kind, isEditing }: CellRenderProps): React.ReactEle
             {kind.text}
           </a>
         </span>
+      )
+
+    case 'sim-resource':
+      return (
+        <SimResourceCell
+          workspaceId={kind.workspaceId}
+          resourceType={kind.resourceType}
+          resourceId={kind.resourceId}
+          href={kind.href}
+          isEditing={isEditing}
+        />
       )
 
     case 'text':
@@ -271,6 +387,24 @@ export function CellRender({ kind, isEditing }: CellRenderProps): React.ReactEle
         >
           {kind.text}
         </span>
+      )
+
+    case 'not-found':
+      return (
+        <Wrap isEditing={isEditing}>
+          <Badge variant='gray' dot size='sm'>
+            Not found
+          </Badge>
+        </Wrap>
+      )
+
+    case 'no-output':
+      return (
+        <Wrap isEditing={isEditing}>
+          <Badge variant='gray' dot size='sm'>
+            No output
+          </Badge>
+        </Wrap>
       )
 
     case 'empty':
@@ -291,30 +425,25 @@ function Wrap({ isEditing, children }: { isEditing: boolean; children: React.Rea
 const TYPEWRITER_MS_PER_CHAR = 15
 
 /**
- * Reveals `text` character-by-character whenever it changes after the first
- * render. Initial render (page hydration or virtualization remount) shows the
- * value statically — animation fires only for subsequent updates, which in
- * practice means SSE-driven workflow completions arriving via
- * `useTableEventStream → applyCell()`.
- *
- * rAF-driven (not `setInterval`) so concurrent reveals batch into one
- * render/paint per frame instead of O(cells) uncoordinated reflows; reveal
- * length is elapsed-time based so dropped frames catch up rather than slow.
+ * Reveals `text` character-by-character when it changes after the first render;
+ * the initial render (mount / scroll-in) shows it statically. The slice is
+ * derived from elapsed time during render rather than held in state, so it is
+ * never `null` and never the full string on the frame `text` changes — which is
+ * what prevents the caller's `?? kind.text` fallback from flashing the whole
+ * value for a frame. `prevText` is state (not a ref) so a discarded render rolls
+ * it back and re-detects the change on the committed render.
  */
 function useTypewriter(text: string | null): string | null {
-  const [revealed, setRevealed] = useState<string | null>(text)
-  const prevTextRef = useRef<string | null>(text)
+  const [prevText, setPrevText] = useState<string | null>(text)
+  const [, forceFrame] = useState(0)
   const mountedRef = useRef(false)
-  const animateRef = useRef(false)
+  // Reveal-clock start; 0 = show statically (mount / cleared / empty).
+  const startRef = useRef(0)
 
-  // Reset synchronously during render when `text` changes (not on first mount)
-  // so no frame ever shows the full new value before the animation begins —
-  // an effect-based reset lands one frame late and flashes the whole text.
-  if (prevTextRef.current !== text) {
-    prevTextRef.current = text
-    const animate = mountedRef.current && text !== null && text.length > 0
-    animateRef.current = animate
-    setRevealed(animate ? '' : text)
+  if (prevText !== text) {
+    setPrevText(text)
+    startRef.current =
+      mountedRef.current && text !== null && text.length > 0 ? performance.now() : 0
   }
 
   useEffect(() => {
@@ -322,19 +451,22 @@ function useTypewriter(text: string | null): string | null {
   }, [])
 
   useEffect(() => {
-    if (!animateRef.current) return
-    animateRef.current = false
-    const full = text as string
-    const start = performance.now()
+    if (startRef.current === 0 || text === null) return
     let raf = 0
-    const tick = (now: number) => {
-      const chars = Math.min(full.length, Math.floor((now - start) / TYPEWRITER_MS_PER_CHAR))
-      setRevealed(full.slice(0, chars))
-      if (chars < full.length) raf = requestAnimationFrame(tick)
+    const tick = () => {
+      const chars = Math.floor((performance.now() - startRef.current) / TYPEWRITER_MS_PER_CHAR)
+      forceFrame((f) => f + 1)
+      if (chars < text.length) raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
   }, [text])
 
-  return revealed
+  if (text === null) return null
+  if (startRef.current === 0) return text
+  const chars = Math.min(
+    text.length,
+    Math.floor((performance.now() - startRef.current) / TYPEWRITER_MS_PER_CHAR)
+  )
+  return text.slice(0, chars)
 }

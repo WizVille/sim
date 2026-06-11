@@ -74,7 +74,7 @@ export type ComboboxOptionGroup = {
   items: ComboboxOption[]
 }
 
-interface ComboboxProps
+export interface ComboboxProps
   extends Omit<HTMLAttributes<HTMLDivElement>, 'onChange'>,
     VariantProps<typeof comboboxVariants> {
   /** Available options for selection */
@@ -213,6 +213,22 @@ const Combobox = memo(
         () => allOptions.find((opt) => opt.value === effectiveSelectedValue),
         [allOptions, effectiveSelectedValue]
       )
+
+      /**
+       * Label rendered in the collapsed trigger for multi-select mode.
+       * Shows the single label when one value is picked, comma-joined labels
+       * for two, or "first, second +N" when more are selected. Falls back to
+       * the raw value if an option for it hasn't loaded yet.
+       */
+      const multiSelectLabel = useMemo(() => {
+        if (!multiSelect || !multiSelectValues || multiSelectValues.length === 0) return null
+        const labelFor = (v: string) => allOptions.find((opt) => opt.value === v)?.label ?? v
+        if (multiSelectValues.length === 1) return labelFor(multiSelectValues[0])
+        if (multiSelectValues.length === 2) {
+          return `${labelFor(multiSelectValues[0])}, ${labelFor(multiSelectValues[1])}`
+        }
+        return `${labelFor(multiSelectValues[0])}, ${labelFor(multiSelectValues[1])} +${multiSelectValues.length - 2}`
+      }, [multiSelect, multiSelectValues, allOptions])
 
       /**
        * Filter options based on current value or search query
@@ -563,7 +579,7 @@ const Combobox = memo(
                     >
                       <ChevronDown
                         className={cn(
-                          'h-4 w-4 opacity-50 transition-transform',
+                          'size-4 opacity-50 transition-transform',
                           open && 'rotate-180'
                         )}
                       />
@@ -590,15 +606,15 @@ const Combobox = memo(
                     <span
                       className={cn(
                         'flex-1 truncate',
-                        !selectedOption && 'text-[var(--text-muted)]',
+                        !selectedOption && !multiSelectLabel && 'text-[var(--text-muted)]',
                         overlayContent && 'text-transparent'
                       )}
                     >
-                      {selectedOption ? selectedOption.label : placeholder}
+                      {multiSelectLabel ?? (selectedOption ? selectedOption.label : placeholder)}
                     </span>
                     <ChevronDown
                       className={cn(
-                        'ml-2 h-4 w-4 flex-shrink-0 opacity-50 transition-transform',
+                        'ml-2 size-4 flex-shrink-0 opacity-50 transition-transform',
                         open && 'rotate-180'
                       )}
                     />
@@ -645,7 +661,7 @@ const Combobox = memo(
                   <Search className='mr-[7px] ml-[1px] size-[13px] shrink-0 text-[var(--text-muted)]' />
                   <input
                     ref={searchInputRef}
-                    className='w-full bg-transparent font-base text-[var(--text-primary)] text-small placeholder:text-[var(--text-muted)] focus:outline-none'
+                    className='w-full bg-transparent text-[var(--text-primary)] text-small placeholder:text-[var(--text-muted)] focus:outline-none'
                     placeholder={searchPlaceholder}
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
@@ -691,16 +707,16 @@ const Combobox = memo(
                   {isLoading ? (
                     <div className='flex items-center justify-center py-3.5'>
                       <Loader className='size-[16px] text-[var(--text-muted)]' animate />
-                      <span className='ml-2 font-base text-[var(--text-muted)] text-caption'>
-                        Loading options…
+                      <span className='ml-2 text-[var(--text-muted)] text-caption'>
+                        Loading options...
                       </span>
                     </div>
                   ) : error ? (
-                    <div className='px-1.5 py-3.5 text-center font-base text-caption text-red-500'>
+                    <div className='px-1.5 py-3.5 text-center text-caption text-red-500'>
                       {error}
                     </div>
                   ) : filteredOptions.length === 0 ? (
-                    <div className='py-3.5 text-center font-base text-[var(--text-muted)] text-caption'>
+                    <div className='py-3.5 text-center text-[var(--text-muted)] text-caption'>
                       {emptyMessage ||
                         (searchQuery || (editable && value)
                           ? 'No matching options found'
@@ -714,7 +730,7 @@ const Combobox = memo(
                           {group.sectionElement
                             ? group.sectionElement
                             : group.section && (
-                                <div className='px-1.5 py-1 font-base text-[var(--text-tertiary)] text-xs first:pt-1'>
+                                <div className='px-1.5 py-1 text-[var(--text-tertiary)] text-xs first:pt-1'>
                                   {group.section}
                                 </div>
                               )}
@@ -854,4 +870,4 @@ const Combobox = memo(
 
 Combobox.displayName = 'Combobox'
 
-export { Combobox }
+export { Combobox, comboboxVariants }

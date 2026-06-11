@@ -1,10 +1,10 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { createLogger } from '@sim/logger'
 import { useQueryClient } from '@tanstack/react-query'
 import type { ActiveDispatch } from '@/lib/api/contracts/tables'
-import type { RowData, RowExecutionMetadata, RowExecutions } from '@/lib/table'
+import type { RowData, RowExecutionMetadata, RowExecutions, TableDefinition } from '@/lib/table'
 import { isExecInFlight } from '@/lib/table/deps'
 import type { TableEvent, TableEventEntry } from '@/lib/table/events'
 import { snapshotAndMutateRows, type TableRunState, tableKeys } from '@/hooks/queries/tables'
@@ -17,6 +17,7 @@ interface PrunedEvent {
 
 const RECONNECT_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000]
 const POINTER_PREFIX = 'table-event-stream-pointer:'
+const DISPATCH_INVALIDATE_DEBOUNCE_MS = 250
 
 function loadPointer(tableId: string): number {
   if (typeof window === 'undefined') return 0
@@ -43,6 +44,9 @@ interface UseTableEventStreamArgs {
   tableId: string | undefined
   workspaceId: string | undefined
   enabled?: boolean
+  /** Fired when the server halts a dispatch because the billed account is over
+   *  its usage limit. The page surfaces an upgrade prompt + redirect. */
+  onUsageLimitReached?: (event: { dispatchId?: string; message: string }) => void
 }
 
 /**
@@ -58,8 +62,13 @@ export function useTableEventStream({
   tableId,
   workspaceId,
   enabled = true,
+  onUsageLimitReached,
 }: UseTableEventStreamArgs): void {
   const queryClient = useQueryClient()
+
+  // Ref so a changing callback identity doesn't tear down + reconnect the SSE.
+  const onUsageLimitReachedRef = useRef(onUsageLimitReached)
+  onUsageLimitReachedRef.current = onUsageLimitReached
 
   useEffect(() => {
     if (!enabled || !tableId || !workspaceId) return
@@ -72,6 +81,27 @@ export function useTableEventStream({
     // `pruned` and we full-refetch + restart from the new earliest.
     let lastEventId = loadPointer(tableId)
     let reconnectAttempt = 0
+
+    // Trailing-edge debounce coalesces window-completion bursts.
+    let dispatchInvalidateTimer: ReturnType<typeof setTimeout> | null = null
+    const scheduleDispatchInvalidate = (): void => {
+      if (dispatchInvalidateTimer !== null) clearTimeout(dispatchInvalidateTimer)
+      dispatchInvalidateTimer = setTimeout(() => {
+        dispatchInvalidateTimer = null
+        void queryClient.invalidateQueries({ queryKey: tableKeys.activeDispatches(tableId) })
+      }, DISPATCH_INVALIDATE_DEBOUNCE_MS)
+    }
+
+    // Live-fill: import progress ticks arrive every N rows; coalesce the row
+    // refetches into one per debounce window instead of refetching per tick.
+    let importInvalidateTimer: ReturnType<typeof setTimeout> | null = null
+    const scheduleRowsInvalidate = (): void => {
+      if (importInvalidateTimer !== null) clearTimeout(importInvalidateTimer)
+      importInvalidateTimer = setTimeout(() => {
+        importInvalidateTimer = null
+        void queryClient.invalidateQueries({ queryKey: tableKeys.rowsRoot(tableId) })
+      }, DISPATCH_INVALIDATE_DEBOUNCE_MS)
+    }
 
     // Keeps the per-row gutter (`runningByRowId`) live between dispatch events.
     // `runningCellCount` (the "X running" badge) is NOT touched here — it's the
@@ -137,16 +167,14 @@ export function useTableEventStream({
       if (wasInFlight === null) {
         // Row outside the loaded page slice — can't compute the delta locally.
         // Refetch the run-state snapshot from the server. Cheap and rare.
-        void queryClient.invalidateQueries({
-          queryKey: tableKeys.activeDispatches(tableId),
-        })
+        scheduleDispatchInvalidate()
       } else {
         updateRunningByRow(rowId, wasInFlight, isExecInFlight({ status } as RowExecutionMetadata))
       }
     }
 
     const applyDispatch = (event: Extract<TableEvent, { kind: 'dispatch' }>): void => {
-      const { dispatchId, status, scope, cursor, mode, isManualRun } = event
+      const { dispatchId, status, scope, cursor, mode, isManualRun, limit } = event
       queryClient.setQueryData<TableRunState>(tableKeys.activeDispatches(tableId), (prev) => {
         // SSE may arrive before the initial fetch lands. Seed an empty
         // run-state so the dispatch isn't dropped; counters are reconciled
@@ -174,6 +202,7 @@ export function useTableEventStream({
         // the cached entry's value if this is a legacy emit without the
         // field, and finally to `false` if we have nothing.
         const resolvedManualRun = isManualRun ?? existing?.isManualRun ?? false
+        const resolvedLimit = limit ?? existing?.limit
         const next: ActiveDispatch = {
           id: dispatchId,
           status,
@@ -181,6 +210,7 @@ export function useTableEventStream({
           isManualRun: resolvedManualRun,
           cursor,
           scope,
+          ...(resolvedLimit ? { limit: resolvedLimit } : {}),
         }
         if (idx === -1) return { ...base, dispatches: [...list, next] }
         const merged = list.slice()
@@ -191,13 +221,70 @@ export function useTableEventStream({
       // finish + the cursor advances) and on completion. Re-sync the
       // dispatch-scope `runningCellCount` from the server so the badge steps
       // down per window and matches a reload exactly.
-      void queryClient.invalidateQueries({ queryKey: tableKeys.activeDispatches(tableId) })
+      scheduleDispatchInvalidate()
+    }
+
+    const applyImport = (event: Extract<TableEvent, { kind: 'import' }>): void => {
+      const { status, progress, error, importId } = event
+      const isTerminal = status === 'ready' || status === 'failed' || status === 'canceled'
+
+      // The SSE buffer replays on (re)connect and can hold a *prior* import's events for this
+      // table. Ignore anything from a superseded run, and don't trust a replayed terminal before
+      // we know the active run's id.
+      const prev = queryClient.getQueryData<TableDefinition>(tableKeys.detail(tableId))
+      const lockedId = prev?.importId
+      if (lockedId && importId && importId !== lockedId) return
+      if (!lockedId && isTerminal) return
+
+      queryClient.setQueryData<TableDefinition>(tableKeys.detail(tableId), (p) =>
+        p
+          ? {
+              ...p,
+              importStatus: status,
+              importId: importId ?? p.importId,
+              importRowsProcessed: progress ?? p.importRowsProcessed,
+              importError: error ?? null,
+            }
+          : p
+      )
+      // The header tray + completion toast are owned by `useImportTrayPoll`. Here we only keep the
+      // detail cache + grid in sync: live-fill rows per batch (debounced), and on the terminal
+      // event refetch rows + the definition (the worker may have rewritten the schema).
+      if (isTerminal) {
+        if (importInvalidateTimer !== null) clearTimeout(importInvalidateTimer)
+        void queryClient.invalidateQueries({ queryKey: tableKeys.rowsRoot(tableId) })
+        void queryClient.invalidateQueries({ queryKey: tableKeys.detail(tableId) })
+      } else {
+        scheduleRowsInvalidate()
+      }
+    }
+
+    const applyUsageLimit = (event: Extract<TableEvent, { kind: 'usageLimitReached' }>): void => {
+      // Drop the halted dispatch from the overlay so the "running" UI clears
+      // immediately (the dispatcher was marked complete server-side). Cascade /
+      // auto-fire events carry no dispatchId — nothing to remove.
+      if (event.dispatchId) {
+        queryClient.setQueryData<TableRunState>(tableKeys.activeDispatches(tableId), (prev) => {
+          if (!prev) return prev
+          const filtered = prev.dispatches.filter((d) => d.id !== event.dispatchId)
+          return filtered.length === prev.dispatches.length
+            ? prev
+            : { ...prev, dispatches: filtered }
+        })
+      }
+      // Blocked cells are left `queued` in the DB with no terminal cell event,
+      // so `runningByRowId` would otherwise stay non-zero (stale "X running").
+      // Re-sync the server counts, and refetch rows so cells whose pre-stamps
+      // the server cleared drop their "Queued" state.
+      scheduleDispatchInvalidate()
+      void queryClient.invalidateQueries({ queryKey: tableKeys.rowsRoot(tableId) })
+      onUsageLimitReachedRef.current?.({ dispatchId: event.dispatchId, message: event.message })
     }
 
     const handlePrune = (payload: PrunedEvent): void => {
       logger.info('Table event buffer pruned — full refetch', { tableId, ...payload })
       void queryClient.invalidateQueries({ queryKey: tableKeys.rowsRoot(tableId) })
-      void queryClient.invalidateQueries({ queryKey: tableKeys.activeDispatches(tableId) })
+      scheduleDispatchInvalidate()
       lastEventId = typeof payload.earliestEventId === 'number' ? payload.earliestEventId : 0
       savePointer(tableId, lastEventId)
       // Close proactively so the server's close doesn't fire onerror and route
@@ -242,6 +329,8 @@ export function useTableEventStream({
           savePointer(tableId, lastEventId)
           if (entry.event?.kind === 'cell') applyCell(entry.event)
           else if (entry.event?.kind === 'dispatch') applyDispatch(entry.event)
+          else if (entry.event?.kind === 'import') applyImport(entry.event)
+          else if (entry.event?.kind === 'usageLimitReached') applyUsageLimit(entry.event)
         } catch (err) {
           logger.warn('Failed to parse table event', { tableId, err })
         }
@@ -274,6 +363,8 @@ export function useTableEventStream({
     return () => {
       cancelled = true
       if (reconnectTimer !== null) clearTimeout(reconnectTimer)
+      if (dispatchInvalidateTimer !== null) clearTimeout(dispatchInvalidateTimer)
+      if (importInvalidateTimer !== null) clearTimeout(importInvalidateTimer)
       eventSource?.close()
       eventSource = null
     }

@@ -13,6 +13,10 @@ import {
   resetExecutionStreamBuffer,
   type TerminalExecutionStreamStatus,
 } from '@/lib/execution/event-buffer'
+import {
+  collectLargeValueReferenceKeys,
+  replaceLargeValueReferenceKeysWithClient,
+} from '@/lib/execution/payloads/large-value-metadata'
 import { compactBlockLogs, compactExecutionPayload } from '@/lib/execution/payloads/serializer'
 import { preprocessExecution } from '@/lib/execution/preprocessing'
 import { LoggingSession } from '@/lib/logs/execution/logging-session'
@@ -46,6 +50,73 @@ const CANCELLABLE_PAUSED_STATUSES = ['paused', 'partially_resumed'] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isPausedOutputForContext(output: unknown, contextId: string): boolean {
+  if (!isRecord(output)) return false
+  const metadata = output._pauseMetadata
+  return isRecord(metadata) && metadata.contextId === contextId
+}
+
+export function updateResumeOutputInAggregationBuffers(
+  state: SerializableExecutionState,
+  stateBlockKey: string,
+  pauseBlockId: string,
+  contextId: string,
+  mergedOutput: Record<string, unknown>
+): void {
+  for (const scope of Object.values(state.loopExecutions ?? {})) {
+    if (!isRecord(scope) || !isRecord(scope.currentIterationOutputs)) continue
+
+    const outputs = scope.currentIterationOutputs
+    const pausedEntry =
+      outputs[stateBlockKey] !== undefined
+        ? stateBlockKey
+        : outputs[pauseBlockId] !== undefined
+          ? pauseBlockId
+          : undefined
+
+    if (pausedEntry !== undefined && isPausedOutputForContext(outputs[pausedEntry], contextId)) {
+      if (pausedEntry !== stateBlockKey) {
+        delete outputs[pausedEntry]
+      }
+      outputs[stateBlockKey] = mergedOutput
+    }
+  }
+
+  for (const scope of Object.values(state.parallelExecutions ?? {})) {
+    if (!isRecord(scope) || !isRecord(scope.branchOutputs)) continue
+
+    for (const [branchIndex, branchOutputs] of Object.entries(scope.branchOutputs)) {
+      if (!Array.isArray(branchOutputs)) continue
+
+      const outputIndex = branchOutputs.findIndex((output) =>
+        isPausedOutputForContext(output, contextId)
+      )
+      if (outputIndex !== -1) {
+        scope.branchOutputs[branchIndex] = [
+          ...branchOutputs.slice(0, outputIndex),
+          mergedOutput,
+          ...branchOutputs.slice(outputIndex + 1),
+        ]
+      }
+    }
+  }
+}
+
+function parseSnapshotForReferenceTracking(snapshotSeed: SerializedSnapshot): unknown {
+  try {
+    return { ...snapshotSeed, snapshot: JSON.parse(snapshotSeed.snapshot) }
+  } catch {
+    return snapshotSeed
+  }
+}
+
+function getSnapshotWorkspaceId(snapshotValue: unknown): string | undefined {
+  if (!isRecord(snapshotValue)) return undefined
+  const metadata = snapshotValue.metadata
+  if (!isRecord(metadata)) return undefined
+  return typeof metadata.workspaceId === 'string' ? metadata.workspaceId : undefined
 }
 
 function isResumablePausedStatus(status: string): boolean {
@@ -169,6 +240,13 @@ export function computeEarliestResumeAt(
 export class PauseResumeManager {
   static async persistPauseResult(args: PersistPauseResultArgs): Promise<void> {
     const { workflowId, executionId, pausePoints, snapshotSeed, executorUserId } = args
+    const snapshotReferenceValue = parseSnapshotForReferenceTracking(snapshotSeed)
+    const snapshotWorkspaceId = getSnapshotWorkspaceId(
+      isRecord(snapshotReferenceValue) ? snapshotReferenceValue.snapshot : undefined
+    )
+    const snapshotReferenceKeys = snapshotWorkspaceId
+      ? collectLargeValueReferenceKeys(snapshotReferenceValue, snapshotWorkspaceId)
+      : []
 
     const pausePointsRecord = pausePoints.reduce<Record<string, any>>((acc, point) => {
       acc[point.contextId] = {
@@ -220,6 +298,18 @@ export class PauseResumeManager {
           updatedAt: now,
           nextResumeAt,
         })
+        if (snapshotWorkspaceId) {
+          await replaceLargeValueReferenceKeysWithClient(
+            tx,
+            {
+              workspaceId: snapshotWorkspaceId,
+              workflowId,
+              executionId,
+              source: 'paused_snapshot',
+            },
+            snapshotReferenceKeys
+          )
+        }
         return
       }
 
@@ -259,11 +349,27 @@ export class PauseResumeManager {
           totalPauseCount,
           resumedCount,
           status: nextStatus,
-          metadata,
+          // Merge rather than replace: foreign keys like `cellContext` (stashed
+          // by the table cell task) live on the same metadata column and must
+          // survive a re-pause so chained-wait resumes can still write the row back.
+          metadata: { ...((existing.metadata as Record<string, unknown>) ?? {}), ...metadata },
           updatedAt: now,
           nextResumeAt: mergedNextResumeAt,
         })
         .where(eq(pausedExecutions.id, existing.id))
+
+      if (snapshotWorkspaceId) {
+        await replaceLargeValueReferenceKeysWithClient(
+          tx,
+          {
+            workspaceId: snapshotWorkspaceId,
+            workflowId,
+            executionId,
+            source: 'paused_snapshot',
+          },
+          snapshotReferenceKeys
+        )
+      }
     })
 
     await PauseResumeManager.processQueuedResumes(executionId, workflowId)
@@ -731,7 +837,7 @@ export class PauseResumeManager {
         resume: existingResponse.resume ?? existingOutput.resume,
       }
 
-      const mergedOutput: Record<string, any> = {
+      const mergedOutput: Record<string, unknown> = {
         ...existingOutput,
         response: mergedResponse,
         submission: submissionPayload,
@@ -776,6 +882,13 @@ export class PauseResumeManager {
       }
 
       stateCopy.blockStates[stateBlockKey] = pauseBlockState
+      updateResumeOutputInAggregationBuffers(
+        stateCopy,
+        stateBlockKey,
+        pauseBlockId,
+        contextId,
+        mergedOutput
+      )
 
       // Update the block log entry with the merged output so logs show the submission data
       if (Array.isArray(stateCopy.blockLogs)) {
@@ -1568,14 +1681,34 @@ export class PauseResumeManager {
       snapshot: JSON.stringify(snapshotData),
       triggerIds: currentSnapshot.triggerIds,
     }
+    const snapshotWorkspaceId = getSnapshotWorkspaceId(snapshotData)
+    const snapshotReferenceValue = { ...updatedSnapshot, snapshot: snapshotData }
+    const snapshotReferenceKeys = snapshotWorkspaceId
+      ? collectLargeValueReferenceKeys(snapshotReferenceValue, snapshotWorkspaceId)
+      : []
 
-    await db
-      .update(pausedExecutions)
-      .set({
-        executionSnapshot: updatedSnapshot,
-        updatedAt: new Date(),
-      })
-      .where(eq(pausedExecutions.id, pausedExecutionId))
+    await db.transaction(async (tx) => {
+      await tx
+        .update(pausedExecutions)
+        .set({
+          executionSnapshot: updatedSnapshot,
+          updatedAt: new Date(),
+        })
+        .where(eq(pausedExecutions.id, pausedExecutionId))
+
+      if (snapshotWorkspaceId) {
+        await replaceLargeValueReferenceKeysWithClient(
+          tx,
+          {
+            workspaceId: snapshotWorkspaceId,
+            workflowId: pausedExecution.workflowId,
+            executionId: pausedExecution.executionId,
+            source: 'paused_snapshot',
+          },
+          snapshotReferenceKeys
+        )
+      }
+    })
 
     logger.info('Updated snapshot after resume', {
       pausedExecutionId,

@@ -26,8 +26,9 @@ import type {
 
 const logger = createLogger('WorkflowGroupScheduler')
 
+import { getColumnId } from './column-keys'
 import { areGroupDepsSatisfied, areOutputsFilled, isExecInFlight } from './deps'
-import type { DispatchMode } from './dispatcher'
+import type { DispatchLimit, DispatchMode } from './dispatcher'
 
 export {
   getUnmetGroupDeps,
@@ -90,14 +91,20 @@ export function classifyEligibility(
   if (mode === 'new' && exec && !isOrphanPreStamp) return 'has-prior-attempt'
 
   const completedAndFilled = status === 'completed' && areOutputsFilled(group, row)
-  if (!isManualRun && completedAndFilled) return 'completed-on-auto'
+  // For an enrichment a `completed` run is terminal even with empty outputs —
+  // a no-match is a real result, not an unfinished run. Treating it as "done"
+  // stops the auto cascade from re-invoking billable provider calls on every
+  // no-match row each dispatch. A genuine input change clears the exec entry
+  // (see deriveExecClearsForDataPatch), so real re-runs still happen.
+  const isDone = completedAndFilled || (group.type === 'enrichment' && status === 'completed')
+  if (!isManualRun && isDone) return 'completed-on-auto'
   if (!isManualRun && status === 'error') return 'error-on-auto'
   if (!isManualRun && status === 'cancelled') return 'cancelled-on-auto'
   // Manual incomplete-mode runs (Run row / Run incomplete) treat a `completed`
   // group as done even if an output is blank — only "Run all" re-runs it. The
-  // auto cascade still re-fills blank outputs (completedAndFilled).
+  // auto cascade still re-fills blank workflow outputs (completedAndFilled).
   if (mode === 'incomplete') {
-    if (isManualRun ? status === 'completed' : completedAndFilled) {
+    if (isManualRun ? status === 'completed' : isDone) {
       return 'completed-on-incomplete'
     }
   }
@@ -130,14 +137,19 @@ export function pickNextEligibleGroupForRow(
   for (const group of groups) {
     if (group.id === excludeGroupId) continue
     const exec = row.executions?.[group.id]
-    // Dispatcher pre-stamp (pending + executionId: null) is a placeholder; the
-    // cascade-loop is the right owner of the claim. Treat as "claimable" by
-    // pretending the exec doesn't exist for the eligibility check.
-    const effectiveRow =
-      exec?.status === 'pending' && exec.executionId == null
-        ? { ...row, executions: { ...row.executions, [group.id]: undefined } as RowExecutions }
-        : row
-    if (isGroupEligible(group, effectiveRow, { isManualRun: false, mode: 'incomplete' })) {
+    // Dispatcher pre-stamp (pending + executionId: null) is a queued marker: an
+    // explicit run request whose cell-task bailed on lock contention. It's the
+    // handoff — the cascade owner runs it next. Treat it as `isManualRun` so an
+    // explicitly-requested `autoRun: false` group is honored (the dispatcher
+    // already applied manual eligibility before stamping it); groups with no
+    // marker stay `isManualRun: false` so pure dep-fill auto-cascade still
+    // respects `autoRun`. Either way the placeholder is cleared from the
+    // eligibility view so the group is claimable.
+    const isRequested = exec?.status === 'pending' && exec.executionId == null
+    const effectiveRow = isRequested
+      ? { ...row, executions: { ...row.executions, [group.id]: undefined } as RowExecutions }
+      : row
+    if (isGroupEligible(group, effectiveRow, { isManualRun: isRequested, mode: 'incomplete' })) {
       return group
     }
   }
@@ -194,6 +206,7 @@ export function buildPendingRuns(
         rowId: row.id,
         groupId: group.id,
         workflowId: group.workflowId,
+        ...(group.enrichmentId ? { enrichmentId: group.enrichmentId } : {}),
         workspaceId: table.workspaceId,
         executionId: generateId(),
       })
@@ -311,9 +324,20 @@ export interface WorkflowGroupCellPayload {
   tableName: string
   rowId: string
   groupId: string
+  /** Backing workflow id for manual groups; `''` for enrichment groups. */
   workflowId: string
+  /** Registry enrichment id for enrichment groups. */
+  enrichmentId?: string
   workspaceId: string
   executionId: string
+  /** Owning dispatch, set by `dispatcherStep`. Lets the cell halt its dispatch
+   *  on a hard stop (e.g. usage limit). Absent for cascade/auto-fire payloads
+   *  that aren't driven by a dispatch. */
+  dispatchId?: string
+  /** User who triggered the run, for per-member usage attribution. Absent for
+   *  auto-fire (row writes, CSV import) → billing falls back to the workspace
+   *  billed account. */
+  triggeredByUserId?: string
 }
 
 /** Per-table concurrency cap. Mirrors trigger.dev's `concurrencyLimit: 20`. */
@@ -439,6 +463,30 @@ export async function cancelWorkflowGroupRuns(
 
   const mutations: RowMutation[] = Array.from(byRow.values())
 
+  // Defense-in-depth for paused/awaiting cells: a cell that paused mid-run is
+  // stamped `pending` with a `paused-<executionId>` jobId and keeps a record in
+  // `paused_executions`. Mark those cancelling so a pending waitpoint short-
+  // circuits before it resumes (the resume worker also re-checks the cell's
+  // cancelled tombstone — that's the authoritative stop). No-op for cells with
+  // no paused record.
+  const pausedCancellations = inFlightRows
+    .filter((r) => r.executionId && r.jobId?.startsWith('paused-'))
+    .map((r) => ({ executionId: r.executionId as string, workflowId: r.workflowId }))
+  if (pausedCancellations.length > 0) {
+    const { PauseResumeManager } = await import(
+      '@/lib/workflows/executor/human-in-the-loop-manager'
+    )
+    await Promise.allSettled(
+      pausedCancellations.map((p) =>
+        PauseResumeManager.beginPausedCancellation(p.executionId, p.workflowId).catch((err) => {
+          logger.warn(`beginPausedCancellation failed for ${p.executionId}`, {
+            error: toError(err).message,
+          })
+        })
+      )
+    )
+  }
+
   // Abort in-flight cell runs. The interface method `cancelByKey` is a no-op
   // on the trigger.dev backend (no in-process AbortControllers) and aborts
   // the matching AbortController on the database backend. Trigger.dev's tag
@@ -539,12 +587,19 @@ export async function runWorkflowColumn(opts: {
   requestId: string
   groupIds?: string[]
   rowIds?: string[]
+  /** Optional cap on work before the dispatch completes (e.g. run only the
+   *  first N eligible rows). Null/omitted = process every row in scope. */
+  limit?: DispatchLimit | null
   /** When false, eligibility honors `autoRun: false` and treats completed
    *  cells as terminal — appropriate for auto-fire after row writes or
    *  schema changes. Defaults to true (user-initiated "Run column"). */
   isManualRun?: boolean
+  /** User who triggered the run, for usage attribution. Omitted by auto-fire
+   *  callers (row writes, CSV import) → falls back to the workspace billed
+   *  account at billing time. */
+  triggeredByUserId?: string | null
 }): Promise<{ dispatchId: string | null }> {
-  const { tableId, workspaceId, mode, requestId, groupIds, rowIds } = opts
+  const { tableId, workspaceId, mode, requestId, groupIds, rowIds, limit, triggeredByUserId } = opts
   const isManualRun = opts.isManualRun ?? true
   // Empty `rowIds` array means "scope explicitly empty" — auto-fire callers
   // (CSV import on zero matches, etc.) end up here. Skip the dispatch entirely
@@ -598,13 +653,20 @@ export async function runWorkflowColumn(opts: {
   }
 
   // Wipe targeted output cols + executions[gid] before any cells fire so the
-  // user sees the column flip to empty/Pending instantly.
-  await bulkClearWorkflowGroupCells({
-    tableId,
-    groups: targetGroups.map((g) => ({ id: g.id, outputs: g.outputs })),
-    rowIds,
-    mode,
-  })
+  // user sees the column flip to empty/Pending instantly. Skipped for capped
+  // runs: the eager clear can't know which N rows the dispatcher will pick
+  // (they depend on per-row eligibility as it walks positions), so wiping all
+  // rows in scope would blank far more than we re-run. `mode: 'all'` re-runs
+  // completed cells without the clear anyway — the clear is only for instant
+  // feedback, which the capped rows still get via the dispatcher's pre-stamp.
+  if (!limit) {
+    await bulkClearWorkflowGroupCells({
+      tableId,
+      groups: targetGroups.map((g) => ({ id: g.id, outputs: g.outputs })),
+      rowIds,
+      mode,
+    })
+  }
 
   // Always insert a `table_run_dispatches` row. The dispatcher state machine
   // is the single source of truth for cursor advancement, SSE emission, and
@@ -619,7 +681,9 @@ export async function runWorkflowColumn(opts: {
       groupIds: targetGroupIds,
       ...(rowIds && rowIds.length > 0 ? { rowIds } : {}),
     },
+    limit,
     isManualRun,
+    triggeredByUserId,
   })
 
   logger.info(
@@ -657,22 +721,28 @@ export async function runWorkflowColumn(opts: {
 
 /**
 /**
- * Removes the given column names from a group's `dependencies.columns`. When
- * the resulting list is empty, drops the `dependencies` field entirely so
- * schema validation doesn't see an empty-deps object. Returns the same group
- * reference when nothing changed.
+ * Removes the given column names from a group's `dependencies.columns` and from
+ * its `inputMappings` (any mapping whose source `columnName` was removed). When
+ * either list ends up empty, drops the field entirely so schema validation
+ * doesn't see an empty object. Returns the same group reference when nothing
+ * changed.
  */
 export function stripGroupDeps(group: WorkflowGroup, removed: ReadonlySet<string>): WorkflowGroup {
-  const cols = group.dependencies?.columns
-  if (!cols || cols.length === 0) return group
-  const filtered = cols.filter((d) => !removed.has(d))
-  if (filtered.length === cols.length) return group
-  return {
-    ...group,
-    ...(filtered.length > 0
-      ? { dependencies: { columns: filtered } }
-      : { dependencies: undefined }),
+  const cols = group.dependencies?.columns ?? []
+  const mappings = group.inputMappings ?? []
+  const filteredDeps = cols.filter((d) => !removed.has(d))
+  const filteredMappings = mappings.filter((m) => !removed.has(m.columnName))
+  const depsChanged = filteredDeps.length !== cols.length
+  const mappingsChanged = filteredMappings.length !== mappings.length
+  if (!depsChanged && !mappingsChanged) return group
+  const next: WorkflowGroup = { ...group }
+  if (depsChanged) {
+    next.dependencies = filteredDeps.length > 0 ? { columns: filteredDeps } : undefined
   }
+  if (mappingsChanged) {
+    next.inputMappings = filteredMappings.length > 0 ? filteredMappings : undefined
+  }
+  return next
 }
 
 /**
@@ -682,18 +752,19 @@ export function stripGroupDeps(group: WorkflowGroup, removed: ReadonlySet<string
  */
 export function validateSchema(schema: TableSchema, columnOrder: string[] | undefined): string[] {
   const errors: string[] = []
-  const columnsByName = new Map(schema.columns.map((c) => [c.name, c]))
+  // Group refs and columnOrder hold stable column ids (not display names).
+  const columnsById = new Map(schema.columns.map((c) => [getColumnId(c), c]))
   const groups = schema.workflowGroups ?? []
   const groupsById = new Map(groups.map((g) => [g.id, g]))
 
   // Reference integrity for group outputs.
-  const claimedColumns = new Map<string, string>() // columnName → groupId
+  const claimedColumns = new Map<string, string>() // columnId → groupId
   for (const group of groups) {
     if (group.outputs.length === 0) {
       errors.push(`Workflow group "${group.name ?? group.id}" has no outputs.`)
     }
     for (const out of group.outputs) {
-      const col = columnsByName.get(out.columnName)
+      const col = columnsById.get(out.columnName)
       if (!col) {
         errors.push(
           `Workflow group "${group.name ?? group.id}" references missing column "${out.columnName}".`
@@ -725,7 +796,7 @@ export function validateSchema(schema: TableSchema, columnOrder: string[] | unde
       )
       continue
     }
-    if (claimedColumns.get(col.name) !== col.workflowGroupId) {
+    if (claimedColumns.get(getColumnId(col)) !== col.workflowGroupId) {
       errors.push(
         `Column "${col.name}" has workflowGroupId "${col.workflowGroupId}" but isn't in that group's outputs.`
       )
@@ -744,7 +815,7 @@ export function validateSchema(schema: TableSchema, columnOrder: string[] | unde
   for (const group of groups) {
     const ownOutputs = new Set(group.outputs.map((o) => o.columnName))
     for (const depCol of group.dependencies?.columns ?? []) {
-      const col = columnsByName.get(depCol)
+      const col = columnsById.get(depCol)
       if (!col) {
         errors.push(`Group "${group.name ?? group.id}" depends on missing column "${depCol}".`)
         continue

@@ -7,6 +7,7 @@ import { toError } from '@sim/utils/errors'
 import * as ipaddr from 'ipaddr.js'
 import { isHosted } from '@/lib/core/config/feature-flags'
 import { type ValidationResult, validateExternalUrl } from '@/lib/core/security/input-validation'
+import { PayloadSizeLimitError } from '@/lib/core/utils/stream-limits'
 
 const logger = createLogger('InputValidation')
 
@@ -207,6 +208,112 @@ export async function validateDatabaseHost(
   }
 }
 
+/**
+ * Patterns run against the WHERE clause with string/identifier literals masked
+ * out (so an attacker cannot smuggle `OR 1` or `; DROP` inside a quoted value).
+ *
+ * The connector-literal rules below are intentionally `OR`-only: only an
+ * `OR <truthy>` term broadens a mutation to every row. `AND <number>` is a no-op
+ * for broadening and is also exactly what `BETWEEN low AND high` produces, so
+ * matching it would reject legitimate range filters (e.g. `id BETWEEN 1 AND 10`).
+ */
+const SQL_WHERE_MASKED_PATTERNS: readonly RegExp[] = [
+  /;\s*\w/, // stacked statement
+  /\bunion\s+(?:all\s+)?select\b/i,
+  /\binto\s+(?:out|dump)file\b/i,
+  /--/,
+  /\/\*/,
+  /\*\//,
+  /\b(?:sleep|pg_sleep|benchmark)\s*\(/i,
+  /\b(\w+)\s*=\s*\1\b/i, // same (unquoted) operand both sides: x=x, 1=1
+  /\b\d+(?:\.\d+)?\s*(?:=|==|<>|!=|<=|>=|<|>)\s*\d+(?:\.\d+)?\b/, // constant vs constant: 1=1, 1<2, 2>1
+  /\bor\s+(?:true|false)\b/i, // OR TRUE / OR FALSE
+  /\bor\s+\d+(?:\.\d+)?\b(?!\s*[=<>!+\-*/%])/i, // standalone truthy literal after OR: OR 1, OR 42
+  /^\s*(?:\d+(?:\.\d+)?|true|false)\s*$/i, // bare constant: "1" / "true" / "false"
+]
+
+/**
+ * Patterns run against the raw WHERE clause (need the literal contents intact),
+ * e.g. equality between two identical string literals.
+ */
+const SQL_WHERE_RAW_PATTERNS: readonly RegExp[] = [
+  /(['"])([^'"]*)\1\s*(?:=|==|<>|!=)\s*\1\2\1/, // 'a'='a' / "x"="x"
+]
+
+/**
+ * Replaces the contents of string literals ('...'), double-quoted and
+ * backtick-quoted identifiers with spaces (preserving length) so structural
+ * scans do not treat data inside quotes as SQL. Comments are intentionally left
+ * intact so comment-injection sequences are still detected.
+ */
+function maskSqlStringLiterals(sql: string): string {
+  let out = ''
+  let i = 0
+  while (i < sql.length) {
+    const ch = sql[i]
+    if (ch === "'" || ch === '"' || ch === '`') {
+      out += ' '
+      i++
+      while (i < sql.length && sql[i] !== ch) {
+        if (ch !== '`' && sql[i] === '\\') {
+          out += '  '
+          i += 2
+          continue
+        }
+        out += ' '
+        i++
+      }
+      if (i < sql.length) {
+        out += ' '
+        i++
+      }
+      continue
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
+/**
+ * Validates a free-form SQL `WHERE` condition for injection and always-true
+ * tautology patterns. Returns a {@link ValidationResult}; callers decide whether
+ * to throw or surface the error.
+ *
+ * IMPORTANT: this is **defense-in-depth, not a security boundary**. A free-form
+ * SQL condition cannot be exhaustively validated against every always-true
+ * expression (e.g. `OR 2 > 1`, `OR (1)`, `OR NOT 0`, `OR length(x) >= 0`). The
+ * real boundary is that the caller supplies their own database credentials and
+ * could run equivalent SQL directly (e.g. via a raw-SQL/execute operation). This
+ * guard stops the easy, obvious ways an injected condition broadens a mutation
+ * to every row; it is not a substitute for constraining untrusted input upstream.
+ *
+ * @param where - The WHERE clause condition (without the `WHERE` keyword)
+ * @param paramName - Label used in the error message
+ */
+export function validateSqlWhereClause(
+  where: string | null | undefined,
+  paramName = 'WHERE clause'
+): ValidationResult {
+  if (typeof where !== 'string' || where.trim().length === 0) {
+    return { isValid: false, error: `${paramName} is required` }
+  }
+
+  const masked = maskSqlStringLiterals(where)
+  const matched =
+    SQL_WHERE_MASKED_PATTERNS.some((pattern) => pattern.test(masked)) ||
+    SQL_WHERE_RAW_PATTERNS.some((pattern) => pattern.test(where))
+
+  if (matched) {
+    return {
+      isValid: false,
+      error: `${paramName} contains a disallowed or always-true expression`,
+    }
+  }
+
+  return { isValid: true }
+}
+
 export interface SecureFetchOptions {
   method?: string
   headers?: Record<string, string>
@@ -263,6 +370,10 @@ const DEFAULT_MAX_REDIRECTS = 5
 
 function isRedirectStatus(status: number): boolean {
   return status >= 300 && status < 400 && status !== 304
+}
+
+function isRetryableHttpStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599)
 }
 
 function resolveRedirectUrl(baseUrl: string, location: string): string {
@@ -383,6 +494,37 @@ export async function secureFetchWithPinnedIP(
         }
       }
 
+      const contentLength = headersRecord['content-length']
+      if (typeof maxResponseBytes === 'number' && maxResponseBytes > 0 && contentLength) {
+        const parsedLength = Number.parseInt(contentLength, 10)
+        if (Number.isFinite(parsedLength) && parsedLength > maxResponseBytes) {
+          cleanupAbort()
+          res.destroy()
+          req.destroy()
+          if (isRetryableHttpStatus(statusCode)) {
+            settledResolve({
+              ok: false,
+              status: statusCode,
+              statusText: res.statusMessage || '',
+              headers: new SecureFetchHeaders(headersRecord, setCookieArray),
+              body: null,
+              text: async () => '',
+              json: async () => ({}),
+              arrayBuffer: async () => new ArrayBuffer(0),
+            })
+            return
+          }
+          settledReject(
+            new PayloadSizeLimitError({
+              label: 'response body',
+              maxBytes: maxResponseBytes,
+              observedBytes: parsedLength,
+            })
+          )
+          return
+        }
+      }
+
       let totalBytes = 0
       const nodeRes = res
       const body = new ReadableStream<Uint8Array>({
@@ -396,7 +538,11 @@ export async function secureFetchWithPinnedIP(
             ) {
               cleanupAbort()
               controller.error(
-                new Error(`Response exceeded maximum size of ${maxResponseBytes} bytes`)
+                new PayloadSizeLimitError({
+                  label: 'response body',
+                  maxBytes: maxResponseBytes,
+                  observedBytes: totalBytes,
+                })
               )
               nodeRes.destroy()
               return

@@ -1,3 +1,4 @@
+import type { Readable } from 'node:stream'
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
@@ -13,7 +14,11 @@ import {
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { getErrorMessage } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
-import { env } from '@/lib/core/config/env'
+import { getAwsCredentialsFromEnv } from '@/lib/core/config/aws'
+import {
+  assertKnownSizeWithinLimit,
+  readNodeStreamToBufferWithLimit,
+} from '@/lib/core/utils/stream-limits'
 import { S3_CONFIG, S3_KB_CONFIG } from '@/lib/uploads/config'
 import type {
   S3Config,
@@ -50,13 +55,9 @@ export function getS3Client(): S3Client {
 
   _s3Client = new S3Client({
     region,
-    credentials:
-      env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY
-        ? {
-            accessKeyId: env.AWS_ACCESS_KEY_ID,
-            secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-          }
-        : undefined,
+    endpoint: S3_CONFIG.endpoint,
+    forcePathStyle: S3_CONFIG.forcePathStyle,
+    credentials: getAwsCredentialsFromEnv(),
   })
 
   return _s3Client
@@ -181,7 +182,17 @@ export async function downloadFromS3(key: string): Promise<Buffer>
  */
 export async function downloadFromS3(key: string, customConfig: S3Config): Promise<Buffer>
 
-export async function downloadFromS3(key: string, customConfig?: S3Config): Promise<Buffer> {
+export async function downloadFromS3(
+  key: string,
+  customConfig: S3Config,
+  maxBytes: number
+): Promise<Buffer>
+
+export async function downloadFromS3(
+  key: string,
+  customConfig?: S3Config,
+  maxBytes?: number
+): Promise<Buffer> {
   const config = customConfig || { bucket: S3_CONFIG.bucket, region: S3_CONFIG.region }
 
   const command = new GetObjectCommand({
@@ -190,14 +201,39 @@ export async function downloadFromS3(key: string, customConfig?: S3Config): Prom
   })
 
   const response = await getS3Client().send(command)
-  const stream = response.Body as any
+  if (maxBytes !== undefined && response.ContentLength !== undefined) {
+    try {
+      assertKnownSizeWithinLimit(response.ContentLength, maxBytes, 'storage download')
+    } catch (error) {
+      const body = response.Body as { destroy?: (error?: Error) => void } | undefined
+      body?.destroy?.(error instanceof Error ? error : undefined)
+      throw error
+    }
+  }
 
-  return new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = []
-    stream.on('data', (chunk: Buffer) => chunks.push(chunk))
-    stream.on('end', () => resolve(Buffer.concat(chunks)))
-    stream.on('error', reject)
+  const stream = response.Body as NodeJS.ReadableStream
+  return readNodeStreamToBufferWithLimit(stream, {
+    maxBytes: maxBytes ?? Number.MAX_SAFE_INTEGER,
+    label: 'storage download',
   })
+}
+
+/**
+ * Stream an object out of S3 without buffering it. The caller MUST fully consume or
+ * `destroy()` the returned stream. Used by the large-CSV import worker so a 1M-row file is
+ * never resident in memory.
+ */
+export async function downloadFromS3Stream(
+  key: string,
+  customConfig?: S3Config
+): Promise<Readable> {
+  const config = customConfig || { bucket: S3_CONFIG.bucket, region: S3_CONFIG.region }
+  const command = new GetObjectCommand({ Bucket: config.bucket, Key: key })
+  const response = await getS3Client().send(command)
+  if (!response.Body) {
+    throw new Error(`S3 object has no body: ${key}`)
+  }
+  return response.Body as Readable
 }
 
 /**
@@ -366,6 +402,33 @@ export async function getS3MultipartPartUrls(
 }
 
 /**
+ * Build a fallback object URL for when the SDK omits `Location` on multipart
+ * completion. For a custom `S3_CONFIG.endpoint` it matches the configured
+ * addressing mode — path-style for MinIO/Ceph (`forcePathStyle`), virtual-hosted
+ * (bucket as a subdomain) for R2 and friends. Falls back to the AWS
+ * virtual-hosted host when no custom endpoint is set.
+ *
+ * The key is percent-encoded per path segment (preserving `/` separators) so
+ * keys containing spaces or reserved characters still yield a valid URL.
+ */
+function buildObjectFallbackUrl(bucket: string, region: string, key: string): string {
+  const encodedKey = key
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/')
+  if (S3_CONFIG.endpoint) {
+    const base = S3_CONFIG.endpoint.replace(/\/+$/, '')
+    if (S3_CONFIG.forcePathStyle) {
+      return `${base}/${bucket}/${encodedKey}`
+    }
+    const url = new URL(base)
+    url.hostname = `${bucket}.${url.hostname}`
+    return `${url.origin}/${encodedKey}`
+  }
+  return `https://${bucket}.s3.${region}.amazonaws.com/${encodedKey}`
+}
+
+/**
  * Complete multipart upload for S3
  */
 export async function completeS3MultipartUpload(
@@ -387,8 +450,7 @@ export async function completeS3MultipartUpload(
   })
 
   const response = await s3Client.send(command)
-  const location =
-    response.Location || `https://${config.bucket}.s3.${config.region}.amazonaws.com/${key}`
+  const location = response.Location || buildObjectFallbackUrl(config.bucket, config.region, key)
   const path = `/api/files/serve/${encodeURIComponent(key)}`
 
   return {

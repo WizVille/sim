@@ -78,10 +78,14 @@ export const getTableQuerySchema = z.object({
 })
 
 export const tableColumnSchema = z.object({
+  /** Stable column id (server-assigned). Absent on legacy/ pre-backfill columns. */
+  id: z.string().optional(),
   name: columnNameSchema,
   type: columnTypeSchema,
   required: z.boolean().optional().default(false),
   unique: z.boolean().optional().default(false),
+  /** Set when the column is a workflow group's output. */
+  workflowGroupId: z.string().optional(),
 })
 
 export const createTableBodySchema = z.object({
@@ -108,6 +112,9 @@ export const renameTableBodySchema = z.object({
 export const createTableColumnBodySchema = z.object({
   workspaceId: z.string().min(1, 'Workspace ID is required'),
   column: z.object({
+    // Optional stable id — first-party undo of a delete re-creates the column
+    // with its original id so saved (id-keyed) cell data restores correctly.
+    id: z.string().optional(),
     name: columnNameSchema,
     type: columnTypeSchema,
     required: z.boolean().optional(),
@@ -135,6 +142,7 @@ export const deleteTableColumnBodySchema = z.object({
 export const tableMetadataSchema = z.object({
   columnWidths: z.record(z.string(), z.number().positive()).optional(),
   columnOrder: z.array(z.string()).optional(),
+  pinnedColumns: z.array(z.string()).optional(),
 }) satisfies z.ZodType<TableMetadata>
 
 export const updateTableMetadataBodySchema = z.object({
@@ -146,11 +154,28 @@ export const rowDataSchema = domainObjectSchema<RowData>()
 export const tableDefinitionSchema = domainObjectSchema<TableDefinition>()
 export const tableRowSchema = domainObjectSchema<TableRow>()
 
-export const insertTableRowBodySchema = z.object({
+/**
+ * Plain-object base for the single-row insert body. Kept un-refined so callers
+ * (e.g. the v1 public contract) can `.omit()` fields before applying
+ * {@link rowAnchorMutexRefine} — Zod forbids `.omit()` on a refined schema.
+ */
+export const insertTableRowBodyBaseSchema = z.object({
   workspaceId: z.string().min(1, 'Workspace ID is required'),
   data: rowDataSchema,
   position: z.number().int().min(0).optional(),
+  /** Fractional ordering: insert directly after this row id. Takes precedence over `position`. */
+  afterRowId: z.string().min(1).optional(),
+  /** Fractional ordering: insert directly before this row id. Takes precedence over `position`. */
+  beforeRowId: z.string().min(1).optional(),
 })
+
+/** `afterRowId` and `beforeRowId` are mutually exclusive insert anchors. */
+export const rowAnchorMutexRefine = [
+  (data: { afterRowId?: string; beforeRowId?: string }) => !data.afterRowId || !data.beforeRowId,
+  { message: 'afterRowId and beforeRowId are mutually exclusive' },
+] as const
+
+export const insertTableRowBodySchema = insertTableRowBodyBaseSchema.refine(...rowAnchorMutexRefine)
 
 /**
  * POST `/api/table/[tableId]/rows/upsert` body — insert-or-update keyed by a
@@ -174,12 +199,17 @@ export const batchInsertTableRowsBodySchema = z
         `Cannot insert more than ${TABLE_LIMITS.MAX_BATCH_INSERT_SIZE} rows per batch`
       ),
     positions: z.array(z.number().int().min(0)).max(TABLE_LIMITS.MAX_BATCH_INSERT_SIZE).optional(),
+    /** Fractional ordering: exact per-row order keys (undo restore). Takes precedence over `positions`. */
+    orderKeys: z.array(z.string().min(1)).max(TABLE_LIMITS.MAX_BATCH_INSERT_SIZE).optional(),
   })
   .refine((data) => !data.positions || data.positions.length === data.rows.length, {
     message: 'positions array length must match rows array length',
   })
   .refine((data) => !data.positions || new Set(data.positions).size === data.positions.length, {
     message: 'positions must not contain duplicates',
+  })
+  .refine((data) => !data.orderKeys || data.orderKeys.length === data.rows.length, {
+    message: 'orderKeys array length must match rows array length',
   })
 
 /**
@@ -347,6 +377,34 @@ export const createTableContract = defineRouteContract({
   },
 })
 
+/**
+ * Kickoff body for an asynchronous large-CSV import into a NEW table. The file is
+ * already uploaded to storage (the client sends its `fileKey`); the route creates an
+ * `importing` table and runs the load in the background.
+ */
+export const importTableAsyncBodySchema = z.object({
+  workspaceId: z.string().min(1, 'Workspace ID is required'),
+  fileKey: z.string().min(1, 'fileKey is required'),
+  fileName: z.string().min(1, 'fileName is required'),
+})
+
+export type ImportTableAsyncBody = z.input<typeof importTableAsyncBodySchema>
+
+export const importTableAsyncContract = defineRouteContract({
+  method: 'POST',
+  path: '/api/table/import-async',
+  body: importTableAsyncBodySchema,
+  response: {
+    mode: 'json',
+    schema: successResponseSchema(
+      z.object({
+        tableId: z.string(),
+        importId: z.string(),
+      })
+    ),
+  },
+})
+
 export const getTableContract = defineRouteContract({
   method: 'GET',
   path: '/api/table/[tableId]',
@@ -453,6 +511,40 @@ export const listTableRowsContract = defineRouteContract({
     ),
   },
 })
+
+export const findTableRowsQuerySchema = z.object({
+  workspaceId: z.string().min(1, 'Workspace ID is required'),
+  q: z.string().min(1, 'Search query is required'),
+  filter: domainObjectSchema<Filter>().optional(),
+  sort: domainObjectSchema<Sort>().optional(),
+})
+
+/** One matching cell: its 0-based ordinal in the filtered+sorted view, its row id, and the column name. */
+export const tableFindMatchSchema = z.object({
+  ordinal: z.number().int(),
+  rowId: z.string(),
+  /** Stable column id of the matching cell (JSONB storage key), not the display name. */
+  column: z.string(),
+})
+
+export const findTableRowsContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/table/[tableId]/rows/find',
+  params: tableIdParamsSchema,
+  query: findTableRowsQuerySchema,
+  response: {
+    mode: 'json',
+    schema: successResponseSchema(
+      z.object({
+        matches: z.array(tableFindMatchSchema),
+        truncated: z.boolean(),
+      })
+    ),
+  },
+})
+export type FindTableRowsQuery = z.input<typeof findTableRowsQuerySchema>
+export type FindTableRowsResponse = ContractJsonResponse<typeof findTableRowsContract>
+export type TableFindMatch = z.output<typeof tableFindMatchSchema>
 
 export const createTableRowContract = defineRouteContract({
   method: 'POST',
@@ -562,6 +654,38 @@ export const csvImportModeSchema = z.enum(['append', 'replace'])
 
 export const csvExtensionSchema = z.enum(['csv', 'tsv'], {
   error: 'Only CSV and TSV files are supported',
+})
+
+/**
+ * Kickoff body for an asynchronous CSV import into an EXISTING table (append/replace).
+ * The file is already uploaded to storage; `mapping`/`createColumns` are the client's
+ * resolved column mapping (the dialog computes them from its preview).
+ */
+export const importIntoTableAsyncBodySchema = z.object({
+  workspaceId: z.string().min(1, 'Workspace ID is required'),
+  fileKey: z.string().min(1, 'fileKey is required'),
+  fileName: z.string().min(1, 'fileName is required'),
+  mode: csvImportModeSchema,
+  mapping: z.record(z.string(), z.string().nullable()).optional(),
+  createColumns: z.array(z.string()).optional(),
+})
+
+export type ImportIntoTableAsyncBody = z.input<typeof importIntoTableAsyncBodySchema>
+
+export const importIntoTableAsyncContract = defineRouteContract({
+  method: 'POST',
+  path: '/api/table/[tableId]/import-async',
+  params: tableIdParamsSchema,
+  body: importIntoTableAsyncBodySchema,
+  response: {
+    mode: 'json',
+    schema: successResponseSchema(
+      z.object({
+        tableId: z.string(),
+        importId: z.string(),
+      })
+    ),
+  },
 })
 
 /**
@@ -716,13 +840,29 @@ export const deleteTableRowsContract = defineRouteContract({
 // ============================================================================
 
 const workflowGroupOutputSchema = z.object({
-  blockId: z.string().min(1),
-  path: z.string().min(1),
+  // Workflow outputs carry blockId/path; enrichment outputs carry outputId and
+  // leave these empty. `.default('')` keeps the parsed value a plain string.
+  blockId: z.string().default(''),
+  path: z.string().default(''),
+  outputId: z.string().optional(),
   columnName: z.string().min(1),
 })
 
 const workflowGroupDependenciesSchema = z.object({
   columns: z.array(z.string()).optional(),
+})
+
+const workflowGroupTypeSchema = z.enum(['manual', 'enrichment'])
+
+/** Which workflow state a group's per-cell runs execute against: `'live'` (the
+ *  editable draft) or `'deployed'` (the latest active deployment). Defaults to
+ *  `'live'` when omitted. */
+const workflowGroupDeploymentModeSchema = z.enum(['live', 'deployed'])
+
+/** One workflow Start-block input field ← one table column. */
+const workflowGroupInputMappingSchema = z.object({
+  inputName: z.string().min(1, 'inputName cannot be empty'),
+  columnName: z.string().min(1, 'columnName cannot be empty'),
 })
 
 const workflowGroupOutputColumnSchema = z.object({
@@ -741,10 +881,19 @@ export const addWorkflowGroupBodySchema = z.object({
   workspaceId: z.string().min(1, 'Workspace ID is required'),
   group: z.object({
     id: z.string().min(1),
-    workflowId: z.string().min(1),
+    /** Workflow id for manual groups; `''` (or omitted) for enrichment groups. */
+    workflowId: z.string().default(''),
+    /** Registry enrichment id for enrichment groups. */
+    enrichmentId: z.string().min(1).optional(),
     name: z.string().optional(),
+    /** Provenance of the group; defaults to `'manual'` when omitted. */
+    type: workflowGroupTypeSchema.optional(),
     dependencies: workflowGroupDependenciesSchema.optional(),
     outputs: z.array(workflowGroupOutputSchema).min(1),
+    /** Maps the workflow's Start-block inputs to table columns. */
+    inputMappings: z.array(workflowGroupInputMappingSchema).optional(),
+    /** Which workflow state per-cell runs execute against. Defaults to `'live'`. */
+    deploymentMode: workflowGroupDeploymentModeSchema.optional(),
     /** When `false`, the group never auto-fires from the scheduler — it can
      *  only be triggered manually. Defaults to `true`. Persisted on the
      *  group; distinct from the top-level `autoRun` below which is a
@@ -787,6 +936,12 @@ export const updateWorkflowGroupBodySchema = z.object({
    * `columnName` must already exist in the group's outputs.
    */
   mappingUpdates: z.array(workflowGroupMappingUpdateSchema).optional(),
+  /** Replace the group's input mappings. Omit to leave unchanged. */
+  inputMappings: z.array(workflowGroupInputMappingSchema).optional(),
+  /** Change which workflow state the group runs against. Omit to leave unchanged. */
+  deploymentMode: workflowGroupDeploymentModeSchema.optional(),
+  /** Update the group's provenance. Omit to leave unchanged. */
+  type: workflowGroupTypeSchema.optional(),
   /** Toggle the group's persisted auto-run flag. Omit to leave unchanged. */
   autoRun: z.boolean().optional(),
 })
@@ -868,6 +1023,24 @@ export const cancelTableRunsContract = defineRouteContract({
   },
 })
 
+export const cancelTableImportBodySchema = z.object({
+  workspaceId: z.string().min(1, 'Workspace ID is required'),
+  importId: z.string().min(1, 'Import ID is required'),
+})
+
+/** Cancel an in-flight async CSV import. The worker stops; committed rows are left in place. */
+export const cancelTableImportContract = defineRouteContract({
+  method: 'POST',
+  path: '/api/table/[tableId]/import/cancel',
+  params: tableIdParamsSchema,
+  body: cancelTableImportBodySchema,
+  response: {
+    mode: 'json',
+    schema: successResponseSchema(z.object({ canceled: z.boolean() })),
+  },
+})
+export type CancelTableImportBody = z.input<typeof cancelTableImportBodySchema>
+
 /**
  * Run modes for `POST /api/table/[tableId]/columns/run`:
  *  - `all`        — every dep-satisfied row not already running/pending
@@ -883,11 +1056,28 @@ export const cancelTableRunsContract = defineRouteContract({
  * action-bar Play/Refresh, column-header menu) reduces to a `groupIds` +
  * optional `rowIds` shape. AI uses the `run_column` tool op.
  */
+/**
+ * Optional cap on how much work the dispatch does before completing. The
+ * discriminated `type` keeps it extensible — only `'rows'` exists today
+ * (`max` = number of eligible rows to run before stopping), but future kinds
+ * (`'cells'`, `'cost'`, …) can extend the union without reshaping the request.
+ */
+export const runLimitSchema = z.object({
+  type: z.literal('rows'),
+  max: z
+    .number()
+    .int('max must be a whole number')
+    .min(1, 'max must be at least 1')
+    .max(1_000_000, 'max cannot exceed 1,000,000'),
+})
+
 export const runColumnBodySchema = z.object({
   workspaceId: z.string().min(1, 'Workspace ID is required'),
   groupIds: z.array(z.string().min(1)).min(1),
   runMode: z.enum(['all', 'incomplete']).default('all'),
   rowIds: z.array(z.string().min(1)).min(1).optional(),
+  /** Cap the run to the first `max` eligible rows. Omit for an unbounded run. */
+  limit: runLimitSchema.optional(),
 })
 
 export const runColumnContract = defineRouteContract({
@@ -916,6 +1106,8 @@ export type RunColumnBodyInput = z.input<typeof runColumnBodySchema>
 /** Shared `runMode` union — used by every UI / hook / Mothership site that
  *  builds a run-column payload. Single source of truth for the literal pair. */
 export type RunMode = NonNullable<RunColumnBodyInput['runMode']>
+/** Run cap shape consumed by hooks/components building a capped run payload. */
+export type RunLimit = z.input<typeof runLimitSchema>
 
 /**
  * Active dispatch overlay: rows in the scope ahead of `cursor` render as
@@ -933,6 +1125,11 @@ export const activeDispatchSchema = z.object({
     groupIds: z.array(z.string()),
     rowIds: z.array(z.string()).optional(),
   }),
+  /** Present when the run is capped. The client's "about to run" overlay skips
+   *  capped dispatches — it can't tell which rows ahead of the cursor fall
+   *  within the budget, so it would over-render Queued; the dispatcher's real
+   *  per-row pending stamps cover the actual rows instead. */
+  limit: runLimitSchema.optional(),
 })
 
 export const listActiveDispatchesContract = defineRouteContract({

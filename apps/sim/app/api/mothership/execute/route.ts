@@ -2,7 +2,7 @@ import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { type NextRequest, NextResponse } from 'next/server'
-import { mothershipExecuteContract } from '@/lib/api/contracts/mothership-tasks'
+import { mothershipExecuteContract } from '@/lib/api/contracts/mothership-chats'
 import { parseRequest } from '@/lib/api/server'
 import { checkInternalAuth } from '@/lib/auth/hybrid'
 import { buildIntegrationToolSchemas } from '@/lib/copilot/chat/payload'
@@ -14,11 +14,13 @@ import {
 import { runHeadlessCopilotLifecycle } from '@/lib/copilot/request/lifecycle/headless'
 import { requestExplicitStreamAbort } from '@/lib/copilot/request/session/explicit-abort'
 import type { StreamEvent } from '@/lib/copilot/request/types'
+import { isE2BDocEnabled } from '@/lib/core/config/feature-flags'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
-import { buildMothershipToolsForRequest } from '@/lib/mothership/settings/runtime'
+import { buildUserSkillTool } from '@/lib/mothership/skills'
 import {
   assertActiveWorkspaceAccess,
   getUserEntityPermissions,
+  isWorkspaceAccessDeniedError,
 } from '@/lib/workspaces/permissions/utils'
 
 export const maxDuration = 3600
@@ -95,14 +97,32 @@ export const POST = withRouteHandler(async (req: NextRequest) => {
       messages,
       responseFormat,
       workspaceId,
-      userId,
+      userId: bodyUserId,
       chatId,
       messageId: providedMessageId,
       requestId: providedRequestId,
       fileAttachments,
       workflowId,
       executionId,
+      userMetadata,
     } = validation.data.body
+
+    // Bind the billing actor to the authenticated identity. The executor mints
+    // the internal JWT with the workflow owner's userId, so a token issued for
+    // one user must never be used to attribute mothership-block cost to another
+    // user via a forged body.userId. When the token carries a userId we require
+    // the body to match it; the JWT userId is authoritative.
+    if (auth.userId && auth.userId !== bodyUserId) {
+      logger.warn('Mothership execute userId does not match authenticated identity', {
+        tokenUserId: auth.userId,
+        bodyUserId,
+      })
+      return NextResponse.json(
+        { error: 'userId does not match authenticated identity' },
+        { status: 403 }
+      )
+    }
+    const userId = auth.userId ?? bodyUserId
 
     await assertActiveWorkspaceAccess(workspaceId, userId)
 
@@ -115,34 +135,32 @@ export const POST = withRouteHandler(async (req: NextRequest) => {
       workflowId,
       executionId,
     })
-    const [workspaceContext, integrationTools, mothershipToolRuntime, userPermission] =
-      await Promise.all([
-        generateWorkspaceContext(workspaceId, userId),
-        buildIntegrationToolSchemas(userId, messageId, undefined, workspaceId),
-        buildMothershipToolsForRequest({ workspaceId, userId }),
-        getUserEntityPermissions(userId, 'workspace', workspaceId).catch(() => null),
-      ])
-    const workspaceContextWithMothershipTools = [
-      workspaceContext,
-      mothershipToolRuntime.catalogContext,
-    ]
-      .filter(Boolean)
-      .join('\n\n')
-
+    const [workspaceContext, integrationTools, userSkillTool, userPermission] = await Promise.all([
+      generateWorkspaceContext(workspaceId, userId),
+      buildIntegrationToolSchemas(userId, messageId, undefined, workspaceId),
+      buildUserSkillTool(workspaceId),
+      getUserEntityPermissions(userId, 'workspace', workspaceId).catch(() => null),
+    ])
     const requestPayload: Record<string, unknown> = {
       messages,
       responseFormat,
       userId,
+      // Go's auth middleware reads workspaceId off the request body to forward
+      // to /api/copilot/api-keys/validate (per-member org usage gate). Omitting
+      // it makes that validation 400 ("API key validation failed"), which kills
+      // the block. The chat path sends it via buildCopilotRequestPayload; the
+      // block path must too.
+      workspaceId,
       chatId: effectiveChatId,
       mode: 'agent',
       messageId,
       isHosted: true,
-      workspaceContext: workspaceContextWithMothershipTools,
+      workspaceContext,
+      ...(isE2BDocEnabled ? { docCompiler: 'python' } : {}),
+      ...(userMetadata ? { userMetadata } : {}),
       ...(fileAttachments && fileAttachments.length > 0 ? { fileAttachments } : {}),
       ...(integrationTools.length > 0 ? { integrationTools } : {}),
-      ...(mothershipToolRuntime.tools.length > 0
-        ? { mothershipTools: mothershipToolRuntime.tools }
-        : {}),
+      ...(userSkillTool ? { mothershipTools: [userSkillTool] } : {}),
       ...(userPermission ? { userPermission } : {}),
     }
 
@@ -158,6 +176,7 @@ export const POST = withRouteHandler(async (req: NextRequest) => {
         streamId: messageId,
         userId,
         chatId: effectiveChatId,
+        workspaceId,
       }).catch((error) => {
         reqLogger.warn('Failed to send explicit abort for mothership execution', {
           error: toError(error).message,
@@ -376,6 +395,10 @@ export const POST = withRouteHandler(async (req: NextRequest) => {
       )
 
       return NextResponse.json({ error: 'Mothership execution aborted' }, { status: 499 })
+    }
+
+    if (isWorkspaceAccessDeniedError(error)) {
+      return NextResponse.json({ error: 'Workspace access denied' }, { status: 403 })
     }
 
     logger.error(

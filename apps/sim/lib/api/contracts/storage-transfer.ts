@@ -301,7 +301,9 @@ export const fileDownloadBodySchema = z
 
 export const fileParseBodySchema = z
   .object({
-    filePath: z.union([z.string(), z.array(z.string())]).optional(),
+    filePath: z
+      .union([z.string(), z.array(z.string()).max(10, 'At most 10 files can be parsed at once')])
+      .optional(),
     fileType: z.string().optional().default(''),
     headers: z.record(z.string(), z.string()).optional(),
     workspaceId: z.string().optional().default(''),
@@ -458,6 +460,8 @@ export const fileServeParamsSchema = z.object({
 
 export const fileServeQuerySchema = z.object({
   raw: z.string().nullish(),
+  /** Content version (the file record's `updatedAt`). Present => the URL is content-immutable and may be cached indefinitely by the browser. */
+  v: z.string().nullish(),
 })
 
 export const fileViewParamsSchema = z.object({

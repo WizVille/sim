@@ -7,7 +7,12 @@ import type { COLUMN_TYPES } from './constants'
 export type ColumnValue = string | number | boolean | null | Date
 export type JsonValue = ColumnValue | JsonValue[] | { [key: string]: JsonValue }
 
-/** Row data mapping column names to values. */
+/**
+ * Row data mapping **column id** → value at rest (in `user_table_rows.data`).
+ * The two name-translating boundaries (public v1 API, mothership tool) and CSV
+ * key by column name on the wire; everything else uses ids. Resolve a column's
+ * storage key with `getColumnId` from `./column-keys`.
+ */
 export type RowData = Record<string, JsonValue>
 
 export type SortDirection = 'asc' | 'desc'
@@ -22,44 +27,104 @@ export interface ColumnOption {
 }
 
 export interface ColumnDefinition {
+  /**
+   * Stable storage key for this column. Row data, metadata, workflow-group
+   * refs, and filter/sort all key on this id; `name` is a pure display label
+   * that can change freely (rename is metadata-only). Absent only on legacy
+   * columns before the backfill — `getColumnId` falls back to `name`, which is
+   * the key those rows were already written under. New columns get a generated
+   * `col_…` from `generateColumnId`.
+   */
+  id?: string
   name: string
   type: (typeof COLUMN_TYPES)[number]
   required?: boolean
   unique?: boolean
   /**
    * When set, this column is one of a workflow group's outputs. The value in
-   * `row.data[name]` is populated by the group's per-cell run.
+   * `row.data[getColumnId(col)]` is populated by the group's per-cell run.
    */
   workflowGroupId?: string
 }
 
-/** One workflow output → one plain column. */
+/** One group output → one plain column. */
 export interface WorkflowGroupOutput {
-  /** Source block id within the configured workflow. */
+  /** Source block id within the configured workflow. `''` for enrichment groups. */
   blockId: string
-  /** Dot-path into that block's output (e.g. `summary`, `result.items[0]`). */
+  /** Dot-path into that block's output. `''` for enrichment groups. */
   path: string
-  /** Plain column in `schema.columns` that receives the plucked value. */
+  /** Enrichment output id this column receives (enrichment groups only). */
+  outputId?: string
+  /**
+   * Stable **column id** (`getColumnId`) of the plain column in
+   * `schema.columns` that receives the produced value. Despite the field name,
+   * this holds the column id, not its display name — so a column rename never
+   * touches this ref. Legacy values equal the column name (== id pre-backfill).
+   */
   columnName: string
 }
 
 export interface WorkflowGroupDependencies {
   /**
-   * Columns that must be non-empty before this group runs. Workflow output
-   * columns count too — once an upstream group fills its output column, any
-   * downstream group depending on that column becomes eligible. The user
-   * model is uniform: deps are columns, not group-completion edges.
+   * Stable **column ids** (`getColumnId`) that must be non-empty before this
+   * group runs. Workflow output columns count too — once an upstream group
+   * fills its output column, any downstream group depending on that column
+   * becomes eligible. The user model is uniform: deps are columns, not
+   * group-completion edges. Legacy values equal column names (== id pre-backfill).
    */
   columns?: string[]
 }
 
+/**
+ * How the group was created. `'manual'` groups are user-built workflow columns;
+ * `'enrichment'` groups are spawned from a shared enrichment template and hide
+ * launch / input-editing affordances in the config sidebar. Defaults to
+ * `'manual'` when absent (pre-feature groups).
+ */
+export type WorkflowGroupType = 'manual' | 'enrichment'
+
+/**
+ * Which workflow state a group's per-cell runs execute against: `'live'` runs
+ * the editable draft (current behavior); `'deployed'` runs the workflow's
+ * latest active deployment. Defaults to `'live'` when absent.
+ */
+export type WorkflowGroupDeploymentMode = 'live' | 'deployed'
+
+/** One workflow Start-block input field ← one table column. */
+export interface WorkflowGroupInputMapping {
+  /** `inputFormat` field name on the workflow's Start block. */
+  inputName: string
+  /**
+   * Stable **column id** (`getColumnId`) whose per-row value feeds that input.
+   * Despite the field name, this holds the column id, not its display name.
+   * Legacy values equal the column name (== id pre-backfill).
+   */
+  columnName: string
+}
+
 export interface WorkflowGroup {
   id: string
+  /** Backing workflow id for `manual` groups. `''` for enrichment groups. */
   workflowId: string
-  /** Display name; defaults to the workflow's name. */
+  /** Registry enrichment id for `enrichment` groups. */
+  enrichmentId?: string
+  /** Display name; defaults to the workflow's / enrichment's name. */
   name?: string
+  /** Provenance of the group. Defaults to `'manual'` when absent. */
+  type?: WorkflowGroupType
   dependencies?: WorkflowGroupDependencies
   outputs: WorkflowGroupOutput[]
+  /**
+   * Maps the workflow's Start-block input fields to the table columns that
+   * supply each per-row value. Absent / empty means no mapping configured yet.
+   */
+  inputMappings?: WorkflowGroupInputMapping[]
+  /**
+   * Which workflow state per-cell runs execute against. Defaults to `'live'`
+   * (editable draft) when absent. `'deployed'` runs the workflow's latest
+   * active deployment. Only meaningful for `manual` groups.
+   */
+  deploymentMode?: WorkflowGroupDeploymentMode
   /**
    * When `false`, the group never auto-fires from the scheduler — it can only
    * be triggered manually via the "Run" actions. Defaults to `true` so
@@ -114,13 +179,20 @@ export interface TableSchema {
 
 /**
  * Table-level metadata stored alongside the table definition. UI state only
- * (column widths, column order) — workflow-group concurrency is enforced at
- * the trigger.dev queue layer, not via metadata.
+ * (column widths, column order, pinned columns) — workflow-group concurrency
+ * is enforced at the trigger.dev queue layer, not via metadata.
  */
 export interface TableMetadata {
+  /** Pixel widths keyed by **column id** (`getColumnId`). */
   columnWidths?: Record<string, number>
+  /** Visible left-to-right order as **column ids** (`getColumnId`). */
   columnOrder?: string[]
+  /** **Column ids** pinned to the left while scrolling horizontally. */
+  pinnedColumns?: string[]
 }
+
+/** Async-import lifecycle state for a table. NULL/undefined = normal (no async import). */
+export type TableImportStatus = 'importing' | 'ready' | 'failed' | 'canceled'
 
 export interface TableDefinition {
   id: string
@@ -135,6 +207,12 @@ export interface TableDefinition {
   archivedAt?: Date | string | null
   createdAt: Date | string
   updatedAt: Date | string
+  /** Async-import state (see `apps/sim/lib/table/import-runner.ts`). */
+  importStatus?: TableImportStatus | null
+  importId?: string | null
+  importError?: string | null
+  importRowsProcessed?: number
+  importStartedAt?: Date | string | null
 }
 
 /** Minimal table info for UI components. */
@@ -152,6 +230,11 @@ export interface TableRow {
   /** Per-group execution state for this row. Empty `{}` if nothing has run. */
   executions: RowExecutions
   position: number
+  /**
+   * Fractional order key. Authoritative row order when `TABLES_FRACTIONAL_ORDERING`
+   * is on; absent only for rows not yet backfilled (clients fall back to `position`).
+   */
+  orderKey?: string
   createdAt: Date | string
   updatedAt: Date | string
 }
@@ -174,6 +257,14 @@ export interface ConditionOperators {
   $in?: ColumnValue[]
   $nin?: ColumnValue[]
   $contains?: string
+  /** Case-insensitive negated substring match. Null/empty cells match. */
+  $ncontains?: string
+  /** Case-insensitive prefix match. */
+  $startsWith?: string
+  /** Case-insensitive suffix match. */
+  $endsWith?: string
+  /** `true` → cell is null or empty string; `false` → cell is present and non-empty. */
+  $empty?: boolean
 }
 
 /**
@@ -231,6 +322,12 @@ export interface QueryOptions {
    * is returned as `null` to signal it was not computed.
    */
   includeTotal?: boolean
+  /**
+   * When true (default), each returned row's `executions` is populated from the
+   * `tableRowExecutions` sidecar. Pass `false` to skip the join and return `{}`
+   * (the public v1 route does not expose executions).
+   */
+  withExecutions?: boolean
 }
 
 export interface QueryResult {
@@ -258,6 +355,10 @@ export interface CreateTableData {
   maxTables?: number
   /** Number of empty rows to create with the table. Defaults to 0. */
   initialRowCount?: number
+  /** When set, the table is created in this async-import state (rows hidden until ready). */
+  importStatus?: TableImportStatus
+  /** Async-import id stamped on the table when `importStatus` is set. */
+  importId?: string
 }
 
 export interface InsertRowData {
@@ -267,6 +368,10 @@ export interface InsertRowData {
   userId?: string
   /** Optional explicit position. When omitted, the row is appended after the last position. */
   position?: number
+  /** Insert directly after this row (fractional ordering). Takes precedence over `position`. */
+  afterRowId?: string
+  /** Insert directly before this row (fractional ordering). Takes precedence over `position`. */
+  beforeRowId?: string
 }
 
 export interface BatchInsertData {
@@ -276,6 +381,11 @@ export interface BatchInsertData {
   userId?: string
   /** Optional per-row target positions. Length must equal `rows.length`. */
   positions?: number[]
+  /**
+   * Optional per-row exact order keys (undo restore re-inserts at the saved key).
+   * Length must equal `rows.length`. Takes precedence over `positions`.
+   */
+  orderKeys?: string[]
 }
 
 export interface UpsertRowData {
@@ -313,12 +423,21 @@ export interface UpdateRowData {
    * state. `updateRow` returns `null` when the guard rejects the write.
    */
   cancellationGuard?: { groupId: string; executionId: string }
+  /**
+   * The member who performed this write. Billed and usage-gated for any
+   * enrichment the write triggers (auto-fire or dependency-cascade re-run), so
+   * costs land on the editor's per-member meter rather than the workspace billed
+   * account. Omitted only for internal `executionsPatch`-only writes.
+   */
+  actorUserId?: string | null
 }
 
 export interface BulkUpdateData {
   filter: Filter
   data: RowData
   limit?: number
+  /** The member who performed this write — billed/gated for triggered enrichment. */
+  actorUserId?: string | null
 }
 
 export interface BatchUpdateByIdData {
@@ -329,6 +448,8 @@ export interface BatchUpdateByIdData {
     executionsPatch?: Record<string, RowExecutionMetadata | null>
   }>
   workspaceId: string
+  /** The member who performed this write — billed/gated for triggered enrichment. */
+  actorUserId?: string | null
 }
 
 export interface BulkDeleteData {
@@ -394,6 +515,8 @@ export interface AddWorkflowGroupData {
    *  `true` (UI behavior). Mothership passes `false` so groups can be staged
    *  without firing every dep-satisfied row. */
   autoRun?: boolean
+  /** The member adding the group — billed/gated for the auto-run enrichment pass. */
+  actorUserId?: string | null
 }
 
 /** Payload for `updateWorkflowGroup` — diffs outputs and writes columns. */
@@ -414,8 +537,16 @@ export interface UpdateWorkflowGroupData {
    * source.
    */
   mappingUpdates?: Array<{ columnName: string; blockId: string; path: string }>
+  /** Replace the group's input mappings. Omit to leave them unchanged. */
+  inputMappings?: WorkflowGroupInputMapping[]
+  /** Change which workflow state the group runs against. Omit to leave unchanged. */
+  deploymentMode?: WorkflowGroupDeploymentMode
+  /** Update the group's provenance. Omit to leave it unchanged. */
+  type?: WorkflowGroupType
   /** Toggle the group's auto-run flag. Omit to leave it unchanged. */
   autoRun?: boolean
+  /** The member updating the group — billed/gated for any triggered re-run. */
+  actorUserId?: string | null
 }
 
 export interface DeleteWorkflowGroupData {

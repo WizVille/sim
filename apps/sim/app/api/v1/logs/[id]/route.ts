@@ -7,6 +7,7 @@ import { type NextRequest, NextResponse } from 'next/server'
 import { v1GetLogContract } from '@/lib/api/contracts/v1/logs'
 import { parseRequest } from '@/lib/api/server'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { materializeExecutionData } from '@/lib/logs/execution/trace-store'
 import { createApiResponse, getUserLimits } from '@/app/api/v1/logs/meta'
 import {
   checkRateLimit,
@@ -50,12 +51,11 @@ export const GET = withRouteHandler(
           endedAt: workflowExecutionLogs.endedAt,
           totalDurationMs: workflowExecutionLogs.totalDurationMs,
           executionData: workflowExecutionLogs.executionData,
-          cost: workflowExecutionLogs.cost,
+          costTotal: workflowExecutionLogs.costTotal,
           files: workflowExecutionLogs.files,
           createdAt: workflowExecutionLogs.createdAt,
           workflowName: workflow.name,
           workflowDescription: workflow.description,
-          workflowColor: workflow.color,
           workflowFolderId: workflow.folderId,
           workflowUserId: workflow.userId,
           workflowWorkspaceId: workflow.workspaceId,
@@ -81,7 +81,6 @@ export const GET = withRouteHandler(
         id: log.workflowId,
         name: log.workflowName || 'Deleted Workflow',
         description: log.workflowDescription,
-        color: log.workflowColor,
         folderId: log.workflowFolderId,
         userId: log.workflowUserId,
         workspaceId: log.workflowWorkspaceId,
@@ -101,8 +100,15 @@ export const GET = withRouteHandler(
         totalDurationMs: log.totalDurationMs,
         files: log.files || undefined,
         workflow: workflowSummary,
-        executionData: log.executionData as any,
-        cost: log.cost as any,
+        executionData: (await materializeExecutionData(
+          log.executionData as Record<string, unknown> | null,
+          {
+            workspaceId: log.workspaceId,
+            workflowId: log.workflowId,
+            executionId: log.executionId,
+          }
+        )) as any,
+        cost: log.costTotal != null ? { total: Number(log.costTotal) } : null,
         createdAt: log.createdAt.toISOString(),
       }
 

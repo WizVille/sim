@@ -50,19 +50,24 @@ export function getModelOptions() {
   const providersState = useProvidersStore.getState()
   const baseModels = providersState.providers.base.models
   const ollamaModels = providersState.providers.ollama.models
+  const ollamaCloudModels = providersState.providers['ollama-cloud'].models
   const vllmModels = providersState.providers.vllm.models
+  const litellmModels = providersState.providers.litellm.models
   const openrouterModels = providersState.providers.openrouter.models
   const fireworksModels = providersState.providers.fireworks.models
-  const litellmModels = providersState.providers.litellm.models
-
+  const togetherModels = providersState.providers.together.models
+  const basetenModels = providersState.providers.baseten.models
   const allModels = Array.from(
     new Set([
       ...baseModels,
       ...ollamaModels,
+      ...ollamaCloudModels,
       ...vllmModels,
+      ...litellmModels,
       ...openrouterModels,
       ...fireworksModels,
-      ...litellmModels
+      ...togetherModels,
+      ...basetenModels,
     ])
   ).filter(m => !m.includes('fallback'))
 
@@ -168,7 +173,8 @@ function shouldRequireApiKeyForModel(model: string): boolean {
   }
 
   const storeProvider = getProviderFromStore(normalizedModel)
-  if (storeProvider === 'ollama' || storeProvider === 'vllm' || storeProvider === 'litellm') return false
+  if (storeProvider === 'ollama' || storeProvider === 'vllm' || storeProvider === 'litellm')
+    return false
   if (storeProvider) return true
 
   if (isOllamaConfigured) {

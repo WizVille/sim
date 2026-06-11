@@ -18,8 +18,8 @@ import { gongHandler } from '@/lib/webhooks/providers/gong'
 import { googleFormsHandler } from '@/lib/webhooks/providers/google-forms'
 import { grainHandler } from '@/lib/webhooks/providers/grain'
 import { greenhouseHandler } from '@/lib/webhooks/providers/greenhouse'
-import { hubspotHandler } from '@/lib/webhooks/providers/hubspot'
 import { imapHandler } from '@/lib/webhooks/providers/imap'
+import { instantlyHandler } from '@/lib/webhooks/providers/instantly'
 import { intercomHandler } from '@/lib/webhooks/providers/intercom'
 import { jiraHandler } from '@/lib/webhooks/providers/jira'
 import { jsmHandler } from '@/lib/webhooks/providers/jsm'
@@ -32,6 +32,7 @@ import { outlookHandler } from '@/lib/webhooks/providers/outlook'
 import { resendHandler } from '@/lib/webhooks/providers/resend'
 import { rssHandler } from '@/lib/webhooks/providers/rss'
 import { salesforceHandler } from '@/lib/webhooks/providers/salesforce'
+import { sendblueHandler } from '@/lib/webhooks/providers/sendblue'
 import { servicenowHandler } from '@/lib/webhooks/providers/servicenow'
 import { slackHandler } from '@/lib/webhooks/providers/slack'
 import { stripeHandler } from '@/lib/webhooks/providers/stripe'
@@ -68,9 +69,9 @@ const PROVIDER_HANDLERS: Record<string, WebhookProviderHandler> = {
   fathom: fathomHandler,
   grain: grainHandler,
   greenhouse: greenhouseHandler,
-  hubspot: hubspotHandler,
   imap: imapHandler,
   intercom: intercomHandler,
+  instantly: instantlyHandler,
   jira: jiraHandler,
   jsm: jsmHandler,
   lemlist: lemlistHandler,
@@ -82,6 +83,7 @@ const PROVIDER_HANDLERS: Record<string, WebhookProviderHandler> = {
   outlook: outlookHandler,
   rss: rssHandler,
   salesforce: salesforceHandler,
+  sendblue: sendblueHandler,
   servicenow: servicenowHandler,
   slack: slackHandler,
   stripe: stripeHandler,

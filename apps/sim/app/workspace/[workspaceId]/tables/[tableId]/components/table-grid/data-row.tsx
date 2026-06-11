@@ -23,6 +23,9 @@ import { type NormalizedSelection, resolveCellExec } from './utils'
 export interface DataRowProps {
   row: TableRowType
   columns: DisplayColumn[]
+  /** Current workspace id — forwarded to cells so in-workspace resource URLs
+   *  render as tagged-resource chips. */
+  workspaceId: string
   rowIndex: number
   isFirstRow: boolean
   editingColumnName: string | null
@@ -37,13 +40,18 @@ export interface DataRowProps {
   onCellMouseDown: (rowIndex: number, colIndex: number, shiftKey: boolean) => void
   onCellMouseEnter: (rowIndex: number, colIndex: number) => void
   isRowChecked: boolean
+  /** Keyboard (space/enter) toggle of the row checkbox. */
   onRowToggle: (rowIndex: number, shiftKey: boolean) => void
+  /** Pointer-down on the gutter — toggles the row and arms gutter drag-select. */
+  onRowMouseDown: (rowIndex: number, shiftKey: boolean) => void
+  /** Pointer entering the gutter cell — extends an in-progress gutter drag. */
+  onRowMouseEnter: (rowIndex: number) => void
   /** Number of workflow cells in this row currently in a running/queued state. */
   runningCount: number
   /** Whether the table has at least one workflow column — controls whether a run/stop icon is rendered. */
   hasWorkflowColumns: boolean
-  /** Width of the row-number inner div in px, derived from the table's maxRows digit count. */
-  numDivWidth: number
+  /** Width of the centered row-number/checkbox region in px, derived from the table's maxRows digit count. */
+  numRegionWidth: number
   onStopRow: (rowId: string) => void
   onRunRow: (rowId: string) => void
   /**
@@ -57,6 +65,10 @@ export interface DataRowProps {
    * queued indicators across page refresh during long Run-all dispatches.
    */
   activeDispatches: ActiveDispatch[] | undefined
+  /** Pixel `left` value for each pinned column key; absent keys are not pinned. */
+  pinnedOffsets?: Map<string, number>
+  /** Key of the rightmost pinned column, used to render a separator shadow. */
+  lastPinnedColKey?: string | null
 }
 
 function cellRangeRowChanged(
@@ -94,6 +106,7 @@ function dataRowPropsAreEqual(prev: DataRowProps, next: DataRowProps): boolean {
   if (
     prev.row !== next.row ||
     prev.columns !== next.columns ||
+    prev.workspaceId !== next.workspaceId ||
     prev.rowIndex !== next.rowIndex ||
     prev.isFirstRow !== next.isFirstRow ||
     prev.editingColumnName !== next.editingColumnName ||
@@ -107,13 +120,17 @@ function dataRowPropsAreEqual(prev: DataRowProps, next: DataRowProps): boolean {
     prev.onCellMouseEnter !== next.onCellMouseEnter ||
     prev.isRowChecked !== next.isRowChecked ||
     prev.onRowToggle !== next.onRowToggle ||
+    prev.onRowMouseDown !== next.onRowMouseDown ||
+    prev.onRowMouseEnter !== next.onRowMouseEnter ||
     prev.runningCount !== next.runningCount ||
     prev.hasWorkflowColumns !== next.hasWorkflowColumns ||
-    prev.numDivWidth !== next.numDivWidth ||
+    prev.numRegionWidth !== next.numRegionWidth ||
     prev.onStopRow !== next.onStopRow ||
     prev.onRunRow !== next.onRunRow ||
     prev.workflowGroups !== next.workflowGroups ||
-    prev.activeDispatches !== next.activeDispatches
+    prev.activeDispatches !== next.activeDispatches ||
+    prev.pinnedOffsets !== next.pinnedOffsets ||
+    prev.lastPinnedColKey !== next.lastPinnedColKey
   ) {
     return false
   }
@@ -135,6 +152,7 @@ function dataRowPropsAreEqual(prev: DataRowProps, next: DataRowProps): boolean {
 export const DataRow = React.memo(function DataRow({
   row,
   columns,
+  workspaceId,
   rowIndex,
   isFirstRow,
   editingColumnName,
@@ -150,13 +168,17 @@ export const DataRow = React.memo(function DataRow({
   onCellMouseDown,
   onCellMouseEnter,
   onRowToggle,
+  onRowMouseDown,
+  onRowMouseEnter,
   runningCount,
   hasWorkflowColumns,
-  numDivWidth,
+  numRegionWidth,
   onStopRow,
   onRunRow,
   workflowGroups,
   activeDispatches,
+  pinnedOffsets,
+  lastPinnedColKey,
 }: DataRowProps) {
   const sel = normalizedSelection
   /**
@@ -168,6 +190,8 @@ export const DataRow = React.memo(function DataRow({
    */
   const waitingByGroupId = React.useMemo(() => {
     if (workflowGroups.length === 0) return null
+    // Deps are stored as column ids; the "Waiting on …" pill shows display names.
+    const nameByColumnId = new Map(columns.map((c) => [c.key, c.name]))
     const map = new Map<string, string[]>()
     for (const group of workflowGroups) {
       // autoRun=false groups never fire from the scheduler — there's nothing
@@ -175,32 +199,51 @@ export const DataRow = React.memo(function DataRow({
       if (group.autoRun === false) continue
       const unmet = getUnmetGroupDeps(group, row)
       if (unmet.columns.length === 0) continue
-      map.set(group.id, unmet.columns)
+      map.set(
+        group.id,
+        unmet.columns.map((id) => nameByColumnId.get(id) ?? id)
+      )
     }
     return map
-  }, [workflowGroups, row])
+  }, [workflowGroups, row, columns])
   const isMultiCell = sel !== null && (sel.startRow !== sel.endRow || sel.startCol !== sel.endCol)
   const isRowSelected = isRowChecked
+  /**
+   * Whether the selection's left edge sits at column 0 for this row. The blue
+   * edge is drawn inside the sticky checkbox cell — over its gray right
+   * border — rather than as the col-0 overlay's `border-l`, so the sticky
+   * cell can never paint over it and the gray/blue lines never double up at
+   * the column boundary. The strip overlaps the row gridlines (`-top-px` /
+   * `-bottom-px`) so consecutive selected rows form one continuous line.
+   */
+  const rowInRange = sel !== null && rowIndex >= sel.startRow && rowIndex <= sel.endRow
+  const isLeftEdgeSelected = isRowChecked || (isMultiCell && rowInRange && sel!.startCol === 0)
 
   return (
     <tr onContextMenu={(e) => onContextMenu(e, row)}>
-      <td className={cn(CELL_CHECKBOX, 'cursor-pointer')}>
-        <div
-          className={cn(
-            'flex items-center',
-            hasWorkflowColumns ? 'justify-end gap-1.5 pr-1' : 'justify-center'
-          )}
-        >
+      <td
+        className={cn(CELL_CHECKBOX, 'cursor-pointer')}
+        onMouseEnter={() => onRowMouseEnter(rowIndex)}
+      >
+        {isLeftEdgeSelected && (
+          <div
+            className={cn(
+              '-right-px -bottom-px pointer-events-none absolute w-px bg-[var(--selection)]',
+              isFirstRow ? 'top-0' : '-top-px'
+            )}
+          />
+        )}
+        <div className={cn('flex items-center justify-start', hasWorkflowColumns && 'gap-1.5')}>
           <div
             role='checkbox'
             tabIndex={0}
             aria-checked={isRowSelected}
             aria-label={`Select row ${rowIndex + 1}`}
             className='group/checkbox flex h-[20px] shrink-0 items-center justify-center'
-            style={{ width: numDivWidth }}
+            style={{ width: numRegionWidth }}
             onMouseDown={(e) => {
               if (e.button !== 0) return
-              onRowToggle(rowIndex, e.shiftKey)
+              onRowMouseDown(rowIndex, e.shiftKey)
             }}
             onKeyDown={(event) =>
               handleKeyboardActivation(event, () => onRowToggle(rowIndex, event.shiftKey))
@@ -208,7 +251,7 @@ export const DataRow = React.memo(function DataRow({
           >
             <span
               className={cn(
-                'text-center text-[var(--text-tertiary)] text-xs tabular-nums',
+                'text-[var(--text-tertiary)] text-xs tabular-nums',
                 isRowSelected ? 'hidden' : 'block group-hover/checkbox:hidden'
               )}
             >
@@ -216,7 +259,7 @@ export const DataRow = React.memo(function DataRow({
             </span>
             <div
               className={cn(
-                'items-center justify-end',
+                'items-center justify-center',
                 isRowSelected ? 'flex' : 'hidden group-hover/checkbox:flex'
               )}
             >
@@ -256,7 +299,7 @@ export const DataRow = React.memo(function DataRow({
           colIndex >= sel.startCol &&
           colIndex <= sel.endCol
         const isAnchor = sel !== null && rowIndex === sel.anchorRow && colIndex === sel.anchorCol
-        const isEditing = editingColumnName === column.name
+        const isEditing = editingColumnName === column.key
         const isHighlighted = inRange || isRowChecked
 
         const isTopEdge = inRange ? rowIndex === sel!.startRow : isRowChecked
@@ -264,26 +307,36 @@ export const DataRow = React.memo(function DataRow({
         const isLeftEdge = inRange ? colIndex === sel!.startCol : colIndex === 0
         const isRightEdge = inRange ? colIndex === sel!.endCol : colIndex === columns.length - 1
 
+        const pinnedLeft = pinnedOffsets?.get(column.key)
+        const isPinnedCell = pinnedLeft !== undefined
+        const isPinnedSeparator = column.key === lastPinnedColKey
+
         return (
           <td
             key={column.key}
             data-row={rowIndex}
             data-row-id={row.id}
             data-col={colIndex}
-            className={cn(CELL, (isHighlighted || isAnchor || isEditing) && 'relative')}
+            className={cn(
+              CELL,
+              (isHighlighted || isAnchor || isEditing) && 'relative',
+              isPinnedCell && 'z-[6] bg-[var(--bg)]',
+              isPinnedSeparator && '[box-shadow:2px_0_0_0_var(--border)]'
+            )}
+            style={isPinnedCell ? { position: 'sticky', left: pinnedLeft } : undefined}
             onMouseDown={(e) => {
               if (e.button !== 0 || isEditing) return
               onCellMouseDown(rowIndex, colIndex, e.shiftKey)
             }}
             onMouseEnter={() => onCellMouseEnter(rowIndex, colIndex)}
             onClick={(e) =>
-              onClick(row.id, column.name, {
+              onClick(row.id, column.key, {
                 toggleBoolean:
                   !e.shiftKey &&
                   Boolean((e.target as HTMLElement).closest('[data-boolean-cell-toggle]')),
               })
             }
-            onDoubleClick={() => onDoubleClick(row.id, column.name, column.key)}
+            onDoubleClick={() => onDoubleClick(row.id, column.key, column.key)}
           >
             {isHighlighted && (isMultiCell || isRowChecked) && (
               <div
@@ -294,7 +347,7 @@ export const DataRow = React.memo(function DataRow({
                   isFirstRow && isTopEdge && 'top-0',
                   isTopEdge && 'border-t border-t-[var(--selection)]',
                   isBottomEdge && 'border-b border-b-[var(--selection)]',
-                  isLeftEdge && 'border-l border-l-[var(--selection)]',
+                  isLeftEdge && colIndex !== 0 && 'border-l border-l-[var(--selection)]',
                   isRightEdge && 'border-r border-r-[var(--selection)]'
                 )}
               />
@@ -310,10 +363,11 @@ export const DataRow = React.memo(function DataRow({
             )}
             <div className={CELL_CONTENT}>
               <CellContent
+                workspaceId={workspaceId}
                 value={
-                  pendingCellValue && column.name in pendingCellValue
-                    ? pendingCellValue[column.name]
-                    : row.data[column.name]
+                  pendingCellValue && column.key in pendingCellValue
+                    ? pendingCellValue[column.key]
+                    : row.data[column.key]
                 }
                 exec={resolveCellExec(
                   row,
@@ -325,12 +379,18 @@ export const DataRow = React.memo(function DataRow({
                 column={column}
                 isEditing={isEditing}
                 initialCharacter={isEditing ? initialCharacter : undefined}
-                onSave={(value, reason) => onSave(row.id, column.name, value, reason)}
+                onSave={(value, reason) => onSave(row.id, column.key, value, reason)}
                 onCancel={onCancel}
                 waitingOnLabels={
                   column.workflowGroupId
                     ? (waitingByGroupId?.get(column.workflowGroupId) ?? undefined)
                     : undefined
+                }
+                isEnrichmentOutput={
+                  column.workflowGroupId
+                    ? workflowGroups.find((g) => g.id === column.workflowGroupId)?.type ===
+                      'enrichment'
+                    : false
                 }
               />
             </div>

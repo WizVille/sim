@@ -18,14 +18,14 @@ import {
   Badge,
   Button,
   ChevronDown,
+  ChipInput,
   Code,
-  Copy as CopyIcon,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  Input,
+  Duplicate,
   Search as SearchIcon,
   Tooltip,
 } from '@/components/emcn'
@@ -55,6 +55,13 @@ const MIN_BAR_PCT = 0.5
 
 interface TraceViewProps {
   traceSpans: TraceSpan[]
+  /**
+   * Authoritative, multiplier-inclusive run cost (dollars) from the persisted
+   * execution log. When provided it drives the header credit chip so the Trace
+   * tab and the Overview cost breakdown can never show different totals. Falls
+   * back to the root span's own cost only when absent (e.g. live previews).
+   */
+  runCostDollars?: number
 }
 
 interface FlatSpanEntry {
@@ -337,7 +344,7 @@ const TraceTreeRow = memo(function TraceTreeRow({
           >
             <ChevronDown
               className={cn(
-                'h-[10px] w-[10px] transition-transform duration-100',
+                'size-[10px] transition-transform duration-100',
                 !isExpanded && '-rotate-90'
               )}
             />
@@ -350,9 +357,7 @@ const TraceTreeRow = memo(function TraceTreeRow({
             className='flex size-[14px] flex-shrink-0 items-center justify-center overflow-hidden rounded-sm'
             style={{ background: bgColor }}
           >
-            {BlockIcon && (
-              <BlockIcon className={cn('h-[10px] w-[10px]', iconColorClass(bgColor))} />
-            )}
+            {BlockIcon && <BlockIcon className={cn('size-[10px]', iconColorClass(bgColor))} />}
           </div>
         )}
         <Tooltip.Root>
@@ -492,7 +497,7 @@ function DetailCodeSection({
         </span>
         <ChevronDown
           className={cn(
-            'h-[8px] w-[8px] text-[var(--text-tertiary)] transition-colors transition-transform duration-100 group-hover:text-[var(--text-primary)]',
+            'size-[8px] text-[var(--text-tertiary)] transition-colors transition-transform duration-100 group-hover:text-[var(--text-primary)]',
             !isOpen && '-rotate-90'
           )}
         />
@@ -556,13 +561,13 @@ function DetailCodeSection({
               className='absolute top-0 right-0 z-30 flex h-[34px] items-center gap-1.5 rounded-sm border border-[var(--border)] bg-[var(--surface-1)] px-1.5 shadow-sm'
               onClick={(e) => e.stopPropagation()}
             >
-              <Input
+              <ChipInput
                 ref={searchInputRef}
                 type='text'
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder='Search...'
-                className='mr-0.5 h-[23px] w-[94px] text-caption'
+                className='mr-0.5 w-[94px]'
               />
               <span
                 className={cn(
@@ -628,7 +633,7 @@ function DetailCodeSection({
                   onCloseAutoFocus={(e) => e.preventDefault()}
                 >
                   <DropdownMenuItem onSelect={handleCopy}>
-                    <CopyIcon />
+                    <Duplicate />
                     Copy
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
@@ -708,8 +713,10 @@ const TraceDetailPane = memo(function TraceDetailPane({ span }: { span: TraceSpa
   if (cacheRead) metaEntries.push({ label: 'Cache read', value: cacheRead })
   if (cacheWrite) metaEntries.push({ label: 'Cache write', value: cacheWrite })
   if (reasoning) metaEntries.push({ label: 'Reasoning tokens', value: reasoning })
-  const costTotal = formatCostAmount(span.cost?.total)
-  if (costTotal) metaEntries.push({ label: 'Cost', value: costTotal })
+  // Per-span cost is intentionally not shown: cost lives only in the usage_log
+  // ledger (the authoritative, multiplier-inclusive run total drives the header
+  // chip). Persisted spans are cost-stripped, so a per-span row would render on
+  // live runs but vanish on reload — show one consistent total instead.
   if (span.errorType) metaEntries.push({ label: 'Error type', value: span.errorType })
   if (span.iterationIndex !== undefined)
     metaEntries.push({ label: 'Iteration', value: String(span.iterationIndex + 1) })
@@ -724,9 +731,7 @@ const TraceDetailPane = memo(function TraceDetailPane({ span }: { span: TraceSpa
             className='mt-[2px] flex size-[18px] flex-shrink-0 items-center justify-center rounded-sm'
             style={{ background: bgColor }}
           >
-            {BlockIcon && (
-              <BlockIcon className={cn('h-[12px] w-[12px]', iconColorClass(bgColor))} />
-            )}
+            {BlockIcon && <BlockIcon className={cn('size-[12px]', iconColorClass(bgColor))} />}
           </div>
         )}
         <div className='flex min-w-0 flex-1 flex-col gap-0.5'>
@@ -812,7 +817,7 @@ const TraceDetailPane = memo(function TraceDetailPane({ span }: { span: TraceSpa
  * in a way that mirrors the executor's internal structure so investigators can
  * follow block-by-block and segment-by-segment what happened and why.
  */
-export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps) {
+export const TraceView = memo(function TraceView({ traceSpans, runCostDollars }: TraceViewProps) {
   const treeRef = useRef<HTMLDivElement>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [treePaneWidth, setTreePaneWidth] = useState(DEFAULT_TREE_PANE_WIDTH)
@@ -1021,7 +1026,7 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
           {blockCount} {blockCount === 1 ? 'span' : 'spans'}
         </span>
         {(() => {
-          const rootCost = formatCostAmount(normalizedSpans[0]?.cost?.total)
+          const rootCost = formatCostAmount(runCostDollars ?? normalizedSpans[0]?.cost?.total)
           return rootCost ? (
             <span className='flex-shrink-0 font-medium text-[var(--text-tertiary)] text-caption tabular-nums'>
               {rootCost}
@@ -1029,16 +1034,14 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
           ) : null
         })()}
         <div className='ml-auto flex items-center gap-1'>
-          <div className='relative'>
-            <Search className='-translate-y-1/2 pointer-events-none absolute top-1/2 left-[7px] size-[11px] text-[var(--text-tertiary)]' />
-            <Input
-              type='text'
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder='Filter spans'
-              className='h-[24px] w-[140px] pl-[22px] text-caption'
-            />
-          </div>
+          <ChipInput
+            icon={Search}
+            type='text'
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder='Filter spans'
+            className='w-[140px]'
+          />
           <Tooltip.Root>
             <Tooltip.Trigger asChild>
               <Button

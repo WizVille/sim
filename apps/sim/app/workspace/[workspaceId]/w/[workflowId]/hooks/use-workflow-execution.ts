@@ -6,6 +6,7 @@ import { generateId, generateShortId } from '@sim/utils/id'
 import { useQueryClient } from '@tanstack/react-query'
 import { useParams } from 'next/navigation'
 import { useShallow } from 'zustand/react/shallow'
+import { toast } from '@/components/emcn'
 import { requestJson } from '@/lib/api/client/request'
 import { cancelWorkflowExecutionContract, workflowLogContract } from '@/lib/api/contracts/workflows'
 import { buildTraceSpans } from '@/lib/logs/execution/trace-spans/trace-spans'
@@ -47,7 +48,6 @@ import {
 } from '@/hooks/use-execution-stream'
 import { WorkflowValidationError } from '@/serializer'
 import { defaultWorkflowExecutionState, useExecutionStore } from '@/stores/execution'
-import { useNotificationStore } from '@/stores/notifications'
 import {
   clearExecutionPointer,
   consolePersistence,
@@ -220,7 +220,6 @@ export function useWorkflowExecution() {
   const runFromBlockOwnerRef = useRef<string | null>(null)
   const lastSeenEventIdRef = useRef<number>(0)
   const isViewingDiff = useWorkflowDiffStore((state) => state.isShowingDiff)
-  const addNotification = useNotificationStore((state) => state.addNotification)
 
   /**
    * Validates debug state before performing debug operations
@@ -763,7 +762,7 @@ export function useWorkflowExecution() {
 
                 // Invalidate subscription queries to update usage
                 setTimeout(() => {
-                  queryClient.invalidateQueries({ queryKey: subscriptionKeys.all })
+                  queryClient.invalidateQueries({ queryKey: subscriptionKeys.users() })
                 }, 1000)
 
                 safeEnqueue(encodeSSE({ event: 'final', data: result }))
@@ -1296,7 +1295,7 @@ export function useWorkflowExecution() {
                   setActiveBlocks(activeWorkflowId, new Set())
                 }
                 setTimeout(() => {
-                  queryClient.invalidateQueries({ queryKey: subscriptionKeys.all })
+                  queryClient.invalidateQueries({ queryKey: subscriptionKeys.users() })
                 }, 1000)
               }
             },
@@ -1966,12 +1965,9 @@ export function useWorkflowExecution() {
 
               if (isWorkflowModified) {
                 clearLastExecutionSnapshot(workflowId)
-                addNotification({
-                  level: 'error',
-                  message:
-                    'Workflow was modified. Run the workflow again to enable running from block.',
-                  workflowId,
-                })
+                toast.error(
+                  'Workflow was modified. Run the workflow again to enable running from block.'
+                )
               }
 
               handleExecutionErrorConsole({
@@ -2056,7 +2052,6 @@ export function useWorkflowExecution() {
       updateConsole,
       finishRunningEntries,
       setExecutionResult,
-      addNotification,
       buildBlockEventHandlers,
       handleExecutionErrorConsole,
       handleExecutionCancelledConsole,

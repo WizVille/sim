@@ -3,7 +3,7 @@ import { getErrorMessage } from '@sim/utils/errors'
 import type OpenAI from 'openai'
 import type { ChatCompletionChunk } from 'openai/resources/chat/completions'
 import type { CompletionUsage } from 'openai/resources/completions'
-import { dollarsToCredits } from '@/lib/billing/credits/conversion'
+import { formatCreditCost } from '@/lib/billing/credits/conversion'
 import { env } from '@/lib/core/config/env'
 import { getBlacklistedProvidersFromEnv, isHosted } from '@/lib/core/config/feature-flags'
 import {
@@ -131,6 +131,7 @@ function buildProviderMetadata(providerId: ProviderId): ProviderMetadata {
 
 export const providers: Record<ProviderId, ProviderMetadata> = {
   ollama: buildProviderMetadata('ollama'),
+  'ollama-cloud': buildProviderMetadata('ollama-cloud'),
   vllm: buildProviderMetadata('vllm'),
   litellm: buildProviderMetadata('litellm'),
   openai: {
@@ -155,6 +156,8 @@ export const providers: Record<ProviderId, ProviderMetadata> = {
   bedrock: buildProviderMetadata('bedrock'),
   openrouter: buildProviderMetadata('openrouter'),
   fireworks: buildProviderMetadata('fireworks'),
+  together: buildProviderMetadata('together'),
+  baseten: buildProviderMetadata('baseten'),
 }
 
 export function updateOllamaProviderModels(models: string[]): void {
@@ -186,15 +189,36 @@ export async function updateFireworksProviderModels(models: string[]): Promise<v
   providers.fireworks.models = getProviderModelsFromDefinitions('fireworks')
 }
 
+export async function updateOllamaCloudProviderModels(models: string[]): Promise<void> {
+  const { updateOllamaCloudModels } = await import('@/providers/models')
+  updateOllamaCloudModels(models)
+  providers['ollama-cloud'].models = getProviderModelsFromDefinitions('ollama-cloud')
+}
+
+export async function updateTogetherProviderModels(models: string[]): Promise<void> {
+  const { updateTogetherModels } = await import('@/providers/models')
+  updateTogetherModels(models)
+  providers.together.models = getProviderModelsFromDefinitions('together')
+}
+
+export async function updateBasetenProviderModels(models: string[]): Promise<void> {
+  const { updateBasetenModels } = await import('@/providers/models')
+  updateBasetenModels(models)
+  providers.baseten.models = getProviderModelsFromDefinitions('baseten')
+}
+
 export function getBaseModelProviders(): Record<string, ProviderId> {
   const allProviders = Object.entries(providers)
     .filter(
       ([providerId]) =>
         providerId !== 'ollama' &&
+        providerId !== 'ollama-cloud' &&
         providerId !== 'vllm' &&
         providerId !== 'litellm' &&
         providerId !== 'openrouter' &&
-        providerId !== 'fireworks'
+        providerId !== 'fireworks' &&
+        providerId !== 'together' &&
+        providerId !== 'baseten'
     )
     .reduce(
       (map, [providerId, config]) => {
@@ -450,6 +474,39 @@ export function extractAndParseJSON(content: string): any {
 }
 
 /**
+ * Resolves canonical pair ids (e.g. `tableId`, `knowledgeBaseId`) from a tool's
+ * raw params, filling them in from their basic/advanced selector subblock source
+ * values when the canonical key isn't already present.
+ *
+ * Selector subblocks persist their value under the subblock id (e.g.
+ * `tableSelector`), not the canonical id, so any lookup that keys off the
+ * canonical id — like the unique-tool-id suffix below — must resolve it first.
+ * Mode selection mirrors {@link transformBlockTool}'s execution-time
+ * `paramsTransform` so the resolved id matches the params the tool actually runs
+ * with.
+ *
+ * @returns The params with canonical resource ids resolved (non-destructive)
+ */
+function resolveCanonicalResourceParams(
+  params: Record<string, any>,
+  canonicalGroups: CanonicalGroup[],
+  blockType: string,
+  canonicalModes?: Record<string, 'basic' | 'advanced'>
+): Record<string, any> {
+  if (canonicalGroups.length === 0) return params
+  const resolved = { ...params }
+  for (const group of canonicalGroups) {
+    const existing = resolved[group.canonicalId]
+    if (existing !== undefined && existing !== null && existing !== '') continue
+    const { basicValue, advancedValue } = getCanonicalValues(group, params)
+    const pairMode = canonicalModes?.[`${blockType}:${group.canonicalId}`] ?? 'basic'
+    const chosen = pairMode === 'advanced' ? advancedValue : basicValue
+    if (chosen !== undefined) resolved[group.canonicalId] = chosen
+  }
+  return resolved
+}
+
+/**
  * Transforms a block tool into a provider tool config with operation selection
  *
  * @param block The block to transform
@@ -525,14 +582,25 @@ export async function transformBlockTool(
     userProvidedParams
   )
 
+  const canonicalGroups: CanonicalGroup[] = blockDef?.subBlocks
+    ? Object.values(buildCanonicalIndex(blockDef.subBlocks).groupsById).filter(isCanonicalPair)
+    : []
+
+  const resolvedResourceParams = resolveCanonicalResourceParams(
+    userProvidedParams,
+    canonicalGroups,
+    block.type,
+    canonicalModes
+  )
+
   let uniqueToolId = toolConfig.id
   let toolName = toolConfig.name
   let toolDescription = enrichedDescription || toolConfig.description
 
-  if (toolId === 'workflow_executor' && userProvidedParams.workflowId) {
-    uniqueToolId = `${toolConfig.id}_${userProvidedParams.workflowId}`
+  if (toolId === 'workflow_executor' && resolvedResourceParams.workflowId) {
+    uniqueToolId = `${toolConfig.id}_${resolvedResourceParams.workflowId}`
 
-    const workflowMetadata = await fetchWorkflowMetadata(userProvidedParams.workflowId)
+    const workflowMetadata = await fetchWorkflowMetadata(resolvedResourceParams.workflowId)
     if (workflowMetadata) {
       toolName = workflowMetadata.name || toolConfig.name
       if (
@@ -542,20 +610,16 @@ export async function transformBlockTool(
         toolDescription = workflowMetadata.description
       }
     }
-  } else if (toolId.startsWith('knowledge_') && userProvidedParams.knowledgeBaseId) {
-    uniqueToolId = `${toolConfig.id}_${userProvidedParams.knowledgeBaseId}`
-  } else if (toolId.startsWith('table_') && userProvidedParams.tableId) {
-    uniqueToolId = `${toolConfig.id}_${userProvidedParams.tableId}`
+  } else if (toolId.startsWith('knowledge_') && resolvedResourceParams.knowledgeBaseId) {
+    uniqueToolId = `${toolConfig.id}_${resolvedResourceParams.knowledgeBaseId}`
+  } else if (toolId.startsWith('table_') && resolvedResourceParams.tableId) {
+    uniqueToolId = `${toolConfig.id}_${resolvedResourceParams.tableId}`
   }
 
   const blockParamsFn = blockDef?.tools?.config?.params as
     | ((p: Record<string, any>) => Record<string, any>)
     | undefined
   const blockInputDefs = blockDef?.inputs as Record<string, any> | undefined
-
-  const canonicalGroups: CanonicalGroup[] = blockDef?.subBlocks
-    ? Object.values(buildCanonicalIndex(blockDef.subBlocks).groupsById).filter(isCanonicalPair)
-    : []
 
   const needsTransform = blockParamsFn || blockInputDefs || canonicalGroups.length > 0
   const paramsTransform = needsTransform
@@ -670,6 +734,59 @@ export function calculateCost(
 }
 
 /**
+ * Recursively enforces OpenAI strict-mode requirements on a JSON schema:
+ * - Sets `additionalProperties: false` on every object type.
+ * - Forces `required` to include ALL property keys.
+ *
+ * Required for any OpenAI-compatible backend that validates strict structured
+ * outputs (OpenAI, Azure OpenAI, and OpenAI routes behind proxies like LiteLLM),
+ * which reject schemas missing these constraints with an HTTP 400.
+ */
+export function enforceStrictSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  if (!schema || typeof schema !== 'object') return schema
+
+  const result = { ...schema }
+
+  if (result.type === 'object') {
+    result.additionalProperties = false
+
+    if (result.properties && typeof result.properties === 'object') {
+      const propKeys = Object.keys(result.properties as Record<string, unknown>)
+      result.required = propKeys
+      result.properties = Object.fromEntries(
+        Object.entries(result.properties as Record<string, unknown>).map(([key, value]) => [
+          key,
+          enforceStrictSchema(value as Record<string, unknown>),
+        ])
+      )
+    }
+  }
+
+  if (result.type === 'array' && result.items) {
+    result.items = enforceStrictSchema(result.items as Record<string, unknown>)
+  }
+
+  for (const keyword of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(result[keyword])) {
+      result[keyword] = (result[keyword] as Record<string, unknown>[]).map(enforceStrictSchema)
+    }
+  }
+
+  for (const defKey of ['$defs', 'definitions']) {
+    if (result[defKey] && typeof result[defKey] === 'object') {
+      result[defKey] = Object.fromEntries(
+        Object.entries(result[defKey] as Record<string, unknown>).map(([key, value]) => [
+          key,
+          enforceStrictSchema(value as Record<string, unknown>),
+        ])
+      )
+    }
+  }
+
+  return result
+}
+
+/**
  * Sums the `cost.total` from each tool result returned during a provider tool loop.
  * Tool results may carry a `cost` object injected by `applyHostedKeyCostToResult`.
  */
@@ -700,11 +817,7 @@ export function getModelPricing(modelId: string): any {
  * @returns Formatted credit string (e.g. "200 credits", "<1 credit", "0 credits")
  */
 export function formatCost(cost: number): string {
-  if (cost === undefined || cost === null) return '—'
-  const credits = dollarsToCredits(cost)
-  if (credits <= 0 && cost > 0) return '<1 credit'
-  if (credits <= 0) return '0 credits'
-  return `${credits.toLocaleString()} credits`
+  return formatCreditCost(cost) ?? '—'
 }
 
 /**
@@ -753,7 +866,7 @@ export function getApiKey(provider: string, model: string, userProvidedKey?: str
   }
 
   const isLitellmModel =
-    provider === 'litellm' || useProvidersStore.getState().providers.litellm?.models.includes(model)
+    provider === 'litellm' || useProvidersStore.getState().providers.litellm.models.includes(model)
   if (isLitellmModel) {
     return userProvidedKey || 'empty'
   }

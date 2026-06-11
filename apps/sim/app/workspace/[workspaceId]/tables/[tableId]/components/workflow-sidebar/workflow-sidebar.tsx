@@ -8,7 +8,9 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, RepeatIcon, SplitIcon, X } from 'lucide-react'
 import {
   Button,
-  Combobox,
+  ButtonGroup,
+  ButtonGroupItem,
+  ChipCombobox,
   type ComboboxOptionGroup,
   FieldDivider,
   Input,
@@ -18,6 +20,7 @@ import {
   Tooltip,
   toast,
 } from '@/components/emcn'
+import { ArrowLeft, ChevronDown } from '@/components/emcn/icons'
 import { findValidationIssue, isValidationError } from '@/lib/api/client/errors'
 import { requestJson } from '@/lib/api/client/request'
 import type {
@@ -33,8 +36,11 @@ import type {
   ColumnDefinition,
   WorkflowGroup,
   WorkflowGroupDependencies,
+  WorkflowGroupDeploymentMode,
+  WorkflowGroupInputMapping,
   WorkflowGroupOutput,
 } from '@/lib/table'
+import { getColumnId } from '@/lib/table/column-keys'
 import { columnTypeForLeaf, deriveOutputColumnName } from '@/lib/table/column-naming'
 import {
   type FlattenOutputsBlockInput,
@@ -54,11 +60,22 @@ import {
 } from '@/hooks/queries/tables'
 import { useWorkflowState, workflowKeys } from '@/hooks/queries/workflows'
 import type { WorkflowMetadata } from '@/stores/workflows/registry/types'
+import { InputMappingSection } from './input-mapping-section'
 import { RunSettingsSection } from './run-settings-section'
 
 /**
+ * Distinguishes a user-built workflow column (`manual`) from one spawned off a
+ * shared enrichment template (`enrichment`). Enrichment groups hide the
+ * launch-workflow and add-inputs affordances and surface a back button to the
+ * enrichments list.
+ */
+export type WorkflowSidebarKind = 'manual' | 'enrichment'
+
+/**
  * Discriminates the three flows the workflow sidebar handles:
- * - `create`: brand-new workflow group spawned from the "+ New column" dropdown's "Workflow" item.
+ * - `create`: brand-new workflow group. From the "+ New column" dropdown's "Workflow" item
+ *   (`kind: 'manual'`) or from an enrichment card (`kind: 'enrichment'`, with the template's
+ *   workflow pre-seeded).
  * - `edit-group`: opened from the workflow-group meta header. Lets the user edit the whole group
  *   (workflow id, deps, output set, group name).
  * - `edit-output`: opened from a single workflow-output column header. Focuses on this column's
@@ -66,7 +83,15 @@ import { RunSettingsSection } from './run-settings-section'
  *   secondary.
  */
 export type WorkflowConfig =
-  | { mode: 'create'; proposedName: string }
+  | {
+      mode: 'create'
+      kind: WorkflowSidebarKind
+      proposedName: string
+      /** Pre-selected (and locked) workflow id for enrichment-create. */
+      workflowId?: string
+      /** Title shown for enrichment-create (the enrichment card's name). */
+      enrichmentName?: string
+    }
   | { mode: 'edit-group'; groupId: string }
   | { mode: 'edit-output'; columnName: string }
 
@@ -83,7 +108,17 @@ interface WorkflowSidebarProps {
   /** Notify parent of a per-output-column rename so it can rewrite local
    *  `columnOrder` / `columnWidths` keys. */
   onColumnRename?: (oldName: string, newName: string) => void
+  /** When set and the active config is an enrichment, renders a back button
+   *  that returns to the enrichments list. */
+  onBack?: () => void
 }
+
+/** Dashed hairline flanking the "Show additional fields" disclosure — mirrors
+ *  the workflow editor's advanced-mode divider. */
+const DASHED_DIVIDER_STYLE = {
+  backgroundImage:
+    'repeating-linear-gradient(to right, var(--border) 0px, var(--border) 6px, transparent 6px, transparent 12px)',
+} as const
 
 const OUTPUT_VALUE_SEPARATOR = '::'
 
@@ -183,8 +218,8 @@ export function WorkflowSidebar(props: WorkflowSidebarProps) {
       role='dialog'
       aria-label='Configure workflow'
       className={cn(
-        'absolute top-0 right-0 bottom-0 z-[var(--z-modal)] flex w-[400px] flex-col overflow-hidden border-[var(--border)] border-l bg-[var(--bg)] shadow-overlay transition-transform duration-200 ease-out',
-        open ? 'translate-x-0' : 'translate-x-full'
+        'absolute top-0 right-0 bottom-0 z-[var(--z-modal)] flex w-[400px] flex-col overflow-hidden border-[var(--border)] border-l bg-[var(--bg)] transition-transform duration-200 ease-out',
+        open ? 'translate-x-0 shadow-overlay' : 'translate-x-full'
       )}
     >
       {props.config && (
@@ -197,7 +232,7 @@ export function WorkflowSidebar(props: WorkflowSidebarProps) {
 function configKey(config: WorkflowConfig): string {
   switch (config.mode) {
     case 'create':
-      return `create:${config.proposedName}`
+      return `create:${config.kind}:${config.workflowId ?? ''}:${config.proposedName}`
     case 'edit-group':
       return `edit-group:${config.groupId}`
     case 'edit-output':
@@ -205,11 +240,17 @@ function configKey(config: WorkflowConfig): string {
   }
 }
 
-interface WorkflowSidebarBodyProps extends Omit<WorkflowSidebarProps, 'config'> {
+export interface WorkflowSidebarBodyProps extends Omit<WorkflowSidebarProps, 'config'> {
   config: WorkflowConfig
 }
 
-function WorkflowSidebarBody({
+/**
+ * The sidebar's inner content (header + scrollable form + footer) without the
+ * sliding `<aside>` shell. Exported so the enrichments panel can host it inside
+ * its own already-open panel — picking an enrichment swaps content in place
+ * rather than cross-sliding a second panel over the list.
+ */
+export function WorkflowSidebarBody({
   config,
   onClose,
   allColumns,
@@ -218,6 +259,7 @@ function WorkflowSidebarBody({
   workspaceId,
   tableId,
   onColumnRename,
+  onBack,
 }: WorkflowSidebarBodyProps) {
   const updateColumn = useUpdateColumn({ workspaceId, tableId })
   const addWorkflowGroup = useAddWorkflowGroup({ workspaceId, tableId })
@@ -229,7 +271,7 @@ function WorkflowSidebarBody({
   const existingGroup: WorkflowGroup | undefined = (() => {
     if (config.mode === 'edit-group') return workflowGroups.find((g) => g.id === config.groupId)
     if (config.mode === 'edit-output') {
-      const col = allColumns.find((c) => c.name === config.columnName)
+      const col = allColumns.find((c) => getColumnId(c) === config.columnName)
       return col?.workflowGroupId
         ? workflowGroups.find((g) => g.id === col.workflowGroupId)
         : undefined
@@ -238,8 +280,15 @@ function WorkflowSidebarBody({
   })()
   const existingColumn =
     config.mode === 'edit-output'
-      ? (allColumns.find((c) => c.name === config.columnName) ?? null)
+      ? (allColumns.find((c) => getColumnId(c) === config.columnName) ?? null)
       : null
+
+  // `manual` vs `enrichment`. For create it's carried on the config; for edit
+  // flows it comes off the persisted group (defaulting to manual). Enrichment
+  // hides the launch + add-inputs affordances and shows a back button.
+  const kind: WorkflowSidebarKind =
+    config.mode === 'create' ? config.kind : (existingGroup?.type ?? 'manual')
+  const isEnrichment = kind === 'enrichment'
 
   // Anchor index for "left of current" filtering.
   //   - edit-output: the column being edited.
@@ -249,7 +298,7 @@ function WorkflowSidebarBody({
   //     existing column qualifies.
   const anchorIdx = (() => {
     if (config.mode === 'edit-output') {
-      const idx = allColumns.findIndex((c) => c.name === config.columnName)
+      const idx = allColumns.findIndex((c) => getColumnId(c) === config.columnName)
       return idx === -1 ? allColumns.length : idx
     }
     if (config.mode === 'edit-group' && existingGroup) {
@@ -274,11 +323,26 @@ function WorkflowSidebarBody({
 
   // Every left-of-current column is a valid dep — workflow output columns
   // included. Exclude this group's own outputs (you can't depend on yourself).
-  const ownOutputNames = new Set(existingGroup?.outputs.map((o) => o.columnName) ?? [])
-  const depOptions = otherColumns.filter((c) => !ownOutputNames.has(c.name))
+  const ownOutputIds = new Set(existingGroup?.outputs.map((o) => o.columnName) ?? [])
+  const depOptions = otherColumns.filter((c) => !ownOutputIds.has(getColumnId(c)))
 
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<string>(
-    () => existingGroup?.workflowId ?? ''
+    () => existingGroup?.workflowId ?? (config.mode === 'create' ? (config.workflowId ?? '') : '')
+  )
+  // Input field name → table column name. Seeded from the group's persisted
+  // mappings; edited via the "Inputs" panel under auto-run. Unmapped fields are
+  // auto-filled post-load with a same-named column (see `inputMappingsHydrated`).
+  const [inputMappings, setInputMappings] = useState<Record<string, string>>(() => {
+    const seed: Record<string, string> = {}
+    for (const m of existingGroup?.inputMappings ?? []) seed[m.inputName] = m.columnName
+    return seed
+  })
+  const [inputMappingsHydrated, setInputMappingsHydrated] = useState(false)
+  // Advanced disclosure for the inputs panel. Hidden by default (normal
+  // workflows don't need it); auto-expanded when the group already has mappings
+  // so editing surfaces them.
+  const [showAdvanced, setShowAdvanced] = useState<boolean>(
+    () => (existingGroup?.inputMappings?.length ?? 0) > 0
   )
   // For existing groups, treat a missing `autoRun` field as `true` (pre-feature
   // groups all ran automatically and shouldn't silently flip to manual when
@@ -286,6 +350,11 @@ function WorkflowSidebarBody({
   // so the user opts in to auto-run explicitly.
   const [autoRun, setAutoRun] = useState<boolean>(() =>
     existingGroup ? existingGroup.autoRun !== false : false
+  )
+  // Which workflow state per-cell runs execute against. Defaults to `'live'`
+  // (the editable draft) for both new and pre-feature groups.
+  const [deploymentMode, setDeploymentMode] = useState<WorkflowGroupDeploymentMode>(
+    () => existingGroup?.deploymentMode ?? 'live'
   )
   // Deps default to none selected. With auto-run on, at least one is required
   // (enforced via `depsValid` below); a legacy group with empty deps will
@@ -334,7 +403,9 @@ function WorkflowSidebarBody({
     return allColumns
       .filter(
         (c) =>
-          c.name !== anchor && !c.workflowGroupId && !startBlockInputs.existingNames.has(c.name)
+          getColumnId(c) !== anchor &&
+          !c.workflowGroupId &&
+          !startBlockInputs.existingNames.has(c.name)
       )
       .map((c) => c.name)
   }, [allColumns, anchorColumnName, startBlockInputs])
@@ -471,7 +542,7 @@ function WorkflowSidebarBody({
     const encoded: string[] = []
     if (config.mode === 'edit-output' && existingColumn) {
       // Single-output sub-mode: only seed the picker with this column's mapping.
-      const own = existingGroup.outputs.find((o) => o.columnName === existingColumn.name)
+      const own = existingGroup.outputs.find((o) => o.columnName === getColumnId(existingColumn))
       if (own) {
         const match = blockOutputGroups.find(
           (g) => g.blockId === own.blockId && g.paths.includes(own.path)
@@ -488,6 +559,27 @@ function WorkflowSidebarBody({
     }
     setSelectedOutputs(encoded)
     setOutputsHydrated(true)
+  }
+
+  // Once the Start block's input fields resolve, auto-fill any field that has no
+  // persisted mapping yet but matches a table column by name. Runs once; never
+  // overrides a persisted or user-picked mapping.
+  if (!inputMappingsHydrated && startBlockInputs.existing.length > 0) {
+    // Map a Start input field to the column sharing its name, storing the
+    // column id (the value the dropdowns and persisted mappings key on).
+    const idByColumnName = new Map(depOptions.map((c) => [c.name, getColumnId(c)]))
+    const next = { ...inputMappings }
+    let changed = false
+    for (const field of startBlockInputs.existing) {
+      if (!field.name || next[field.name]) continue
+      const colId = idByColumnName.get(field.name)
+      if (colId) {
+        next[field.name] = colId
+        changed = true
+      }
+    }
+    if (changed) setInputMappings(next)
+    setInputMappingsHydrated(true)
   }
 
   /**
@@ -563,6 +655,9 @@ function WorkflowSidebarBody({
     try {
       const orderedOutputs = buildOrderedPickedOutputs()
       const dependencies: WorkflowGroupDependencies = { columns: deps }
+      const inputMappingsList: WorkflowGroupInputMapping[] = Object.entries(inputMappings)
+        .filter(([, columnName]) => Boolean(columnName))
+        .map(([inputName, columnName]) => ({ inputName, columnName }))
 
       if (existingGroup) {
         // edit-output: swap one column's source mapping (and optionally rename
@@ -627,6 +722,8 @@ function WorkflowSidebarBody({
             dependencies,
             outputs: fullOutputs,
             ...(newOutputColumns.length > 0 ? { newOutputColumns } : {}),
+            inputMappings: inputMappingsList,
+            deploymentMode,
             autoRun,
           })
           toast.success(`Saved "${existingGroup.name ?? 'Workflow'}"`)
@@ -654,8 +751,11 @@ function WorkflowSidebarBody({
           id: groupId,
           workflowId: selectedWorkflowId,
           name: workflowName,
+          type: kind,
           dependencies,
           outputs: groupOutputs,
+          inputMappings: inputMappingsList,
+          deploymentMode,
           autoRun,
         }
         await addWorkflowGroup.mutateAsync({ group, outputColumns: newOutputColumns })
@@ -691,6 +791,11 @@ function WorkflowSidebarBody({
     'edit-group': 'Configure workflow',
     'edit-output': 'Configure output column',
   } as const
+  const title =
+    config.mode === 'create' && config.kind === 'enrichment' && config.enrichmentName
+      ? config.enrichmentName
+      : titleByMode[config.mode]
+  const showBackButton = isEnrichment && Boolean(onBack)
 
   // edit-output mode is single-select on the output picker; everywhere else
   // is multi-select. Same Combobox shape, different mode.
@@ -699,14 +804,25 @@ function WorkflowSidebarBody({
   return (
     <div className='flex h-full flex-col'>
       <div className='flex items-center justify-between border-[var(--border)] border-b px-3 py-[8.5px]'>
-        <h2 className='font-medium text-[var(--text-primary)] text-small'>
-          {titleByMode[config.mode]}
-        </h2>
+        <div className='flex min-w-0 items-center gap-1.5'>
+          {showBackButton && (
+            <Button
+              variant='ghost'
+              size='sm'
+              onClick={onBack}
+              className='!p-1 size-7 flex-none'
+              aria-label='Back to enrichments'
+            >
+              <ArrowLeft className='size-[14px]' />
+            </Button>
+          )}
+          <h2 className='truncate font-medium text-[var(--text-primary)] text-small'>{title}</h2>
+        </div>
         <Button
           variant='ghost'
           size='sm'
           onClick={onClose}
-          className='!p-1 size-7'
+          className='!p-1 size-7 flex-none'
           aria-label='Close'
         >
           <X className='size-[14px]' />
@@ -748,27 +864,29 @@ function WorkflowSidebarBody({
             <div className='flex flex-col gap-[9.5px]'>
               <div className='flex min-w-0 items-center justify-between gap-2 pl-0.5'>
                 <Label>Workflow preview</Label>
-                {startBlockInputs.blockId && missingInputColumnNames.length > 0 && (
-                  <Tooltip.Root>
-                    <Tooltip.Trigger asChild>
-                      <Button
-                        type='button'
-                        variant='default'
-                        size='sm'
-                        className='flex-none whitespace-nowrap'
-                        onClick={() => addInputsMutation.mutate()}
-                        disabled={addInputsMutation.isPending}
-                      >
-                        {addInputsMutation.isPending
-                          ? 'Adding…'
-                          : `Add inputs (${missingInputColumnNames.length})`}
-                      </Button>
-                    </Tooltip.Trigger>
-                    <Tooltip.Content side='top'>
-                      Adds {missingInputColumnNames.join(', ')} to the workflow's Start block
-                    </Tooltip.Content>
-                  </Tooltip.Root>
-                )}
+                {!isEnrichment &&
+                  startBlockInputs.blockId &&
+                  missingInputColumnNames.length > 0 && (
+                    <Tooltip.Root>
+                      <Tooltip.Trigger asChild>
+                        <Button
+                          type='button'
+                          variant='default'
+                          size='sm'
+                          className='flex-none whitespace-nowrap'
+                          onClick={() => addInputsMutation.mutate()}
+                          disabled={addInputsMutation.isPending}
+                        >
+                          {addInputsMutation.isPending
+                            ? 'Adding…'
+                            : `Add column inputs (${missingInputColumnNames.length})`}
+                        </Button>
+                      </Tooltip.Trigger>
+                      <Tooltip.Content side='top'>
+                        Adds {missingInputColumnNames.join(', ')} to the workflow's Start block
+                      </Tooltip.Content>
+                    </Tooltip.Root>
+                  )}
               </div>
               <div className='relative h-[160px] overflow-hidden rounded-sm border border-[var(--border)]'>
                 {workflowState.isLoading ? (
@@ -789,25 +907,27 @@ function WorkflowSidebarBody({
                         lightweight
                       />
                     </div>
-                    <Tooltip.Root>
-                      <Tooltip.Trigger asChild>
-                        <Button
-                          type='button'
-                          variant='ghost'
-                          onClick={() =>
-                            window.open(
-                              `/workspace/${workspaceId}/w/${selectedWorkflowId}`,
-                              '_blank',
-                              'noopener,noreferrer'
-                            )
-                          }
-                          className='absolute right-[6px] bottom-1.5 z-10 size-[24px] cursor-pointer border border-[var(--border)] bg-[var(--surface-2)] p-0 hover-hover:bg-[var(--surface-4)]'
-                        >
-                          <ExternalLink className='size-[12px]' />
-                        </Button>
-                      </Tooltip.Trigger>
-                      <Tooltip.Content side='top'>Open workflow</Tooltip.Content>
-                    </Tooltip.Root>
+                    {!isEnrichment && (
+                      <Tooltip.Root>
+                        <Tooltip.Trigger asChild>
+                          <Button
+                            type='button'
+                            variant='ghost'
+                            onClick={() =>
+                              window.open(
+                                `/workspace/${workspaceId}/w/${selectedWorkflowId}`,
+                                '_blank',
+                                'noopener,noreferrer'
+                              )
+                            }
+                            className='absolute right-[6px] bottom-1.5 z-10 size-[24px] cursor-pointer border border-[var(--border)] bg-[var(--surface-2)] p-0 hover-hover:bg-[var(--surface-4)]'
+                          >
+                            <ExternalLink className='size-[12px]' />
+                          </Button>
+                        </Tooltip.Trigger>
+                        <Tooltip.Content side='top'>Open workflow</Tooltip.Content>
+                      </Tooltip.Root>
+                    )}
                   </>
                 ) : (
                   <div className='flex h-full items-center justify-center bg-[var(--surface-3)]'>
@@ -824,12 +944,12 @@ function WorkflowSidebarBody({
 
         <div className='flex flex-col gap-[9.5px]'>
           <RequiredLabel>Workflow</RequiredLabel>
-          <Combobox
+          <ChipCombobox
             options={workflows?.map((wf) => ({ label: wf.name, value: wf.id })) ?? []}
             value={selectedWorkflowId}
             onChange={(v) => setSelectedWorkflowId(v)}
             placeholder='Select a workflow'
-            disabled={!workflows || workflows.length === 0 || isEditOutputMode}
+            disabled={!workflows || workflows.length === 0 || isEditOutputMode || isEnrichment}
             emptyMessage='No manual triggers configured'
             maxHeight={260}
             searchable
@@ -843,12 +963,11 @@ function WorkflowSidebarBody({
 
         <div className='flex flex-col gap-[9.5px]'>
           <RequiredLabel>{isEditOutputMode ? 'Output' : 'Output columns'}</RequiredLabel>
-          <Combobox
+          <ChipCombobox
             multiSelect={!outputPickerSingleSelect}
             searchable
             searchPlaceholder='Search outputs…'
-            size='sm'
-            className='h-[32px] w-full rounded-md'
+            className='w-full'
             dropdownWidth='trigger'
             maxHeight={280}
             disabled={workflowState.isLoading || blockOutputGroups.length === 0}
@@ -901,6 +1020,54 @@ function WorkflowSidebarBody({
                   onChangeDeps={setDeps}
                   error={showValidation && deps.length === 0 ? 'Select at least one column' : null}
                 />
+              </>
+            )}
+            {selectedWorkflowId && (
+              <>
+                <div className='flex items-center gap-2.5 px-0.5 pt-3.5 pb-1'>
+                  <div className='h-[1.25px] flex-1' style={DASHED_DIVIDER_STYLE} />
+                  <button
+                    type='button'
+                    onClick={() => setShowAdvanced((v) => !v)}
+                    className='flex items-center gap-1.5 whitespace-nowrap font-medium text-[var(--text-secondary)] text-small hover-hover:text-[var(--text-primary)]'
+                  >
+                    {showAdvanced ? 'Hide additional fields' : 'Show additional fields'}
+                    <ChevronDown
+                      className={cn(
+                        'size-[14px] transition-transform duration-200',
+                        showAdvanced && 'rotate-180'
+                      )}
+                    />
+                  </button>
+                  <div className='h-[1.25px] flex-1' style={DASHED_DIVIDER_STYLE} />
+                </div>
+                {showAdvanced && (
+                  <>
+                    {!isEnrichment && (
+                      <>
+                        <div className='flex items-center justify-between pl-0.5'>
+                          <Label>Workflow version</Label>
+                          <ButtonGroup
+                            value={deploymentMode}
+                            onValueChange={(v) =>
+                              setDeploymentMode(v === 'deployed' ? 'deployed' : 'live')
+                            }
+                          >
+                            <ButtonGroupItem value='live'>Live</ButtonGroupItem>
+                            <ButtonGroupItem value='deployed'>Deployed</ButtonGroupItem>
+                          </ButtonGroup>
+                        </div>
+                        <FieldDivider />
+                      </>
+                    )}
+                    <InputMappingSection
+                      inputFields={startBlockInputs.existing}
+                      columnOptions={depOptions}
+                      value={inputMappings}
+                      onChange={setInputMappings}
+                    />
+                  </>
+                )}
               </>
             )}
           </>

@@ -8,6 +8,10 @@ export type BYOKProviderId =
   | 'google'
   | 'mistral'
   | 'fireworks'
+  | 'together'
+  | 'baseten'
+  | 'ollama-cloud'
+  | 'falai'
   | 'firecrawl'
   | 'exa'
   | 'serper'
@@ -18,6 +22,14 @@ export type BYOKProviderId =
   | 'brandfetch'
   | 'parallel_ai'
   | 'cohere'
+  | 'hunter'
+  | 'peopledatalabs'
+  | 'findymail'
+  | 'prospeo'
+  | 'wiza'
+  | 'zerobounce'
+  | 'neverbounce'
+  | 'millionverifier'
 
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD'
 
@@ -306,7 +318,9 @@ export type ToolHostingPricing<P = Record<string, unknown>> = PerRequestPricing 
  * Adding more keys only requires updating the count and adding the new env var —
  * no code changes needed.
  */
-interface ToolHostingConfig<P = Record<string, unknown>> {
+export interface ToolHostingConfig<P = Record<string, unknown>> {
+  /** Optional predicate for tools where hosted keys only apply to some parameter combinations. */
+  enabled?: (params: P) => boolean
   /**
    * Env var name prefix for hosted keys.
    * At runtime, `{envKeyPrefix}_COUNT` is read to determine how many keys exist,

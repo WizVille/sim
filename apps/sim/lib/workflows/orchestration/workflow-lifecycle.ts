@@ -1,9 +1,10 @@
 import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { db } from '@sim/db'
-import { templates, workflow, workflowFolder } from '@sim/db/schema'
+import { workflow, workflowFolder } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
+import { isFolderInWorkspace } from '@sim/workflow-authz'
 import { and, eq, isNull, min, ne } from 'drizzle-orm'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { buildDefaultWorkflowArtifacts } from '@/lib/workflows/defaults'
@@ -20,7 +21,6 @@ export interface PerformCreateWorkflowParams {
   name: string
   id?: string
   description?: string | null
-  color?: string
   folderId?: string | null
   sortOrder?: number
   deduplicate?: boolean
@@ -35,7 +35,6 @@ export interface PerformCreateWorkflowResult {
     id: string
     name: string
     description?: string | null
-    color?: string
     workspaceId: string
     folderId?: string | null
     sortOrder: number
@@ -54,7 +53,6 @@ export interface PerformUpdateWorkflowParams {
   currentFolderId?: string | null
   name?: string
   description?: string | null
-  color?: string
   folderId?: string | null
   sortOrder?: number
   locked?: boolean
@@ -69,7 +67,6 @@ export interface PerformUpdateWorkflowResult {
     id: string
     name: string
     description: string | null
-    color: string | null
     workspaceId: string | null
     folderId: string | null
     sortOrder: number | null
@@ -84,8 +81,6 @@ export interface PerformDeleteWorkflowParams {
   workflowId: string
   userId: string
   requestId?: string
-  /** When 'delete', delete published templates. When 'orphan' (default), set their workflowId to null. */
-  templateAction?: 'delete' | 'orphan'
   /** When true, allows deleting the last workflow in a workspace (used by admin API). */
   skipLastWorkflowGuard?: boolean
   /** Override the actor ID used in audit logs. Defaults to `userId`. */
@@ -188,6 +183,10 @@ export async function performCreateWorkflow(
   const folderId = params.folderId || null
 
   try {
+    if (!(await isFolderInWorkspace(folderId, params.workspaceId))) {
+      return { success: false, error: 'Target folder not found', errorCode: 'validation' }
+    }
+
     const name = params.deduplicate
       ? await deduplicateWorkflowName(params.name, params.workspaceId, folderId)
       : params.name
@@ -223,7 +222,6 @@ export async function performCreateWorkflow(
         sortOrder,
         name,
         description: params.description,
-        color: params.color,
         lastSynced: now,
         createdAt: now,
         updatedAt: now,
@@ -248,7 +246,6 @@ export async function performCreateWorkflow(
       metadata: {
         name,
         description: params.description || undefined,
-        color: params.color,
         workspaceId: params.workspaceId,
         folderId: folderId || undefined,
         sortOrder,
@@ -261,7 +258,6 @@ export async function performCreateWorkflow(
         id: workflowId,
         name,
         description: params.description,
-        color: params.color,
         workspaceId: params.workspaceId,
         folderId,
         sortOrder,
@@ -287,6 +283,13 @@ export async function performUpdateWorkflow(
     const targetFolderId =
       params.folderId !== undefined ? params.folderId || null : params.currentFolderId || null
 
+    if (
+      params.folderId !== undefined &&
+      !(await isFolderInWorkspace(targetFolderId, params.workspaceId))
+    ) {
+      return { success: false, error: 'Target folder not found', errorCode: 'validation' }
+    }
+
     if (params.name !== undefined || params.folderId !== undefined) {
       const duplicate = await workflowNameExistsInFolder({
         workspaceId: params.workspaceId,
@@ -306,7 +309,6 @@ export async function performUpdateWorkflow(
     const updateData: Record<string, unknown> = { updatedAt: new Date() }
     if (params.name !== undefined) updateData.name = params.name
     if (params.description !== undefined) updateData.description = params.description
-    if (params.color !== undefined) updateData.color = params.color
     if (params.folderId !== undefined) updateData.folderId = params.folderId
     if (params.sortOrder !== undefined) updateData.sortOrder = params.sortOrder
     if (params.locked !== undefined) updateData.locked = params.locked
@@ -319,7 +321,6 @@ export async function performUpdateWorkflow(
         id: workflow.id,
         name: workflow.name,
         description: workflow.description,
-        color: workflow.color,
         workspaceId: workflow.workspaceId,
         folderId: workflow.folderId,
         sortOrder: workflow.sortOrder,
@@ -346,14 +347,14 @@ export async function performUpdateWorkflow(
 
 /**
  * Performs a full workflow deletion: enforces the last-workflow guard,
- * handles published templates, archives the workflow via `archiveWorkflow`,
- * and records an audit entry. Both the workflow API DELETE handler and the
- * copilot delete_workflow tool must use this function.
+ * archives the workflow via `archiveWorkflow`, and records an audit entry.
+ * Both the workflow API DELETE handler and the copilot delete_workflow tool
+ * must use this function.
  */
 export async function performDeleteWorkflow(
   params: PerformDeleteWorkflowParams
 ): Promise<PerformDeleteWorkflowResult> {
-  const { workflowId, userId, templateAction = 'orphan', skipLastWorkflowGuard = false } = params
+  const { workflowId, userId, skipLastWorkflowGuard = false } = params
   const actorId = params.actorId ?? userId
   const requestId = params.requestId ?? generateRequestId()
 
@@ -382,34 +383,6 @@ export async function performDeleteWorkflow(
     }
   }
 
-  try {
-    const publishedTemplates = await db
-      .select({ id: templates.id })
-      .from(templates)
-      .where(eq(templates.workflowId, workflowId))
-
-    if (publishedTemplates.length > 0) {
-      if (templateAction === 'delete') {
-        await db.delete(templates).where(eq(templates.workflowId, workflowId))
-        logger.info(
-          `[${requestId}] Deleted ${publishedTemplates.length} templates for workflow ${workflowId}`
-        )
-      } else {
-        await db
-          .update(templates)
-          .set({ workflowId: null })
-          .where(eq(templates.workflowId, workflowId))
-        logger.info(
-          `[${requestId}] Orphaned ${publishedTemplates.length} templates for workflow ${workflowId}`
-        )
-      }
-    }
-  } catch (templateError) {
-    logger.warn(`[${requestId}] Failed to handle templates for workflow ${workflowId}`, {
-      error: templateError,
-    })
-  }
-
   const archiveResult = await archiveWorkflow(workflowId, { requestId })
   if (!archiveResult.workflow) {
     return { success: false, error: 'Workflow not found', errorCode: 'not_found' }
@@ -427,7 +400,6 @@ export async function performDeleteWorkflow(
     description: `Archived workflow "${workflowRecord.name}"`,
     metadata: {
       archived: archiveResult.archived,
-      templateAction,
     },
   })
 

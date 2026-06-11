@@ -27,12 +27,14 @@ import {
 import type { McpToolSchema } from '@/lib/mcp/types'
 import { getProviderIdFromServiceId, type OAuthProvider, type OAuthService } from '@/lib/oauth'
 import { extractInputFieldsFromBlocks } from '@/lib/workflows/input-format'
+import { buildToolSubBlockId } from '@/lib/workflows/tool-input/synthetic-subblocks'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import { McpServerFormModal } from '@/app/workspace/[workspaceId]/settings/components/mcp/components/mcp-server-form-modal/mcp-server-form-modal'
 import {
   LongInput,
   ShortInput,
 } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components'
+import { formatDisplayText } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/formatted-text'
 import {
   type CustomTool,
   CustomToolModal,
@@ -46,8 +48,16 @@ import {
   isMcpToolAlreadySelected,
   isWorkflowAlreadySelected,
 } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/tool-input/utils'
+import {
+  getActiveWorkflowSearchHighlight,
+  getWorkflowSearchLabelHighlight,
+} from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/workflow-search-highlight'
 import { useSubBlockValue } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/hooks/use-sub-block-value'
 import type { WandControlHandlers } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/sub-block'
+import {
+  ActiveSearchTargetProvider,
+  useActiveSearchTarget,
+} from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/providers/active-search-target-provider'
 import { getAllBlocks } from '@/blocks'
 import type { SubBlockConfig as BlockSubBlockConfig } from '@/blocks/types'
 import { BUILT_IN_TOOL_TYPES } from '@/blocks/utils'
@@ -73,6 +83,7 @@ import { useCollaborativeWorkflow } from '@/hooks/use-collaborative-workflow'
 import { usePermissionConfig } from '@/hooks/use-permission-config'
 import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
 import { getProviderFromModel, supportsToolUsageControl } from '@/providers/utils'
+import type { ActiveSearchTarget } from '@/stores/panel/editor/store'
 import { useSubBlockStore } from '@/stores/workflows/subblock/store'
 import { useWorkflowStore } from '@/stores/workflows/workflow/store'
 import {
@@ -138,6 +149,7 @@ function WorkflowInputMapperInput({
   disabled: boolean
   workflowId: string
 }) {
+  const activeSearchTarget = useActiveSearchTarget()
   const { data: workflowState, isLoading } = useWorkflowState(workflowId)
   const inputFields = useMemo(
     () => (workflowState?.blocks ? extractInputFieldsFromBlocks(workflowState.blocks) : []),
@@ -186,22 +198,35 @@ function WorkflowInputMapperInput({
 
   return (
     <div className='space-y-3'>
-      {inputFields.map((field: { name: string; type: string }) => (
-        <ShortInput
-          key={field.name}
-          blockId={blockId}
-          subBlockId={`${paramId}-${field.name}`}
-          placeholder={`Enter ${field.name}${field.type !== 'string' ? ` (${field.type})` : ''}`}
-          value={String(parsedValue[field.name] ?? '')}
-          onChange={(newValue: string) => handleFieldChange(field.name, newValue)}
-          disabled={disabled}
-          config={{
-            id: `${paramId}-${field.name}`,
-            type: 'short-input',
-            title: field.name,
-          }}
-        />
-      ))}
+      {inputFields.map((field: { name: string; type: string }) => {
+        const syntheticId = `${paramId}-${field.name}`
+        const fieldActiveSearchTarget =
+          activeSearchTarget?.valuePath[0] === field.name
+            ? {
+                ...activeSearchTarget,
+                subBlockId: syntheticId,
+                canonicalSubBlockId: syntheticId,
+                valuePath: [],
+              }
+            : null
+        return (
+          <ActiveSearchTargetProvider key={field.name} value={fieldActiveSearchTarget}>
+            <ShortInput
+              blockId={blockId}
+              subBlockId={syntheticId}
+              placeholder={`Enter ${field.name}${field.type !== 'string' ? ` (${field.type})` : ''}`}
+              value={String(parsedValue[field.name] ?? '')}
+              onChange={(newValue: string) => handleFieldChange(field.name, newValue)}
+              disabled={disabled}
+              config={{
+                id: syntheticId,
+                type: 'short-input',
+                title: field.name,
+              }}
+            />
+          </ActiveSearchTargetProvider>
+        )
+      })}
     </div>
   )
 }
@@ -213,7 +238,7 @@ function WorkflowToolDeployBadge({
   workflowId: string
   onDeploySuccess?: () => void
 }) {
-  const { data, isLoading } = useDeploymentInfo(workflowId, { refetchOnMount: 'always' })
+  const { data, isLoading } = useDeploymentInfo(workflowId)
   const { mutate, isPending: isDeploying } = useDeployWorkflow()
   const userPermissions = useUserPermissionsContext()
 
@@ -440,6 +465,7 @@ export const ToolInput = memo(function ToolInput({
   const params = useParams()
   const workspaceId = params.workspaceId as string
   const workflowId = params.workflowId as string
+  const activeSearchTarget = useActiveSearchTarget()
   const [storeValue, setStoreValue] = useSubBlockValue(blockId, subBlockId)
   const [open, setOpen] = useState(false)
   const [customToolModalOpen, setCustomToolModalOpen] = useState(false)
@@ -1094,6 +1120,32 @@ export const ToolInput = memo(function ToolInput({
     )
   }
 
+  const getParamActiveSearchTarget = (
+    toolIndex: number | undefined,
+    paramId: string,
+    syntheticSubBlockId: string
+  ): ActiveSearchTarget | null => {
+    if (toolIndex === undefined || activeSearchTarget?.subBlockId !== subBlockId) return null
+    const [activeToolIndex, paramsKey, activeParamId, ...leafPath] = activeSearchTarget.valuePath
+    if (activeToolIndex !== toolIndex || paramsKey !== 'params' || activeParamId !== paramId) {
+      return null
+    }
+    return {
+      ...activeSearchTarget,
+      subBlockId: syntheticSubBlockId,
+      canonicalSubBlockId: syntheticSubBlockId,
+      valuePath: leafPath,
+    }
+  }
+
+  const getToolTitleSearchHighlight = (toolIndex: number) =>
+    getActiveWorkflowSearchHighlight({
+      activeSearchTarget,
+      blockId,
+      subBlockId,
+      valuePath: [toolIndex, 'title'],
+    })
+
   /**
    * Renders a parameter input for custom tools, MCP tools, and legacy registry
    * tools that don't have SubBlockConfig definitions.
@@ -1110,142 +1162,175 @@ export const ToolInput = memo(function ToolInput({
   ) => {
     const uniqueSubBlockId =
       toolIndex !== undefined
-        ? `${subBlockId}-tool-${toolIndex}-${param.id}`
+        ? buildToolSubBlockId(subBlockId, toolIndex, param.id)
         : `${subBlockId}-${param.id}`
+    const paramActiveSearchTarget = getParamActiveSearchTarget(
+      toolIndex,
+      param.id,
+      uniqueSubBlockId
+    )
     const uiComponent = param.uiComponent
 
-    if (!uiComponent) {
-      return (
-        <ShortInput
-          blockId={blockId}
-          subBlockId={uniqueSubBlockId}
-          placeholder={param.description || `Enter ${formatParameterLabel(param.id).toLowerCase()}`}
-          password={isPasswordParameter(param.id)}
-          config={{
-            id: uniqueSubBlockId,
-            type: 'short-input',
-            title: param.id,
-          }}
-          value={value}
-          onChange={onChange}
-          wandControlRef={wandControlRef}
-          hideInternalWand={true}
-        />
-      )
-    }
-
-    switch (uiComponent.type) {
-      case 'dropdown':
-        return (
-          <Combobox
-            options={
-              (uiComponent.options as { id?: string; label: string; value?: string }[] | undefined)
-                ?.filter((option) => (option.id ?? option.value) !== '')
-                .map((option) => ({
-                  label: option.label,
-                  value: option.id ?? option.value ?? '',
-                })) || []
-            }
-            value={value}
-            onChange={onChange}
-            placeholder={uiComponent.placeholder || 'Select option'}
-            disabled={disabled}
-          />
-        )
-
-      case 'switch':
-        return (
-          <Switch
-            checked={value === 'true' || value === 'True'}
-            onCheckedChange={(checked) => onChange(checked ? 'true' : 'false')}
-          />
-        )
-
-      case 'long-input':
-        return (
-          <LongInput
-            blockId={blockId}
-            subBlockId={uniqueSubBlockId}
-            placeholder={uiComponent.placeholder || param.description}
-            config={{
-              id: uniqueSubBlockId,
-              type: 'long-input',
-              title: param.id,
-              wandConfig: uiComponent.wandConfig,
-            }}
-            value={value}
-            onChange={onChange}
-            wandControlRef={wandControlRef}
-            hideInternalWand={true}
-          />
-        )
-
-      case 'short-input':
+    const content = (() => {
+      if (!uiComponent) {
         return (
           <ShortInput
             blockId={blockId}
             subBlockId={uniqueSubBlockId}
-            placeholder={uiComponent.placeholder || param.description}
-            password={uiComponent.password || isPasswordParameter(param.id)}
+            placeholder={
+              param.description || `Enter ${formatParameterLabel(param.id).toLowerCase()}`
+            }
+            password={isPasswordParameter(param.id)}
             config={{
               id: uniqueSubBlockId,
               type: 'short-input',
               title: param.id,
-              wandConfig: uiComponent.wandConfig,
             }}
             value={value}
             onChange={onChange}
-            disabled={disabled}
             wandControlRef={wandControlRef}
             hideInternalWand={true}
-          />
-        )
-
-      case 'oauth-input':
-        return (
-          <ToolCredentialSelector
-            value={value}
-            onChange={onChange}
-            provider={getProviderIdFromServiceId(uiComponent.serviceId || '') as OAuthProvider}
-            serviceId={uiComponent.serviceId as OAuthService}
-            disabled={disabled}
-            requiredScopes={uiComponent.requiredScopes || []}
-          />
-        )
-
-      case 'workflow-input-mapper': {
-        const selectedWorkflowId = currentToolParams?.workflowId || ''
-        return (
-          <WorkflowInputMapperInput
-            blockId={blockId}
-            paramId={param.id}
-            value={value}
-            onChange={onChange}
-            disabled={disabled}
-            workflowId={selectedWorkflowId}
           />
         )
       }
 
-      default:
-        return (
-          <ShortInput
-            blockId={blockId}
-            subBlockId={uniqueSubBlockId}
-            placeholder={uiComponent.placeholder || param.description}
-            password={uiComponent.password || isPasswordParameter(param.id)}
-            config={{
-              id: uniqueSubBlockId,
-              type: 'short-input',
-              title: param.id,
-            }}
-            value={value}
-            onChange={onChange}
-            wandControlRef={wandControlRef}
-            hideInternalWand={true}
-          />
-        )
-    }
+      switch (uiComponent.type) {
+        case 'dropdown': {
+          const options =
+            (uiComponent.options as { id?: string; label: string; value?: string }[] | undefined)
+              ?.filter((option) => (option.id ?? option.value) !== '')
+              .map((option) => ({
+                label: option.label,
+                value: option.id ?? option.value ?? '',
+              })) || []
+          const selectedLabel = options.find((option) => option.value === value)?.label ?? ''
+          const workflowSearchHighlight = getWorkflowSearchLabelHighlight({
+            activeSearchTarget: paramActiveSearchTarget,
+            blockId,
+            subBlockId: uniqueSubBlockId,
+            valuePath: [],
+            label: selectedLabel,
+          })
+          return (
+            <Combobox
+              options={options}
+              value={value}
+              onChange={onChange}
+              placeholder={uiComponent.placeholder || 'Select option'}
+              disabled={disabled}
+              overlayContent={
+                workflowSearchHighlight ? (
+                  <span className='truncate text-[var(--text-primary)]'>
+                    {formatDisplayText(selectedLabel, { workflowSearchHighlight })}
+                  </span>
+                ) : undefined
+              }
+            />
+          )
+        }
+
+        case 'switch':
+          return (
+            <Switch
+              checked={value === 'true' || value === 'True'}
+              onCheckedChange={(checked) => onChange(checked ? 'true' : 'false')}
+            />
+          )
+
+        case 'long-input':
+          return (
+            <LongInput
+              blockId={blockId}
+              subBlockId={uniqueSubBlockId}
+              placeholder={uiComponent.placeholder || param.description}
+              config={{
+                id: uniqueSubBlockId,
+                type: 'long-input',
+                title: param.id,
+                wandConfig: uiComponent.wandConfig,
+              }}
+              value={value}
+              onChange={onChange}
+              wandControlRef={wandControlRef}
+              hideInternalWand={true}
+            />
+          )
+
+        case 'short-input':
+          return (
+            <ShortInput
+              blockId={blockId}
+              subBlockId={uniqueSubBlockId}
+              placeholder={uiComponent.placeholder || param.description}
+              password={uiComponent.password || isPasswordParameter(param.id)}
+              config={{
+                id: uniqueSubBlockId,
+                type: 'short-input',
+                title: param.id,
+                wandConfig: uiComponent.wandConfig,
+              }}
+              value={value}
+              onChange={onChange}
+              disabled={disabled}
+              wandControlRef={wandControlRef}
+              hideInternalWand={true}
+            />
+          )
+
+        case 'oauth-input':
+          return (
+            <ToolCredentialSelector
+              blockId={blockId}
+              subBlockId={uniqueSubBlockId}
+              value={value}
+              onChange={onChange}
+              provider={getProviderIdFromServiceId(uiComponent.serviceId || '') as OAuthProvider}
+              serviceId={uiComponent.serviceId as OAuthService}
+              disabled={disabled}
+              requiredScopes={uiComponent.requiredScopes || []}
+            />
+          )
+
+        case 'workflow-input-mapper': {
+          const selectedWorkflowId = currentToolParams?.workflowId || ''
+          return (
+            <WorkflowInputMapperInput
+              blockId={blockId}
+              paramId={param.id}
+              value={value}
+              onChange={onChange}
+              disabled={disabled}
+              workflowId={selectedWorkflowId}
+            />
+          )
+        }
+
+        default:
+          return (
+            <ShortInput
+              blockId={blockId}
+              subBlockId={uniqueSubBlockId}
+              placeholder={uiComponent.placeholder || param.description}
+              password={uiComponent.password || isPasswordParameter(param.id)}
+              config={{
+                id: uniqueSubBlockId,
+                type: 'short-input',
+                title: param.id,
+              }}
+              value={value}
+              onChange={onChange}
+              wandControlRef={wandControlRef}
+              hideInternalWand={true}
+            />
+          )
+      }
+    })()
+
+    return (
+      <ActiveSearchTargetProvider value={paramActiveSearchTarget}>
+        {content}
+      </ActiveSearchTargetProvider>
+    )
   }
 
   /**
@@ -1663,10 +1748,14 @@ export const ToolInput = memo(function ToolInput({
             : displayParams.filter((param) => evaluateParameterCondition(param, tool)).length > 0
           const hasToolBody = hasOperations || hasParams
 
+          const isSearchExpanded =
+            activeSearchTarget?.subBlockId === subBlockId &&
+            activeSearchTarget.valuePath[0] === toolIndex &&
+            activeSearchTarget.valuePath[1] === 'params'
           const isExpandedForDisplay = hasToolBody
             ? isPreview || disabled
-              ? (localExpanded[toolIndex] ?? !!tool.isExpanded)
-              : !!tool.isExpanded
+              ? isSearchExpanded || (localExpanded[toolIndex] ?? !!tool.isExpanded)
+              : isSearchExpanded || !!tool.isExpanded
             : false
 
           return (
@@ -1734,7 +1823,9 @@ export const ToolInput = memo(function ToolInput({
                     )}
                   </div>
                   <span className='truncate font-medium text-[var(--text-primary)] text-small'>
-                    {isCustomTool ? customToolTitle : tool.title}
+                    {formatDisplayText((isCustomTool ? customToolTitle : tool.title) ?? '', {
+                      workflowSearchHighlight: getToolTitleSearchHighlight(toolIndex),
+                    })}
                   </span>
                   {isMcpTool &&
                     !mcpDataLoading &&
@@ -1962,18 +2053,26 @@ export const ToolInput = memo(function ToolInput({
                         : { ...sb, title: formatParameterLabel(effectiveParamId) }
 
                       return (
-                        <ToolSubBlockRenderer
+                        <ActiveSearchTargetProvider
                           key={sb.id}
-                          blockId={blockId}
-                          subBlockId={subBlockId}
-                          toolIndex={toolIndex}
-                          subBlock={sbWithTitle}
-                          effectiveParamId={effectiveParamId}
-                          toolParams={tool.params}
-                          onParamChange={handleParamChange}
-                          disabled={disabled}
-                          canonicalToggle={canonicalToggleProp}
-                        />
+                          value={getParamActiveSearchTarget(
+                            toolIndex,
+                            effectiveParamId,
+                            buildToolSubBlockId(subBlockId, toolIndex, effectiveParamId)
+                          )}
+                        >
+                          <ToolSubBlockRenderer
+                            blockId={blockId}
+                            subBlockId={subBlockId}
+                            toolIndex={toolIndex}
+                            subBlock={sbWithTitle}
+                            effectiveParamId={effectiveParamId}
+                            toolParams={tool.params}
+                            onParamChange={handleParamChange}
+                            disabled={disabled}
+                            canonicalToggle={canonicalToggleProp}
+                          />
+                        </ActiveSearchTargetProvider>
                       )
                     }
 

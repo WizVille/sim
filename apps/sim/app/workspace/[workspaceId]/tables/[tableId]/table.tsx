@@ -3,28 +3,22 @@
 import { useCallback, useMemo, useReducer, useRef, useState } from 'react'
 import { createLogger } from '@sim/logger'
 import { useParams, useRouter } from 'next/navigation'
-import {
-  Button,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalDescription,
-  ModalFooter,
-  ModalHeader,
-  toast,
-} from '@/components/emcn'
+import { usePostHog } from 'posthog-js/react'
+import { Chip, ChipConfirmModal, toast } from '@/components/emcn'
 import { Download, Pencil, Table as TableIcon, Trash, Upload } from '@/components/emcn/icons'
-import type { RunMode } from '@/lib/api/contracts/tables'
-import type { ColumnDefinition, Filter, TableRow as TableRowType } from '@/lib/table'
+import type { RunLimit, RunMode } from '@/lib/api/contracts/tables'
+import { captureEvent } from '@/lib/posthog/client'
+import type { ColumnDefinition, Filter, TableRow as TableRowType, WorkflowGroup } from '@/lib/table'
+import { getColumnId } from '@/lib/table/column-keys'
 import {
   type ColumnOption,
-  ResourceHeader,
-  ResourceOptionsBar,
+  Resource,
   type SortConfig,
 } from '@/app/workspace/[workspaceId]/components'
 import { LogDetails } from '@/app/workspace/[workspaceId]/logs/components'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import { ImportCsvDialog } from '@/app/workspace/[workspaceId]/tables/components/import-csv-dialog'
+import { ImportProgressMenu } from '@/app/workspace/[workspaceId]/tables/components/import-progress-menu'
 import { useLogByExecutionId } from '@/hooks/queries/logs'
 import {
   downloadTableExport,
@@ -34,11 +28,13 @@ import {
   useRunColumn,
 } from '@/hooks/queries/tables'
 import { useInlineRename } from '@/hooks/use-inline-rename'
+import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
 import { useLogDetailsUIStore } from '@/stores/logs/store'
 import type { DeletedRowSnapshot } from '@/stores/table/types'
 import {
   type ColumnConfig,
   ColumnConfigSidebar,
+  EnrichmentsSidebar,
   NewColumnDropdown,
   RowModal,
   RunStatusControl,
@@ -75,11 +71,13 @@ interface TableProps {
 type SlideoutState =
   | { kind: 'none' }
   | { kind: 'column'; config: ColumnConfig }
+  | { kind: 'enrichments'; editGroup?: WorkflowGroup }
   | { kind: 'workflow'; config: WorkflowConfig }
   | { kind: 'execution'; executionId: string }
 
 type SlideoutAction =
   | { type: 'OPEN_COLUMN'; config: ColumnConfig }
+  | { type: 'OPEN_ENRICHMENTS'; editGroup?: WorkflowGroup }
   | { type: 'OPEN_WORKFLOW'; config: WorkflowConfig }
   | { type: 'OPEN_EXECUTION'; executionId: string }
   | { type: 'CLOSE' }
@@ -88,6 +86,8 @@ function slideoutReducer(_state: SlideoutState, action: SlideoutAction): Slideou
   switch (action.type) {
     case 'OPEN_COLUMN':
       return { kind: 'column', config: action.config }
+    case 'OPEN_ENRICHMENTS':
+      return { kind: 'enrichments', editGroup: action.editGroup }
     case 'OPEN_WORKFLOW':
       return { kind: 'workflow', config: action.config }
     case 'OPEN_EXECUTION':
@@ -118,7 +118,19 @@ export function Table({
   const workspaceId = propWorkspaceId || (params.workspaceId as string)
   const tableId = propTableId || (params.tableId as string)
 
-  useTableEventStream({ tableId, workspaceId })
+  const posthog = usePostHog()
+  const posthogRef = useRef(posthog)
+  posthogRef.current = posthog
+
+  const { navigateToSettings } = useSettingsNavigation()
+  // Plain function: `useTableEventStream` keeps it in a ref (its effect doesn't
+  // depend on the identity), so a stable reference buys nothing here.
+  const onUsageLimitReached = ({ message }: { dispatchId?: string; message: string }) => {
+    toast.error(message, {
+      action: { label: 'Upgrade', onClick: () => navigateToSettings({ section: 'billing' }) },
+    })
+  }
+  useTableEventStream({ tableId, workspaceId, onUsageLimitReached })
 
   const [slideout, dispatch] = useReducer(slideoutReducer, { kind: 'none' })
   const [showDeleteTableConfirm, setShowDeleteTableConfirm] = useState(false)
@@ -130,6 +142,7 @@ export function Table({
     actionBarRowIds: [],
     runningInActionBarSelection: 0,
     totalRunning: 0,
+    hasActiveDispatch: false,
     hasWorkflowColumns: false,
     selectedRunScope: null,
     selectionStats: { hasIncompleteOrFailed: false, hasCompleted: false, hasInFlight: false },
@@ -146,12 +159,18 @@ export function Table({
   const onOpenWorkflowConfig = useCallback((config: WorkflowConfig) => {
     dispatch({ type: 'OPEN_WORKFLOW', config })
   }, [])
+  const onOpenEnrichments = useCallback(() => {
+    dispatch({ type: 'OPEN_ENRICHMENTS' })
+  }, [])
+  const onOpenEnrichmentConfig = useCallback((editGroup: WorkflowGroup) => {
+    dispatch({ type: 'OPEN_ENRICHMENTS', editGroup })
+  }, [])
   const onOpenExecutionDetails = useCallback((executionId: string) => {
     dispatch({ type: 'OPEN_EXECUTION', executionId })
   }, [])
   const onCloseSlideout = () => dispatch({ type: 'CLOSE' })
   const onOpenRowModal = (row: TableRowType) => setEditingRow(row)
-  // useCallback because <ResourceHeader> is memo-wrapped — these flow into
+  // useCallback because <Resource.Header> is memo-wrapped — these flow into
   // the breadcrumbs / headerActions memos, whose identity drives that re-render.
   const onRequestDeleteTable = useCallback(() => setShowDeleteTableConfirm(true), [])
   const onRequestImportCsv = useCallback(() => setIsImportCsvOpen(true), [])
@@ -214,24 +233,50 @@ export function Table({
   // gutter, action-bar Play/Refresh, right-click context menu) reduces to a
   // (groupIds, rowIds?, runMode) triple. Empty groupIds = no-op.
   const runScope = useCallback(
-    (args: { groupIds: string[]; rowIds?: string[]; runMode: RunMode }) => {
-      if (args.groupIds.length === 0) return
-      if (args.rowIds && args.rowIds.length === 0) return
-      runColumnMutate(args)
+    (args: {
+      groupIds: string[]
+      rowIds?: string[]
+      runMode: RunMode
+      limit?: RunLimit
+      source: 'row' | 'rows' | 'column'
+    }) => {
+      const { source, ...mutateArgs } = args
+      if (mutateArgs.groupIds.length === 0) return
+      if (mutateArgs.rowIds && mutateArgs.rowIds.length === 0) return
+      runColumnMutate(mutateArgs)
+      // Derive the run's deployment mode from the targeted groups (default 'live' when unset).
+      // 'mixed' when the targeted groups don't all agree.
+      const targetGroupIds = new Set(mutateArgs.groupIds)
+      const modes = new Set(
+        tableWorkflowGroups
+          .filter((g) => targetGroupIds.has(g.id))
+          .map((g) => g.deploymentMode ?? 'live')
+      )
+      const deploymentMode = modes.size === 1 ? [...modes][0] : 'mixed'
+      captureEvent(posthogRef.current, 'table_workflow_run', {
+        table_id: tableId,
+        workspace_id: workspaceId,
+        source,
+        run_mode: mutateArgs.runMode,
+        group_count: mutateArgs.groupIds.length,
+        row_count: mutateArgs.rowIds?.length ?? null,
+        has_limit: mutateArgs.limit != null,
+        deployment_mode: deploymentMode,
+      })
     },
-    [runColumnMutate]
+    [runColumnMutate, tableId, workspaceId, tableWorkflowGroups]
   )
 
   const onRunColumn = useCallback(
-    (groupId: string, runMode: RunMode, rowIds?: string[]) => {
-      runScope({ groupIds: [groupId], rowIds, runMode })
+    (groupId: string, runMode: RunMode, rowIds?: string[], limit?: RunLimit) => {
+      runScope({ groupIds: [groupId], rowIds, runMode, limit, source: 'column' })
     },
     [runScope]
   )
 
   const onRunRows = useCallback(
     (rowIds: string[], runMode: RunMode) => {
-      runScope({ groupIds: tableWorkflowGroups.map((g) => g.id), rowIds, runMode })
+      runScope({ groupIds: tableWorkflowGroups.map((g) => g.id), rowIds, runMode, source: 'rows' })
     },
     [runScope, tableWorkflowGroups]
   )
@@ -242,6 +287,7 @@ export function Table({
         groupIds: tableWorkflowGroups.map((g) => g.id),
         rowIds: [rowId],
         runMode: 'incomplete',
+        source: 'row',
       })
     },
     [runScope, tableWorkflowGroups]
@@ -252,8 +298,14 @@ export function Table({
   const onStopRow = useCallback(
     (rowId: string) => {
       cancelRunsMutate({ scope: 'row', rowId })
+      captureEvent(posthogRef.current, 'table_workflow_stopped', {
+        table_id: tableId,
+        workspace_id: workspaceId,
+        scope: 'row',
+        row_count: 1,
+      })
     },
-    [cancelRunsMutate]
+    [cancelRunsMutate, tableId, workspaceId]
   )
 
   const onStopRows = (rowIds: string[]) => {
@@ -261,12 +313,24 @@ export function Table({
     for (const rowId of rowIds) {
       cancelRunsMutate({ scope: 'row', rowId })
     }
+    captureEvent(posthogRef.current, 'table_workflow_stopped', {
+      table_id: tableId,
+      workspace_id: workspaceId,
+      scope: 'rows',
+      row_count: rowIds.length,
+    })
   }
 
   // useCallback because <RunStatusControl> is memo-wrapped.
   const onStopAll = useCallback(() => {
     cancelRunsMutate({ scope: 'all' })
-  }, [cancelRunsMutate])
+    captureEvent(posthogRef.current, 'table_workflow_stopped', {
+      table_id: tableId,
+      workspace_id: workspaceId,
+      scope: 'all',
+      row_count: null,
+    })
+  }, [cancelRunsMutate, tableId, workspaceId])
 
   const onSelectionChange = (next: SelectionSnapshot) => {
     setSelection(next)
@@ -279,7 +343,7 @@ export function Table({
     onSave: (_id, name) => {
       const data = tableDataRef.current
       if (data) pushTableRenameUndoSinkRef.current?.(data.name, name)
-      renameTableMutation.mutate({ tableId, name })
+      return renameTableMutation.mutateAsync({ tableId, name })
     },
   })
 
@@ -297,23 +361,32 @@ export function Table({
   }
 
   const handleAddWorkflowColumn = () => {
-    onOpenWorkflowConfig({ mode: 'create', proposedName: generateColumnName(columns) })
+    onOpenWorkflowConfig({
+      mode: 'create',
+      kind: 'manual',
+      proposedName: generateColumnName(columns),
+    })
   }
 
   const handleExportCsv = useCallback(async () => {
     if (!tableData) return
     try {
       await downloadTableExport(tableData.id, tableData.name)
+      captureEvent(posthogRef.current, 'table_exported', {
+        table_id: tableData.id,
+        workspace_id: workspaceId,
+      })
     } catch (err) {
       logger.error('Failed to export table:', err)
       toast.error('Failed to export table')
     }
-  }, [tableData])
+  }, [tableData, workspaceId])
 
   const columnOptions = useMemo<ColumnOption[]>(
     () =>
       columns.map((col) => ({
-        id: col.name,
+        // `id` is the filter/sort field key (column id); `label` is what the user sees.
+        id: getColumnId(col),
         label: col.name,
         type: col.type,
         icon: COLUMN_TYPE_ICONS[col.type],
@@ -413,12 +486,13 @@ export function Table({
       disabled={false}
       onPickType={handleAddColumnOfType}
       onPickWorkflow={handleAddWorkflowColumn}
+      onPickEnrichment={onOpenEnrichments}
     />
   ) : null
 
   const logPanelWidth = useLogDetailsUIStore((state) => state.panelWidth)
   const sidebarReservedPx =
-    slideout.kind === 'column' || slideout.kind === 'workflow'
+    slideout.kind === 'column' || slideout.kind === 'workflow' || slideout.kind === 'enrichments'
       ? COLUMN_SIDEBAR_WIDTH
       : slideout.kind === 'execution'
         ? logPanelWidth
@@ -435,6 +509,13 @@ export function Table({
     }
   }
 
+  const handleConfirmDeleteColumns = () => {
+    if (!deletingColumns) return
+    const names = deletingColumns
+    setDeletingColumns(null)
+    confirmDeleteColumnsSinkRef.current?.(names)
+  }
+
   const columnConfig = slideout.kind === 'column' ? slideout.config : null
   const workflowConfig = slideout.kind === 'workflow' ? slideout.config : null
   const executionId = slideout.kind === 'execution' ? slideout.executionId : null
@@ -446,36 +527,61 @@ export function Table({
   return (
     <div className='relative flex h-full flex-col overflow-hidden'>
       {!embedded && (
-        <>
-          <ResourceHeader
-            icon={TableIcon}
-            breadcrumbs={breadcrumbs}
-            createTrigger={createTrigger}
-            actions={headerActions}
-            leadingActions={
-              selection.totalRunning > 0 ? (
+        <Resource.Header
+          icon={TableIcon}
+          breadcrumbs={breadcrumbs}
+          aside={
+            <div className='flex items-center gap-1.5'>
+              <ImportProgressMenu workspaceId={workspaceId} tableId={tableId} />
+              {selection.totalRunning > 0 || selection.hasActiveDispatch ? (
                 <RunStatusControl
                   running={selection.totalRunning}
                   onStopAll={onStopAll}
                   isStopping={cancelRunsMutation.isPending}
                 />
-              ) : null
-            }
-          />
-          <ResourceOptionsBar
-            sort={sortConfig}
-            onFilterToggle={() => setFilterOpen((prev) => !prev)}
-            filterActive={filterOpen || !!queryOptions.filter}
-          />
-          {filterOpen && (
-            <TableFilter
-              columns={columns}
-              filter={queryOptions.filter}
-              onApply={handleFilterApply}
-              onClose={() => setFilterOpen(false)}
+              ) : null}
+              {headerActions?.map((action) => (
+                <Chip
+                  key={action.label}
+                  leftIcon={action.icon}
+                  onClick={action.onClick}
+                  disabled={action.disabled}
+                >
+                  {action.label}
+                </Chip>
+              ))}
+              {createTrigger}
+            </div>
+          }
+        />
+      )}
+      {/* Sort + filter render in both modes (left-aligned). In embedded (mothership)
+          mode there's no Resource.Header, so the run/stop control rides in the options
+          bar's right-aligned `aside` slot — opposite the left-aligned filter/sort. */}
+      <Resource.Options
+        sort={sortConfig}
+        filter={{
+          mode: 'toggle',
+          active: filterOpen || !!queryOptions.filter,
+          onToggle: () => setFilterOpen((prev) => !prev),
+        }}
+        aside={
+          embedded && (selection.totalRunning > 0 || selection.hasActiveDispatch) ? (
+            <RunStatusControl
+              running={selection.totalRunning}
+              onStopAll={onStopAll}
+              isStopping={cancelRunsMutation.isPending}
             />
-          )}
-        </>
+          ) : undefined
+        }
+      />
+      {filterOpen && (
+        <TableFilter
+          columns={columns}
+          filter={queryOptions.filter}
+          onApply={handleFilterApply}
+          onClose={() => setFilterOpen(false)}
+        />
       )}
       <TableGrid
         workspaceId={workspaceId}
@@ -484,6 +590,8 @@ export function Table({
         sidebarReservedPx={sidebarReservedPx}
         onOpenColumnConfig={onOpenColumnConfig}
         onOpenWorkflowConfig={onOpenWorkflowConfig}
+        onOpenEnrichments={onOpenEnrichments}
+        onOpenEnrichmentConfig={onOpenEnrichmentConfig}
         onOpenExecutionDetails={onOpenExecutionDetails}
         onOpenRowModal={onOpenRowModal}
         onRequestDeleteRows={onRequestDeleteRows}
@@ -493,8 +601,6 @@ export function Table({
         onRunRows={onRunRows}
         onStopRows={onStopRows}
         onStopRow={onStopRow}
-        onStopAll={onStopAll}
-        cancelRunsPending={cancelRunsMutation.isPending}
         onSelectionChange={onSelectionChange}
         queryOptions={queryOptions}
         columnRenameSinkRef={columnRenameSinkRef}
@@ -521,6 +627,7 @@ export function Table({
               groupIds: scope.groupIds,
               rowIds: scope.allRows ? undefined : scope.rowIds,
               runMode: 'incomplete',
+              source: 'rows',
             })
           }}
           onRefresh={() => {
@@ -530,6 +637,7 @@ export function Table({
               groupIds: scope.groupIds,
               rowIds: scope.allRows ? undefined : scope.rowIds,
               runMode: 'all',
+              source: 'rows',
             })
           }}
           onStopWorkflows={() => {
@@ -553,12 +661,20 @@ export function Table({
         onClose={onCloseSlideout}
         existingColumn={
           columnConfig?.mode === 'edit'
-            ? (columns.find((c) => c.name === columnConfig.columnName) ?? null)
+            ? (columns.find((c) => getColumnId(c) === columnConfig.columnName) ?? null)
             : null
         }
         workspaceId={workspaceId}
         tableId={tableId}
         onColumnRename={onColumnRename}
+      />
+      <EnrichmentsSidebar
+        open={slideout.kind === 'enrichments'}
+        onClose={onCloseSlideout}
+        allColumns={columns}
+        workspaceId={workspaceId}
+        tableId={tableId}
+        editGroup={slideout.kind === 'enrichments' ? slideout.editGroup : undefined}
       />
       <WorkflowSidebar
         config={workflowConfig}
@@ -606,94 +722,77 @@ export function Table({
           }}
         />
       )}
-      <Modal
+      <ChipConfirmModal
         open={deletingColumns !== null}
         onOpenChange={(open) => {
           if (!open) setDeletingColumns(null)
         }}
-      >
-        <ModalContent size='sm'>
-          <ModalHeader>
-            {deletingColumns && deletingColumns.length > 1
-              ? `Delete ${deletingColumns.length} Columns`
-              : 'Delete Column'}
-          </ModalHeader>
-          <ModalBody>
-            <ModalDescription className='text-[var(--text-secondary)]'>
-              {deletingColumns && deletingColumns.length > 1 ? (
-                <>
-                  Are you sure you want to delete{' '}
-                  <span className='font-medium text-[var(--text-primary)]'>
-                    {deletingColumns.length} columns
-                  </span>
-                  ?{' '}
-                </>
-              ) : (
-                <>
-                  Are you sure you want to delete{' '}
-                  <span className='font-medium text-[var(--text-primary)]'>
-                    {deletingColumns?.[0]}
-                  </span>
-                  ?{' '}
-                </>
-              )}
-              <span className='text-[var(--text-error)]'>
-                This will remove all data in{' '}
-                {deletingColumns && deletingColumns.length > 1 ? 'these columns' : 'this column'}.
-              </span>{' '}
-              You can undo this action.
-            </ModalDescription>
-          </ModalBody>
-          <ModalFooter>
-            <Button variant='default' onClick={() => setDeletingColumns(null)}>
-              Cancel
-            </Button>
-            <Button
-              variant='destructive'
-              onClick={() => {
-                if (!deletingColumns) return
-                const names = deletingColumns
-                setDeletingColumns(null)
-                confirmDeleteColumnsSinkRef.current?.(names)
-              }}
-            >
-              Delete
-            </Button>
-          </ModalFooter>
-        </ModalContent>
-      </Modal>
-      {!embedded && (
-        <Modal open={showDeleteTableConfirm} onOpenChange={setShowDeleteTableConfirm}>
-          <ModalContent size='sm'>
-            <ModalHeader>Delete Table</ModalHeader>
-            <ModalBody>
-              <ModalDescription className='text-[var(--text-secondary)]'>
+        srTitle={
+          deletingColumns && deletingColumns.length > 1
+            ? `Delete ${deletingColumns.length} Columns`
+            : 'Delete Column'
+        }
+        title={
+          deletingColumns && deletingColumns.length > 1
+            ? `Delete ${deletingColumns.length} Columns`
+            : 'Delete Column'
+        }
+        description={
+          <>
+            {deletingColumns && deletingColumns.length > 1 ? (
+              <>
                 Are you sure you want to delete{' '}
-                <span className='font-medium text-[var(--text-primary)]'>{tableData?.name}</span>?{' '}
-                <span className='text-[var(--text-error)]'>
-                  All {tableData?.rowCount ?? 0} rows will be removed.
-                </span>{' '}
-                You can restore it from Recently Deleted in Settings.
-              </ModalDescription>
-            </ModalBody>
-            <ModalFooter>
-              <Button
-                variant='default'
-                onClick={() => setShowDeleteTableConfirm(false)}
-                disabled={deleteTableMutation.isPending}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant='destructive'
-                onClick={handleDeleteTable}
-                disabled={deleteTableMutation.isPending}
-              >
-                {deleteTableMutation.isPending ? 'Deleting...' : 'Delete'}
-              </Button>
-            </ModalFooter>
-          </ModalContent>
-        </Modal>
+                <span className='font-medium text-[var(--text-primary)]'>
+                  {deletingColumns.length} columns
+                </span>
+                ?{' '}
+              </>
+            ) : (
+              <>
+                Are you sure you want to delete{' '}
+                <span className='font-medium text-[var(--text-primary)]'>
+                  {(deletingColumns &&
+                    columns.find((c) => getColumnId(c) === deletingColumns[0])?.name) ??
+                    deletingColumns?.[0]}
+                </span>
+                ?{' '}
+              </>
+            )}
+            <span className='text-[var(--text-error)]'>
+              This will remove all data in{' '}
+              {deletingColumns && deletingColumns.length > 1 ? 'these columns' : 'this column'}.
+            </span>{' '}
+            You can undo this action.
+          </>
+        }
+        confirm={{
+          label: 'Delete',
+          onClick: handleConfirmDeleteColumns,
+        }}
+      />
+      {!embedded && (
+        <ChipConfirmModal
+          open={showDeleteTableConfirm}
+          onOpenChange={setShowDeleteTableConfirm}
+          srTitle='Delete Table'
+          title='Delete Table'
+          description={
+            <>
+              Are you sure you want to delete{' '}
+              <span className='font-medium text-[var(--text-primary)]'>{tableData?.name}</span>?{' '}
+              <span className='text-[var(--text-error)]'>
+                All {tableData?.rowCount ?? 0} rows will be removed.
+              </span>{' '}
+              You can restore it from Recently Deleted in Settings.
+            </>
+          }
+          confirm={{
+            label: 'Delete',
+            onClick: handleDeleteTable,
+            pending: deleteTableMutation.isPending,
+            pendingLabel: 'Deleting...',
+          }}
+        />
       )}
     </div>
   )

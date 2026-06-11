@@ -1,9 +1,17 @@
 import type { workflow } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { getActiveWorkflowRecord } from '@sim/workflow-authz'
-import { checkServerSideUsageLimits } from '@/lib/billing/calculations/usage-monitor'
+import {
+  checkOrgMemberUsageLimit,
+  checkServerSideUsageLimits,
+} from '@/lib/billing/calculations/usage-monitor'
+import { reserveExecutionSlot } from '@/lib/billing/calculations/usage-reservation'
 import type { HighestPrioritySubscription } from '@/lib/billing/core/plan'
 import { getHighestPrioritySubscription } from '@/lib/billing/core/subscription'
+import {
+  describeRetryableInfrastructureError,
+  isRetryableInfrastructureError,
+} from '@/lib/core/errors/retryable-infrastructure'
 import { getExecutionTimeout } from '@/lib/core/execution-limits'
 import { RateLimiter } from '@/lib/core/rate-limiter/rate-limiter'
 import type { SubscriptionPlan } from '@/lib/core/rate-limiter/types'
@@ -23,7 +31,7 @@ export interface PreprocessExecutionOptions {
   // Required fields
   workflowId: string
   userId: string // The authenticated user ID
-  triggerType: CoreTriggerType | 'form'
+  triggerType: CoreTriggerType
   executionId: string
   requestId: string
 
@@ -31,6 +39,15 @@ export interface PreprocessExecutionOptions {
   checkRateLimit?: boolean // Default: false for manual/chat, true for others
   checkDeployment?: boolean // Default: true for non-manual triggers
   skipUsageLimits?: boolean // Default: false (only use for test mode)
+  /**
+   * Skip the atomic in-flight concurrency reservation while still enforcing the
+   * usage-cost cap. Default: false. Set by surfaces that already bound and pace
+   * their own fan-out (e.g. table-cell dispatch, which is row-bounded, async
+   * rate-limited, and surfaces a graceful "wait/upgrade" state) so the
+   * reservation's 429 can't surface as a hard error there.
+   */
+  skipConcurrencyReservation?: boolean
+  logPreprocessingErrors?: boolean // Default: true. When false, skip writing workflow_execution_logs error rows (caller surfaces failures itself, e.g. table cells)
 
   // Context information
   workspaceId?: string // If known, used for billing resolution
@@ -40,7 +57,7 @@ export interface PreprocessExecutionOptions {
   useAuthenticatedUserAsActor?: boolean // If true, use the authenticated userId as actorUserId (for client-side executions and personal API keys)
   /** @deprecated No longer used - background/async executions always use deployed state */
   useDraftState?: boolean
-  /** Pre-fetched workflow record to skip the Step 1 DB query. Must be a full workflow table row. */
+  /** Pre-fetched workflow row for caller context; preprocessing still re-checks active state. */
   workflowRecord?: WorkflowRecord
 }
 
@@ -53,6 +70,8 @@ export interface PreprocessExecutionResult {
     message: string
     statusCode: number
     logCreated: boolean
+    retryable?: boolean
+    cause?: Record<string, unknown>
   }
   actorUserId?: string
   workflowRecord?: WorkflowRecord
@@ -83,6 +102,8 @@ export async function preprocessExecution(
     checkRateLimit = triggerType !== 'manual' && triggerType !== 'chat',
     checkDeployment = triggerType !== 'manual',
     skipUsageLimits = false,
+    skipConcurrencyReservation = false,
+    logPreprocessingErrors = true,
     workspaceId: providedWorkspaceId,
     loggingSession: providedLoggingSession,
     triggerData,
@@ -90,6 +111,11 @@ export async function preprocessExecution(
     useAuthenticatedUserAsActor = false,
     workflowRecord: prefetchedWorkflowRecord,
   } = options
+
+  // When `logPreprocessingErrors` is false the caller surfaces failures itself
+  // (e.g. table cells use cell state / SSE), so skip the execution-log writes.
+  const recordPreprocessingError: typeof logPreprocessingError = (args) =>
+    logPreprocessingErrors ? logPreprocessingError(args) : Promise.resolve()
 
   logger.info(`[${requestId}] Starting execution preprocessing`, {
     workflowId,
@@ -116,7 +142,7 @@ export async function preprocessExecution(
       if (!workflowRecord) {
         logger.warn(`[${requestId}] Workflow not found: ${workflowId}`)
 
-        await logPreprocessingError({
+        await recordPreprocessingError({
           workflowId,
           executionId,
           triggerType,
@@ -141,7 +167,7 @@ export async function preprocessExecution(
     } catch (error) {
       logger.error(`[${requestId}] Error fetching workflow`, { error, workflowId })
 
-      await logPreprocessingError({
+      await recordPreprocessingError({
         workflowId,
         executionId,
         triggerType,
@@ -159,6 +185,8 @@ export async function preprocessExecution(
           message: 'Internal error while fetching workflow',
           statusCode: 500,
           logCreated: true,
+          retryable: isRetryableInfrastructureError(error),
+          cause: describeRetryableInfrastructureError(error),
         },
       }
     }
@@ -245,7 +273,7 @@ export async function preprocessExecution(
         workspaceId,
       })
 
-      await logPreprocessingError({
+      await recordPreprocessingError({
         workflowId,
         executionId,
         triggerType,
@@ -269,7 +297,7 @@ export async function preprocessExecution(
   } catch (error) {
     logger.error(`[${requestId}] Error resolving billing actor`, { error, workflowId })
     const fallbackUserId = userId || 'unknown'
-    await logPreprocessingError({
+    await recordPreprocessingError({
       workflowId,
       executionId,
       triggerType,
@@ -287,6 +315,8 @@ export async function preprocessExecution(
         message: 'Error resolving billing account',
         statusCode: 500,
         logCreated: true,
+        retryable: isRetryableInfrastructureError(error),
+        cause: describeRetryableInfrastructureError(error),
       },
     }
   }
@@ -295,9 +325,12 @@ export async function preprocessExecution(
   const userSubscription = await getHighestPrioritySubscription(actorUserId)
 
   // ========== STEP 5: Check Usage Limits ==========
+  // Snapshot reused by the STEP 7 admission reservation.
+  let usageSnapshot: { currentUsage: number; limit: number } | null = null
   if (!skipUsageLimits) {
     try {
       const usageCheck = await checkServerSideUsageLimits(actorUserId, userSubscription)
+      usageSnapshot = { currentUsage: usageCheck.currentUsage, limit: usageCheck.limit }
       if (usageCheck.isExceeded) {
         logger.warn(
           `[${requestId}] User ${actorUserId} has exceeded usage limits. Blocking execution.`,
@@ -309,7 +342,7 @@ export async function preprocessExecution(
           }
         )
 
-        await logPreprocessingError({
+        await recordPreprocessingError({
           workflowId,
           executionId,
           triggerType,
@@ -333,13 +366,55 @@ export async function preprocessExecution(
           },
         }
       }
+
+      // Per-member org-workspace cap (hosted-only). Independent, additive gate:
+      // blocks an individual member's executions in org-owned workspaces once
+      // their personal credit limit for the org is reached, even if the pooled
+      // org limit still has room.
+      const memberUsageCheck = await checkOrgMemberUsageLimit(actorUserId, workspaceId)
+      if (memberUsageCheck.isExceeded) {
+        const memberLimitMessage =
+          memberUsageCheck.message ||
+          'Member usage limit exceeded for this organization. Ask an organization admin to raise your credit limit to continue.'
+
+        logger.warn(
+          `[${requestId}] User ${actorUserId} exceeded their per-member org usage limit. Blocking execution.`,
+          {
+            currentUsage: memberUsageCheck.currentUsage,
+            limit: memberUsageCheck.limit,
+            workflowId,
+            triggerType,
+          }
+        )
+
+        await recordPreprocessingError({
+          workflowId,
+          executionId,
+          triggerType,
+          requestId,
+          userId: actorUserId,
+          workspaceId,
+          errorMessage: memberLimitMessage,
+          loggingSession: providedLoggingSession,
+          triggerData,
+        })
+
+        return {
+          success: false,
+          error: {
+            message: memberLimitMessage,
+            statusCode: 402,
+            logCreated: true,
+          },
+        }
+      }
     } catch (error) {
       logger.error(`[${requestId}] Error checking usage limits`, {
         error,
         actorUserId,
       })
 
-      await logPreprocessingError({
+      await recordPreprocessingError({
         workflowId,
         executionId,
         triggerType,
@@ -358,6 +433,8 @@ export async function preprocessExecution(
           message: 'Unable to determine usage limits. Execution blocked for security.',
           statusCode: 500,
           logCreated: true,
+          retryable: isRetryableInfrastructureError(error),
+          cause: describeRetryableInfrastructureError(error),
         },
       }
     }
@@ -383,7 +460,7 @@ export async function preprocessExecution(
           resetAt: rateLimitInfo.resetAt,
         })
 
-        await logPreprocessingError({
+        await recordPreprocessingError({
           workflowId,
           executionId,
           triggerType,
@@ -407,7 +484,7 @@ export async function preprocessExecution(
     } catch (error) {
       logger.error(`[${requestId}] Error checking rate limits`, { error, actorUserId })
 
-      await logPreprocessingError({
+      await recordPreprocessingError({
         workflowId,
         executionId,
         triggerType,
@@ -425,8 +502,66 @@ export async function preprocessExecution(
           message: 'Error checking rate limits',
           statusCode: 500,
           logCreated: true,
+          retryable: isRetryableInfrastructureError(error),
+          cause: describeRetryableInfrastructureError(error),
         },
       }
+    }
+  }
+
+  /**
+   * STEP 7: Atomic admission reservation. Cost is only recorded once an
+   * execution finishes, so without this a burst of concurrent executions all
+   * observe the same pre-burst usage and all pass the gate above. Reserving
+   * bounds in-flight (un-costed) executions per billing entity. Done last so an
+   * earlier rejection never leaves a slot held; the slot is released at
+   * execution completion (see {@link LoggingSession}).
+   */
+  if (!skipUsageLimits && !skipConcurrencyReservation && usageSnapshot) {
+    try {
+      const { reserved } = await reserveExecutionSlot({
+        userId: actorUserId,
+        executionId,
+        subscription: userSubscription,
+        currentUsage: usageSnapshot.currentUsage,
+        limit: usageSnapshot.limit,
+      })
+
+      if (!reserved) {
+        logger.warn(`[${requestId}] Admission reservation full for user ${actorUserId}`, {
+          workflowId,
+          triggerType,
+        })
+
+        await recordPreprocessingError({
+          workflowId,
+          executionId,
+          triggerType,
+          requestId,
+          userId: actorUserId,
+          workspaceId,
+          errorMessage:
+            'Too many concurrent executions in flight for this account. Please wait for in-progress runs to finish and try again.',
+          loggingSession: providedLoggingSession,
+          triggerData,
+        })
+
+        return {
+          success: false,
+          error: {
+            message:
+              'Too many concurrent executions in flight. Please wait for in-progress runs to finish and try again.',
+            statusCode: 429,
+            logCreated: true,
+            retryable: true,
+          },
+        }
+      }
+    } catch (error) {
+      logger.error(`[${requestId}] Unexpected error reserving admission slot`, {
+        error,
+        actorUserId,
+      })
     }
   }
 
