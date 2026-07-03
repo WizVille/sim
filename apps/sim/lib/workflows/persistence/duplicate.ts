@@ -7,16 +7,24 @@ import {
   workflowSubflows,
 } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
+import {
+  authorizeWorkflowByWorkspacePermission,
+  FolderLockedError,
+} from '@sim/platform-authz/workflow'
 import { generateId } from '@sim/utils/id'
-import { authorizeWorkflowByWorkspacePermission, FolderLockedError } from '@sim/workflow-authz'
 import { and, eq, isNull, min } from 'drizzle-orm'
 import type { DbOrTx } from '@/lib/db/types'
-import { remapConditionBlockIds, remapConditionEdgeHandle } from '@/lib/workflows/condition-ids'
+import { remapConditionEdgeHandle } from '@/lib/workflows/condition-ids'
+import {
+  remapConditionIdsInSubBlocks,
+  remapVariableIdsInSubBlocks,
+  remapWorkflowReferencesInSubBlocks,
+  type SubBlockRecord,
+  sanitizeSubBlocksForDuplicate,
+} from '@/lib/workflows/persistence/remap-internal-ids'
 import { deduplicateWorkflowName } from '@/lib/workflows/utils'
-import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 import type { Variable } from '@/stores/variables/types'
 import type { LoopConfig, ParallelConfig } from '@/stores/workflows/workflow/types'
-import { SYSTEM_SUBBLOCK_IDS, TRIGGER_RUNTIME_SUBBLOCK_IDS } from '@/triggers/constants'
 
 const logger = createLogger('WorkflowDuplicateHelper')
 
@@ -29,6 +37,13 @@ interface DuplicateWorkflowOptions {
   folderId?: string | null
   requestId?: string
   newWorkflowId?: string
+  /**
+   * Run inside the caller's transaction. Callers that pass `tx` must have
+   * already authorized the user on the source workflow's workspace: the
+   * authorization helpers query through the global pool, so running them here
+   * would require a second pooled connection while the caller's transaction
+   * holds the first.
+   */
   tx?: DbOrTx
   workflowIdMap?: Map<string, string>
 }
@@ -44,43 +59,6 @@ interface DuplicateWorkflowResult {
   blocksCount: number
   edgesCount: number
   subflowsCount: number
-}
-/**
- * Untrusted shape of a persisted block subBlocks JSON column. We narrow `type`/`value`
- * with runtime checks before mutating; the index signature exists because callers pass
- * the raw record back to drizzle without knowing which subBlock keys it contains.
- */
-type SubBlockRecord = Record<string, { type?: unknown; value?: unknown; [key: string]: unknown }>
-
-/**
- * Untrusted shape of a single entry inside a `variables-input` value array. The
- * `variableId` slot is widened to `unknown` so we are forced to type-narrow before
- * trusting it as a remap key — persisted JSON may legitimately predate the field.
- */
-type VariableAssignment = Record<string, unknown> & { variableId?: unknown }
-const DUPLICATE_STRIPPED_SYSTEM_SUBBLOCK_IDS = new Set(
-  SYSTEM_SUBBLOCK_IDS.filter((id) => id !== 'triggerCredentials')
-)
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
-}
-
-function isSystemSubBlockKey(key: string, ids: Set<string> | string[]): boolean {
-  const idList = Array.isArray(ids) ? ids : Array.from(ids)
-  return idList.some((id) => key === id || key.startsWith(`${id}_`))
-}
-
-function sanitizeSubBlocksForDuplicate(subBlocks: SubBlockRecord): SubBlockRecord {
-  const sanitized: SubBlockRecord = {}
-
-  for (const [key, subBlock] of Object.entries(subBlocks)) {
-    if (isSystemSubBlockKey(key, TRIGGER_RUNTIME_SUBBLOCK_IDS)) continue
-    if (isSystemSubBlockKey(key, DUPLICATE_STRIPPED_SYSTEM_SUBBLOCK_IDS)) continue
-    sanitized[key] = subBlock
-  }
-
-  return sanitized
 }
 
 async function assertTargetFolderMutable(
@@ -115,149 +93,6 @@ async function assertTargetFolderMutable(
   }
 }
 
-function remapVariableAssignment(value: unknown, varIdMap: Map<string, string>): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => remapVariableAssignment(item, varIdMap))
-  }
-
-  if (!isRecord(value)) {
-    return value
-  }
-
-  const assignment = value as VariableAssignment
-  const next: Record<string, unknown> = {}
-  for (const [key, nestedValue] of Object.entries(assignment)) {
-    next[key] = remapVariableAssignment(nestedValue, varIdMap)
-  }
-
-  if (typeof assignment.variableId === 'string') {
-    const newVarId = varIdMap.get(assignment.variableId)
-    if (newVarId) {
-      next.variableId = newVarId
-    } else {
-      logger.warn('Skipping unknown variable reference during duplication', {
-        variableId: assignment.variableId,
-      })
-    }
-  }
-
-  return next
-}
-
-function remapVariableInputValue(value: unknown, varIdMap: Map<string, string>): unknown {
-  if (value == null) {
-    return value
-  }
-
-  if (Array.isArray(value)) {
-    return remapVariableAssignment(value, varIdMap)
-  }
-
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    if (!trimmed) return value
-
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(trimmed)
-    } catch {
-      throw new Error('Variables input assignments could not be parsed for duplication')
-    }
-    if (Array.isArray(parsed)) {
-      return remapVariableAssignment(parsed, varIdMap)
-    }
-    throw new Error('Variables input assignments must be an array')
-  }
-
-  throw new Error('Variables input assignments must be an array')
-}
-
-/**
- * Remaps old variable IDs to new variable IDs inside block subBlocks.
- * Specifically targets `variables-input` subblocks whose value is an array
- * of variable assignments containing a `variableId` field.
- */
-function remapVariableIdsInSubBlocks(
-  subBlocks: SubBlockRecord,
-  varIdMap: Map<string, string>
-): SubBlockRecord {
-  const updated: SubBlockRecord = {}
-
-  for (const [key, subBlock] of Object.entries(subBlocks)) {
-    if (subBlock && typeof subBlock === 'object' && subBlock.type === 'variables-input') {
-      updated[key] = {
-        ...subBlock,
-        value: remapVariableInputValue(subBlock.value, varIdMap),
-      }
-    } else {
-      updated[key] = subBlock
-    }
-  }
-
-  return updated
-}
-
-function remapWorkflowReferencesInSubBlocks(
-  subBlocks: SubBlockRecord,
-  workflowIdMap: Map<string, string> | undefined
-): SubBlockRecord {
-  if (!workflowIdMap?.size) return subBlocks
-
-  const updated: SubBlockRecord = {}
-  for (const [key, subBlock] of Object.entries(subBlocks)) {
-    if (
-      subBlock &&
-      typeof subBlock === 'object' &&
-      subBlock.type === 'workflow-selector' &&
-      typeof subBlock.value === 'string'
-    ) {
-      updated[key] = {
-        ...subBlock,
-        value: workflowIdMap.get(subBlock.value) ?? subBlock.value,
-      }
-      continue
-    }
-
-    updated[key] = subBlock
-  }
-
-  return updated
-}
-
-/**
- * Remaps condition/router block IDs within subBlocks when a block is duplicated.
- * Returns a new object without mutating the input.
- */
-function remapConditionIdsInSubBlocks(
-  subBlocks: Record<string, any>,
-  oldBlockId: string,
-  newBlockId: string
-): Record<string, any> {
-  const updated: Record<string, any> = {}
-
-  for (const [key, subBlock] of Object.entries(subBlocks)) {
-    if (
-      subBlock &&
-      typeof subBlock === 'object' &&
-      (subBlock.type === 'condition-input' || subBlock.type === 'router-input') &&
-      typeof subBlock.value === 'string'
-    ) {
-      try {
-        const parsed = JSON.parse(subBlock.value)
-        if (Array.isArray(parsed) && remapConditionBlockIds(parsed, oldBlockId, newBlockId)) {
-          updated[key] = { ...subBlock, value: JSON.stringify(parsed) }
-          continue
-        }
-      } catch {
-        // Not valid JSON, skip
-      }
-    }
-    updated[key] = subBlock
-  }
-
-  return updated
-}
-
 /**
  * Duplicate a workflow with all its blocks, edges, and subflows
  * This is a shared helper used by both the workflow duplicate API and folder duplicate API
@@ -281,6 +116,41 @@ export async function duplicateWorkflow(
   const newWorkflowId = clientNewWorkflowId || workflowIdMap?.get(sourceWorkflowId) || generateId()
   const now = new Date()
 
+  // Authorization runs before the transaction opens so its global-pool
+  // queries never execute while a pooled connection is held. Callers that
+  // pass `tx` authorize the workspace themselves (see DuplicateWorkflowOptions).
+  if (!providedTx) {
+    const sourceAuthorization = await authorizeWorkflowByWorkspacePermission({
+      workflowId: sourceWorkflowId,
+      userId,
+      action: 'read',
+    })
+    if (!sourceAuthorization.allowed || !sourceAuthorization.workflow) {
+      throw new Error('Source workflow not found or access denied')
+    }
+
+    const sourceWorkspaceId = sourceAuthorization.workflow.workspaceId
+    if (!sourceWorkspaceId) {
+      throw new Error(
+        'This workflow is not attached to a workspace. Personal workflows are deprecated and cannot be duplicated.'
+      )
+    }
+
+    const targetWorkspaceId = workspaceId || sourceWorkspaceId
+    if (targetWorkspaceId !== sourceWorkspaceId) {
+      throw new Error('Cross-workspace workflow duplication is not supported')
+    }
+
+    // The target workspace equals the source workspace, so the permission
+    // resolved by the authorization above is the target permission.
+    if (
+      sourceAuthorization.workspacePermission !== 'admin' &&
+      sourceAuthorization.workspacePermission !== 'write'
+    ) {
+      throw new Error('Write or admin access required for target workspace')
+    }
+  }
+
   const duplicateWithinTransaction = async (tx: DbOrTx) => {
     // First verify the source workflow exists
     const sourceWorkflowRow = await tx
@@ -300,28 +170,11 @@ export async function duplicateWorkflow(
       )
     }
 
-    const sourceAuthorization = await authorizeWorkflowByWorkspacePermission({
-      workflowId: sourceWorkflowId,
-      userId,
-      action: 'read',
-    })
-    if (!sourceAuthorization.allowed) {
-      throw new Error('Source workflow not found or access denied')
-    }
-
     const targetWorkspaceId = workspaceId || source.workspaceId
     if (targetWorkspaceId !== source.workspaceId) {
       throw new Error('Cross-workspace workflow duplication is not supported')
     }
 
-    const targetWorkspacePermission = await getUserEntityPermissions(
-      userId,
-      'workspace',
-      targetWorkspaceId
-    )
-    if (targetWorkspacePermission !== 'admin' && targetWorkspacePermission !== 'write') {
-      throw new Error('Write or admin access required for target workspace')
-    }
     const targetFolderId = folderId !== undefined ? folderId : source.folderId
     await assertTargetFolderMutable(tx, targetFolderId, targetWorkspaceId)
 
@@ -354,7 +207,12 @@ export async function duplicateWorkflow(
     // Mapping from old variable IDs to new variable IDs (populated during variable duplication)
     const varIdMapping = new Map<string, string>()
 
-    const deduplicatedName = await deduplicateWorkflowName(name, targetWorkspaceId, targetFolderId)
+    const deduplicatedName = await deduplicateWorkflowName(
+      name,
+      targetWorkspaceId,
+      targetFolderId,
+      tx
+    )
 
     await tx.insert(workflow).values({
       id: newWorkflowId,

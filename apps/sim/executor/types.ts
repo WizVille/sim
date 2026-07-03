@@ -5,6 +5,7 @@ import type {
   ChildWorkflowContext,
   IterationContext,
   ParentIteration,
+  PiiBlockOutputRedaction,
   SerializableExecutionState,
 } from '@/executor/execution/types'
 import type { RunFromBlockContext } from '@/executor/utils/run-from-block'
@@ -20,6 +21,12 @@ export interface UserFile {
   key: string
   context?: string
   base64?: string
+  /** Provider Files API handle (OpenAI/Anthropic `file_...` id) set when a large file is uploaded instead of inlined as base64. */
+  providerFileId?: string
+  /** Provider File API uri (Gemini `fileUri`) set when a large file is uploaded instead of inlined as base64. */
+  providerFileUri?: string
+  /** Short-lived signed HTTPS URL passed to providers that fetch attachments by remote URL instead of inlining base64. */
+  remoteUrl?: string
 }
 
 export interface ParallelPauseScope {
@@ -300,6 +307,8 @@ export interface ExecutionContext {
   isDeployedContext?: boolean
   enforceCredentialAccess?: boolean
   copilotToolExecution?: boolean
+  /** In-flight block-output PII redaction policy (resolved `blockOutputs` stage). */
+  piiBlockOutputRedaction?: PiiBlockOutputRedaction
 
   permissionConfig?: PermissionGroupConfig | null
   permissionConfigLoaded?: boolean

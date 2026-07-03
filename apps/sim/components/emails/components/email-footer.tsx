@@ -1,6 +1,6 @@
 import { Container, Img, Link, Section } from '@react-email/components'
 import { baseStyles, colors, spacing, typography } from '@/components/emails/_styles'
-import { isHosted } from '@/lib/core/config/feature-flags'
+import { isHosted } from '@/lib/core/config/env-flags'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import { getBrandConfig } from '@/ee/whitelabeling'
 
@@ -81,12 +81,15 @@ export function EmailFooter({
                             </Link>
                           </td>
                           <td align='left' style={{ padding: '0 8px' }}>
-                            <Link href={`${baseUrl}/discord`} rel='noopener noreferrer'>
+                            <Link
+                              href='https://www.linkedin.com/company/simdotai'
+                              rel='noopener noreferrer'
+                            >
                               <Img
-                                src={`${baseUrl}/static/discord-icon.png`}
+                                src={`${baseUrl}/static/linkedin-icon.png`}
                                 width='20'
                                 height='20'
-                                alt='Discord'
+                                alt='LinkedIn'
                               />
                             </Link>
                           </td>

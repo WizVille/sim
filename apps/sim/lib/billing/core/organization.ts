@@ -19,7 +19,8 @@ import {
   hasUsableSubscriptionStatus,
 } from '@/lib/billing/subscriptions/utils'
 import { toDecimal, toNumber } from '@/lib/billing/utils/decimal'
-import type { DbOrTx } from '@/lib/db/types'
+import type { DbClient } from '@/lib/db/types'
+import { isOrganizationAdminOrOwner } from '@/lib/workspaces/permissions/utils'
 
 const logger = createLogger('OrganizationBilling')
 
@@ -66,11 +67,11 @@ interface MemberUsageData {
 export async function getOrgMemberLedgerByUser(
   organizationId: string,
   period?: { start: Date; end: Date } | null,
-  executor: DbOrTx = db
+  executor: DbClient = db
 ): Promise<Map<string, number>> {
   let billingPeriod = period ?? null
   if (period === undefined) {
-    const subscription = await getOrganizationSubscription(organizationId)
+    const subscription = await getOrganizationSubscription(organizationId, { executor })
     billingPeriod =
       subscription?.periodStart && subscription?.periodEnd
         ? { start: subscription.periodStart, end: subscription.periodEnd }
@@ -90,11 +91,11 @@ export async function getOrgMemberLedgerByUser(
  */
 export async function getOrganizationBillingData(
   organizationId: string,
-  executor: DbOrTx = db
+  executor: DbClient = db
 ): Promise<OrganizationUsageData | null> {
   try {
     // Get organization info
-    const orgRecord = await db
+    const orgRecord = await executor
       .select()
       .from(organization)
       .where(eq(organization.id, organizationId))
@@ -108,7 +109,7 @@ export async function getOrganizationBillingData(
     const organizationData = orgRecord[0]
 
     // Get organization subscription directly (referenceId = organizationId)
-    const subscription = await getOrganizationSubscription(organizationId)
+    const subscription = await getOrganizationSubscription(organizationId, { executor })
 
     if (!subscription) {
       logger.warn('No subscription found for organization', { organizationId })
@@ -116,7 +117,7 @@ export async function getOrganizationBillingData(
     }
 
     // Get all organization members with their usage data
-    const membersWithUsage = await db
+    const membersWithUsage = await executor
       .select({
         userId: member.userId,
         userName: user.name,
@@ -185,7 +186,8 @@ export async function getOrganizationBillingData(
         const memberIds = members.map((m) => m.userId)
         const userBounds = await getOrgMemberRefreshBounds(
           subscription.referenceId,
-          subscription.periodStart
+          subscription.periodStart,
+          executor
         )
         const refreshConsumed = await computeDailyRefreshConsumed(
           {
@@ -233,7 +235,7 @@ export async function getOrganizationBillingData(
 
     const averageUsagePerMember = members.length > 0 ? totalCurrentUsage / members.length : 0
 
-    const [pendingInvitationCount] = await db
+    const [pendingInvitationCount] = await executor
       .select({ count: count() })
       .from(invitation)
       .where(
@@ -418,7 +420,11 @@ async function getOrganizationBillingSummary(organizationId: string) {
 }
 
 /**
- * Check if a user is an owner or admin of a specific organization
+ * Error-tolerant wrapper around {@link isOrganizationAdminOrOwner} for billing
+ * gates: on a DB error it logs and returns false instead of throwing, so a
+ * transient failure denies access rather than surfacing a 500 mid-checkout.
+ * Prefer the canonical {@link isOrganizationAdminOrOwner} when a thrown error
+ * should propagate.
  *
  * @param userId - The ID of the user to check
  * @param organizationId - The ID of the organization
@@ -429,18 +435,7 @@ export async function isOrganizationOwnerOrAdmin(
   organizationId: string
 ): Promise<boolean> {
   try {
-    const memberRecord = await db
-      .select({ role: member.role })
-      .from(member)
-      .where(and(eq(member.userId, userId), eq(member.organizationId, organizationId)))
-      .limit(1)
-
-    if (memberRecord.length === 0) {
-      return false
-    }
-
-    const userRole = memberRecord[0].role
-    return ['owner', 'admin'].includes(userRole)
+    return await isOrganizationAdminOrOwner(userId, organizationId)
   } catch (error) {
     logger.error('Error checking organization ownership/admin status:', error)
     return false

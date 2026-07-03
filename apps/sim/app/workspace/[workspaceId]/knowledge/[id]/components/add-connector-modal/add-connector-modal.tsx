@@ -1,8 +1,6 @@
 'use client'
 
 import { useMemo, useState } from 'react'
-import { ArrowLeft, Plus } from 'lucide-react'
-import { useParams } from 'next/navigation'
 import {
   ArrowRight,
   Button,
@@ -18,11 +16,13 @@ import {
   ChipModalFooter,
   ChipModalHeader,
   type ComboboxOption,
+  cn,
+  handleKeyboardActivation,
   Search,
-} from '@/components/emcn'
+} from '@sim/emcn'
+import { ArrowLeft, Plus } from 'lucide-react'
+import { useParams } from 'next/navigation'
 import { getSubscriptionAccessState } from '@/lib/billing/client'
-import { cn } from '@/lib/core/utils/cn'
-import { handleKeyboardActivation } from '@/lib/core/utils/keyboard'
 import { consumeOAuthReturnContext } from '@/lib/credentials/client-state'
 import {
   getCanonicalScopesForProvider,
@@ -36,14 +36,15 @@ import { MaxBadge } from '@/app/workspace/[workspaceId]/knowledge/[id]/component
 import { useConnectorConfigFields } from '@/app/workspace/[workspaceId]/knowledge/[id]/hooks/use-connector-config-fields'
 import { isBillingEnabled } from '@/app/workspace/[workspaceId]/settings/navigation'
 import { getBlock } from '@/blocks'
-import { CONNECTOR_REGISTRY } from '@/connectors/registry'
-import type { ConnectorConfig } from '@/connectors/types'
+import { getTileIconColorClass } from '@/blocks/icon-color'
+import { CONNECTOR_META_REGISTRY } from '@/connectors/registry'
+import type { ConnectorMeta } from '@/connectors/types'
 import { useCreateConnector } from '@/hooks/queries/kb/connectors'
 import { useOAuthCredentials } from '@/hooks/queries/oauth/oauth-credentials'
 import { useSubscriptionData } from '@/hooks/queries/subscription'
 import { useCredentialRefreshTriggers } from '@/hooks/use-credential-refresh-triggers'
 
-const CONNECTOR_ENTRIES = Object.entries(CONNECTOR_REGISTRY)
+const CONNECTOR_ENTRIES = Object.entries(CONNECTOR_META_REGISTRY)
 
 interface AddConnectorModalProps {
   open: boolean
@@ -81,7 +82,7 @@ export function AddConnectorModal({
   const subscriptionAccess = getSubscriptionAccessState(subscriptionResponse?.data)
   const hasMaxAccess = !isBillingEnabled || subscriptionAccess.hasUsableMaxAccess
 
-  const connectorConfig = selectedType ? CONNECTOR_REGISTRY[selectedType] : null
+  const connectorConfig = selectedType ? CONNECTOR_META_REGISTRY[selectedType] : null
   const isApiKeyMode = connectorConfig?.auth.mode === 'apiKey'
   const connectorProviderId = useMemo(
     () =>
@@ -453,7 +454,7 @@ export function AddConnectorModal({
 
 interface ConnectorTypeCardProps {
   type: string
-  config: ConnectorConfig
+  config: ConnectorMeta
   onClick: () => void
 }
 
@@ -477,7 +478,12 @@ function ConnectorTypeCard({ type, config, onClick }: ConnectorTypeCardProps) {
           )}
           style={brandBg ? { background: brandBg } : undefined}
         >
-          <Icon className={cn('size-5', brandBg ? 'text-white' : 'text-[var(--text-icon)]')} />
+          <Icon
+            className={cn(
+              'size-5',
+              brandBg ? getTileIconColorClass(brandBg) : 'text-[var(--text-icon)]'
+            )}
+          />
         </div>
       </div>
       <div className='flex min-w-0 flex-1 flex-col'>

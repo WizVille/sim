@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { workspaceIdSchema } from '@/lib/api/contracts/primitives'
 import { defineRouteContract } from '@/lib/api/contracts/types'
 
 const subBlockValuesSchema = z.record(z.string(), z.record(z.string(), z.unknown()))
@@ -219,6 +220,7 @@ export const workflowListItemSchema = z.object({
   updatedAt: z.string(),
   archivedAt: z.string().nullable(),
   locked: z.boolean(),
+  isDeployed: z.boolean().optional(),
 })
 
 export const createWorkflowBodySchema = z.object({
@@ -323,7 +325,6 @@ export const executeWorkflowTriggerTypeSchema = z.enum([
   'chat',
   'webhook',
   'mcp',
-  'a2a',
   'copilot',
   'mothership',
   'workflow',
@@ -344,6 +345,13 @@ export const executeWorkflowBodySchema = z.object({
   startBlockId: z.string().optional(),
   stopAfterBlockId: z.string().optional(),
   runFromBlock: executeWorkflowRunFromBlockSchema.optional(),
+  /**
+   * Workspace of the parent execution when this call is a workflow-in-workflow
+   * invocation (e.g. the agent `workflow_executor` tool). When present, the
+   * route rejects execution of a workflow that lives in a different workspace.
+   * Direct API callers omit it and are unaffected.
+   */
+  parentWorkspaceId: workspaceIdSchema.optional(),
 })
 export type ExecuteWorkflowBody = z.input<typeof executeWorkflowBodySchema>
 
@@ -884,5 +892,30 @@ export const resumeWorkflowExecutionContextContract = defineRouteContract({
   response: {
     mode: 'json',
     schema: resumeWorkflowExecutionContextResponseSchema,
+  },
+})
+
+/**
+ * Detail for a single pause context. The `pausePoint`/`queue`/`activeResumeEntry`
+ * shapes are modeled loosely (the pause point's `response.data` is block- and
+ * user-defined) — consistent with how the parent execution detail contract
+ * (`pausedWorkflowExecutionDetailSchema`) keeps its pause points as records.
+ */
+const pauseContextDetailResponseSchema = z
+  .object({
+    execution: pausedWorkflowExecutionSummarySchema,
+    pausePoint: z.record(z.string(), z.unknown()),
+    queue: z.array(z.record(z.string(), z.unknown())),
+    activeResumeEntry: z.record(z.string(), z.unknown()).nullable().optional(),
+  })
+  .passthrough()
+
+export const getPauseContextDetailContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/resume/[workflowId]/[executionId]/[contextId]',
+  params: resumeExecutionContextParamsSchema,
+  response: {
+    mode: 'json',
+    schema: pauseContextDetailResponseSchema,
   },
 })

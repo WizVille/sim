@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from 'react'
+import { toast } from '@sim/emcn'
 import { createLogger } from '@sim/logger'
 import {
   BLOCK_OPERATIONS,
@@ -15,7 +16,6 @@ import { useQueryClient } from '@tanstack/react-query'
 import { isEqual } from 'es-toolkit'
 import type { Edge } from 'reactflow'
 import { useShallow } from 'zustand/react/shallow'
-import { toast } from '@/components/emcn'
 import { requestJson } from '@/lib/api/client/request'
 import { getWorkflowStateContract } from '@/lib/api/contracts'
 import { useSession } from '@/lib/auth/auth-client'
@@ -378,6 +378,7 @@ export function useCollaborativeWorkflow() {
               }
               break
             case VARIABLE_OPERATIONS.REMOVE:
+              useOperationQueueStore.getState().cancelOperationsForVariable(payload.variableId)
               useVariablesStore.getState().deleteVariable(payload.variableId)
               break
           }
@@ -443,6 +444,8 @@ export function useCollaborativeWorkflow() {
               })
 
               if (ids && ids.length > 0) {
+                const operationQueue = useOperationQueueStore.getState()
+                ids.forEach((id: string) => operationQueue.cancelOperationsForBlock(id))
                 useWorkflowStore.getState().batchRemoveBlocks(ids)
               }
 

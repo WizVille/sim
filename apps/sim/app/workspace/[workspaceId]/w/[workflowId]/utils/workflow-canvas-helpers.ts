@@ -1,5 +1,5 @@
+import { BLOCK_DIMENSIONS, CONTAINER_DIMENSIONS } from '@sim/workflow-renderer'
 import type { Edge, Node } from 'reactflow'
-import { BLOCK_DIMENSIONS, CONTAINER_DIMENSIONS } from '@/lib/workflows/blocks/block-dimensions'
 import { TriggerUtils } from '@/lib/workflows/triggers/triggers'
 import { clampPositionToContainer } from '@/app/workspace/[workspaceId]/w/[workflowId]/utils/node-position-utils'
 import type { BlockState } from '@/stores/workflows/workflow/types'
@@ -85,6 +85,26 @@ export function validateTriggerPaste(
     }
   }
   return { isValid: true }
+}
+
+/**
+ * Determines whether a block should be treated as a positional trigger — a workflow
+ * entry point inferred from having no incoming edges.
+ *
+ * Blocks nested inside a loop or parallel subflow are never triggers regardless of
+ * their edges: a block pasted into a subflow starts with no incoming edges but is
+ * still an ordinary nested block (e.g. it must keep its "Remove from Subflow" action).
+ *
+ * @param block - The block to classify (id plus its parent binding, if any)
+ * @param edges - All workflow edges
+ * @returns True if the block is a top-level block with no incoming edges
+ */
+export function isPositionalTriggerBlock(
+  block: { id: string; parentId?: string } | undefined,
+  edges: Array<Pick<Edge, 'target'>>
+): boolean {
+  if (!block || block.parentId) return false
+  return !edges.some((edge) => edge.target === block.id)
 }
 
 /**

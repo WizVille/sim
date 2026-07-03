@@ -4,6 +4,7 @@ import { createLogger } from '@sim/logger'
 import { generateShortId } from '@sim/utils/id'
 import { and, eq, inArray, isNotNull, isNull, or } from 'drizzle-orm'
 import type { NextRequest } from 'next/server'
+import type { DbOrTx } from '@/lib/db/types'
 import { getProviderIdFromServiceId } from '@/lib/oauth'
 import { PendingWebhookVerificationTracker } from '@/lib/webhooks/pending-verification'
 import {
@@ -16,7 +17,12 @@ import {
   findConflictingWebhookPathOwner,
   syncWebhooksForCredentialSet,
 } from '@/lib/webhooks/utils.server'
-import { buildCanonicalIndex } from '@/lib/workflows/subblocks/visibility'
+import {
+  buildCanonicalIndex,
+  buildSubBlockValues,
+  isCanonicalPair,
+  resolveActiveCanonicalValue,
+} from '@/lib/workflows/subblocks/visibility'
 import { getBlock } from '@/blocks'
 import type { SubBlockConfig } from '@/blocks/types'
 import type { BlockState } from '@/stores/workflows/workflow/types'
@@ -37,7 +43,8 @@ interface TriggerSaveResult {
 }
 
 export async function validateTriggerWebhookConfigForDeploy(
-  blocks: Record<string, BlockState>
+  blocks: Record<string, BlockState>,
+  executor: DbOrTx = db
 ): Promise<TriggerSaveResult> {
   const triggerBlocks = Object.values(blocks || {}).filter((b) => b && b.enabled !== false)
 
@@ -74,7 +81,8 @@ export async function validateTriggerWebhookConfigForDeploy(
       const oauthProviderId = getProviderIdFromServiceId(provider)
       const hasCredential = await credentialSetHasProviderCredential(
         providerConfig.credentialSetId as string,
-        oauthProviderId
+        oauthProviderId,
+        executor
       )
       if (!hasCredential) {
         return {
@@ -93,9 +101,10 @@ export async function validateTriggerWebhookConfigForDeploy(
 
 async function credentialSetHasProviderCredential(
   credentialSetId: string,
-  providerId: string
+  providerId: string,
+  executor: DbOrTx
 ): Promise<boolean> {
-  const members = await db
+  const members = await executor
     .select({ userId: credentialSetMember.userId })
     .from(credentialSetMember)
     .where(
@@ -107,7 +116,7 @@ async function credentialSetHasProviderCredential(
 
   if (members.length === 0) return false
 
-  const [credential] = await db
+  const [credential] = await executor
     .select({ id: account.id })
     .from(account)
     .where(
@@ -246,7 +255,13 @@ function getConfigValue(block: BlockState, subBlock: SubBlockConfig): unknown {
   return fieldValue
 }
 
-function buildProviderConfig(
+/**
+ * Build the persisted `webhook.providerConfig` for a trigger block at deploy time.
+ *
+ * Exported for unit testing the canonical-collapse pass; not part of the public
+ * deploy API.
+ */
+export function buildProviderConfig(
   block: BlockState,
   triggerId: string,
   triggerDef: { subBlocks: SubBlockConfig[] }
@@ -301,6 +316,25 @@ function buildProviderConfig(
     if (canonicalId && satisfiedCanonicalIds.has(canonicalId)) continue
     if (isFieldRequired(subBlock, subBlockValues)) {
       missingFields.push(subBlock.title || subBlock.id)
+    }
+  }
+
+  // Collapse each canonical pair (basic + advanced swap) to its ACTIVE value under the
+  // canonical key, so pollers read one authoritative key instead of guessing basic-first.
+  // resolveActiveCanonicalValue is the shared SOT: an explicit block.data.canonicalModes
+  // override, else the value heuristic. The raw subblock keys written in the first pass are
+  // kept for transitional readers (removable in a follow-up contract phase). This only runs on
+  // a (re)deploy, so any drift collapse is scoped to the new deployment version — already
+  // deployed rows are migrated separately and keep their current resource.
+  const canonicalModes = block.data?.canonicalModes
+  const flatSubBlockValues = buildSubBlockValues(block.subBlocks || {})
+  for (const group of Object.values(canonicalIndex.groupsById)) {
+    if (!isCanonicalPair(group)) continue
+    const activeValue = resolveActiveCanonicalValue(group, flatSubBlockValues, canonicalModes)
+    if (activeValue !== null && activeValue !== undefined && activeValue !== '') {
+      providerConfig[group.canonicalId] = activeValue
+    } else {
+      delete providerConfig[group.canonicalId]
     }
   }
 
@@ -928,6 +962,10 @@ async function persistCreatedWebhookRecordAfterCleanupFailure({
  * Removes external subscriptions and deletes webhook records from the database.
  *
  * @param skipExternalCleanup - If true, skip external subscription cleanup (already done elsewhere)
+ * @param shouldDeleteWebhook - Best-effort early-exit probe. Its implementations
+ *   query the global pool, so it MUST only be awaited while no transaction is open.
+ *   See {@link deleteWebhookRecordAfterCleanup} for the in-transaction recheck that
+ *   makes this probe non-authoritative.
  */
 export async function cleanupWebhooksForWorkflow(
   workflowId: string,
@@ -1032,6 +1070,16 @@ export async function cleanupWebhooksForWorkflow(
   )
 }
 
+/**
+ * Deletes a webhook record unless the deployment became active again.
+ *
+ * `shouldDeleteWebhook` is awaited BEFORE the transaction opens — its
+ * implementations query the global pool, so running it inside the
+ * transaction would nest a second pooled checkout under the held
+ * connection. The transaction does not need it: the `FOR UPDATE` select
+ * on the deployment version row is the authoritative recheck, and it
+ * aborts the delete if the version was reactivated.
+ */
 async function deleteWebhookRecordAfterCleanup(params: {
   workflowId: string
   deploymentVersionId?: string | null

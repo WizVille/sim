@@ -1,6 +1,7 @@
 import { db } from '@sim/db'
 import { member, organization, subscription, user } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
+import { isOrgAdminRole } from '@sim/platform-authz/workspace'
 import { and, eq, inArray, sql } from 'drizzle-orm'
 import { getEffectiveBillingStatus, isOrganizationBillingBlocked } from '@/lib/billing/core/access'
 import {
@@ -9,6 +10,7 @@ import {
 } from '@/lib/billing/core/plan'
 import {
   getPlanTierCredits,
+  isEnterprise as isPlanEnterprise,
   isPro as isPlanPro,
   isTeam as isPlanTeam,
 } from '@/lib/billing/plan-helpers'
@@ -27,7 +29,7 @@ import {
   isHosted,
   isInboxEnabled,
   isSsoEnabled,
-} from '@/lib/core/config/feature-flags'
+} from '@/lib/core/config/env-flags'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 
 const logger = createLogger('SubscriptionCore')
@@ -50,6 +52,21 @@ export function getBillingInterval(
   metadata: SubscriptionMetadata | null | undefined
 ): 'month' | 'year' {
   return metadata?.billingInterval === 'year' ? 'year' : 'month'
+}
+
+/**
+ * Resolves a subscription's effective billing interval. Prefers the Stripe-synced
+ * `billingInterval` column — the only source populated on enterprise/manual
+ * subscriptions, which skip the checkout flow that writes the metadata value — and
+ * falls back to `metadata.billingInterval` (the column is often null on
+ * checkout-created subs), defaulting to monthly. Where both are set they agree.
+ */
+export function resolveBillingInterval(
+  sub: { billingInterval?: string | null; metadata?: unknown } | null | undefined
+): 'month' | 'year' {
+  const column = sub?.billingInterval
+  if (column === 'year' || column === 'month') return column
+  return getBillingInterval((sub?.metadata ?? null) as SubscriptionMetadata | null)
 }
 
 /**
@@ -183,7 +200,7 @@ export async function getOrganizationIdForSubscriptionReference(
     .where(eq(member.userId, referenceId))
     .limit(1)
 
-  if (memberRecord && (memberRecord.role === 'owner' || memberRecord.role === 'admin')) {
+  if (memberRecord && isOrgAdminRole(memberRecord.role)) {
     return memberRecord.organizationId
   }
 
@@ -502,31 +519,91 @@ export async function isWorkspaceOnEnterprisePlan(workspaceId: string): Promise<
   }
 }
 
+const MAX_PLAN_CREDITS = 25000
+
 /**
- * Check if user has access to inbox (Sim Mailer) feature
- * Returns true if:
- * - INBOX_ENABLED env var is set, OR
- * - Non-production environment, OR
- * - User has a Max plan (credits >= 25000) or enterprise plan
+ * Whether a plan tier entitles the inbox (Sim Mailer) feature: a Max tier
+ * (credits >= 25000, covering `pro_25000` and `team_25000`) or any enterprise
+ * plan. Subscription status (usable vs entitled) is gated by callers before this
+ * runs — the predicate is tier-only.
  */
-export async function hasInboxAccess(userId: string): Promise<boolean> {
+function isInboxEntitledPlan(plan: string): boolean {
+  return getPlanTierCredits(plan) >= MAX_PLAN_CREDITS || isPlanEnterprise(plan)
+}
+
+/**
+ * Check whether a workspace is entitled to the inbox (Sim Mailer) feature.
+ * Entitlement follows the workspace's billing entity — not the acting user — so
+ * any workspace admin (including an external member) can manage the inbox when
+ * the workspace's organization, or its billed account for personal workspaces,
+ * is on a Max or enterprise plan.
+ *
+ * Returns true if:
+ * - INBOX_ENABLED env var is set (self-hosted override), OR
+ * - billing is disabled, OR
+ * - the workspace belongs to an organization on a Max/enterprise plan (org-mode), OR
+ * - the billed user has an individual Max/enterprise subscription (personal workspace).
+ */
+export async function hasWorkspaceInboxAccess(workspaceId: string): Promise<boolean> {
   try {
-    if (isInboxEnabled) {
-      return true
+    if (isInboxEnabled) return true
+    if (!isBillingEnabled) return true
+
+    const { getWorkspaceWithOwner } = await import('@/lib/workspaces/permissions/utils')
+    const ws = await getWorkspaceWithOwner(workspaceId, { includeArchived: true })
+    if (!ws) return false
+
+    if (ws.organizationId) {
+      if (await isOrganizationBillingBlocked(ws.organizationId)) return false
+      const orgSub = await getOrganizationSubscriptionUsable(ws.organizationId)
+      return !!orgSub && isInboxEntitledPlan(orgSub.plan)
     }
-    if (!isBillingEnabled) {
-      return true
-    }
-    const [sub, billingStatus] = await Promise.all([
-      getHighestPrioritySubscription(userId),
-      getEffectiveBillingStatus(userId),
+
+    const [billedSub, billingStatus] = await Promise.all([
+      getHighestPrioritySubscription(ws.billedAccountUserId),
+      getEffectiveBillingStatus(ws.billedAccountUserId),
     ])
-    if (!sub) return false
-    if (!hasUsableSubscriptionAccess(sub.status, billingStatus.billingBlocked)) return false
-    return getPlanTierCredits(sub.plan) >= 25000 || checkEnterprisePlan(sub)
+    if (!billedSub) return false
+    if (!hasUsableSubscriptionAccess(billedSub.status, billingStatus.billingBlocked)) return false
+    return isInboxEntitledPlan(billedSub.plan)
   } catch (error) {
-    logger.error('Error checking inbox access', { error, userId })
+    logger.error('Error checking workspace inbox access', { error, workspaceId })
     return false
+  }
+}
+
+/**
+ * Whether a workspace should RETAIN its provisioned inbox (Sim Mailer)
+ * infrastructure. Unlike {@link hasWorkspaceInboxAccess}, which gates active use
+ * on a *usable* (active) subscription, this uses the broader *entitled* status
+ * set (active OR `past_due`) so a transient payment failure never triggers the
+ * destructive teardown of a paying customer's inbox.
+ *
+ * Reconciliation should delete AgentMail resources only when this returns
+ * `false` — i.e. the plan is genuinely terminal (canceled, downgraded off
+ * Max/Enterprise, or gone). Fails open (returns `true`) on any error or
+ * ambiguity: never tear down on uncertainty.
+ */
+export async function hasWorkspaceInboxGraceAccess(workspaceId: string): Promise<boolean> {
+  try {
+    if (isInboxEnabled) return true
+    if (!isBillingEnabled) return true
+
+    const { getWorkspaceWithOwner } = await import('@/lib/workspaces/permissions/utils')
+    const ws = await getWorkspaceWithOwner(workspaceId, { includeArchived: true })
+    if (!ws) return true
+
+    if (ws.organizationId) {
+      const { getOrganizationSubscription } = await import('@/lib/billing/core/billing')
+      const orgSub = await getOrganizationSubscription(ws.organizationId)
+      return !!orgSub && isInboxEntitledPlan(orgSub.plan)
+    }
+
+    const billedSub = await getHighestPrioritySubscription(ws.billedAccountUserId)
+    return !!billedSub && isInboxEntitledPlan(billedSub.plan)
+  } catch (error) {
+    logger.error('Error checking workspace inbox grace access', { error, workspaceId })
+    return true
   }
 }
 

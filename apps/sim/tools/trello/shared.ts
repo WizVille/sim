@@ -1,22 +1,20 @@
+import { isRecordLike } from '@sim/utils/object'
 import type {
   TrelloAction,
   TrelloActionBoardTarget,
   TrelloActionCardTarget,
   TrelloActionListTarget,
+  TrelloBoard,
   TrelloCard,
+  TrelloChecklist,
+  TrelloChecklistItem,
   TrelloComment,
   TrelloLabel,
   TrelloList,
   TrelloMember,
 } from '@/tools/trello/types'
 
-type TrelloRecord = Record<string, unknown>
-
 export const TRELLO_API_BASE_URL = 'https://api.trello.com/1'
-
-function isRecord(value: unknown): value is TrelloRecord {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
 
 function getRequiredString(value: unknown, field: string): string {
   if (typeof value === 'string' && value.trim().length > 0) {
@@ -57,7 +55,7 @@ function getOptionalNumber(value: unknown): number | null {
   return null
 }
 
-function getIdArray(value: unknown): string[] {
+export function getIdArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return []
   }
@@ -67,7 +65,7 @@ function getIdArray(value: unknown): string[] {
       return [item]
     }
 
-    if (isRecord(item) && typeof item.id === 'string' && item.id.trim().length > 0) {
+    if (isRecordLike(item) && typeof item.id === 'string' && item.id.trim().length > 0) {
       return [item.id]
     }
 
@@ -76,7 +74,7 @@ function getIdArray(value: unknown): string[] {
 }
 
 function mapTrelloLabel(value: unknown): TrelloLabel | null {
-  if (!isRecord(value) || typeof value.id !== 'string') {
+  if (!isRecordLike(value) || typeof value.id !== 'string') {
     return null
   }
 
@@ -87,8 +85,8 @@ function mapTrelloLabel(value: unknown): TrelloLabel | null {
   }
 }
 
-function mapTrelloMember(value: unknown): TrelloMember | null {
-  if (!isRecord(value) || typeof value.id !== 'string') {
+export function mapTrelloMember(value: unknown): TrelloMember | null {
+  if (!isRecordLike(value) || typeof value.id !== 'string') {
     return null
   }
 
@@ -100,7 +98,7 @@ function mapTrelloMember(value: unknown): TrelloMember | null {
 }
 
 function mapActionCardTarget(value: unknown): TrelloActionCardTarget | null {
-  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.name !== 'string') {
+  if (!isRecordLike(value) || typeof value.id !== 'string' || typeof value.name !== 'string') {
     return null
   }
 
@@ -114,7 +112,7 @@ function mapActionCardTarget(value: unknown): TrelloActionCardTarget | null {
 }
 
 function mapActionBoardTarget(value: unknown): TrelloActionBoardTarget | null {
-  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.name !== 'string') {
+  if (!isRecordLike(value) || typeof value.id !== 'string' || typeof value.name !== 'string') {
     return null
   }
 
@@ -126,7 +124,7 @@ function mapActionBoardTarget(value: unknown): TrelloActionBoardTarget | null {
 }
 
 function mapActionListTarget(value: unknown): TrelloActionListTarget | null {
-  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.name !== 'string') {
+  if (!isRecordLike(value) || typeof value.id !== 'string' || typeof value.name !== 'string') {
     return null
   }
 
@@ -137,7 +135,7 @@ function mapActionListTarget(value: unknown): TrelloActionListTarget | null {
 }
 
 export function mapTrelloList(value: unknown): TrelloList {
-  if (!isRecord(value)) {
+  if (!isRecordLike(value)) {
     throw new Error('Trello returned an invalid list object')
   }
 
@@ -151,7 +149,7 @@ export function mapTrelloList(value: unknown): TrelloList {
 }
 
 export function mapTrelloCard(value: unknown): TrelloCard {
-  if (!isRecord(value)) {
+  if (!isRecordLike(value)) {
     throw new Error('Trello returned an invalid card object')
   }
 
@@ -180,12 +178,55 @@ export function mapTrelloCard(value: unknown): TrelloCard {
   }
 }
 
+export function mapTrelloBoard(value: unknown): TrelloBoard {
+  if (!isRecordLike(value)) {
+    throw new Error('Trello returned an invalid board object')
+  }
+
+  return {
+    id: getRequiredString(value.id, 'id'),
+    name: getRequiredString(value.name, 'name'),
+    desc: typeof value.desc === 'string' ? value.desc : '',
+    url: getRequiredString(value.url, 'url'),
+    closed: typeof value.closed === 'boolean' ? value.closed : false,
+    idOrganization: getOptionalString(value.idOrganization),
+  }
+}
+
+export function mapTrelloChecklist(value: unknown): TrelloChecklist {
+  if (!isRecordLike(value)) {
+    throw new Error('Trello returned an invalid checklist object')
+  }
+
+  return {
+    id: getRequiredString(value.id, 'id'),
+    name: getRequiredString(value.name, 'name'),
+    idCard: getRequiredString(value.idCard, 'idCard'),
+    idBoard: getOptionalString(value.idBoard),
+    pos: getNumber(value.pos),
+  }
+}
+
+export function mapTrelloChecklistItem(value: unknown): TrelloChecklistItem {
+  if (!isRecordLike(value)) {
+    throw new Error('Trello returned an invalid checklist item object')
+  }
+
+  return {
+    id: getRequiredString(value.id, 'id'),
+    name: getRequiredString(value.name, 'name'),
+    state: getRequiredString(value.state, 'state'),
+    pos: getNumber(value.pos),
+    idChecklist: getOptionalString(value.idChecklist),
+  }
+}
+
 export function mapTrelloAction(value: unknown): TrelloAction {
-  if (!isRecord(value)) {
+  if (!isRecordLike(value)) {
     throw new Error('Trello returned an invalid action object')
   }
 
-  const data = isRecord(value.data) ? value.data : null
+  const data = isRecordLike(value.data) ? value.data : null
 
   return {
     id: getRequiredString(value.id, 'id'),
@@ -211,7 +252,7 @@ export function extractTrelloErrorMessage(
 ): string {
   const parts: string[] = []
 
-  if (isRecord(data)) {
+  if (isRecordLike(data)) {
     const message = data.message
     const error = data.error
 

@@ -1,8 +1,6 @@
 'use client'
 
 import { useMemo, useRef, useState } from 'react'
-import { createLogger } from '@sim/logger'
-import { getErrorMessage } from '@sim/utils/errors'
 import {
   Button,
   ButtonGroup,
@@ -22,13 +20,15 @@ import {
   TableHeader,
   TableRow,
   toast,
-} from '@/components/emcn'
+} from '@sim/emcn'
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { CSV_ASYNC_IMPORT_THRESHOLD_BYTES } from '@/lib/table/constants'
 import { buildAutoMapping, parseCsvBuffer } from '@/lib/table/import'
 import type { TableDefinition } from '@/lib/table/types'
 import {
   type CsvImportMode,
-  cancelTableImport,
+  cancelTableJob,
   useImportCsvIntoTable,
   useImportCsvIntoTableAsync,
 } from '@/hooks/queries/tables'
@@ -322,7 +322,7 @@ export function ImportCsvDialog({
             // the id so it's not shown and cancel the worker server-side.
             if (useImportTrayStore.getState().consumeCanceled(table.id) && data?.importId) {
               useImportTrayStore.getState().cancel(table.id)
-              void cancelTableImport(workspaceId, table.id, data.importId).catch(() => {})
+              void cancelTableJob(workspaceId, table.id, data.importId).catch(() => {})
             }
           },
           onError: () => {

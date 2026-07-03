@@ -4,8 +4,10 @@ import https from 'https'
 import type { LookupFunction } from 'net'
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
+import { omit } from '@sim/utils/object'
 import * as ipaddr from 'ipaddr.js'
-import { isHosted } from '@/lib/core/config/feature-flags'
+import { Agent, type RequestInit as UndiciRequestInit, fetch as undiciFetch } from 'undici'
+import { isHosted, isPrivateDatabaseHostsAllowed } from '@/lib/core/config/env-flags'
 import { type ValidationResult, validateExternalUrl } from '@/lib/core/security/input-validation'
 import { PayloadSizeLimitError } from '@/lib/core/utils/stream-limits'
 
@@ -153,6 +155,12 @@ export async function validateUrlWithDNS(
  * database hostnames (e.g. underscores in Docker/K8s service names). It only
  * blocks localhost and private/reserved IPs.
  *
+ * Self-hosted operators can set `ALLOW_PRIVATE_DATABASE_HOSTS` to reach databases
+ * on their private network (e.g. a Docker/Swarm service name that resolves to an
+ * internal IP). The opt-in only bypasses the private/reserved/loopback block; DNS
+ * is still resolved so the caller can pin the connection to the resolved IP. The
+ * bypass is never honored on the hosted platform (see {@link isPrivateDatabaseHostsAllowed}).
+ *
  * @param host - The database hostname to validate
  * @param paramName - Name of the parameter for error messages
  * @returns AsyncValidationResult with resolved IP
@@ -166,19 +174,25 @@ export async function validateDatabaseHost(
   }
 
   const lowerHost = host.toLowerCase()
+  const cleanHost =
+    lowerHost.startsWith('[') && lowerHost.endsWith(']') ? lowerHost.slice(1, -1) : lowerHost
 
-  if (lowerHost === 'localhost') {
+  if (cleanHost === 'localhost' && !isPrivateDatabaseHostsAllowed) {
     return { isValid: false, error: `${paramName} cannot be localhost` }
   }
 
-  if (ipaddr.isValid(lowerHost) && isPrivateOrReservedIP(lowerHost)) {
+  if (
+    ipaddr.isValid(cleanHost) &&
+    isPrivateOrReservedIP(cleanHost) &&
+    !isPrivateDatabaseHostsAllowed
+  ) {
     return { isValid: false, error: `${paramName} cannot be a private IP address` }
   }
 
   try {
-    const { address } = await dns.lookup(host, { verbatim: true })
+    const { address } = await dns.lookup(cleanHost, { verbatim: true })
 
-    if (isPrivateOrReservedIP(address)) {
+    if (isPrivateOrReservedIP(address) && !isPrivateDatabaseHostsAllowed) {
       logger.warn('Database host resolves to blocked IP address', {
         paramName,
         hostname: host,
@@ -322,6 +336,8 @@ export interface SecureFetchOptions {
   maxRedirects?: number
   maxResponseBytes?: number
   signal?: AbortSignal
+  /** Drop the Authorization header when following a redirect, so it is not sent to the redirect target's origin. */
+  stripAuthOnRedirect?: boolean
 }
 
 export class SecureFetchHeaders {
@@ -403,6 +419,40 @@ export function createPinnedLookup(resolvedIP: string): LookupFunction {
 }
 
 /**
+ * Builds a standard `fetch`-compatible function that pins every outbound
+ * connection to `resolvedIP`, preventing DNS-rebinding (TOCTOU) between URL
+ * validation and connection. The original hostname is preserved for TLS SNI and
+ * the `Host` header so it still matches the certificate. This is the single
+ * source of truth for pinned outbound fetches — both the LLM providers and the
+ * MCP transport consume it.
+ *
+ * Pass the returned function as the `fetch` option to the OpenAI/Anthropic SDKs
+ * (or call it directly) after validating the URL with {@link validateUrlWithDNS}
+ * and capturing `resolvedIP`. Because the pinned lookup always returns
+ * `resolvedIP` regardless of hostname, any redirect the server returns also
+ * connects to the validated IP — an attacker cannot rebind a redirect target to
+ * an internal address.
+ *
+ * The `Agent` is captured for the lifetime of the returned function, so repeated
+ * calls (e.g. a provider tool loop) reuse its keep-alive connections.
+ */
+export function createPinnedFetch(resolvedIP: string): typeof fetch {
+  const dispatcher = new Agent({ connect: { lookup: createPinnedLookup(resolvedIP) } })
+
+  const pinned = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    // double-cast-allowed: DOM RequestInfo/URL and undici fetch input types differ but are structurally compatible at runtime (Node's global fetch IS undici)
+    const undiciInput = input as unknown as Parameters<typeof undiciFetch>[0]
+    // double-cast-allowed: DOM RequestInit and undici RequestInit are structurally compatible at runtime but the TS types differ
+    const undiciInit: UndiciRequestInit = { ...(init as unknown as UndiciRequestInit), dispatcher }
+    const response = await undiciFetch(undiciInput, undiciInit)
+    // double-cast-allowed: undici Response and DOM Response are structurally compatible at runtime
+    return response as unknown as Response
+  }
+
+  return pinned
+}
+
+/**
  * Performs a fetch with IP pinning to prevent DNS rebinding attacks.
  * Uses the pre-resolved IP address while preserving the original hostname for TLS SNI.
  * Follows redirects securely by validating each redirect target.
@@ -455,10 +505,16 @@ export async function secureFetchWithPinnedIP(
               settledReject(new Error(`Redirect blocked: ${validation.error}`))
               return
             }
+            const redirectOptions = options.stripAuthOnRedirect
+              ? {
+                  ...options,
+                  headers: omit(options.headers ?? {}, ['Authorization', 'authorization']),
+                }
+              : options
             return secureFetchWithPinnedIP(
               redirectUrl,
               validation.resolvedIP!,
-              options,
+              redirectOptions,
               redirectCount + 1
             )
           })

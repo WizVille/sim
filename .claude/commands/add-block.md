@@ -27,7 +27,7 @@ export const {ServiceName}Block: BlockConfig = {
   name: '{Service Name}',               // Human readable
   description: 'Brief description',     // One sentence
   longDescription: 'Detailed description for docs',
-  docsLink: 'https://docs.sim.ai/tools/{service}',
+  docsLink: 'https://docs.sim.ai/integrations/{service}',
   category: 'tools',                    // 'tools' | 'blocks' | 'triggers'
   integrationType: IntegrationType.X,   // Primary category (see IntegrationType enum)
   tags: ['oauth', 'api'],              // Cross-cutting tags (see IntegrationTag type)
@@ -600,16 +600,19 @@ export const ServiceV2Block: BlockConfig = {
 
 ## Registering Blocks
 
-After creating the block, remind the user to:
-1. Import in `apps/sim/blocks/registry.ts`
-2. Add to the `registry` object (alphabetically):
+After creating the block, remind the user to register it in `apps/sim/blocks/registry-maps.ts` (the data maps live here; `registry.ts` holds only the accessor functions). Add the import and an entry to each map alphabetically:
 
 ```typescript
-import { ServiceBlock } from '@/blocks/blocks/service'
+import { ServiceBlock, ServiceBlockMeta } from '@/blocks/blocks/service'
 
-export const registry: Record<string, BlockConfig> = {
+export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   // ... existing blocks ...
   service: ServiceBlock,
+}
+
+export const BLOCK_META_REGISTRY: Record<string, BlockMeta> = {
+  // ... existing metas ...
+  service: ServiceBlockMeta,
 }
 ```
 
@@ -626,7 +629,7 @@ export const ServiceBlock: BlockConfig = {
   name: 'Service',
   description: 'Integrate with Service API',
   longDescription: 'Full description for documentation...',
-  docsLink: 'https://docs.sim.ai/tools/service',
+  docsLink: 'https://docs.sim.ai/integrations/service',
   category: 'tools',
   integrationType: IntegrationType.DeveloperTools,
   tags: ['oauth', 'api'],
@@ -729,6 +732,13 @@ Please provide the SVG and I'll convert it to a React component.
 You can usually find this in the service's brand/press kit page, or copy it from their website.
 ```
 
+When converting the SVG: a **monochrome** logo (single white or black mark) must
+use `fill='currentColor'`, never a hardcoded `#fff`/`#000000`. Block icons render
+both inside their `bgColor` tile and "bare" on a neutral page (the home Suggested
+actions list) in light and dark mode; a hardcoded white/black mark goes invisible
+bare on the matching background. Multi-color brand logos keep their own fills.
+Verify with `bun run check:bare-icons`.
+
 ## Advanced Mode for Optional Fields
 
 Optional fields that are rarely used should be set to `mode: 'advanced'` so they don't clutter the basic UI. This includes:
@@ -794,6 +804,7 @@ import type { BlockMeta } from '@/blocks/types'
 
 export const {Service}BlockMeta = {
   tags: ['tag1', 'tag2'],                  // IntegrationTag[]
+  url: 'https://{service}.com',            // external service homepage (verify it resolves) — NOT docs.sim.ai
   templates: [
     {
       icon: {Service}Icon,
@@ -839,12 +850,13 @@ Derive templates from the service's real use cases. Each prompt should name a co
 - [ ] Tools.access lists all tool IDs (snake_case)
 - [ ] Tools.config.tool returns correct tool ID (snake_case)
 - [ ] Outputs match tool outputs
-- [ ] Block registered in registry.ts
+- [ ] Block + meta registered in registry-maps.ts (`BLOCK_REGISTRY` / `BLOCK_META_REGISTRY`)
 - [ ] If icon missing: asked user to provide SVG
 - [ ] If triggers exist: `triggers` config set, trigger subBlocks spread
 - [ ] Optional/rarely-used fields set to `mode: 'advanced'`
 - [ ] Timestamps and complex inputs have `wandConfig` enabled
 - [ ] Exported `{Service}BlockMeta` with at least 7 templates
+- [ ] `url` set on `{Service}BlockMeta` to the external service's verified homepage (omit only for first-party blocks with no external service)
 - [ ] `skills` added to `{Service}BlockMeta`, each grounded in `tools.access` and sourced from a real online use case (not invented)
 
 ## Final Validation (Required)

@@ -1,6 +1,7 @@
 'use client'
 
-import { Plus, Table as TableIcon, Upload } from '@/components/emcn'
+import { Plus, Upload } from '@sim/emcn'
+import { Table as TableIcon } from '@sim/emcn/icons'
 import {
   type ChromeActionSpec,
   ResourceChromeFallback,

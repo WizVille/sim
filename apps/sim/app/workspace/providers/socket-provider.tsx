@@ -11,6 +11,19 @@ import {
   useState,
 } from 'react'
 import { createLogger } from '@sim/logger'
+import type {
+  CursorUpdateBroadcast,
+  OperationConfirmedBroadcast,
+  OperationFailedBroadcast,
+  SelectionUpdateBroadcast,
+  SubblockUpdateBroadcast,
+  VariableUpdateBroadcast,
+  WorkflowDeletedBroadcast,
+  WorkflowDeployedBroadcast,
+  WorkflowOperationBroadcast,
+  WorkflowRevertedBroadcast,
+  WorkflowUpdatedBroadcast,
+} from '@sim/realtime-protocol/events'
 import { generateId } from '@sim/utils/id'
 import { backoffWithJitter } from '@sim/utils/retry'
 import { useParams } from 'next/navigation'
@@ -25,6 +38,13 @@ import {
   resolveSocketWorkflowTarget,
 } from '@/app/workspace/providers/socket-join-target'
 import { useOperationQueueStore } from '@/stores/operation-queue/store'
+import type {
+  SubblockUpdateEmit,
+  VariableUpdateEmit,
+  WorkflowOperationEmit,
+} from '@/stores/operation-queue/types'
+import { usePresenceStore } from '@/stores/presence/store'
+import type { PresenceUser } from '@/stores/presence/types'
 import { useWorkflowRegistry as useWorkflowRegistryStore } from '@/stores/workflows/registry/store'
 
 const logger = createLogger('SocketContext')
@@ -53,15 +73,6 @@ interface User {
   email?: string
 }
 
-interface PresenceUser {
-  socketId: string
-  userId: string
-  userName: string
-  avatarUrl?: string | null
-  cursor?: { x: number; y: number } | null
-  selection?: { type: 'block' | 'edge' | 'none'; id?: string }
-}
-
 interface SocketContextType {
   socket: Socket | null
   isConnected: boolean
@@ -69,48 +80,35 @@ interface SocketContextType {
   isReconnecting: boolean
   isRetryingWorkflowJoin: boolean
   authFailed: boolean
+  /**
+   * Workflow whose room join failed non-retryably (e.g. access denied). The room
+   * is blocked until the user targets a different workflow or refreshes; edits made
+   * while blocked would never persist, so consumers should surface this and block edits.
+   */
+  blockedJoinWorkflowId: string | null
   currentWorkflowId: string | null
   currentSocketId: string | null
-  presenceUsers: PresenceUser[]
   joinWorkflow: (workflowId: string) => void
   leaveWorkflow: () => void
   retryConnection: () => void
-  emitWorkflowOperation: (
-    workflowId: string,
-    operation: string,
-    target: string,
-    payload: any,
-    operationId?: string
-  ) => void
-  emitSubblockUpdate: (
-    blockId: string,
-    subblockId: string,
-    value: any,
-    operationId: string | undefined,
-    workflowId: string
-  ) => void
-  emitVariableUpdate: (
-    variableId: string,
-    field: string,
-    value: any,
-    operationId: string | undefined,
-    workflowId: string
-  ) => void
+  emitWorkflowOperation: WorkflowOperationEmit
+  emitSubblockUpdate: SubblockUpdateEmit
+  emitVariableUpdate: VariableUpdateEmit
 
   emitCursorUpdate: (cursor: { x: number; y: number } | null) => void
   emitSelectionUpdate: (selection: { type: 'block' | 'edge' | 'none'; id?: string }) => void
-  onWorkflowOperation: (handler: (data: any) => void) => void
-  onSubblockUpdate: (handler: (data: any) => void) => void
-  onVariableUpdate: (handler: (data: any) => void) => void
+  onWorkflowOperation: (handler: (data: WorkflowOperationBroadcast) => void) => void
+  onSubblockUpdate: (handler: (data: SubblockUpdateBroadcast) => void) => void
+  onVariableUpdate: (handler: (data: VariableUpdateBroadcast) => void) => void
 
-  onCursorUpdate: (handler: (data: any) => void) => void
-  onSelectionUpdate: (handler: (data: any) => void) => void
-  onWorkflowDeleted: (handler: (data: any) => void) => void
-  onWorkflowReverted: (handler: (data: any) => void) => void
-  onWorkflowUpdated: (handler: (data: any) => void) => void
-  onWorkflowDeployed: (handler: (data: any) => void) => void
-  onOperationConfirmed: (handler: (data: any) => void) => void
-  onOperationFailed: (handler: (data: any) => void) => void
+  onCursorUpdate: (handler: (data: CursorUpdateBroadcast) => void) => void
+  onSelectionUpdate: (handler: (data: SelectionUpdateBroadcast) => void) => void
+  onWorkflowDeleted: (handler: (data: WorkflowDeletedBroadcast) => void) => void
+  onWorkflowReverted: (handler: (data: WorkflowRevertedBroadcast) => void) => void
+  onWorkflowUpdated: (handler: (data: WorkflowUpdatedBroadcast) => void) => void
+  onWorkflowDeployed: (handler: (data: WorkflowDeployedBroadcast) => void) => void
+  onOperationConfirmed: (handler: (data: OperationConfirmedBroadcast) => void) => void
+  onOperationFailed: (handler: (data: OperationFailedBroadcast) => void) => void
 }
 
 const SocketContext = createContext<SocketContextType>({
@@ -120,15 +118,15 @@ const SocketContext = createContext<SocketContextType>({
   isReconnecting: false,
   isRetryingWorkflowJoin: false,
   authFailed: false,
+  blockedJoinWorkflowId: null,
   currentWorkflowId: null,
   currentSocketId: null,
-  presenceUsers: [],
   joinWorkflow: () => {},
   leaveWorkflow: () => {},
   retryConnection: () => {},
-  emitWorkflowOperation: () => {},
-  emitSubblockUpdate: () => {},
-  emitVariableUpdate: () => {},
+  emitWorkflowOperation: () => false,
+  emitSubblockUpdate: () => false,
+  emitVariableUpdate: () => false,
   emitCursorUpdate: () => {},
   emitSelectionUpdate: () => {},
   onWorkflowOperation: () => {},
@@ -159,8 +157,8 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
   const [isRetryingWorkflowJoin, setIsRetryingWorkflowJoin] = useState(false)
   const [currentWorkflowId, setCurrentWorkflowId] = useState<string | null>(null)
   const [currentSocketId, setCurrentSocketId] = useState<string | null>(null)
-  const [presenceUsers, setPresenceUsers] = useState<PresenceUser[]>([])
   const [authFailed, setAuthFailed] = useState(false)
+  const [blockedJoinWorkflowId, setBlockedJoinWorkflowId] = useState<string | null>(null)
   const [explicitWorkflowId, setExplicitWorkflowId] = useState<string | null>(null)
   const initializedRef = useRef(false)
   const socketRef = useRef<Socket | null>(null)
@@ -178,21 +176,36 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
   explicitWorkflowIdRef.current = explicitWorkflowId
 
   const eventHandlers = useRef<{
-    workflowOperation?: (data: any) => void
-    subblockUpdate?: (data: any) => void
-    variableUpdate?: (data: any) => void
-    cursorUpdate?: (data: any) => void
-    selectionUpdate?: (data: any) => void
-    workflowDeleted?: (data: any) => void
-    workflowReverted?: (data: any) => void
-    workflowUpdated?: (data: any) => void
-    workflowDeployed?: (data: any) => void
-    operationConfirmed?: (data: any) => void
-    operationFailed?: (data: any) => void
+    workflowOperation?: (data: WorkflowOperationBroadcast) => void
+    subblockUpdate?: (data: SubblockUpdateBroadcast) => void
+    variableUpdate?: (data: VariableUpdateBroadcast) => void
+    cursorUpdate?: (data: CursorUpdateBroadcast) => void
+    selectionUpdate?: (data: SelectionUpdateBroadcast) => void
+    workflowDeleted?: (data: WorkflowDeletedBroadcast) => void
+    workflowReverted?: (data: WorkflowRevertedBroadcast) => void
+    workflowUpdated?: (data: WorkflowUpdatedBroadcast) => void
+    workflowDeployed?: (data: WorkflowDeployedBroadcast) => void
+    operationConfirmed?: (data: OperationConfirmedBroadcast) => void
+    operationFailed?: (data: OperationFailedBroadcast) => void
   }>({})
 
   const positionUpdateTimeouts = useRef<Map<string, number>>(new Map())
   const pendingPositionUpdates = useRef<Map<string, any>>(new Map())
+
+  /**
+   * Presence is high-frequency (cursor frames many times per second) so it lives
+   * in {@link usePresenceStore}, not the broad socket context — writing it here no
+   * longer mints a new context value, so emitter-only `useSocket()` consumers stop
+   * re-rendering on every cursor frame. These thin wrappers delegate to the store's
+   * stable actions read via `getState()`.
+   */
+  const setPresenceUsers = useCallback((users: PresenceUser[]) => {
+    usePresenceStore.getState().setPresenceUsers(users)
+  }, [])
+
+  const updatePresenceUsers = useCallback((updater: (prev: PresenceUser[]) => PresenceUser[]) => {
+    usePresenceStore.getState().updatePresenceUsers(updater)
+  }, [])
 
   const setVisibleWorkflowId = useCallback((workflowId: string | null) => {
     currentWorkflowIdRef.current = workflowId
@@ -247,7 +260,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
       setPresenceUsers([])
       setVisibleWorkflowId(null)
     },
-    [resetVisibleWorkflowState, setVisibleWorkflowId]
+    [resetVisibleWorkflowState, setPresenceUsers, setVisibleWorkflowId]
   )
 
   const executeJoinCommands = useCallback(
@@ -493,7 +506,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
             return
           }
 
-          setPresenceUsers((prev) => {
+          updatePresenceUsers((prev) => {
             const prevMap = new Map(prev.map((u) => [u.socketId, u]))
 
             return users.map((user) => {
@@ -517,6 +530,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
             logger.debug(`Ignoring stale join-workflow-success for ${workflowId}`)
           } else {
             setIsRetryingWorkflowJoin(false)
+            setBlockedJoinWorkflowId(null)
             setVisibleWorkflowId(workflowId)
             setPresenceUsers(presenceUsers || [])
             logger.info(`Successfully joined workflow room: ${workflowId}`, {
@@ -547,6 +561,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
             if (result.workflowId) {
               useOperationQueueStore.getState().cancelOperationsForWorkflow(result.workflowId)
             }
+            setBlockedJoinWorkflowId(result.workflowId ?? null)
 
             logger.error('Failed to join workflow:', {
               workflowId: result.workflowId,
@@ -558,19 +573,19 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
           executeJoinCommands(result.commands)
         })
 
-        socketInstance.on('workflow-operation', (data) => {
+        socketInstance.on('workflow-operation', (data: WorkflowOperationBroadcast) => {
           eventHandlers.current.workflowOperation?.(data)
         })
 
-        socketInstance.on('subblock-update', (data) => {
+        socketInstance.on('subblock-update', (data: SubblockUpdateBroadcast) => {
           eventHandlers.current.subblockUpdate?.(data)
         })
 
-        socketInstance.on('variable-update', (data) => {
+        socketInstance.on('variable-update', (data: VariableUpdateBroadcast) => {
           eventHandlers.current.variableUpdate?.(data)
         })
 
-        socketInstance.on('workflow-deleted', (data) => {
+        socketInstance.on('workflow-deleted', (data: WorkflowDeletedBroadcast) => {
           logger.warn(`Workflow ${data.workflowId} has been deleted`)
           const result = joinControllerRef.current.handleWorkflowDeleted(data.workflowId)
           if (result.shouldClearCurrent) {
@@ -580,17 +595,17 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
           eventHandlers.current.workflowDeleted?.(data)
         })
 
-        socketInstance.on('workflow-reverted', (data) => {
+        socketInstance.on('workflow-reverted', (data: WorkflowRevertedBroadcast) => {
           logger.info(`Workflow ${data.workflowId} has been reverted to deployed state`)
           eventHandlers.current.workflowReverted?.(data)
         })
 
-        socketInstance.on('workflow-updated', (data) => {
+        socketInstance.on('workflow-updated', (data: WorkflowUpdatedBroadcast) => {
           logger.info(`Workflow ${data.workflowId} has been updated externally`)
           eventHandlers.current.workflowUpdated?.(data)
         })
 
-        socketInstance.on('workflow-deployed', (data) => {
+        socketInstance.on('workflow-deployed', (data: WorkflowDeployedBroadcast) => {
           logger.info(`Workflow ${data.workflowId} deployment state changed`)
           eventHandlers.current.workflowDeployed?.(data)
         })
@@ -650,22 +665,22 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
           return true
         }
 
-        socketInstance.on('operation-confirmed', (data) => {
+        socketInstance.on('operation-confirmed', (data: OperationConfirmedBroadcast) => {
           logger.debug('Operation confirmed', { operationId: data.operationId })
           eventHandlers.current.operationConfirmed?.(data)
         })
 
-        socketInstance.on('operation-failed', (data) => {
+        socketInstance.on('operation-failed', (data: OperationFailedBroadcast) => {
           logger.warn('Operation failed', { operationId: data.operationId, error: data.error })
           eventHandlers.current.operationFailed?.(data)
         })
 
-        socketInstance.on('cursor-update', (data) => {
+        socketInstance.on('cursor-update', (data: CursorUpdateBroadcast) => {
           if (!isWorkflowVisible()) {
             return
           }
 
-          setPresenceUsers((prev) => {
+          updatePresenceUsers((prev) => {
             const existingIndex = prev.findIndex((user) => user.socketId === data.socketId)
             if (existingIndex === -1) {
               logger.debug('Received cursor-update for unknown user', { socketId: data.socketId })
@@ -678,12 +693,12 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
           eventHandlers.current.cursorUpdate?.(data)
         })
 
-        socketInstance.on('selection-update', (data) => {
+        socketInstance.on('selection-update', (data: SelectionUpdateBroadcast) => {
           if (!isWorkflowVisible()) {
             return
           }
 
-          setPresenceUsers((prev) => {
+          updatePresenceUsers((prev) => {
             const existingIndex = prev.findIndex((user) => user.socketId === data.socketId)
             if (existingIndex === -1) {
               logger.debug('Received selection-update for unknown user', {
@@ -769,6 +784,9 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
         socketRef.current.close()
         socketRef.current = null
       }
+
+      // Clear the module-global presence store on unmount to match the prior per-provider lifetime.
+      usePresenceStore.getState().clearPresenceUsers()
     }
   }, [user?.id])
 
@@ -806,7 +824,10 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
       return
     }
 
-    executeJoinCommands(joinControllerRef.current.requestWorkflow(getRequestedWorkflowId()))
+    const requestedWorkflowId = getRequestedWorkflowId()
+
+    setBlockedJoinWorkflowId((prev) => (prev && prev !== requestedWorkflowId ? null : prev))
+    executeJoinCommands(joinControllerRef.current.requestWorkflow(requestedWorkflowId))
   }, [
     explicitWorkflowId,
     getRequestedWorkflowId,
@@ -847,7 +868,13 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
   }, [authFailed])
 
   const emitWorkflowOperation = useCallback(
-    (workflowId: string, operation: string, target: string, payload: any, operationId?: string) => {
+    (
+      workflowId: string,
+      operation: string,
+      target: string,
+      payload: any,
+      operationId?: string
+    ): boolean => {
       if (
         !socket ||
         !currentWorkflowId ||
@@ -861,7 +888,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
           operation,
           target,
         })
-        return
+        return false
       }
 
       const isPositionUpdate = operation === 'update-position' && target === 'block'
@@ -885,7 +912,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
             clearTimeout(timeoutId)
             positionUpdateTimeouts.current.delete(blockId)
           }
-          return
+          return true
         }
 
         pendingPositionUpdates.current.set(blockId, {
@@ -909,16 +936,18 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
 
           positionUpdateTimeouts.current.set(blockId, timeoutId)
         }
-      } else {
-        socket.emit('workflow-operation', {
-          workflowId,
-          operation,
-          target,
-          payload,
-          timestamp: Date.now(),
-          operationId,
-        })
+        return true
       }
+
+      socket.emit('workflow-operation', {
+        workflowId,
+        operation,
+        target,
+        payload,
+        timestamp: Date.now(),
+        operationId,
+      })
+      return true
     },
     [socket, currentWorkflowId, isWorkflowVisible]
   )
@@ -930,7 +959,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
       value: any,
       operationId: string | undefined,
       workflowId: string
-    ) => {
+    ): boolean => {
       if (
         !socket ||
         workflowId !== currentWorkflowIdRef.current ||
@@ -949,7 +978,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
           reason,
           currentWorkflowId: currentWorkflowIdRef.current,
         })
-        return
+        return false
       }
       socket.emit('subblock-update', {
         workflowId,
@@ -959,6 +988,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
         timestamp: Date.now(),
         operationId,
       })
+      return true
     },
     [socket]
   )
@@ -970,7 +1000,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
       value: any,
       operationId: string | undefined,
       workflowId: string
-    ) => {
+    ): boolean => {
       if (
         !socket ||
         workflowId !== currentWorkflowIdRef.current ||
@@ -989,7 +1019,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
           reason,
           currentWorkflowId: currentWorkflowIdRef.current,
         })
-        return
+        return false
       }
       socket.emit('variable-update', {
         workflowId,
@@ -999,6 +1029,7 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
         timestamp: Date.now(),
         operationId,
       })
+      return true
     },
     [socket]
   )
@@ -1035,47 +1066,50 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
     [socket, currentWorkflowId, isWorkflowVisible]
   )
 
-  const onWorkflowOperation = useCallback((handler: (data: any) => void) => {
+  const onWorkflowOperation = useCallback((handler: (data: WorkflowOperationBroadcast) => void) => {
     eventHandlers.current.workflowOperation = handler
   }, [])
 
-  const onSubblockUpdate = useCallback((handler: (data: any) => void) => {
+  const onSubblockUpdate = useCallback((handler: (data: SubblockUpdateBroadcast) => void) => {
     eventHandlers.current.subblockUpdate = handler
   }, [])
 
-  const onVariableUpdate = useCallback((handler: (data: any) => void) => {
+  const onVariableUpdate = useCallback((handler: (data: VariableUpdateBroadcast) => void) => {
     eventHandlers.current.variableUpdate = handler
   }, [])
 
-  const onCursorUpdate = useCallback((handler: (data: any) => void) => {
+  const onCursorUpdate = useCallback((handler: (data: CursorUpdateBroadcast) => void) => {
     eventHandlers.current.cursorUpdate = handler
   }, [])
 
-  const onSelectionUpdate = useCallback((handler: (data: any) => void) => {
+  const onSelectionUpdate = useCallback((handler: (data: SelectionUpdateBroadcast) => void) => {
     eventHandlers.current.selectionUpdate = handler
   }, [])
 
-  const onWorkflowDeleted = useCallback((handler: (data: any) => void) => {
+  const onWorkflowDeleted = useCallback((handler: (data: WorkflowDeletedBroadcast) => void) => {
     eventHandlers.current.workflowDeleted = handler
   }, [])
 
-  const onWorkflowReverted = useCallback((handler: (data: any) => void) => {
+  const onWorkflowReverted = useCallback((handler: (data: WorkflowRevertedBroadcast) => void) => {
     eventHandlers.current.workflowReverted = handler
   }, [])
 
-  const onWorkflowUpdated = useCallback((handler: (data: any) => void) => {
+  const onWorkflowUpdated = useCallback((handler: (data: WorkflowUpdatedBroadcast) => void) => {
     eventHandlers.current.workflowUpdated = handler
   }, [])
 
-  const onWorkflowDeployed = useCallback((handler: (data: any) => void) => {
+  const onWorkflowDeployed = useCallback((handler: (data: WorkflowDeployedBroadcast) => void) => {
     eventHandlers.current.workflowDeployed = handler
   }, [])
 
-  const onOperationConfirmed = useCallback((handler: (data: any) => void) => {
-    eventHandlers.current.operationConfirmed = handler
-  }, [])
+  const onOperationConfirmed = useCallback(
+    (handler: (data: OperationConfirmedBroadcast) => void) => {
+      eventHandlers.current.operationConfirmed = handler
+    },
+    []
+  )
 
-  const onOperationFailed = useCallback((handler: (data: any) => void) => {
+  const onOperationFailed = useCallback((handler: (data: OperationFailedBroadcast) => void) => {
     eventHandlers.current.operationFailed = handler
   }, [])
 
@@ -1087,9 +1121,9 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
       isReconnecting,
       isRetryingWorkflowJoin,
       authFailed,
+      blockedJoinWorkflowId,
       currentWorkflowId,
       currentSocketId,
-      presenceUsers,
       joinWorkflow,
       leaveWorkflow,
       retryConnection,
@@ -1117,9 +1151,9 @@ export function SocketProvider({ children, user }: SocketProviderProps) {
       isReconnecting,
       isRetryingWorkflowJoin,
       authFailed,
+      blockedJoinWorkflowId,
       currentWorkflowId,
       currentSocketId,
-      presenceUsers,
       joinWorkflow,
       leaveWorkflow,
       retryConnection,

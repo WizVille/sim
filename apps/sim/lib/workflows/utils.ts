@@ -1,8 +1,8 @@
 import { db } from '@sim/db'
-import { permissions, workflowFolder, workflow as workflowTable } from '@sim/db/schema'
+import { workflowFolder, workflow as workflowTable } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
+import { authorizeWorkflowByWorkspacePermission } from '@sim/platform-authz/workflow'
 import { generateId } from '@sim/utils/id'
-import { authorizeWorkflowByWorkspacePermission } from '@sim/workflow-authz'
 import { and, asc, eq, inArray, isNull, max, min, sql } from 'drizzle-orm'
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/auth'
@@ -11,6 +11,7 @@ import { materializeInlineExecutionValue } from '@/lib/execution/payloads/inline
 import type { ExecutionMaterializationContext } from '@/lib/execution/payloads/materialization.server'
 import { buildDefaultWorkflowArtifacts } from '@/lib/workflows/defaults'
 import { saveWorkflowToNormalizedTables } from '@/lib/workflows/persistence/utils'
+import { listAccessibleWorkspaceRowsForUser } from '@/lib/workspaces/utils'
 import type { ExecutionResult } from '@/executor/types'
 
 const logger = createLogger('WorkflowUtils')
@@ -53,17 +54,21 @@ export async function listWorkflows(workspaceId: string, options?: { scope?: Wor
 /**
  * Generates a unique workflow name within a workspace+folder scope.
  * If the name already exists among active workflows, appends (2), (3), etc.
+ *
+ * Pass a transaction as `executor` when running inside an open tx so the
+ * lookup observes workflows inserted earlier in the same transaction.
  */
 export async function deduplicateWorkflowName(
   name: string,
   workspaceId: string,
-  folderId: string | null | undefined
+  folderId: string | null | undefined,
+  executor: Pick<typeof db, 'select'> = db
 ): Promise<string> {
   const folderCondition = folderId
     ? eq(workflowTable.folderId, folderId)
     : isNull(workflowTable.folderId)
 
-  const [existing] = await db
+  const [existing] = await executor
     .select({ id: workflowTable.id })
     .from(workflowTable)
     .where(
@@ -82,7 +87,7 @@ export async function deduplicateWorkflowName(
 
   for (let i = 2; i < 100; i++) {
     const candidate = `${name} (${i})`
-    const [dup] = await db
+    const [dup] = await executor
       .select({ id: workflowTable.id })
       .from(workflowTable)
       .where(
@@ -157,12 +162,8 @@ export async function resolveWorkflowIdForUser(
     }
   }
 
-  const workspaceIds = await db
-    .select({ entityId: permissions.entityId })
-    .from(permissions)
-    .where(and(eq(permissions.userId, userId), eq(permissions.entityType, 'workspace')))
-
-  const workspaceIdList = workspaceIds.map((row) => row.entityId)
+  const accessibleRows = await listAccessibleWorkspaceRowsForUser(userId, 'all')
+  const workspaceIdList = accessibleRows.map((row) => row.workspace.id)
   const allowedWorkspaceIds = workspaceId
     ? workspaceIdList.filter((candidateWorkspaceId) => candidateWorkspaceId === workspaceId)
     : workspaceIdList
@@ -604,6 +605,7 @@ export async function listFolders(workspaceId: string) {
       folderName: workflowFolder.name,
       parentId: workflowFolder.parentId,
       sortOrder: workflowFolder.sortOrder,
+      locked: workflowFolder.locked,
     })
     .from(workflowFolder)
     .where(and(eq(workflowFolder.workspaceId, workspaceId), isNull(workflowFolder.archivedAt)))

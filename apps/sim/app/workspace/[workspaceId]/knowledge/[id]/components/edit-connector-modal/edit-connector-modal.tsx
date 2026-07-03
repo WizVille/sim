@@ -1,8 +1,6 @@
 'use client'
 
 import { useMemo, useState } from 'react'
-import { createLogger } from '@sim/logger'
-import { ExternalLink, RotateCcw } from 'lucide-react'
 import {
   Button,
   ButtonGroup,
@@ -16,7 +14,9 @@ import {
   ChipModalTabs,
   Skeleton,
   Tooltip,
-} from '@/components/emcn'
+} from '@sim/emcn'
+import { createLogger } from '@sim/logger'
+import { ExternalLink, RotateCcw } from 'lucide-react'
 import { getSubscriptionAccessState } from '@/lib/billing/client'
 import { ConnectorConfigFields } from '@/app/workspace/[workspaceId]/knowledge/[id]/components/connector-config-fields'
 import { SYNC_INTERVALS } from '@/app/workspace/[workspaceId]/knowledge/[id]/components/consts'
@@ -27,8 +27,8 @@ import type {
 } from '@/app/workspace/[workspaceId]/knowledge/[id]/hooks/use-connector-config-fields'
 import { useConnectorConfigFields } from '@/app/workspace/[workspaceId]/knowledge/[id]/hooks/use-connector-config-fields'
 import { isBillingEnabled } from '@/app/workspace/[workspaceId]/settings/navigation'
-import { CONNECTOR_REGISTRY } from '@/connectors/registry'
-import type { ConnectorConfig, ConnectorConfigField } from '@/connectors/types'
+import { CONNECTOR_META_REGISTRY } from '@/connectors/registry'
+import type { ConnectorConfigField, ConnectorMeta } from '@/connectors/types'
 import type { ConnectorData } from '@/hooks/queries/kb/connectors'
 import {
   useConnectorDocuments,
@@ -79,10 +79,10 @@ function valuesEqual(a: unknown, b: unknown): boolean {
   const toArray = (v: unknown): string[] | null => {
     if (Array.isArray(v)) return v.filter((x): x is string => typeof x === 'string')
     if (typeof v === 'string') {
-      return v
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)
+      return v.split(',').flatMap((s) => {
+        const t = s.trim()
+        return t ? [t] : []
+      })
     }
     return null
   }
@@ -126,7 +126,7 @@ export function EditConnectorModal({
   knowledgeBaseId,
   connector,
 }: EditConnectorModalProps) {
-  const connectorConfig = CONNECTOR_REGISTRY[connector.connectorType] ?? null
+  const connectorConfig = CONNECTOR_META_REGISTRY[connector.connectorType] ?? null
 
   const [activeTab, setActiveTab] = useState('settings')
   const [syncInterval, setSyncInterval] = useState(connector.syncIntervalMinutes)
@@ -159,10 +159,10 @@ export function EditConnectorModal({
         if (Array.isArray(rawValue)) {
           config[field.id] = rawValue.filter((v): v is string => typeof v === 'string')
         } else if (typeof rawValue === 'string') {
-          config[field.id] = rawValue
-            .split(',')
-            .map((s) => s.trim())
-            .filter(Boolean)
+          config[field.id] = rawValue.split(',').flatMap((s) => {
+            const t = s.trim()
+            return t ? [t] : []
+          })
         } else {
           config[field.id] = []
         }
@@ -327,7 +327,7 @@ export function EditConnectorModal({
 }
 
 interface SettingsTabProps {
-  connectorConfig: ConnectorConfig | null
+  connectorConfig: ConnectorMeta | null
   sourceConfig: ConfigFieldMap
   credentialId: string | null
   canonicalGroups: Map<string, ConnectorConfigField[]>

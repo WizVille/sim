@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Button, cn, DashedDividerLine, FieldDivider, Loader, Tooltip } from '@sim/emcn'
 import { isEqual } from 'es-toolkit'
 import {
   BookOpen,
@@ -16,7 +17,6 @@ import { useParams } from 'next/navigation'
 import { usePostHog } from 'posthog-js/react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStoreWithEqualityFn } from 'zustand/traditional'
-import { Button, FieldDivider, Loader, Tooltip } from '@/components/emcn'
 import { captureEvent } from '@/lib/posthog/client'
 import {
   buildCanonicalIndex,
@@ -49,6 +49,7 @@ import {
   isBlockProtected,
 } from '@/app/workspace/[workspaceId]/w/[workflowId]/utils/block-protection-utils'
 import { PreviewWorkflow } from '@/app/workspace/[workspaceId]/w/components/preview'
+import { getTileIconColorClass } from '@/blocks/icon-color'
 import { getBlock } from '@/blocks/registry'
 import { useFolderMap } from '@/hooks/queries/folders'
 import { isWorkflowEffectivelyLocked } from '@/hooks/queries/utils/folder-tree'
@@ -61,12 +62,6 @@ import { useWorkflowStore } from '@/stores/workflows/workflow/store'
 
 /** Stable empty object to avoid creating new references */
 const EMPTY_SUBBLOCK_VALUES = {} as Record<string, any>
-
-/** Shared style for dashed divider lines */
-const DASHED_DIVIDER_STYLE = {
-  backgroundImage:
-    'repeating-linear-gradient(to right, var(--border) 0px, var(--border) 6px, transparent 6px, transparent 12px)',
-} as const
 
 /**
  * Icon component for rendering block icons.
@@ -381,7 +376,10 @@ export function Editor() {
               >
                 <IconComponent
                   icon={isSubflow ? subflowConfig?.icon : blockConfig?.icon}
-                  className='size-[12px] text-[var(--white)]'
+                  className={cn(
+                    'size-[12px]',
+                    getTileIconColorClass(isSubflow ? subflowConfig?.bgColor : blockConfig?.bgColor)
+                  )}
                 />
               </div>
             )}
@@ -657,7 +655,7 @@ export function Editor() {
 
                     {hasAdvancedOnlyFields && canEditBlock && (
                       <div className='flex items-center gap-2.5 px-0.5 pt-3.5 pb-3'>
-                        <div className='h-[1.25px] flex-1' style={DASHED_DIVIDER_STYLE} />
+                        <DashedDividerLine className='flex-1' />
                         <button
                           type='button'
                           onClick={handleToggleAdvancedMode}
@@ -670,16 +668,16 @@ export function Editor() {
                             className={`size-[14px] transition-transform duration-200 ${displayAdvancedOptions ? 'rotate-180' : ''}`}
                           />
                         </button>
-                        <div className='h-[1.25px] flex-1' style={DASHED_DIVIDER_STYLE} />
+                        <DashedDividerLine className='flex-1' />
                       </div>
                     )}
                     {hasAdvancedOnlyFields && !canEditBlock && displayAdvancedOptions && (
                       <div className='flex items-center gap-2.5 px-0.5 pt-3.5 pb-3'>
-                        <div className='h-[1.25px] flex-1' style={DASHED_DIVIDER_STYLE} />
+                        <DashedDividerLine className='flex-1' />
                         <span className='whitespace-nowrap font-medium text-[var(--text-secondary)] text-small'>
                           Additional fields
                         </span>
-                        <div className='h-[1.25px] flex-1' style={DASHED_DIVIDER_STYLE} />
+                        <DashedDividerLine className='flex-1' />
                       </div>
                     )}
 

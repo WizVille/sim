@@ -2,9 +2,8 @@ import { db } from '@sim/db'
 import { member, organization, subscription, userStats } from '@sim/db/schema'
 import { and, desc, eq, inArray } from 'drizzle-orm'
 import {
-  getBillingInterval,
   getHighestPrioritySubscription,
-  type SubscriptionMetadata,
+  resolveBillingInterval,
 } from '@/lib/billing/core/subscription'
 import { getOrgUsageLimit, getUserUsageData } from '@/lib/billing/core/usage'
 import { COPILOT_USAGE_SOURCES, getBillingPeriodUsageCost } from '@/lib/billing/core/usage-log'
@@ -22,7 +21,7 @@ import {
   isOrgScopedSubscription,
 } from '@/lib/billing/subscriptions/utils'
 import { Decimal, toDecimal, toNumber } from '@/lib/billing/utils/decimal'
-import type { DbOrTx } from '@/lib/db/types'
+import type { DbClient } from '@/lib/db/types'
 
 export { getPlanPricing }
 
@@ -32,6 +31,8 @@ const logger = createLogger('Billing')
 
 interface GetOrganizationSubscriptionOptions {
   onError?: 'return-null' | 'throw'
+  /** Read-routing client (primary or replica); defaults to the primary. */
+  executor?: DbClient
 }
 
 /**
@@ -42,14 +43,18 @@ interface GetOrganizationSubscriptionOptions {
  * For product-access gating use `getOrganizationSubscriptionUsable`
  * (from `core/subscription.ts`), which excludes `past_due`.
  * Returns `null` when there is no entitled sub.
+ *
+ * `options.executor` exists for replica routing on display/summary read
+ * paths only. Enforcement and webhook callers must read the primary —
+ * omit the executor (or pass `db`).
  */
 export async function getOrganizationSubscription(
   organizationId: string,
   options: GetOrganizationSubscriptionOptions = {}
 ) {
-  const { onError = 'return-null' } = options
+  const { onError = 'return-null', executor = db } = options
   try {
-    const orgSubs = await db
+    const orgSubs = await executor
       .select()
       .from(subscription)
       .where(
@@ -111,13 +116,16 @@ export async function isSubscriptionOrgScoped(sub: { referenceId: string }): Pro
  * column is `NOT NULL DEFAULT '0'` and mixing scopes would break
  * current-period billing math.
  */
-async function aggregateOrgMemberStats(organizationId: string): Promise<{
+async function aggregateOrgMemberStats(
+  organizationId: string,
+  executor: DbClient = db
+): Promise<{
   memberIds: string[]
   currentPeriodCost: number
   currentPeriodCopilotCost: number
   lastPeriodCopilotCost: number
 }> {
-  const rows = await db
+  const rows = await executor
     .select({
       userId: member.userId,
       currentPeriodCost: userStats.currentPeriodCost,
@@ -386,7 +394,7 @@ export async function calculateSubscriptionOverage(sub: {
 export async function getSimplifiedBillingSummary(
   userId: string,
   organizationId?: string,
-  executor: DbOrTx = db
+  executor: DbClient = db
 ): Promise<{
   type: 'individual' | 'organization'
   plan: string
@@ -432,8 +440,8 @@ export async function getSimplifiedBillingSummary(
     // Get subscription and usage data upfront
     const [subscription, usageData] = await Promise.all([
       organizationId
-        ? getOrganizationSubscription(organizationId)
-        : getHighestPrioritySubscription(userId),
+        ? getOrganizationSubscription(organizationId, { executor })
+        : getHighestPrioritySubscription(userId, { executor }),
       getUserUsageData(userId, executor),
     ])
 
@@ -455,7 +463,7 @@ export async function getSimplifiedBillingSummary(
       // Pool usage/copilot across all members in one query. Must not use
       // `getUserUsageData` per-member — it now returns the pool itself
       // for org-scoped subs, which would N-times-count.
-      const pooled = await aggregateOrgMemberStats(organizationId)
+      const pooled = await aggregateOrgMemberStats(organizationId, executor)
 
       const rawCurrentUsage = pooled.currentPeriodCost
       const totalLastPeriodCopilotCost = pooled.lastPeriodCopilotCost
@@ -495,7 +503,8 @@ export async function getSimplifiedBillingSummary(
         if (planDollars > 0) {
           const userBounds = await getOrgMemberRefreshBounds(
             organizationId,
-            subscription.periodStart
+            subscription.periodStart,
+            executor
           )
           refreshDeduction = await computeDailyRefreshConsumed(
             {
@@ -516,7 +525,8 @@ export async function getSimplifiedBillingSummary(
       const { limit: orgUsageLimit } = await getOrgUsageLimit(
         organizationId,
         plan,
-        subscription.seats ?? null
+        subscription.seats ?? null,
+        executor
       )
 
       const percentUsed =
@@ -532,8 +542,8 @@ export async function getSimplifiedBillingSummary(
           )
         : 0
 
-      const orgCredits = await getCreditBalance(userId)
-      const orgBillingInterval = getBillingInterval(subscription.metadata as SubscriptionMetadata)
+      const orgCredits = await getCreditBalance(userId, executor)
+      const orgBillingInterval = resolveBillingInterval(subscription)
 
       return {
         type: 'organization',
@@ -576,7 +586,7 @@ export async function getSimplifiedBillingSummary(
       }
     }
 
-    const userStatsRows = await db
+    const userStatsRows = await executor
       .select({
         currentPeriodCopilotCost: userStats.currentPeriodCopilotCost,
         lastPeriodCopilotCost: userStats.lastPeriodCopilotCost,
@@ -597,7 +607,7 @@ export async function getSimplifiedBillingSummary(
     let totalCopilotCost = copilotCost
     let totalLastPeriodCopilotCost = lastPeriodCopilotCost
     if (orgScoped && subscription?.referenceId) {
-      const pooled = await aggregateOrgMemberStats(subscription.referenceId)
+      const pooled = await aggregateOrgMemberStats(subscription.referenceId, executor)
       totalCopilotCost = pooled.currentPeriodCopilotCost
       totalLastPeriodCopilotCost = pooled.lastPeriodCopilotCost
     }
@@ -631,10 +641,8 @@ export async function getSimplifiedBillingSummary(
         )
       : 0
 
-    const userCredits = await getCreditBalance(userId)
-    const individualBillingInterval = getBillingInterval(
-      subscription?.metadata as SubscriptionMetadata
-    )
+    const userCredits = await getCreditBalance(userId, executor)
+    const individualBillingInterval = resolveBillingInterval(subscription)
 
     return {
       type: 'individual',

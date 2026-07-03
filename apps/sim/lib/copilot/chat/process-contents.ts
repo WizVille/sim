@@ -1,11 +1,13 @@
-import { db } from '@sim/db'
-import { knowledgeBase } from '@sim/db/schema'
+import { db, dbReplica } from '@sim/db'
+import { knowledgeBase, workflowSchedule } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import {
   authorizeWorkflowByWorkspacePermission,
   getActiveWorkflowRecord,
-} from '@sim/workflow-authz'
-import { and, eq, isNull } from 'drizzle-orm'
+} from '@sim/platform-authz/workflow'
+import { and, eq, isNull, ne } from 'drizzle-orm'
+import { QueryLogs } from '@/lib/copilot/generated/tool-catalog-v1'
+import { normalizeVfsSegment } from '@/lib/copilot/vfs/normalize-segment'
 import {
   buildVfsFolderPathMap,
   canonicalBlockVfsPath,
@@ -16,7 +18,9 @@ import {
   encodeVfsPathSegments,
   encodeVfsSegment,
 } from '@/lib/copilot/vfs/path-utils'
-import { getAllowedIntegrationsFromEnv } from '@/lib/core/config/feature-flags'
+import { getAllowedIntegrationsFromEnv } from '@/lib/core/config/env-flags'
+import { toOverview } from '@/lib/logs/log-views'
+import type { TraceSpan } from '@/lib/logs/types'
 import { getTableById } from '@/lib/table/service'
 import { getWorkspaceFileFolderPath } from '@/lib/uploads/contexts/workspace/workspace-file-folder-manager'
 import { getWorkspaceFile } from '@/lib/uploads/contexts/workspace/workspace-file-manager'
@@ -163,6 +167,16 @@ export async function processContextsServer(
         if (!result) return null
         return {
           type: 'filefolder',
+          tag: ctx.label ? `@${ctx.label}` : '@',
+          content: result.content,
+          path: result.path,
+        }
+      }
+      if (ctx.kind === 'scheduledtask' && ctx.scheduleId && currentWorkspaceId) {
+        const result = await resolveScheduledTaskResource(ctx.scheduleId, currentWorkspaceId)
+        if (!result) return null
+        return {
+          type: 'active_resource',
           tag: ctx.label ? `@${ctx.label}` : '@',
           content: result.content,
           path: result.path,
@@ -454,7 +468,7 @@ async function processKnowledgeFromDb(
     if (currentWorkspaceId) {
       conditions.push(eq(knowledgeBase.workspaceId, currentWorkspaceId))
     }
-    const kbRows = await db
+    const kbRows = await dbReplica
       .select({
         id: knowledgeBase.id,
         name: knowledgeBase.name,
@@ -554,6 +568,31 @@ async function processWorkflowBlockFromDb(
   }
 }
 
+/**
+ * Cap on the serialized summary (including the block overview tree) sent for
+ * a tagged run. `toOverview` already excludes every block's input/output, so
+ * this is a safety net against pathological span counts, not the primary
+ * defense — mirrors `MAX_FULL_RESULT_BYTES` in `query-logs.ts`, scaled down
+ * since this lands in the prompt unconditionally rather than behind an
+ * explicit tool call.
+ */
+const MAX_LOG_SUMMARY_BYTES = 64 * 1024
+
+/**
+ * Resolve a tagged run to a compact summary instead of its full execution
+ * trace. A run's trace can carry every block's input/output plus nested
+ * tool-call spans, which is unbounded and would repeatedly blow the context
+ * window if inlined directly. The summary includes the block-level overview
+ * tree (name/type/status/timing/cost, no input or output — the same
+ * projection `query_logs`'s `overview` view returns) so the model can see
+ * which block failed without a round trip, and points it at `query_logs` for
+ * that block's actual input/output/error, or to grep the trace.
+ *
+ * `materializeExecutionData` only unwraps a top-level object-storage pointer,
+ * for runs whose whole trace was offloaded as one blob — a no-op for the
+ * common inline case. Individual span input/output stay as large-value refs;
+ * `toOverview` never resolves those.
+ */
 async function processExecutionLogFromDb(
   executionId: string,
   userId: string | undefined,
@@ -562,7 +601,6 @@ async function processExecutionLogFromDb(
 ): Promise<AgentContext | null> {
   try {
     const { workflowExecutionLogs, workflow } = await import('@sim/db/schema')
-    const { db } = await import('@sim/db')
     const rows = await db
       .select({
         id: workflowExecutionLogs.id,
@@ -600,12 +638,14 @@ async function processExecutionLogFromDb(
       }
     }
 
-    // Heavy execution data may live in object storage; resolve the pointer.
     const { materializeExecutionData } = await import('@/lib/logs/execution/trace-store')
     const executionData = (await materializeExecutionData(
       log.executionData as Record<string, unknown> | null,
       { workspaceId: log.workspaceId, workflowId: log.workflowId, executionId: log.executionId }
-    )) as any
+    )) as { traceSpans?: TraceSpan[] } | undefined
+    const overview = executionData?.traceSpans?.length
+      ? toOverview(executionData.traceSpans)
+      : undefined
 
     const summary = {
       id: log.id,
@@ -617,13 +657,13 @@ async function processExecutionLogFromDb(
       endedAt: log.endedAt?.toISOString?.() || (log.endedAt ? String(log.endedAt) : null),
       totalDurationMs: log.totalDurationMs ?? null,
       workflowName: log.workflowName || '',
-      executionData: executionData
-        ? {
-            traceSpans: executionData.traceSpans || undefined,
-            errorDetails: executionData.errorDetails || undefined,
-          }
-        : undefined,
       cost: log.costTotal != null ? { total: Number(log.costTotal) } : undefined,
+      overview,
+      note: `For a block's input/output/error, or to grep the trace, call ${QueryLogs.id} with executionId: '${log.executionId}' — view: 'full' (scope with blockId or blockName), or pattern to grep.`,
+    }
+
+    if (overview && JSON.stringify(summary).length > MAX_LOG_SUMMARY_BYTES) {
+      summary.overview = undefined
     }
 
     const content = JSON.stringify(summary)
@@ -696,6 +736,9 @@ export async function resolveActiveResourceContext(
       case 'filefolder': {
         return await resolveFileFolderResource(resourceId, workspaceId)
       }
+      case 'scheduledtask': {
+        return await resolveScheduledTaskResource(resourceId, workspaceId)
+      }
       default:
         return null
     }
@@ -716,6 +759,38 @@ async function resolveTableResource(
     tag: '@active_resource',
     content: '',
     path: canonicalTableVfsPath(table.name),
+  }
+}
+
+async function resolveScheduledTaskResource(
+  scheduleId: string,
+  workspaceId: string
+): Promise<AgentContext | null> {
+  const [row] = await db
+    .select({ id: workflowSchedule.id, jobTitle: workflowSchedule.jobTitle })
+    .from(workflowSchedule)
+    .where(
+      and(
+        eq(workflowSchedule.id, scheduleId),
+        eq(workflowSchedule.sourceWorkspaceId, workspaceId),
+        eq(workflowSchedule.sourceType, 'job'),
+        isNull(workflowSchedule.archivedAt),
+        // Mirror the VFS materializer (workspace-vfs `materializeJobs`), which
+        // excludes completed jobs — otherwise we'd point at a meta.json it never
+        // wrote and the agent's read would dangle.
+        ne(workflowSchedule.status, 'completed')
+      )
+    )
+    .limit(1)
+  if (!row) return null
+  // The VFS materializes jobs at `jobs/{sanitized title}/meta.json` (see
+  // workspace-vfs `materializeJobs`); emit the same lightweight path pointer so
+  // the agent reads it via the VFS instead of us inlining the (heavy) row.
+  return {
+    type: 'active_resource',
+    tag: '@active_resource',
+    content: '',
+    path: `jobs/${normalizeVfsSegment(row.jobTitle || row.id)}/meta.json`,
   }
 }
 

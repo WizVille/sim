@@ -1,6 +1,6 @@
 import { createLogger } from '@sim/logger'
+import { isPlainRecord } from '@sim/utils/object'
 import { DEFAULT_SUBBLOCK_TYPE } from '@sim/workflow-persistence/subblocks'
-import { isPlainRecord } from '@/lib/core/utils/records'
 import { sanitizeMalformedSubBlocks } from '@/lib/workflows/sanitization/subblocks'
 import {
   buildCanonicalIndex,
@@ -25,6 +25,10 @@ const logger = createLogger('SubblockMigrations')
 export const SUBBLOCK_ID_MIGRATIONS: Record<string, Record<string, string>> = {
   knowledge: {
     knowledgeBaseId: 'knowledgeBaseSelector',
+  },
+  algolia: {
+    listPage: 'page',
+    listHitsPerPage: 'hitsPerPage',
   },
   kalshi: {
     settlementStatus: '_removed_settlementStatus',

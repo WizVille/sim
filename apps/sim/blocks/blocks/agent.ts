@@ -130,7 +130,7 @@ Return ONLY the JSON array.`,
       type: 'combobox',
       placeholder: 'Type or select a model...',
       required: true,
-      defaultValue: 'vertex/gemini-2.5-flash',
+      defaultValue: 'litellm/gpt-5.4-mini',
       options: getModelOptions,
       commandSearchable: true,
     },
@@ -417,6 +417,28 @@ Return ONLY the JSON array.`,
       title: 'Temperature',
       type: 'slider',
       min: 0,
+      max: 1.5,
+      defaultValue: 0.3,
+      mode: 'advanced',
+      condition: () => ({
+        field: 'model',
+        value: (() => {
+          const deepResearch = new Set(MODELS_WITH_DEEP_RESEARCH.map((m) => m.toLowerCase()))
+          const allModels = Object.keys(getBaseModelProviders())
+          return allModels.filter(
+            (model) =>
+              supportsTemperature(model) &&
+              getMaxTemperature(model) === 1.5 &&
+              !deepResearch.has(model.toLowerCase())
+          )
+        })(),
+      }),
+    },
+    {
+      id: 'temperature',
+      title: 'Temperature',
+      type: 'slider',
+      min: 0,
       max: 2,
       defaultValue: 0.3,
       mode: 'advanced',
@@ -481,7 +503,7 @@ Return ONLY the JSON array.`,
     ],
     config: {
       tool: (params: Record<string, any>) => {
-        const model = params.model || 'claude-sonnet-4-6'
+        const model = params.model || 'claude-sonnet-5'
         if (!model) {
           throw new Error('No model selected')
         }

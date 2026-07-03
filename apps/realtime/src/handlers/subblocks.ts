@@ -1,13 +1,13 @@
 import { db } from '@sim/db'
 import { workflow, workflowBlocks } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
+import { assertWorkflowMutable, WorkflowLockedError } from '@sim/platform-authz/workflow'
 import { SUBBLOCK_OPERATIONS } from '@sim/realtime-protocol/constants'
 import { getErrorMessage } from '@sim/utils/errors'
-import { assertWorkflowMutable, WorkflowLockedError } from '@sim/workflow-authz'
 import { isWorkflowBlockProtected } from '@sim/workflow-types/workflow'
 import { and, eq } from 'drizzle-orm'
 import type { AuthenticatedSocket } from '@/middleware/auth'
-import { checkRolePermission } from '@/middleware/permissions'
+import { checkWorkflowOperationPermission } from '@/middleware/permissions'
 import type { IRoomManager } from '@/rooms'
 
 const logger = createLogger('SubblocksHandlers')
@@ -130,13 +130,18 @@ export function setupSubblocksHandlers(socket: AuthenticatedSocket, roomManager:
           socket.emit('operation-failed', {
             operationId,
             error: 'User session not found',
-            retryable: false,
+            retryable: true,
           })
         }
         return
       }
 
-      const permissionCheck = checkRolePermission(userPresence.role, SUBBLOCK_OPERATIONS.UPDATE)
+      const permissionCheck = await checkWorkflowOperationPermission(
+        session.userId,
+        workflowId,
+        SUBBLOCK_OPERATIONS.UPDATE,
+        userPresence.role
+      )
       if (!permissionCheck.allowed) {
         socket.emit('operation-forbidden', {
           type: 'INSUFFICIENT_PERMISSIONS',
@@ -250,7 +255,7 @@ async function flushSubblockUpdate(
         io.to(socketId).emit('operation-failed', {
           operationId: opId,
           error: 'Workflow not found',
-          retryable: false,
+          retryable: true,
         })
       })
       return
@@ -352,7 +357,7 @@ async function flushSubblockUpdate(
         io.to(socketId).emit('operation-failed', {
           operationId: opId,
           error: 'Block no longer exists',
-          retryable: false,
+          retryable: true,
         })
       })
     }

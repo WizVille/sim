@@ -8,7 +8,7 @@ import { env, envNumber } from '@/lib/core/config/env'
 export const TABLE_LIMITS = {
   MAX_TABLES_PER_WORKSPACE: 100,
   MAX_ROWS_PER_TABLE: 10000,
-  MAX_ROW_SIZE_BYTES: 100 * 1024, // 100KB
+  MAX_ROW_SIZE_BYTES: 400 * 1024, // 400KB
   MAX_COLUMNS_PER_TABLE: 50,
   MAX_TABLE_NAME_LENGTH: 128,
   MAX_COLUMN_NAME_LENGTH: 50,
@@ -26,6 +26,15 @@ export const TABLE_LIMITS = {
   MAX_BULK_OPERATION_SIZE: 1000,
   /** Maximum rows a single clipboard copy/cut serializes; beyond this the user is steered to Export. */
   MAX_COPY_ROWS: 50000,
+  /** Rows selected + deleted per page in the async background delete-job loop. Each
+   *  DELETE_BATCH_SIZE chunk inside the page commits in its own transaction; the page is the
+   *  keyset-select and cancel/ownership-check granularity. */
+  DELETE_PAGE_SIZE: 10000,
+  /** Row count above which an export runs as a background job instead of a synchronous stream.
+   *  Tables at or under this stream instantly; larger ones fall back to an async export job. */
+  EXPORT_ASYNC_THRESHOLD_ROWS: 10000,
+  /** Cap on the exclusion set ("select all, minus these") sent to an async delete job. */
+  MAX_EXCLUDE_ROW_IDS: 10000,
 } as const
 
 /**
@@ -35,22 +44,34 @@ export const TABLE_LIMITS = {
  */
 export const DEFAULT_TABLE_PLAN_LIMITS = {
   free: {
-    maxTables: 3,
-    maxRowsPerTable: 1000,
+    maxTables: 5,
+    maxRowsPerTable: 50000,
   },
   pro: {
-    maxTables: 25,
-    maxRowsPerTable: 5000,
+    maxTables: 100,
+    maxRowsPerTable: 100000,
   },
   team: {
-    maxTables: 100,
-    maxRowsPerTable: 10000,
+    maxTables: 1000,
+    maxRowsPerTable: 500000,
   },
   enterprise: {
     maxTables: 10000,
     maxRowsPerTable: 1000000,
   },
 } as const
+
+/**
+ * Maximum serialized size in bytes of a single row. Defaults to
+ * `TABLE_LIMITS.MAX_ROW_SIZE_BYTES`; overridable via the
+ * `TABLE_MAX_ROW_SIZE_BYTES` env var (server-only, read at call time).
+ */
+export function getMaxRowSizeBytes(): number {
+  return envNumber(env.TABLE_MAX_ROW_SIZE_BYTES, TABLE_LIMITS.MAX_ROW_SIZE_BYTES, {
+    min: 1,
+    integer: true,
+  })
+}
 
 export type PlanName = keyof typeof DEFAULT_TABLE_PLAN_LIMITS
 

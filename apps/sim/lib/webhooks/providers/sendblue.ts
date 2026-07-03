@@ -1,4 +1,5 @@
 import { createLogger } from '@sim/logger'
+import { isRecordLike } from '@sim/utils/object'
 import { getProviderConfig } from '@/lib/webhooks/provider-subscription-utils'
 import type {
   EventMatchContext,
@@ -21,13 +22,25 @@ const SENDBLUE_TRIGGER_IS_OUTBOUND: Record<string, boolean> = {
   sendblue_message_status_updated: true,
 }
 
+/**
+ * Sendblue webhook handler.
+ *
+ * No `verifyAuth` is implemented: Sendblue supports an optional per-webhook
+ * `secret`/`globalSecret` that it "includes in the webhook request headers,"
+ * but the official docs never name the header or specify whether the value is
+ * a plain token echo or an HMAC signature. Implementing verification today
+ * would require guessing the header name, so it is deferred. When Sendblue
+ * documents the scheme, wire `verifyTokenAuth` (plain token) or
+ * `createHmacVerifier` (HMAC) from `@/lib/webhooks/providers/utils` and add a
+ * secret sub-block to the block definition.
+ */
 export const sendblueHandler: WebhookProviderHandler = {
   matchEvent({ body, webhook, requestId }: EventMatchContext): boolean {
     const providerConfig = getProviderConfig(webhook)
     const triggerId = providerConfig.triggerId as string | undefined
     if (!triggerId || !(triggerId in SENDBLUE_TRIGGER_IS_OUTBOUND)) return true
 
-    if (!isRecord(body)) {
+    if (!isRecordLike(body)) {
       logger.warn(`[${requestId}] Sendblue webhook payload was not an object`)
       return false
     }
@@ -43,7 +56,7 @@ export const sendblueHandler: WebhookProviderHandler = {
   },
 
   extractIdempotencyId(body: unknown): string | null {
-    if (!isRecord(body)) return null
+    if (!isRecordLike(body)) return null
     const handle = body.message_handle
     if (typeof handle !== 'string' || handle.length === 0) return null
     // A single outbound message emits multiple status callbacks (e.g. SENT then
@@ -54,12 +67,12 @@ export const sendblueHandler: WebhookProviderHandler = {
   },
 
   async formatInput({ body }: FormatInputContext): Promise<FormatInputResult> {
-    const b = isRecord(body) ? body : {}
+    const b = isRecordLike(body) ? body : {}
     return {
       input: {
         account_email: b.accountEmail ?? b.account_email ?? null,
         content: b.content ?? null,
-        media_url: b.media_url ?? null,
+        media_url: (typeof b.media_url === 'string' && b.media_url) || null,
         is_outbound: b.is_outbound ?? null,
         status: b.status ?? null,
         error_code: b.error_code ?? null,
@@ -75,7 +88,7 @@ export const sendblueHandler: WebhookProviderHandler = {
         was_downgraded: b.was_downgraded ?? null,
         plan: b.plan ?? null,
         message_type: b.message_type ?? null,
-        group_id: b.group_id ?? null,
+        group_id: (typeof b.group_id === 'string' && b.group_id) || null,
         participants: b.participants ?? [],
         send_style: b.send_style ?? null,
         opted_out: b.opted_out ?? null,
@@ -88,8 +101,4 @@ export const sendblueHandler: WebhookProviderHandler = {
       },
     }
   },
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }

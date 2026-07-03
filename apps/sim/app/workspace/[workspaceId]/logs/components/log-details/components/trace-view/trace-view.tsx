@@ -2,6 +2,23 @@
 
 import type React from 'react'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Badge,
+  Button,
+  ChevronDown,
+  ChipInput,
+  Code,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  Duplicate,
+  Search as SearchIcon,
+  Tooltip,
+  useCopyToClipboard,
+} from '@sim/emcn'
 import { formatDuration } from '@sim/utils/formatting'
 import {
   ArrowDown,
@@ -14,25 +31,9 @@ import {
   X,
 } from 'lucide-react'
 import { createPortal } from 'react-dom'
-import {
-  Badge,
-  Button,
-  ChevronDown,
-  ChipInput,
-  Code,
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-  Duplicate,
-  Search as SearchIcon,
-  Tooltip,
-} from '@/components/emcn'
-import { cn } from '@/lib/core/utils/cn'
 import type { TraceSpan } from '@/lib/logs/types'
 import {
-  DEFAULT_BLOCK_COLOR,
+  adjustBgForContrast,
   formatCostAmount,
   formatTokenCount,
   formatTps,
@@ -41,6 +42,7 @@ import {
   getDisplayName,
   hasErrorInTree,
   hasUnhandledErrorInTree,
+  iconColorClass,
   isIterationType,
   parseTime,
 } from '@/app/workspace/[workspaceId]/logs/components/log-details/utils'
@@ -116,31 +118,6 @@ function getDisplayChildren(span: TraceSpan): TraceSpan[] {
   const hasToolCall = kids.some((c) => c.type?.toLowerCase() === 'tool')
   if (isAgent && !hasToolCall) return kids.filter((c) => c.type?.toLowerCase() !== 'model')
   return kids
-}
-
-/** Returns 'text-white' for dark backgrounds, dark text for light ones. */
-function iconColorClass(bgColor: string): string {
-  const hex = bgColor.replace('#', '')
-  if (hex.length !== 6) return 'text-white'
-  const r = Number.parseInt(hex.slice(0, 2), 16)
-  const g = Number.parseInt(hex.slice(2, 4), 16)
-  const b = Number.parseInt(hex.slice(4, 6), 16)
-  return r * 299 + g * 587 + b * 114 > 160_000 ? 'text-[#111111]' : 'text-white'
-}
-
-/**
- * Near-black bgColors disappear against the dark-mode surface (--bg: #1b1b1b).
- * Below the luminance threshold we fall back to the neutral block color used
- * for blocks with no distinct identity; everything brighter passes through.
- */
-function adjustBgForContrast(bgColor: string): string {
-  const hex = bgColor.replace('#', '')
-  if (hex.length !== 6) return bgColor
-  const r = Number.parseInt(hex.slice(0, 2), 16)
-  const g = Number.parseInt(hex.slice(2, 4), 16)
-  const b = Number.parseInt(hex.slice(4, 6), 16)
-  if (r * 299 + g * 587 + b * 114 < 30_000) return DEFAULT_BLOCK_COLOR
-  return bgColor
 }
 
 /**
@@ -428,7 +405,7 @@ function DetailCodeSection({
   const [isOpen, setIsOpen] = useState(defaultOpen)
   const [isContextMenuOpen, setIsContextMenuOpen] = useState(false)
   const [contextMenuPosition, setContextMenuPosition] = useState({ x: 0, y: 0 })
-  const [copied, setCopied] = useState(false)
+  const { copied, copy } = useCopyToClipboard({ resetMs: 1500 })
   const contentRef = useRef<HTMLDivElement>(null)
 
   const {
@@ -459,9 +436,7 @@ function DetailCodeSection({
   }
 
   function handleCopy() {
-    navigator.clipboard.writeText(jsonString)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
+    copy(jsonString)
     setIsContextMenuOpen(false)
   }
 
@@ -819,6 +794,7 @@ const TraceDetailPane = memo(function TraceDetailPane({ span }: { span: TraceSpa
  */
 export const TraceView = memo(function TraceView({ traceSpans, runCostDollars }: TraceViewProps) {
   const treeRef = useRef<HTMLDivElement>(null)
+  const { copied: traceCopied, copy: copyTrace } = useCopyToClipboard()
   const [searchQuery, setSearchQuery] = useState('')
   const [treePaneWidth, setTreePaneWidth] = useState(DEFAULT_TREE_PANE_WIDTH)
   const treePaneWidthRef = useRef(DEFAULT_TREE_PANE_WIDTH)
@@ -1042,6 +1018,26 @@ export const TraceView = memo(function TraceView({ traceSpans, runCostDollars }:
             placeholder='Filter spans'
             className='w-[140px]'
           />
+          <Tooltip.Root>
+            <Tooltip.Trigger asChild>
+              <Button
+                type='button'
+                variant='ghost'
+                className='!p-1'
+                onClick={() => copyTrace(JSON.stringify(traceSpans, null, 2))}
+                aria-label='Copy raw trace'
+              >
+                {traceCopied ? (
+                  <Check className='size-[12px] text-[var(--text-success)]' />
+                ) : (
+                  <Clipboard className='size-[12px]' />
+                )}
+              </Button>
+            </Tooltip.Trigger>
+            <Tooltip.Content side='top'>
+              {traceCopied ? 'Copied' : 'Copy raw trace'}
+            </Tooltip.Content>
+          </Tooltip.Root>
           <Tooltip.Root>
             <Tooltip.Trigger asChild>
               <Button

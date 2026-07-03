@@ -14,7 +14,9 @@ import {
   workspaceEnvironment,
 } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
+import { PERMISSION_RANK, type PermissionType } from '@sim/platform-authz/workspace'
 import { generateId } from '@sim/utils/id'
+import { normalizeEmail } from '@sim/utils/string'
 import { and, eq, inArray, lte } from 'drizzle-orm'
 import { setActiveOrganizationForCurrentSession } from '@/lib/auth/active-organization'
 import { syncUsageLimitsFromSubscription } from '@/lib/billing/core/usage'
@@ -25,16 +27,12 @@ import {
 } from '@/lib/billing/organizations/membership'
 import { ensureTeamOrganizationForAcceptance } from '@/lib/billing/organizations/provision-seat'
 import { reconcileOrganizationSeats } from '@/lib/billing/organizations/seats'
-import { isBillingEnabled } from '@/lib/core/config/feature-flags'
+import { isBillingEnabled } from '@/lib/core/config/env-flags'
 import { syncWorkspaceEnvCredentials } from '@/lib/credentials/environment'
-import { applyWorkspaceAutoAddGroup } from '@/lib/permission-groups/auto-add'
 import { captureServerEvent } from '@/lib/posthog/server'
 import { getWorkspaceWithOwner } from '@/lib/workspaces/permissions/utils'
 
 const logger = createLogger('InvitationCore')
-
-const PERMISSION_RANK = { read: 0, write: 1, admin: 2 } as const
-type PermissionLevel = keyof typeof PERMISSION_RANK
 
 export const INVITATION_EXPIRY_DAYS = 7
 
@@ -203,10 +201,6 @@ export async function expireStalePendingInvitationsForWorkspaces(
       error,
     })
   }
-}
-
-export function normalizeEmail(email: string): string {
-  return email.trim().toLowerCase()
 }
 
 export type AcceptInvitationFailure =
@@ -478,12 +472,12 @@ export async function acceptInvitation(
           )
           .limit(1)
 
-        const newPermission = grant.permission as PermissionLevel
+        const newPermission = grant.permission as PermissionType
         const newRank = PERMISSION_RANK[newPermission] ?? 0
 
         if (existingPermission) {
           const existingRank =
-            PERMISSION_RANK[existingPermission.permissionType as PermissionLevel] ?? 0
+            PERMISSION_RANK[existingPermission.permissionType as PermissionType] ?? 0
           if (newRank > existingRank) {
             await tx
               .update(permissions)
@@ -501,8 +495,6 @@ export async function acceptInvitation(
             updatedAt: new Date(),
           })
         }
-
-        await applyWorkspaceAutoAddGroup(tx, grant.workspaceId, input.userId)
 
         acceptedWorkspaceIds.push(grant.workspaceId)
       }

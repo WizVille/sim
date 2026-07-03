@@ -29,11 +29,20 @@ export const byokProviderIdSchema = z.enum([
   'zerobounce',
   'neverbounce',
   'millionverifier',
+  'datagma',
+  'dropcontact',
+  'leadmagic',
+  'icypeas',
+  'enrow',
 ])
+
+/** Maximum number of keys a workspace may store per provider. */
+export const MAX_BYOK_KEYS_PER_PROVIDER = 10
 
 export const byokKeySchema = z.object({
   id: z.string(),
   providerId: byokProviderIdSchema,
+  name: z.string().nullable(),
   maskedKey: z.string(),
   createdBy: z.string().nullable(),
   createdAt: z.string(),
@@ -45,6 +54,7 @@ export type BYOKKey = z.output<typeof byokKeySchema>
 export const byokKeyMutationSchema = z.object({
   id: z.string(),
   providerId: byokProviderIdSchema,
+  name: z.string().nullable(),
   maskedKey: z.string(),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
@@ -57,10 +67,16 @@ export const byokWorkspaceParamsSchema = z.object({
 export const upsertByokKeyBodySchema = z.object({
   providerId: byokProviderIdSchema,
   apiKey: z.string().min(1, 'API key is required'),
+  /** When set, updates that specific key; otherwise a new key is added for the provider. */
+  keyId: z.string().min(1, 'keyId cannot be empty').optional(),
+  /** Display label for the key. An empty string clears the label. */
+  name: z.string().trim().max(120, 'Name must be 120 characters or fewer').optional(),
 })
 
 export const deleteByokKeyBodySchema = z.object({
   providerId: byokProviderIdSchema,
+  /** When set, deletes only that key; otherwise every key for the provider is removed. */
+  keyId: z.string().min(1, 'keyId cannot be empty').optional(),
 })
 
 export const listByokKeysContract = defineRouteContract({

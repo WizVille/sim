@@ -2,7 +2,7 @@
  * Type definitions for user-defined tables.
  */
 
-import type { COLUMN_TYPES } from './constants'
+import type { COLUMN_TYPES } from '@/lib/table/constants'
 
 export type ColumnValue = string | number | boolean | null | Date
 export type JsonValue = ColumnValue | JsonValue[] | { [key: string]: JsonValue }
@@ -135,6 +135,59 @@ export interface WorkflowGroup {
 }
 
 /**
+ * State of one provider in an enrichment cascade run. `matched`/`no_match`/
+ * `error` actually called the tool; `skipped` had insufficient inputs; `not_run`
+ * was never reached because an earlier provider matched.
+ */
+export type EnrichmentProviderStatus = 'matched' | 'no_match' | 'skipped' | 'error' | 'not_run'
+
+/**
+ * Outcome of one provider attempt in an enrichment cascade, for the enrichment
+ * details panel. The full configured cascade is recorded: `skipped` providers
+ * had insufficient inputs, `not_run` providers sit after the match.
+ */
+export interface EnrichmentProviderOutcome {
+  /** Provider id, e.g. `'hunter'`. */
+  id: string
+  /** Human label, e.g. `'Hunter'`. */
+  label: string
+  /** Tool id the provider runs, e.g. `'hunter_find_email'` — resolves the block
+   *  icon for the details panel. */
+  toolId: string
+  status: EnrichmentProviderStatus
+  /** Hosted-key cost (USD) this provider incurred; `0` for skip / no_match / error / BYOK. */
+  cost: number
+  /** Wall-clock ms this provider's tool call took; `0` for skipped. */
+  durationMs: number
+  /** Error message when `status === 'error'`, else `null`. */
+  error: string | null
+}
+
+/**
+ * Per-(row, group) cascade breakdown for an enrichment run, surfaced in the
+ * enrichment details panel. Persisted on the `tableRowExecutions` sidecar but
+ * deliberately kept out of the hot grid read path (fetched on demand) — it can
+ * carry a dozen provider outcomes per cell.
+ */
+export interface EnrichmentRunDetail {
+  /** ISO timestamp when the cascade started. */
+  startedAt: string
+  /** ISO timestamp when the cascade finished. */
+  completedAt: string
+  /** Wall-clock ms across the whole cascade. */
+  durationMs: number
+  /** Sum of per-provider hosted-key cost (USD). */
+  totalCost: number
+  /** Provider id that produced the match, or `null` on no match. */
+  matchedProvider: string | null
+  /** True when the run was cancelled (stop / signal abort) — drives a
+   *  "Cancelled" result rather than inferring no-match/not-run from the cascade. */
+  aborted: boolean
+  /** Every configured provider, in cascade order (including `not_run` ones). */
+  providers: EnrichmentProviderOutcome[]
+}
+
+/**
  * Per-row execution state for one workflow group, persisted as a row in the
  * `tableRowExecutions` sidecar keyed by `(rowId, groupId)`. Holds run
  * metadata only — picked output values land in `row.data` directly.
@@ -163,6 +216,13 @@ export interface RowExecutionMetadata {
    *  re-runs whose `cancelledAt > dispatch.requestedAt` — a user cancel
    *  mid-dispatch must not be overridden by `isManualRun`. */
   cancelledAt?: string
+  /**
+   * Enrichment cascade breakdown for `enrichment`-type groups, written on the
+   * terminal cell write. Persisted on `tableRowExecutions` but NOT hydrated by
+   * `loadExecutionsByRow` (kept off the hot grid read) — read it on demand via
+   * `loadEnrichmentDetail` for the details panel.
+   */
+  enrichmentDetails?: EnrichmentRunDetail | null
 }
 
 /** Map of `WorkflowGroup.id` → execution state. Stored on every row. */
@@ -191,8 +251,86 @@ export interface TableMetadata {
   pinnedColumns?: string[]
 }
 
-/** Async-import lifecycle state for a table. NULL/undefined = normal (no async import). */
-export type TableImportStatus = 'importing' | 'ready' | 'failed' | 'canceled'
+/** Async background-job lifecycle state for a table. NULL/undefined = idle (no job). */
+export type TableJobStatus = 'running' | 'ready' | 'failed' | 'canceled'
+
+/**
+ * Which kind of background job a `table_jobs` row tracks. `import`, `delete`, and `backfill`
+ * mutate row data and share the single-running-job gate; `export` is read-only and bypasses it
+ * (the partial-unique index excludes it), so an export can run alongside any other job.
+ */
+export type TableJobType = 'import' | 'delete' | 'export' | 'backfill' | 'update'
+
+/**
+ * Persisted scope of a running delete job (`table_jobs.payload`). Defines the doomed row set —
+ * `matches(filter) AND created_at <= cutoff AND id NOT IN excludeRowIds` — so the rows read-path
+ * can mask those rows out while the job runs, making mid-job reads (refresh, other clients)
+ * consistent with the eventual result.
+ */
+export interface TableDeleteJobPayload {
+  filter?: Filter
+  excludeRowIds?: string[]
+  /** ISO timestamp; rows created after it are spared. */
+  cutoff: string
+  /** Doomed-row estimate captured at kickoff — display-only: list/detail counts subtract the
+   *  not-yet-deleted remainder (doomedCount - rows_processed) while the job runs. Set only for an
+   *  unbounded delete (the masked "delete everything matching" path); omitted when `maxRows` is set. */
+  doomedCount?: number
+  /**
+   * Stop after deleting this many rows (an explicit caller-supplied limit above the inline cap).
+   * Omitted = delete every match. When set, reads are NOT masked: the delete is eventually
+   * consistent (rows disappear as they're deleted) like a bounded update, because the filter-based
+   * mask would over-hide the rows beyond the cap that this job never deletes.
+   */
+  maxRows?: number
+}
+
+/**
+ * Persisted scope of a running bulk-update job (`table_jobs.payload`): the same `data` patch is
+ * merged into every row matching `filter` with `created_at <= cutoff` (so mid-job inserts are
+ * spared, matching the delete job's snapshot semantics). `affectedCount` is the kickoff estimate,
+ * display-only. Unlike delete, reads are not masked — updated rows still exist, so a background
+ * update is eventually consistent (readers may see a mix of patched/unpatched rows mid-job).
+ */
+export interface TableUpdateJobPayload {
+  filter: Filter
+  /** Column-id-keyed partial patch applied to every matched row (JSONB merge). */
+  data: RowData
+  /** ISO timestamp; rows created after it are not patched. */
+  cutoff: string
+  affectedCount?: number
+  /** Stop after updating this many rows (an explicit caller-supplied limit). Omitted = every match. */
+  maxRows?: number
+}
+
+/**
+ * Persisted scope of an export job (`table_jobs.payload`). `resultKey` is merged in by the worker
+ * on completion — the storage key of the generated file, served to the client via a presigned URL
+ * and deleted by the janitor when the terminal job is pruned.
+ */
+export interface TableExportJobPayload {
+  format: 'csv' | 'json'
+  resultKey?: string
+}
+
+/**
+ * Keyset cursor for paginating a table's default row order, `(order_key, id)`. The grid's
+ * infinite scroll threads this instead of an OFFSET — offset paging re-scans every prior row per
+ * page (O(N²) to drain a table); the cursor makes each page an index seek on
+ * `(table_id, order_key, id)`. Only valid for the default order: sorted views fall back to offset.
+ */
+export interface TableRowsCursor {
+  orderKey: string
+  id: string
+}
+
+/** Persisted scope of an output-column backfill job (`table_jobs.payload`). */
+export interface TableBackfillJobPayload {
+  groupId: string
+  outputs: WorkflowGroupOutput[]
+  /** Remaps overwrite existing cell values; added columns never clobber hand-edits. */
+  overwrite: boolean
+}
 
 export interface TableDefinition {
   id: string
@@ -207,12 +345,15 @@ export interface TableDefinition {
   archivedAt?: Date | string | null
   createdAt: Date | string
   updatedAt: Date | string
-  /** Async-import state (see `apps/sim/lib/table/import-runner.ts`). */
-  importStatus?: TableImportStatus | null
-  importId?: string | null
-  importError?: string | null
-  importRowsProcessed?: number
-  importStartedAt?: Date | string | null
+  /**
+   * Async background-job state, derived from the table's latest `table_jobs` row (running if any,
+   * else the most recent terminal). See `import-runner.ts` / `delete-runner.ts`.
+   */
+  jobStatus?: TableJobStatus | null
+  jobId?: string | null
+  jobType?: TableJobType | null
+  jobError?: string | null
+  jobRowsProcessed?: number
 }
 
 /** Minimal table info for UI components. */
@@ -316,6 +457,9 @@ export interface QueryOptions {
   sort?: Sort
   limit?: number
   offset?: number
+  /** Keyset cursor for the default `(order_key, id)` order — see {@link TableRowsCursor}.
+   *  Mutually exclusive with `sort` and `offset`; takes precedence over `offset` when set. */
+  after?: TableRowsCursor
   /**
    * When true (default), runs a `COUNT(*)` and returns `totalCount` as a number.
    * Pass `false` to skip the count query (grid UI doesn't need it); `totalCount`
@@ -349,16 +493,19 @@ export interface CreateTableData {
   schema: TableSchema
   workspaceId: string
   userId: string
-  /** Optional max rows override based on billing plan. Defaults to TABLE_LIMITS.MAX_ROWS_PER_TABLE. */
+  /** Optional stored row cap. Vestigial under plan-based enforcement (the column is no longer
+   *  consulted on insert), but retained so callers that still set it type-check. */
   maxRows?: number
   /** Optional max tables override based on billing plan. Defaults to TABLE_LIMITS.MAX_TABLES_PER_WORKSPACE. */
   maxTables?: number
   /** Number of empty rows to create with the table. Defaults to 0. */
   initialRowCount?: number
-  /** When set, the table is created in this async-import state (rows hidden until ready). */
-  importStatus?: TableImportStatus
-  /** Async-import id stamped on the table when `importStatus` is set. */
-  importId?: string
+  /** When set, the table is created with this job already running (rows hidden until ready). */
+  jobStatus?: TableJobStatus
+  /** Job kind, paired with `jobStatus` (create-mode import sets `'import'`). */
+  jobType?: TableJobType
+  /** Async job id stamped on the table when `jobStatus` is set. */
+  jobId?: string
 }
 
 export interface InsertRowData {

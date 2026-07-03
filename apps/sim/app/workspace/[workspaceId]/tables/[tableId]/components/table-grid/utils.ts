@@ -11,13 +11,21 @@ import { areGroupDepsSatisfied, areOutputsFilled } from '@/lib/table/deps'
 import type { DeletedRowSnapshot } from '@/stores/table/types'
 import type { DisplayColumn } from './types'
 
-export type RowSelection = { kind: 'none' } | { kind: 'some'; ids: Set<string> } | { kind: 'all' }
+/**
+ * `all` means "every row matching the active filter" — including rows not yet loaded by the
+ * virtualized grid. `excluded` holds rows deselected after a select-all, so the pair maps directly
+ * onto the async delete job's `{ filter, excludeRowIds }`.
+ */
+export type RowSelection =
+  | { kind: 'none' }
+  | { kind: 'some'; ids: Set<string> }
+  | { kind: 'all'; excluded?: Set<string> }
 
 export const ROW_SELECTION_NONE: RowSelection = { kind: 'none' }
 export const ROW_SELECTION_ALL: RowSelection = { kind: 'all' }
 
 export function rowSelectionIncludes(sel: RowSelection, id: string): boolean {
-  if (sel.kind === 'all') return true
+  if (sel.kind === 'all') return !sel.excluded?.has(id)
   if (sel.kind === 'some') return sel.ids.has(id)
   return false
 }
@@ -29,26 +37,27 @@ export function rowSelectionIsEmpty(sel: RowSelection): boolean {
 }
 
 export function rowSelectionMaterialize(sel: RowSelection, rows: TableRowType[]): Set<string> {
-  if (sel.kind === 'all') return new Set(rows.map((r) => r.id))
+  if (sel.kind === 'all')
+    return new Set(rows.filter((r) => !sel.excluded?.has(r.id)).map((r) => r.id))
   if (sel.kind === 'some') return new Set(sel.ids)
   return new Set<string>()
 }
 
 export function rowSelectionCoversAll(sel: RowSelection, rows: TableRowType[]): boolean {
   if (rows.length === 0) return false
-  if (sel.kind === 'all') return true
+  if (sel.kind === 'all') return !rows.some((r) => sel.excluded?.has(r.id))
   if (sel.kind === 'none') return false
   if (sel.ids.size < rows.length) return false
   for (const r of rows) if (!sel.ids.has(r.id)) return false
   return true
 }
 
-/** Returns sticky row-number column dimensions sized to the digit count of `maxRows`. */
+/** Returns sticky row-number column dimensions sized to the digit count of `rowCount`. */
 export function checkboxColLayout(
-  maxRows: number,
+  rowCount: number,
   hasWorkflowCols: boolean
 ): { colWidth: number; numRegionWidth: number } {
-  const digits = maxRows > 0 ? Math.floor(Math.log10(maxRows)) + 1 : 1
+  const digits = rowCount > 0 ? Math.floor(Math.log10(rowCount)) + 1 : 1
   const numWidth = Math.max(20, digits * 8 + 4)
   // Region the number/checkbox is centered within (digit width + 12px breathing
   // room, min 32). The select-all header checkbox centers in the same region so it
@@ -107,10 +116,18 @@ export function expandToDisplayColumns(
         size++
       }
       const group = groupById.get(gid)
+      // Pre-index outputs by column name for O(1) lookup. First output wins on a
+      // duplicate columnName, exactly matching the previous `Array.find()` behavior.
+      const outputByColumnName = new Map<string, WorkflowGroup['outputs'][number]>()
+      if (group) {
+        for (const o of group.outputs) {
+          if (!outputByColumnName.has(o.columnName)) outputByColumnName.set(o.columnName, o)
+        }
+      }
       const startIdx = out.length
       for (let k = 0; k < size; k++) {
         const child = columns[i + k]
-        const output = group?.outputs.find((o) => o.columnName === getColumnId(child))
+        const output = outputByColumnName.get(getColumnId(child))
         out.push({
           ...child,
           key: getColumnId(child),

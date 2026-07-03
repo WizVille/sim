@@ -5,7 +5,7 @@ import type { ChatCompletionChunk } from 'openai/resources/chat/completions'
 import type { CompletionUsage } from 'openai/resources/completions'
 import { formatCreditCost } from '@/lib/billing/credits/conversion'
 import { env } from '@/lib/core/config/env'
-import { getBlacklistedProvidersFromEnv, isHosted } from '@/lib/core/config/feature-flags'
+import { getBlacklistedProvidersFromEnv, isHosted } from '@/lib/core/config/env-flags'
 import {
   normalizeRecord,
   normalizeStringRecord,
@@ -14,8 +14,8 @@ import {
 import {
   buildCanonicalIndex,
   type CanonicalGroup,
-  getCanonicalValues,
   isCanonicalPair,
+  resolveActiveCanonicalValue,
 } from '@/lib/workflows/subblocks/visibility'
 import { isCustomTool } from '@/executor/constants'
 import {
@@ -28,9 +28,8 @@ import {
   getModelsWithDeepResearch,
   getModelsWithoutMemory,
   getModelsWithReasoningEffort,
+  getModelsWithTemperatureRange,
   getModelsWithTemperatureSupport,
-  getModelsWithTempRange01,
-  getModelsWithTempRange02,
   getModelsWithThinking,
   getModelsWithVerbosity,
   getProviderDefaultModel as getProviderDefaultModelFromDefinitions,
@@ -152,6 +151,7 @@ export const providers: Record<ProviderId, ProviderMetadata> = {
   xai: buildProviderMetadata('xai'),
   cerebras: buildProviderMetadata('cerebras'),
   groq: buildProviderMetadata('groq'),
+  sakana: buildProviderMetadata('sakana'),
   mistral: buildProviderMetadata('mistral'),
   bedrock: buildProviderMetadata('bedrock'),
   openrouter: buildProviderMetadata('openrouter'),
@@ -498,9 +498,14 @@ function resolveCanonicalResourceParams(
   for (const group of canonicalGroups) {
     const existing = resolved[group.canonicalId]
     if (existing !== undefined && existing !== null && existing !== '') continue
-    const { basicValue, advancedValue } = getCanonicalValues(group, params)
-    const pairMode = canonicalModes?.[`${blockType}:${group.canonicalId}`] ?? 'basic'
-    const chosen = pairMode === 'advanced' ? advancedValue : basicValue
+    // Route through the canonical SOT: an explicit scoped override wins, else the value heuristic -
+    // no `?? 'basic'` (which ignored an advanced-only value when basic was empty).
+    const explicitMode = canonicalModes?.[`${blockType}:${group.canonicalId}`]
+    const chosen = resolveActiveCanonicalValue(
+      group,
+      params,
+      explicitMode ? { [group.canonicalId]: explicitMode } : undefined
+    )
     if (chosen !== undefined) resolved[group.canonicalId] = chosen
   }
   return resolved
@@ -627,10 +632,14 @@ export async function transformBlockTool(
         let result = { ...params }
 
         for (const group of canonicalGroups) {
-          const { basicValue, advancedValue } = getCanonicalValues(group, result)
-          const scopedKey = `${block.type}:${group.canonicalId}`
-          const pairMode = canonicalModes?.[scopedKey] ?? 'basic'
-          const chosen = pairMode === 'advanced' ? advancedValue : basicValue
+          // Route through the canonical SOT: an explicit scoped override wins, else the value
+          // heuristic - no `?? 'basic'` (which dropped an advanced-only value when basic was empty).
+          const explicitMode = canonicalModes?.[`${block.type}:${group.canonicalId}`]
+          const chosen = resolveActiveCanonicalValue(
+            group,
+            result,
+            explicitMode ? { [group.canonicalId]: explicitMode } : undefined
+          )
 
           const sourceIds = [group.basicId, ...group.advancedIds].filter(Boolean) as string[]
           sourceIds.forEach((id) => delete result[id])
@@ -1167,8 +1176,9 @@ export function trackForcedToolUsage(
   }
 }
 
-export const MODELS_TEMP_RANGE_0_2 = getModelsWithTempRange02()
-export const MODELS_TEMP_RANGE_0_1 = getModelsWithTempRange01()
+export const MODELS_TEMP_RANGE_0_2 = getModelsWithTemperatureRange(2)
+export const MODELS_TEMP_RANGE_0_15 = getModelsWithTemperatureRange(1.5)
+export const MODELS_TEMP_RANGE_0_1 = getModelsWithTemperatureRange(1)
 export const MODELS_WITH_TEMPERATURE_SUPPORT = getModelsWithTemperatureSupport()
 export const MODELS_WITH_REASONING_EFFORT = getModelsWithReasoningEffort()
 export const MODELS_WITH_VERBOSITY = getModelsWithVerbosity()

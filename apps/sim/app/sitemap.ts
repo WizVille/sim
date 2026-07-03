@@ -2,7 +2,7 @@ import type { MetadataRoute } from 'next'
 import { COURSES } from '@/lib/academy/content'
 import { getAllPostMeta } from '@/lib/blog/registry'
 import { SITE_URL } from '@/lib/core/utils/urls'
-import { INTEGRATIONS } from '@/lib/integrations'
+import { INTEGRATIONS, INTEGRATIONS_UPDATED_AT } from '@/lib/integrations'
 import { ALL_CATALOG_MODELS, MODEL_PROVIDERS_WITH_CATALOGS } from '@/app/(landing)/models/utils'
 
 /**
@@ -10,7 +10,7 @@ import { ALL_CATALOG_MODELS, MODEL_PROVIDERS_WITH_CATALOGS } from '@/app/(landin
  * dynamic catalogs (blog posts, authors, integrations, model providers,
  * individual models, and academy courses). Per-integration entries are
  * emitted under `/integrations/{slug}` to match the landing route at
- * `app/(landing)/integrations/(shell)/[slug]`; slugs are guaranteed unique
+ * `app/(landing)/integrations/[slug]`; slugs are guaranteed unique
  * by the catalog generator in `scripts/generate-docs.ts`.
  */
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
@@ -27,9 +27,44 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   )
   const latestModelDate = modelTimes.length > 0 ? new Date(Math.max(...modelTimes)) : undefined
 
+  const integrationsUpdatedAt = new Date(`${INTEGRATIONS_UPDATED_AT}T00:00:00Z`)
+
   const staticPages: MetadataRoute.Sitemap = [
     {
       url: baseUrl,
+    },
+    {
+      url: `${baseUrl}/workflows`,
+    },
+    {
+      url: `${baseUrl}/pricing`,
+    },
+    {
+      url: `${baseUrl}/demo`,
+    },
+    {
+      url: `${baseUrl}/contact`,
+    },
+    {
+      url: `${baseUrl}/careers`,
+    },
+    {
+      url: `${baseUrl}/enterprise`,
+    },
+    {
+      url: `${baseUrl}/solutions/compliance`,
+    },
+    {
+      url: `${baseUrl}/solutions/engineering`,
+    },
+    {
+      url: `${baseUrl}/solutions/finance`,
+    },
+    {
+      url: `${baseUrl}/solutions/hr`,
+    },
+    {
+      url: `${baseUrl}/solutions/it`,
     },
     {
       url: `${baseUrl}/blog`,
@@ -45,7 +80,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     },
     {
       url: `${baseUrl}/integrations`,
-      lastModified: latestModelDate,
+      lastModified: integrationsUpdatedAt,
     },
     {
       url: `${baseUrl}/models`,
@@ -53,9 +88,6 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     },
     {
       url: `${baseUrl}/partners`,
-    },
-    {
-      url: `${baseUrl}/contact`,
     },
     {
       url: `${baseUrl}/terms`,
@@ -89,6 +121,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
 
   const integrationPages: MetadataRoute.Sitemap = INTEGRATIONS.map((integration) => ({
     url: `${baseUrl}/integrations/${integration.slug}`,
+    lastModified: integrationsUpdatedAt,
   }))
 
   const providerPages: MetadataRoute.Sitemap = MODEL_PROVIDERS_WITH_CATALOGS.flatMap((provider) => {
