@@ -1,6 +1,7 @@
 import type { Metadata } from 'next'
 import type { SearchParams } from 'nuqs/server'
 import { SITE_URL } from '@/lib/core/utils/urls'
+import { withFilteredNoindex } from '@/lib/landing/seo'
 import { JsonLd } from '@/app/(landing)/components/json-ld'
 import { LandingFAQ } from '@/app/(landing)/components/landing-faq'
 import { ModelComparisonCharts } from '@/app/(landing)/models/components/model-comparison-charts'
@@ -60,38 +61,56 @@ const faqItems = [
   },
 ]
 
-export const metadata: Metadata = {
-  title: 'AI Models Directory',
-  description: `Compare ${TOTAL_MODELS}+ AI models across ${TOTAL_MODEL_PROVIDERS} providers in Sim's AI workspace. Compare pricing, context windows, and capabilities for your agents.`,
-  keywords: [
-    'AI models directory',
-    'AI model comparison',
-    'LLM model list',
-    'model pricing',
-    'context window comparison',
-    'OpenAI models',
-    'Anthropic models',
-    'Google Gemini models',
-    'xAI Grok models',
-    'Mistral models',
-    ...TOP_MODEL_PROVIDERS.map((provider) => `${provider} models`),
-  ],
-  // og:image/twitter:image come from the sibling opengraph-image.tsx -
-  // Next serves it at a hash-suffixed URL, so hardcoding it here 404s.
-  openGraph: {
-    title: 'AI Models Directory | Sim',
-    description: `Explore ${TOTAL_MODELS}+ AI models across ${TOTAL_MODEL_PROVIDERS} providers with pricing, context windows, and capability details.`,
-    url: `${baseUrl}/models`,
-    type: 'website',
-  },
-  twitter: {
-    card: 'summary_large_image',
-    title: 'AI Models Directory | Sim',
-    description: `Search ${TOTAL_MODELS}+ AI models across ${TOTAL_MODEL_PROVIDERS} providers.`,
-  },
-  alternates: {
-    canonical: `${baseUrl}/models`,
-  },
+/**
+ * `q`/`provider` render a genuinely different server-rendered list (see
+ * search-params.ts), so filtered URLs are noindexed rather than
+ * self-canonicalized — keeps the single indexable URL as the bare directory
+ * page instead of asking Google to index every filter permutation.
+ */
+export async function generateMetadata({
+  searchParams,
+}: {
+  searchParams: Promise<SearchParams>
+}): Promise<Metadata> {
+  const { q, provider } = await modelsSearchParamsCache.parse(searchParams)
+  const isFiltered = Boolean(q || provider)
+
+  return withFilteredNoindex(
+    {
+      title: 'AI Models Directory',
+      description: `Compare ${TOTAL_MODELS}+ AI models across ${TOTAL_MODEL_PROVIDERS} providers in Sim's AI workspace. Compare pricing, context windows, and capabilities for your agents.`,
+      keywords: [
+        'AI models directory',
+        'AI model comparison',
+        'LLM model list',
+        'model pricing',
+        'context window comparison',
+        'OpenAI models',
+        'Anthropic models',
+        'Google Gemini models',
+        'xAI Grok models',
+        'Mistral models',
+        ...TOP_MODEL_PROVIDERS.map((provider) => `${provider} models`),
+      ],
+      // og:image/twitter:image come from the sibling opengraph-image.tsx -
+      // Next serves it at a hash-suffixed URL, so hardcoding it here 404s.
+      openGraph: {
+        title: 'AI Models Directory | Sim',
+        description: `Explore ${TOTAL_MODELS}+ AI models across ${TOTAL_MODEL_PROVIDERS} providers with pricing, context windows, and capability details.`,
+        url: `${baseUrl}/models`,
+        type: 'website',
+      },
+      twitter: {
+        card: 'summary_large_image',
+        title: 'AI Models Directory | Sim',
+        description: `Search ${TOTAL_MODELS}+ AI models across ${TOTAL_MODEL_PROVIDERS} providers.`,
+      },
+      alternates: {
+        canonical: `${baseUrl}/models`,
+      },
+    },
+    isFiltered
+  )
 }
 
 export default async function ModelsPage({
@@ -163,7 +182,7 @@ export default async function ModelsPage({
       <JsonLd data={faqJsonLd} />
 
       <section className='bg-[var(--bg)]'>
-        <div className='mx-auto w-full max-w-[1446px] px-12 pt-[112px] max-sm:px-5 max-sm:pt-20 max-lg:px-8'>
+        <div className='mx-auto w-full max-w-[1460px] px-20 pt-[112px] max-sm:px-5 max-sm:pt-20 max-lg:px-8'>
           <div className='flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between'>
             <h1
               id='models-heading'
@@ -180,7 +199,7 @@ export default async function ModelsPage({
 
         <div className='mt-8 h-px w-full bg-[var(--border)]' />
 
-        <div className='mx-auto w-full max-w-[1446px] px-12 max-sm:px-5 max-lg:px-8'>
+        <div className='mx-auto w-full max-w-[1460px] px-20 max-sm:px-5 max-lg:px-8'>
           <div className='border-[var(--border)] border-x'>
             {featuredProviders.length > 0 && (
               <>

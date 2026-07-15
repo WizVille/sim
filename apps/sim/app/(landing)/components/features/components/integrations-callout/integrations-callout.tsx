@@ -1,62 +1,50 @@
-import type { ComponentType, SVGProps } from 'react'
-import { Search } from '@sim/emcn'
-import {
-  GithubIcon,
-  GmailIcon,
-  GoogleDriveIcon,
-  HubspotIcon,
-  JiraIcon,
-  LinearIcon,
-  NotionIcon,
-  PostgresIcon,
-  SalesforceIcon,
-  SlackIcon,
-} from '@/components/icons'
-import { CalloutFrame } from '@/app/(landing)/components/features/components/feature-stage/feature-stage'
+import Image from 'next/image'
+import { CalloutFrame } from '@/app/(landing)/components/features/components/callout-frame'
 
 /**
- * The Integrate beat's callout - a static recreation of Sim's integration
- * picker: a search over the 1,000+ connectors, each with its real brand mark
- * and category, the way you'd wire a tool into an agent. The lower rows dissolve
- * through the frame's foot fade, implying the rest of the catalog. Decorative.
+ * The Integrate beat's callout - the REAL platform Integrations page as one
+ * floating window: a full capture of the workspace UI (sidebar + Integrations
+ * tab with the showcase mosaic, search, and Featured sections) taken by
+ * `exports/readme-banner/capture-integrations-ui.mjs` at the hero shot's card
+ * geometry (1280x735 @2x), framed by the shared {@link CalloutFrame} so it
+ * wears the hero platform window's exact chrome (10px radius + layered
+ * shadow).
+ *
+ * The window is oversized (125% of the media stage, ~82% of the capture's
+ * native scale) and anchored with visually EQUAL top and left insets
+ * (percentage-based - 9.6% of the stage width; 14.4% of its 3:2 height lands
+ * at the same px), so its top-left corner floats free over the backdrop while
+ * the right AND bottom edges bleed past the media stage's clip - a zoomed-in
+ * peek at part of the product rather than a complete miniature, scaling
+ * proportionally with the aspect-locked stage. Decorative.
+ *
+ * `sizes` is derived directly from the section's grid math rather than
+ * approximated, then rounded up to the worst-case (peak render/viewport
+ * ratio) in each tier so the browser never under-fetches:
+ * `callout = 1.25 * (viewport - 2*gutter - 32px card padding - [40px gap +
+ * 386px fixed copy column, desktop only])`, gutter = `px-20`/`max-lg:px-8`/
+ * `max-sm:px-5` from `Features`'s grid, matching `FeatureCard`'s
+ * `max-lg:grid-cols-1` stack. Peak ratios (verified against a static
+ * reproduction of this exact layout rendered at each Tailwind breakpoint):
+ * ~113.3% at the `max-width: 1023px` stacked tier's own upper edge, ~108.6%
+ * at `1460px` (the container's cap, where render width stops growing with
+ * viewport - hence the final tier is a flat px value, not a vw fraction).
  */
-interface Integration {
-  name: string
-  Icon: ComponentType<SVGProps<SVGSVGElement>>
-  category: string
-}
-
-const INTEGRATIONS: Integration[] = [
-  { name: 'Slack', Icon: SlackIcon, category: 'Messaging' },
-  { name: 'Gmail', Icon: GmailIcon, category: 'Email' },
-  { name: 'HubSpot', Icon: HubspotIcon, category: 'CRM' },
-  { name: 'Salesforce', Icon: SalesforceIcon, category: 'CRM' },
-  { name: 'Notion', Icon: NotionIcon, category: 'Docs' },
-  { name: 'Jira', Icon: JiraIcon, category: 'Issues' },
-  { name: 'GitHub', Icon: GithubIcon, category: 'Code' },
-  { name: 'Linear', Icon: LinearIcon, category: 'Issues' },
-  { name: 'Google Drive', Icon: GoogleDriveIcon, category: 'Storage' },
-  { name: 'Postgres', Icon: PostgresIcon, category: 'Database' },
-]
-
 export function IntegrationsCallout() {
   return (
-    <CalloutFrame className='w-[340px]' bodyClassName='h-[320px]' fade>
-      <div className='flex h-full flex-col'>
-        <div className='flex h-[40px] flex-shrink-0 items-center gap-2 border-[var(--border)] border-b px-4'>
-          <Search className='size-[14px] flex-shrink-0 text-[var(--text-icon)]' />
-          <span className='text-[var(--text-muted)] text-sm'>Search 1,000+ integrations…</span>
-        </div>
-        <div className='flex flex-col px-2 pt-1.5'>
-          {INTEGRATIONS.map(({ name, Icon, category }) => (
-            <div key={name} className='flex items-center gap-2.5 rounded-md px-2 py-1.5'>
-              <Icon className='size-[16px] flex-shrink-0' />
-              <span className='flex-1 text-[var(--text-body)] text-sm'>{name}</span>
-              <span className='text-[11px] text-[var(--text-muted)]'>{category}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </CalloutFrame>
+    <div className='absolute inset-0'>
+      <CalloutFrame
+        className='absolute top-[14.4%] left-[9.6%] w-[125%]'
+        bodyClassName='aspect-[1280/735]'
+      >
+        <Image
+          src='/landing/feature-integrate-ui.png'
+          alt=''
+          fill
+          sizes='(max-width: 1023px) 114vw, (max-width: 1460px) 109vw, 1053px'
+          className='object-cover'
+        />
+      </CalloutFrame>
+    </div>
   )
 }

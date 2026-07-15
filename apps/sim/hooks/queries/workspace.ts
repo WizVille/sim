@@ -8,14 +8,12 @@ import {
   deleteWorkspaceContract,
   getWorkspaceContract,
   getWorkspaceMembersContract,
-  getWorkspaceOwnerBillingContract,
   getWorkspacePermissionsContract,
   listWorkspacesContract,
   updateWorkspaceContract,
   type Workspace,
   type WorkspaceCreationPolicy,
   type WorkspaceMember,
-  type WorkspaceOwnerBilling,
   type WorkspacePermissions,
   type WorkspaceQueryScope,
   type WorkspacesResponse,
@@ -35,12 +33,17 @@ export const workspaceKeys = {
   settings: (id: string) => [...workspaceKeys.detail(id), 'settings'] as const,
   permissions: (id: string) => [...workspaceKeys.detail(id), 'permissions'] as const,
   members: (id: string) => [...workspaceKeys.detail(id), 'members'] as const,
-  ownerBilling: (id: string) => [...workspaceKeys.detail(id), 'ownerBilling'] as const,
   adminLists: () => [...workspaceKeys.all, 'adminList'] as const,
   adminList: (userId: string | undefined) => [...workspaceKeys.adminLists(), userId ?? ''] as const,
 }
 
 export type { Workspace, WorkspaceCreationPolicy, WorkspaceMember, WorkspacePermissions }
+
+export const WORKSPACE_PERMISSIONS_STALE_TIME = 30 * 1000
+export const WORKSPACE_LIST_STALE_TIME = 30 * 1000
+export const WORKSPACE_SETTINGS_STALE_TIME = 30 * 1000
+export const WORKSPACE_MEMBERS_STALE_TIME = 5 * 60 * 1000
+export const WORKSPACE_ADMIN_LIST_STALE_TIME = 60 * 1000
 
 async function fetchWorkspaces(
   scope: WorkspaceQueryScope = 'active',
@@ -83,7 +86,7 @@ export function useWorkspacesQuery(enabled = true, scope: WorkspaceQueryScope = 
     queryFn: ({ signal }) => fetchWorkspaces(scope, signal),
     select: selectWorkspaces,
     enabled,
-    staleTime: 30 * 1000,
+    staleTime: WORKSPACE_LIST_STALE_TIME,
     placeholderData: keepPreviousData,
   })
 }
@@ -97,7 +100,7 @@ export function useWorkspacesWithMetadata(enabled = true) {
     queryKey: workspaceKeys.list('active'),
     queryFn: ({ signal }) => fetchWorkspaces('active', signal),
     enabled,
-    staleTime: 30 * 1000,
+    staleTime: WORKSPACE_LIST_STALE_TIME,
   })
 }
 
@@ -107,37 +110,7 @@ export function useWorkspaceCreationPolicy(enabled = true) {
     queryFn: ({ signal }) => fetchWorkspaces('active', signal),
     select: (data) => data.creationPolicy,
     enabled,
-    staleTime: 30 * 1000,
-  })
-}
-
-async function fetchWorkspaceOwnerBilling(
-  workspaceId: string,
-  signal?: AbortSignal
-): Promise<WorkspaceOwnerBilling> {
-  return requestJson(getWorkspaceOwnerBillingContract, {
-    params: { id: workspaceId },
-    signal,
-  })
-}
-
-/**
- * Subscription access state of the workspace's billed account (its owner's
- * rolled-up plan) — the workspace-scoped counterpart to `useSubscriptionData`.
- * Feed the result to `getSubscriptionAccessState` to gate workspace features on
- * the owner's plan rather than the viewer's, so a free member of a paid workspace
- * isn't gated.
- *
- * `staleTime: 0` so consumers (e.g. the deploy modal) refetch on mount: a plan
- * change happens outside this query's invalidation graph, and the cached value is
- * shown during the background refetch (no flash), so gates self-heal on reopen.
- */
-export function useWorkspaceOwnerBilling(workspaceId?: string) {
-  return useQuery({
-    queryKey: workspaceKeys.ownerBilling(workspaceId ?? ''),
-    queryFn: ({ signal }) => fetchWorkspaceOwnerBilling(workspaceId as string, signal),
-    enabled: Boolean(workspaceId),
-    staleTime: 0,
+    staleTime: WORKSPACE_LIST_STALE_TIME,
   })
 }
 
@@ -250,7 +223,7 @@ export function useWorkspacePermissionsQuery(workspaceId: string | null | undefi
     queryKey: workspaceKeys.permissions(workspaceId ?? ''),
     queryFn: ({ signal }) => fetchWorkspacePermissions(workspaceId as string, signal),
     enabled: Boolean(workspaceId),
-    staleTime: 30 * 1000,
+    staleTime: WORKSPACE_PERMISSIONS_STALE_TIME,
     placeholderData: keepPreviousData,
   })
 }
@@ -275,7 +248,7 @@ export function useWorkspaceMembersQuery(workspaceId: string | null | undefined)
     queryKey: workspaceKeys.members(workspaceId ?? ''),
     queryFn: ({ signal }) => fetchWorkspaceMembers(workspaceId as string, signal),
     enabled: Boolean(workspaceId),
-    staleTime: 5 * 60 * 1000,
+    staleTime: WORKSPACE_MEMBERS_STALE_TIME,
   })
 }
 
@@ -302,7 +275,7 @@ export function prefetchWorkspaceSettings(queryClient: QueryClient, workspaceId:
   queryClient.prefetchQuery({
     queryKey: workspaceKeys.settings(workspaceId),
     queryFn: ({ signal }) => fetchWorkspaceSettings(workspaceId, signal),
-    staleTime: 30 * 1000,
+    staleTime: WORKSPACE_SETTINGS_STALE_TIME,
   })
 }
 
@@ -315,7 +288,7 @@ export function useWorkspaceSettings(workspaceId: string) {
     queryKey: workspaceKeys.settings(workspaceId),
     queryFn: ({ signal }) => fetchWorkspaceSettings(workspaceId, signal),
     enabled: !!workspaceId,
-    staleTime: 30 * 1000,
+    staleTime: WORKSPACE_SETTINGS_STALE_TIME,
     placeholderData: keepPreviousData,
   })
 }
@@ -401,7 +374,7 @@ export function useAdminWorkspaces(userId: string | undefined, organizationId?: 
     queryKey: [...workspaceKeys.adminList(userId), organizationId ?? ''] as const,
     queryFn: ({ signal }) => fetchAdminWorkspaces(userId, organizationId, signal),
     enabled: Boolean(userId),
-    staleTime: 60 * 1000,
+    staleTime: WORKSPACE_ADMIN_LIST_STALE_TIME,
     placeholderData: keepPreviousData,
   })
 }

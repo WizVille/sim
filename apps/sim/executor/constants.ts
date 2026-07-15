@@ -1,3 +1,7 @@
+import {
+  normalizeWorkflowBlockName,
+  RESERVED_WORKFLOW_BLOCK_NAMES,
+} from '@sim/workflow-types/workflow'
 import { getMaxExecutionTimeout } from '@/lib/core/execution-limits'
 import type { LoopType, ParallelType } from '@/lib/workflows/types'
 
@@ -151,11 +155,12 @@ export const SPECIAL_REFERENCE_PREFIXES = [
   REFERENCE.PREFIX.VARIABLE,
 ] as const
 
-export const RESERVED_BLOCK_NAMES = [
-  REFERENCE.PREFIX.LOOP,
-  REFERENCE.PREFIX.PARALLEL,
-  REFERENCE.PREFIX.VARIABLE,
-] as const
+/**
+ * Delegates to the shared implementation in `@sim/workflow-types` so the
+ * client store and the realtime persistence layer agree on the same reserved
+ * names. Values intentionally mirror REFERENCE.PREFIX.{LOOP,PARALLEL,VARIABLE} above.
+ */
+export const RESERVED_BLOCK_NAMES = RESERVED_WORKFLOW_BLOCK_NAMES
 
 export const LOOP_REFERENCE = {
   ITERATION: 'iteration',
@@ -220,18 +225,6 @@ export const AGENT = {
 export const MCP = {
   TOOL_PREFIX: 'mcp-',
 } as const
-
-export const CREDENTIAL_SET = {
-  PREFIX: 'credentialSet:',
-} as const
-
-export function isCredentialSetValue(value: string | null | undefined): boolean {
-  return typeof value === 'string' && value.startsWith(CREDENTIAL_SET.PREFIX)
-}
-
-export function extractCredentialSetId(value: string): string {
-  return value.slice(CREDENTIAL_SET.PREFIX.length)
-}
 
 export const MEMORY = {
   DEFAULT_SLIDING_WINDOW_SIZE: 10,
@@ -490,12 +483,10 @@ export function escapeRegExp(value: string): string {
  * spaces and dots. Used for both block names and variable names to ensure
  * consistent matching.
  *
- * Dots are stripped because `.` is the reference path delimiter — a name like
- * "Trigger.dev 1" must normalize to "triggerdev1" so the reference
- * `<triggerdev1.output>` parses unambiguously. Dotted names could never be
- * referenced before (the first path segment cut the name at the dot), so
- * stripping dots cannot break any previously working reference.
+ * Delegates to the shared implementation in `@sim/workflow-types` so the
+ * client store and the realtime persistence layer normalize block names
+ * identically when checking for reserved/duplicate names.
  */
 export function normalizeName(name: string): string {
-  return name.toLowerCase().replace(/\s+/g, '').replace(/\./g, '')
+  return normalizeWorkflowBlockName(name)
 }

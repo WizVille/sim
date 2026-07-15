@@ -14,8 +14,20 @@ import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
 import { isApiClientError } from '@/lib/api/client/errors'
 import { serviceAccountJsonSchema } from '@/lib/api/contracts/credentials'
-import { ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID } from '@/lib/oauth/types'
-import { useCreateWorkspaceCredential } from '@/hooks/queries/credentials'
+import {
+  getTokenServiceAccountDescriptor,
+  type TokenServiceAccountProviderId,
+} from '@/lib/credentials/token-service-accounts/descriptors'
+import {
+  ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID,
+  SLACK_CUSTOM_BOT_PROVIDER_ID,
+} from '@/lib/oauth/types'
+import { TokenServiceAccountModal } from '@/app/workspace/[workspaceId]/integrations/components/connect-service-account-modal/token-service-account-modal'
+import { ConnectSlackBotModal } from '@/app/workspace/[workspaceId]/integrations/components/connect-slack-bot-modal/connect-slack-bot-modal'
+import {
+  useCreateWorkspaceCredential,
+  useUpdateWorkspaceCredential,
+} from '@/hooks/queries/credentials'
 
 const logger = createLogger('ConnectServiceAccountModal')
 
@@ -24,6 +36,8 @@ const GOOGLE_SERVICE_ACCOUNT_PROVIDER_ID = 'google-service-account' as const
 export type ServiceAccountProviderId =
   | typeof GOOGLE_SERVICE_ACCOUNT_PROVIDER_ID
   | typeof ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID
+  | typeof SLACK_CUSTOM_BOT_PROVIDER_ID
+  | TokenServiceAccountProviderId
 
 /** Sim setup guides for each provider, docked bottom-left of each modal. */
 const GOOGLE_SERVICE_ACCOUNT_DOCS_URL = 'https://docs.sim.ai/integrations/google-service-account'
@@ -78,6 +92,16 @@ interface ConnectServiceAccountModalProps {
   serviceAccountProviderId: ServiceAccountProviderId
   serviceName: string
   serviceIcon: ComponentType<{ className?: string }>
+  /**
+   * When set, the modal reconnects (rotates secrets on) this existing credential
+   * in place instead of creating a new one. The id is preserved, so shares and
+   * (for Slack) the ingest URL stay valid.
+   */
+  credentialId?: string
+  /** Existing display name, used to seed reconnect-capable modals. */
+  credentialDisplayName?: string
+  /** Existing description, used to seed reconnect-capable modals. */
+  credentialDescription?: string
 }
 
 /**
@@ -99,7 +123,38 @@ export function ConnectServiceAccountModal({
   serviceAccountProviderId,
   serviceName,
   serviceIcon,
+  credentialId,
+  credentialDisplayName,
+  credentialDescription,
 }: ConnectServiceAccountModalProps) {
+  const tokenDescriptor = getTokenServiceAccountDescriptor(serviceAccountProviderId)
+  if (tokenDescriptor) {
+    return (
+      <TokenServiceAccountModal
+        open={open}
+        onOpenChange={onOpenChange}
+        workspaceId={workspaceId}
+        descriptor={tokenDescriptor}
+        serviceName={serviceName}
+        serviceIcon={serviceIcon}
+        credentialId={credentialId}
+        initialDisplayName={credentialDisplayName}
+        initialDescription={credentialDescription}
+      />
+    )
+  }
+  if (serviceAccountProviderId === SLACK_CUSTOM_BOT_PROVIDER_ID) {
+    return (
+      <ConnectSlackBotModal
+        open={open}
+        onOpenChange={onOpenChange}
+        workspaceId={workspaceId}
+        credentialId={credentialId}
+        initialDisplayName={credentialDisplayName}
+        initialDescription={credentialDescription}
+      />
+    )
+  }
   if (serviceAccountProviderId === ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID) {
     return (
       <AtlassianServiceAccountModal
@@ -108,6 +163,9 @@ export function ConnectServiceAccountModal({
         workspaceId={workspaceId}
         serviceName={serviceName}
         serviceIcon={serviceIcon}
+        credentialId={credentialId}
+        initialDisplayName={credentialDisplayName}
+        initialDescription={credentialDescription}
       />
     )
   }
@@ -118,6 +176,9 @@ export function ConnectServiceAccountModal({
       workspaceId={workspaceId}
       serviceName={serviceName}
       serviceIcon={serviceIcon}
+      credentialId={credentialId}
+      initialDisplayName={credentialDisplayName}
+      initialDescription={credentialDescription}
     />
   )
 }
@@ -128,6 +189,11 @@ interface ProviderModalProps {
   workspaceId: string
   serviceName: string
   serviceIcon: ComponentType<{ className?: string }>
+  /** When set, reconnect (rotate secrets on) this credential in place. */
+  credentialId?: string
+  /** Existing name/description, seeded into the fields on reconnect. */
+  initialDisplayName?: string
+  initialDescription?: string
 }
 
 /**
@@ -141,23 +207,27 @@ function GoogleServiceAccountModal({
   workspaceId,
   serviceName,
   serviceIcon: ServiceIcon,
+  credentialId,
+  initialDisplayName,
+  initialDescription,
 }: ProviderModalProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [uploadedFileName, setUploadedFileName] = useState<string | null>(null)
-  const [displayName, setDisplayName] = useState('')
-  const [description, setDescription] = useState('')
+  const [displayName, setDisplayName] = useState(initialDisplayName ?? '')
+  const [description, setDescription] = useState(initialDescription ?? '')
   const [error, setError] = useState<string | null>(null)
 
   const createCredential = useCreateWorkspaceCredential()
+  const updateCredential = useUpdateWorkspaceCredential()
 
   useEffect(() => {
     if (open) return
     setJsonInput('')
     setUploadedFileName(null)
-    setDisplayName('')
-    setDescription('')
+    setDisplayName(initialDisplayName ?? '')
+    setDescription(initialDescription ?? '')
     setError(null)
-  }, [open])
+  }, [open, initialDisplayName, initialDescription])
 
   /**
    * Try to auto-populate display name from the JSON `client_email`. Silent on
@@ -209,13 +279,22 @@ function GoogleServiceAccountModal({
       return
     }
     try {
-      await createCredential.mutateAsync({
-        workspaceId,
-        type: 'service_account',
-        displayName: displayName.trim() || undefined,
-        description: description.trim() || undefined,
-        serviceAccountJson: trimmed,
-      })
+      if (credentialId) {
+        await updateCredential.mutateAsync({
+          credentialId,
+          serviceAccountJson: trimmed,
+          displayName: displayName.trim() || undefined,
+          description: description.trim() || undefined,
+        })
+      } else {
+        await createCredential.mutateAsync({
+          workspaceId,
+          type: 'service_account',
+          displayName: displayName.trim() || undefined,
+          description: description.trim() || undefined,
+          serviceAccountJson: trimmed,
+        })
+      }
       onOpenChange(false)
     } catch (err: unknown) {
       const message = getErrorMessage(err, 'Failed to add service account')
@@ -224,7 +303,7 @@ function GoogleServiceAccountModal({
     }
   }
 
-  const isPending = createCredential.isPending
+  const isPending = createCredential.isPending || updateCredential.isPending
   const isDisabled = !jsonInput.trim() || isPending
 
   return (
@@ -315,45 +394,59 @@ function AtlassianServiceAccountModal({
   workspaceId,
   serviceName,
   serviceIcon: ServiceIcon,
+  credentialId,
+  initialDisplayName,
+  initialDescription,
 }: ProviderModalProps) {
   const [apiToken, setApiToken] = useState('')
   const [domain, setDomain] = useState('')
-  const [displayName, setDisplayName] = useState('')
-  const [description, setDescription] = useState('')
+  const [displayName, setDisplayName] = useState(initialDisplayName ?? '')
+  const [description, setDescription] = useState(initialDescription ?? '')
   const [error, setError] = useState<string | null>(null)
 
   const createCredential = useCreateWorkspaceCredential()
+  const updateCredential = useUpdateWorkspaceCredential()
 
   useEffect(() => {
     if (open) return
     setApiToken('')
     setDomain('')
-    setDisplayName('')
-    setDescription('')
+    setDisplayName(initialDisplayName ?? '')
+    setDescription(initialDescription ?? '')
     setError(null)
-  }, [open])
+  }, [open, initialDisplayName, initialDescription])
 
   const trimmedToken = apiToken.trim()
   const normalizedDomain = normalizeAtlassianDomain(domain)
   const showDomainHint =
     normalizedDomain.length > 0 && !ATLASSIAN_DOMAIN_HINT_REGEX.test(normalizedDomain)
 
-  const isPending = createCredential.isPending
+  const isPending = createCredential.isPending || updateCredential.isPending
   const isDisabled = !trimmedToken || !normalizedDomain || isPending
 
   const handleSubmit = async () => {
     setError(null)
     if (isDisabled) return
     try {
-      await createCredential.mutateAsync({
-        workspaceId,
-        type: 'service_account',
-        providerId: ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID,
-        apiToken: trimmedToken,
-        domain: normalizedDomain,
-        displayName: displayName.trim() || undefined,
-        description: description.trim() || undefined,
-      })
+      if (credentialId) {
+        await updateCredential.mutateAsync({
+          credentialId,
+          apiToken: trimmedToken,
+          domain: normalizedDomain,
+          displayName: displayName.trim() || undefined,
+          description: description.trim() || undefined,
+        })
+      } else {
+        await createCredential.mutateAsync({
+          workspaceId,
+          type: 'service_account',
+          providerId: ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID,
+          apiToken: trimmedToken,
+          domain: normalizedDomain,
+          displayName: displayName.trim() || undefined,
+          description: description.trim() || undefined,
+        })
+      }
       onOpenChange(false)
     } catch (err: unknown) {
       setError(messageForAtlassianError(err))

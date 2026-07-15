@@ -86,6 +86,7 @@ import {
   groupWorkflowsByFolder,
 } from '@/app/workspace/[workspaceId]/w/components/sidebar/utils'
 import { useImportWorkflow } from '@/app/workspace/[workspaceId]/w/hooks'
+import { useCustomBlockOverlayVersion } from '@/blocks/custom/client-overlay'
 import { useWorkspaceCredentials } from '@/hooks/queries/credentials'
 import { useFolderMap, useFolders } from '@/hooks/queries/folders'
 import { useKnowledgeBasesQuery } from '@/hooks/queries/kb/knowledge'
@@ -109,6 +110,7 @@ import { SIDEBAR_WIDTH } from '@/stores/constants'
 import { useFolderStore } from '@/stores/folders/store'
 import { useSearchModalStore } from '@/stores/modals/search/store'
 import { useProvidersStore } from '@/stores/providers'
+import { useSettingsDirtyStore } from '@/stores/settings/dirty/store'
 import { useSidebarStore } from '@/stores/sidebar/store'
 
 const logger = createLogger('Sidebar')
@@ -118,18 +120,20 @@ export function SidebarTooltip({
   label,
   enabled,
   side = 'right',
+  shortcut,
 }: {
   children: React.ReactElement
   label: string
   enabled: boolean
   side?: 'right' | 'bottom'
+  shortcut?: string
 }) {
   if (!enabled) return children
   return (
     <Tooltip.Root>
       <Tooltip.Trigger asChild>{children}</Tooltip.Trigger>
       <Tooltip.Content side={side}>
-        <p>{label}</p>
+        {shortcut ? <Tooltip.Shortcut keys={shortcut}>{label}</Tooltip.Shortcut> : <p>{label}</p>}
       </Tooltip.Content>
     </Tooltip.Root>
   )
@@ -373,6 +377,7 @@ export const Sidebar = memo(function Sidebar({ isCollapsed }: SidebarProps) {
   const { config: permissionConfig, filterBlocks } = usePermissionConfig()
   const { navigateToSettings, getSettingsHref } = useSettingsNavigation()
   const initializeSearchData = useSearchModalStore((state) => state.initializeData)
+  const customBlockOverlayVersion = useCustomBlockOverlayVersion()
   const providers = useProvidersStore((state) => state.providers)
   const providerModelSignature = useMemo(
     () =>
@@ -384,7 +389,7 @@ export const Sidebar = memo(function Sidebar({ isCollapsed }: SidebarProps) {
 
   useEffect(() => {
     initializeSearchData(filterBlocks)
-  }, [initializeSearchData, filterBlocks, providerModelSignature])
+  }, [initializeSearchData, filterBlocks, providerModelSignature, customBlockOverlayVersion])
 
   const setSidebarWidth = useSidebarStore((state) => state.setSidebarWidth)
   const toggleCollapsed = useSidebarStore((state) => state.toggleCollapsed)
@@ -1070,16 +1075,21 @@ export const Sidebar = memo(function Sidebar({ isCollapsed }: SidebarProps) {
     fileInputRef.current?.click()
   }
 
+  const requestLeave = useSettingsDirtyStore((s) => s.requestLeave)
+
   const handleWorkspaceSwitch = useCallback(
-    async (workspace: Workspace) => {
+    (workspace: Workspace) => {
       if (workspace.id === workspaceId) {
         setIsWorkspaceMenuOpen(false)
         return
       }
-      await switchWorkspace(workspace)
+      // Close the switcher first so the settings discard dialog (if any) is visible.
       setIsWorkspaceMenuOpen(false)
+      requestLeave(() => {
+        void switchWorkspace(workspace)
+      })
     },
-    [workspaceId, switchWorkspace]
+    [workspaceId, switchWorkspace, requestLeave]
   )
 
   const handleSidebarClick = (e: React.MouseEvent<HTMLElement>) => {
@@ -1226,6 +1236,12 @@ export const Sidebar = memo(function Sidebar({ isCollapsed }: SidebarProps) {
           handleCreateWorkflow()
         },
       },
+      {
+        id: 'toggle-sidebar',
+        handler: () => {
+          toggleCollapsed()
+        },
+      },
     ])
   )
 
@@ -1276,7 +1292,12 @@ export const Sidebar = memo(function Sidebar({ isCollapsed }: SidebarProps) {
                 isCollapsed={isCollapsed}
                 onExpandSidebar={toggleCollapsed}
               />
-              <SidebarTooltip label='Collapse sidebar' enabled={!isCollapsed} side='bottom'>
+              <SidebarTooltip
+                label='Collapse sidebar'
+                enabled={!isCollapsed}
+                side='bottom'
+                shortcut={isMac ? '⌘B' : 'Ctrl+B'}
+              >
                 <button
                   type='button'
                   onClick={toggleCollapsed}

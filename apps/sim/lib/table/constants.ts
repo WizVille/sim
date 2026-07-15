@@ -12,7 +12,6 @@ export const TABLE_LIMITS = {
   MAX_COLUMNS_PER_TABLE: 50,
   MAX_TABLE_NAME_LENGTH: 128,
   MAX_COLUMN_NAME_LENGTH: 50,
-  MAX_STRING_VALUE_LENGTH: 10000,
   MAX_DESCRIPTION_LENGTH: 500,
   DEFAULT_QUERY_LIMIT: 100,
   MAX_QUERY_LIMIT: 1000,
@@ -39,8 +38,9 @@ export const TABLE_LIMITS = {
 
 /**
  * Default plan-based table limits. Each value can be overridden via env vars
- * (see `getTablePlanLimits`) so self-hosted deployments can raise the free-tier
- * caps that apply when billing is disabled.
+ * (see `getTablePlanLimits`). Billing-disabled deployments are unlimited
+ * unless the free-tier env vars are explicitly set (see
+ * `getBillingDisabledTableLimits`).
  */
 export const DEFAULT_TABLE_PLAN_LIMITS = {
   free: {
@@ -62,6 +62,17 @@ export const DEFAULT_TABLE_PLAN_LIMITS = {
 } as const
 
 /**
+ * Byte budget for one page of row reads, or null when disabled (the default).
+ * Dev-preview of the byte-bounded pagination follow-up: set `TABLE_MAX_PAGE_BYTES`
+ * to cut pages early once their serialized row data exceeds the budget. The
+ * production version moves the cut into SQL — see the pagination-hardening plan.
+ */
+export function getMaxPageBytes(): number | null {
+  const value = envNumber(env.TABLE_MAX_PAGE_BYTES, 0, { min: 0, integer: true })
+  return value > 0 ? value : null
+}
+
+/**
  * Maximum serialized size in bytes of a single row. Defaults to
  * `TABLE_LIMITS.MAX_ROW_SIZE_BYTES`; overridable via the
  * `TABLE_MAX_ROW_SIZE_BYTES` env var (server-only, read at call time).
@@ -78,6 +89,20 @@ export type PlanName = keyof typeof DEFAULT_TABLE_PLAN_LIMITS
 export interface TablePlanLimits {
   maxTables: number
   maxRowsPerTable: number
+}
+
+/**
+ * Table limits for billing-disabled deployments: unlimited by default, with
+ * each cap opting back in only when its free-tier env var is explicitly set
+ * to a valid positive integer.
+ */
+export function getBillingDisabledTableLimits(): TablePlanLimits {
+  const tablesOverride = envNumber(env.FREE_TABLES_LIMIT, 0, { min: 1, integer: true })
+  const rowsOverride = envNumber(env.FREE_TABLE_ROWS_LIMIT, 0, { min: 1, integer: true })
+  return {
+    maxTables: tablesOverride > 0 ? tablesOverride : Number.MAX_SAFE_INTEGER,
+    maxRowsPerTable: rowsOverride > 0 ? rowsOverride : Number.MAX_SAFE_INTEGER,
+  }
 }
 
 export type TablePlanLimitsByPlan = Record<PlanName, TablePlanLimits>

@@ -1,9 +1,14 @@
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
 import { sleep } from '@sim/utils/helpers'
-import { randomFloat } from '@sim/utils/random'
+import { backoffWithJitter, parseRetryAfter } from '@sim/utils/retry'
 import { getBYOKKey } from '@/lib/api-key/byok'
 import { generateInternalToken } from '@/lib/auth/internal'
+import {
+  BILLING_ATTRIBUTION_HEADER,
+  type BillingAttributionSnapshot,
+  serializeBillingAttributionHeader,
+} from '@/lib/billing/core/billing-attribution'
 import { isHosted } from '@/lib/core/config/env-flags'
 import { DEFAULT_EXECUTION_TIMEOUT_MS, getMaxExecutionTimeout } from '@/lib/core/execution-limits'
 import { getHostedKeyRateLimiter } from '@/lib/core/rate-limiter'
@@ -28,6 +33,7 @@ import { assertPermissionsAllowed } from '@/ee/access-control/utils/permission-c
 import { isCustomTool, isMcpTool } from '@/executor/constants'
 import { resolveSkillContent } from '@/executor/handlers/agent/skills-resolver'
 import type { ExecutionContext, UserFile } from '@/executor/types'
+import { resolveEnvVarReferences } from '@/executor/utils/reference-validation'
 import type { ErrorInfo } from '@/tools/error-extractors'
 import { extractErrorMessage } from '@/tools/error-extractors'
 import type {
@@ -52,6 +58,7 @@ interface ToolExecutionScope {
   isDeployedContext?: boolean
   enforceCredentialAccess?: boolean
   copilotToolExecution?: boolean
+  billingAttribution?: BillingAttributionSnapshot
 }
 
 function resolveToolScope(
@@ -73,6 +80,8 @@ function resolveToolScope(
     copilotToolExecution: (executionContext?.copilotToolExecution ?? ctx?.copilotToolExecution) as
       | boolean
       | undefined,
+    billingAttribution: (executionContext?.metadata.billingAttribution ??
+      ctx?.billingAttribution) as BillingAttributionSnapshot | undefined,
   }
 }
 
@@ -172,6 +181,71 @@ async function normalizeCopilotFileParams(
         values.map((item) => resolveCopilotFileReference(item, scope.workspaceId!, paramId))
       )
     }
+  }
+}
+
+/**
+ * Resolves whole-value {{ENV_VAR}} references in user-only params for copilot
+ * tool executions. Chat agents never see secret values (the workspace VFS
+ * exposes env var names only), so they pass references; workflow runs resolve
+ * these in the executor, and this is the equivalent step for direct tool
+ * calls, delegating to the executor's resolver so both paths share one set of
+ * reference semantics. Resolution is deliberately restricted to params
+ * declared `visibility: 'user-only'` (API keys and other operator-supplied
+ * secrets) and to values that are exactly one reference, so LLM-writable
+ * params (URLs, headers, bodies) can never be used to extract secret values.
+ *
+ * Mutates only the given params object — callers pass the per-execution copy,
+ * never the copilot-side tool-call state, so decrypted values cannot leak
+ * into failure logs or persisted chat state.
+ */
+async function resolveCopilotEnvReferences(
+  tool: ToolConfig,
+  params: Record<string, unknown>,
+  scope: ToolExecutionScope
+): Promise<void> {
+  if (!scope.copilotToolExecution) {
+    return
+  }
+
+  const pending: Array<{ paramId: string; value: string }> = []
+  for (const [paramId, paramDef] of Object.entries(tool.params || {})) {
+    if (paramDef?.visibility !== 'user-only') continue
+    const value = params[paramId]
+    if (typeof value === 'string' && value.startsWith('{{') && value.endsWith('}}')) {
+      pending.push({ paramId, value })
+    }
+  }
+
+  if (pending.length === 0) {
+    return
+  }
+
+  if (!scope.userId) {
+    throw new Error(
+      `Cannot resolve environment variable reference in parameter "${pending[0].paramId}" without an authenticated user context.`
+    )
+  }
+
+  const { getEffectiveDecryptedEnv } = await import('@/lib/environment/utils')
+  const envVars = await getEffectiveDecryptedEnv(scope.userId, scope.workspaceId)
+
+  for (const { paramId, value } of pending) {
+    const missingKeys: string[] = []
+    const resolved = resolveEnvVarReferences(value, envVars, {
+      allowEmbedded: false,
+      missingKeys,
+    })
+    if (missingKeys.length > 0) {
+      const scopeHint = scope.workspaceId
+        ? ''
+        : ' (no workspace context — only personal variables are available here)'
+      throw new Error(
+        `Environment variable "${missingKeys[0]}" referenced by parameter "${paramId}" was not found${scopeHint}. ` +
+          `Check environment/variables.json for available variable names.`
+      )
+    }
+    params[paramId] = resolved as string
   }
 }
 
@@ -475,7 +549,7 @@ async function executeWithRetry<T>(
         throw error
       }
 
-      const delayMs = baseDelayMs * 2 ** attempt
+      const delayMs = backoffWithJitter(attempt + 1, null, { baseMs: baseDelayMs })
 
       // Track throttling event via telemetry
       PlatformEvents.hostedKeyRateLimited({
@@ -999,6 +1073,12 @@ export async function executeTool(
 
     // Ensure context is preserved if it exists
     const contextParams = { ...params }
+    if (scope.billingAttribution) {
+      contextParams._context = {
+        ...(contextParams._context as Record<string, unknown> | undefined),
+        billingAttribution: scope.billingAttribution,
+      }
+    }
 
     // Validate the tool and its parameters
     validateRequiredParametersAfterMerge(toolId, tool, contextParams)
@@ -1011,6 +1091,7 @@ export async function executeTool(
     await normalizeCopilotFileParams(tool, contextParams, scope)
     normalizeCopilotCredentialParams(contextParams)
     enforceCopilotCredentialSelection(toolId, tool, contextParams, scope)
+    await resolveCopilotEnvReferences(tool, contextParams, scope)
 
     // Inject hosted API key if tool supports it and user didn't provide one
     const hostedKeyInfo = await injectHostedKeyIfNeeded(
@@ -1486,26 +1567,6 @@ function isRetryableFailure(error: unknown, status?: number): boolean {
   return false
 }
 
-function calculateBackoff(attempt: number, initialDelayMs: number, maxDelayMs: number): number {
-  const base = Math.min(initialDelayMs * 2 ** attempt, maxDelayMs)
-  return Math.round(base / 2 + randomFloat() * (base / 2))
-}
-
-function parseRetryAfterHeader(header: string | null): number {
-  if (!header) return 0
-  const trimmed = header.trim()
-  if (/^\d+$/.test(trimmed)) {
-    const seconds = Number.parseInt(trimmed, 10)
-    return seconds > 0 ? seconds * 1000 : 0
-  }
-  const date = new Date(trimmed)
-  if (!Number.isNaN(date.getTime())) {
-    const deltaMs = date.getTime() - Date.now()
-    return deltaMs > 0 ? deltaMs : 0
-  }
-  return 0
-}
-
 function shouldRetryWithoutReadingBody(
   status: number,
   headers: { get(name: string): string | null },
@@ -1515,7 +1576,10 @@ function shouldRetryWithoutReadingBody(
   if (!retryConfig || isLastAttempt || !isRetryableFailure(null, status)) {
     return false
   }
-  return parseRetryAfterHeader(headers.get('retry-after')) <= retryConfig.maxDelayMs
+  return (
+    (parseRetryAfter(headers.get('retry-after'), Number.POSITIVE_INFINITY) ?? 0) <=
+    retryConfig.maxDelayMs
+  )
 }
 
 /**
@@ -1591,6 +1655,12 @@ async function executeToolRequest(
       toolId,
       params._context?.userId
     )
+    if (isInternalRoute && params._context?.billingAttribution) {
+      headers.set(
+        BILLING_ATTRIBUTION_HEADER,
+        serializeBillingAttributionHeader(params._context.billingAttribution)
+      )
+    }
 
     const shouldPropagateCallChain = isInternalRoute || isSelfOriginUrl(fullUrl)
     if (shouldPropagateCallChain) {
@@ -1742,11 +1812,10 @@ async function executeToolRequest(
         if (!retryConfig || isLastAttempt || !isRetryableFailure(error)) {
           throw error
         }
-        const delayMs = calculateBackoff(
-          attempt,
-          retryConfig.initialDelayMs,
-          retryConfig.maxDelayMs
-        )
+        const delayMs = backoffWithJitter(attempt + 1, null, {
+          baseMs: retryConfig.initialDelayMs,
+          maxMs: retryConfig.maxDelayMs,
+        })
         logger.warn(
           `[${requestId}] Retrying ${toolId} after error (attempt ${attempt + 1}/${maxAttempts})`,
           { delayMs }
@@ -1762,8 +1831,11 @@ async function executeToolRequest(
         !response.ok &&
         isRetryableFailure(null, response.status)
       ) {
-        const retryAfterMs = parseRetryAfterHeader(response.headers.get('retry-after'))
-        if (retryAfterMs > retryConfig.maxDelayMs) {
+        const retryAfterMs = parseRetryAfter(
+          response.headers.get('retry-after'),
+          Number.POSITIVE_INFINITY
+        )
+        if (retryAfterMs !== null && retryAfterMs > retryConfig.maxDelayMs) {
           logger.warn(
             `[${requestId}] Retry-After (${retryAfterMs}ms) exceeds maxDelayMs (${retryConfig.maxDelayMs}ms), skipping retry`
           )
@@ -1774,12 +1846,10 @@ async function executeToolRequest(
         } catch {
           // Ignore errors when consuming body
         }
-        const backoffMs = calculateBackoff(
-          attempt,
-          retryConfig.initialDelayMs,
-          retryConfig.maxDelayMs
-        )
-        const delayMs = Math.max(backoffMs, retryAfterMs)
+        const delayMs = backoffWithJitter(attempt + 1, retryAfterMs, {
+          baseMs: retryConfig.initialDelayMs,
+          maxMs: retryConfig.maxDelayMs,
+        })
         logger.warn(
           `[${requestId}] Retrying ${toolId} after HTTP ${response.status} (attempt ${attempt + 1}/${maxAttempts})`,
           { delayMs }
@@ -2054,12 +2124,29 @@ async function executeMcpTool(
     if (mcpScope.callChain && mcpScope.callChain.length > 0) {
       headers[SIM_VIA_HEADER] = serializeCallChain(mcpScope.callChain)
     }
+    if (mcpScope.billingAttribution) {
+      headers[BILLING_ATTRIBUTION_HEADER] = serializeBillingAttributionHeader(
+        mcpScope.billingAttribution
+      )
+    }
 
     if (!mcpScope.workspaceId) {
       return {
         success: false,
         output: {},
         error: `Missing workspaceId in execution context for MCP tool ${toolName}`,
+        timing: {
+          startTime: actualStartTime,
+          endTime: new Date().toISOString(),
+          duration: Date.now() - new Date(actualStartTime).getTime(),
+        },
+      }
+    }
+    if (!mcpScope.billingAttribution) {
+      return {
+        success: false,
+        output: {},
+        error: `Missing billing attribution in execution context for MCP tool ${toolName}`,
         timing: {
           startTime: actualStartTime,
           endTime: new Date().toISOString(),

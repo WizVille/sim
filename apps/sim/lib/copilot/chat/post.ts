@@ -9,6 +9,7 @@ import { type NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { isZodError, validationErrorResponse } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
+import { resolveBillingAttribution } from '@/lib/billing/core/billing-attribution'
 import { type ChatLoadResult, resolveOrCreateChat } from '@/lib/copilot/chat/lifecycle'
 import { appendCopilotChatMessages } from '@/lib/copilot/chat/messages-store'
 import { buildCopilotRequestPayload } from '@/lib/copilot/chat/payload'
@@ -25,6 +26,7 @@ import { finalizeAssistantTurn } from '@/lib/copilot/chat/terminal-state'
 import { generateWorkspaceSnapshot } from '@/lib/copilot/chat/workspace-context'
 import { chatPubSub } from '@/lib/copilot/chat-status'
 import { COPILOT_REQUEST_MODES } from '@/lib/copilot/constants'
+import { computeWorkspaceEntitlements } from '@/lib/copilot/entitlements'
 import {
   CopilotChatFinalizeOutcome,
   CopilotChatPersistOutcome,
@@ -45,6 +47,7 @@ import type { ExecutionContext, OrchestratorResult } from '@/lib/copilot/request
 import { persistChatResources } from '@/lib/copilot/resources/persistence'
 import { prepareExecutionContext } from '@/lib/copilot/tools/handlers/context'
 import { getEffectiveDecryptedEnv } from '@/lib/environment/utils'
+import { captureServerEvent } from '@/lib/posthog/server'
 import { resolveWorkflowIdForUser } from '@/lib/workflows/utils'
 import {
   getUserEntityPermissions,
@@ -174,6 +177,7 @@ type UnifiedChatBranch =
         contexts: Array<{ type: string; content: string; tag?: string; path?: string }>
         fileAttachments?: UnifiedChatRequest['fileAttachments']
         userPermission?: string
+        entitlements?: string[]
         userTimezone?: string
         userMetadata?: { name?: string; email?: string; timezone?: string }
         workflowId: string
@@ -211,6 +215,7 @@ type UnifiedChatBranch =
         contexts: Array<{ type: string; content: string; tag?: string; path?: string }>
         fileAttachments?: UnifiedChatRequest['fileAttachments']
         userPermission?: string
+        entitlements?: string[]
         userTimezone?: string
         userMetadata?: { name?: string; email?: string; timezone?: string }
         workspaceContext?: string
@@ -402,13 +407,19 @@ async function buildInitialExecutionContext(params: {
     }
   }
 
-  const decryptedEnvVars = await getEffectiveDecryptedEnv(userId, workspaceId)
+  const [decryptedEnvVars, billingAttribution] = await Promise.all([
+    getEffectiveDecryptedEnv(userId, workspaceId),
+    workspaceId
+      ? resolveBillingAttribution({ actorUserId: userId, workspaceId })
+      : Promise.resolve(undefined),
+  ])
   return {
     userId,
     workflowId: workflowId ?? '',
     workspaceId,
     chatId,
     decryptedEnvVars,
+    billingAttribution,
     messageId,
     userTimezone,
     requestMode,
@@ -623,6 +634,7 @@ async function resolveBranch(params: {
             workspaceContext: payloadParams.workspaceContext,
             vfs: payloadParams.vfs,
             userPermission: payloadParams.userPermission,
+            entitlements: payloadParams.entitlements,
             userTimezone: payloadParams.userTimezone,
             userMetadata: payloadParams.userMetadata,
           },
@@ -678,6 +690,7 @@ async function resolveBranch(params: {
           workspaceContext: payloadParams.workspaceContext,
           vfs: payloadParams.vfs,
           userPermission: payloadParams.userPermission,
+          entitlements: payloadParams.entitlements,
           userTimezone: payloadParams.userTimezone,
           userMetadata: payloadParams.userMetadata,
           includeMothershipTools: true,
@@ -898,6 +911,9 @@ export async function handleUnifiedChatPost(req: NextRequest) {
                 }
               )
             : Promise.resolve(null)
+      const entitlementsPromise = workspaceId
+        ? computeWorkspaceEntitlements(workspaceId, authenticatedUserId)
+        : Promise.resolve([])
       // Wrap the pre-LLM prep work in spans so the trace waterfall shows
       // where time is going between "request received" and "llm.stream
       // opens". Previously these ran bare under the root and inflated the
@@ -952,10 +968,11 @@ export async function handleUnifiedChatPost(req: NextRequest) {
         activeOtelRoot.context
       )
 
-      const [agentContexts, userPermission, workspaceSnapshot, , executionContext] =
+      const [agentContexts, userPermission, entitlements, workspaceSnapshot, , executionContext] =
         await Promise.all([
           agentContextsPromise,
           userPermissionPromise,
+          entitlementsPromise,
           workspaceContextPromise,
           persistUserMessagePromise,
           executionContextPromise,
@@ -990,6 +1007,7 @@ export async function handleUnifiedChatPost(req: NextRequest) {
                 contexts: agentContexts,
                 fileAttachments: body.fileAttachments,
                 userPermission: userPermission ?? undefined,
+                entitlements,
                 userTimezone: body.userTimezone,
                 userMetadata,
                 workflowId: branch.workflowId,
@@ -1011,6 +1029,7 @@ export async function handleUnifiedChatPost(req: NextRequest) {
                 contexts: agentContexts,
                 fileAttachments: body.fileAttachments,
                 userPermission: userPermission ?? undefined,
+                entitlements,
                 userTimezone: body.userTimezone,
                 userMetadata,
                 workspaceContext,
@@ -1069,6 +1088,19 @@ export async function handleUnifiedChatPost(req: NextRequest) {
           }),
         },
       })
+
+      captureServerEvent(
+        authenticatedUserId,
+        'copilot_chat_sent',
+        {
+          ...(branch.kind === 'workflow' ? { workflow_id: branch.workflowId } : {}),
+          ...(workspaceId ? { workspace_id: workspaceId } : {}),
+          has_file_attachments: (body.fileAttachments?.length ?? 0) > 0,
+          has_contexts: normalizedContexts.length > 0,
+          mode: branch.kind === 'workflow' ? branch.mode : 'agent',
+        },
+        workspaceId ? { groups: { workspace: workspaceId } } : undefined
+      )
 
       // Expose the root gen_ai.agent.execute span's trace identity to
       // the browser so subsequent HTTP calls (stop, abort, confirm,

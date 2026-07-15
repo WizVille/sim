@@ -1,5 +1,5 @@
 import { db } from '@sim/db'
-import { member, organization, subscription, user } from '@sim/db/schema'
+import { member, organization, subscription, user, userStats } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { isOrgAdminRole } from '@sim/platform-authz/workspace'
 import { and, eq, inArray, sql } from 'drizzle-orm'
@@ -25,7 +25,6 @@ import {
 import {
   isAccessControlEnabled,
   isBillingEnabled,
-  isCredentialSetsEnabled,
   isHosted,
   isInboxEnabled,
   isSsoEnabled,
@@ -122,7 +121,15 @@ export async function syncSubscriptionPlan(
  * when you need the billing-side entitlement row that includes
  * past-due subscriptions. Returns `null` when there is no usable sub.
  */
-export async function getOrganizationSubscriptionUsable(organizationId: string) {
+interface GetOrganizationSubscriptionUsableOptions {
+  onError?: 'return-null' | 'throw'
+}
+
+export async function getOrganizationSubscriptionUsable(
+  organizationId: string,
+  options: GetOrganizationSubscriptionUsableOptions = {}
+) {
+  const { onError = 'return-null' } = options
   try {
     const [orgSub] = await db
       .select()
@@ -138,6 +145,9 @@ export async function getOrganizationSubscriptionUsable(organizationId: string) 
     return orgSub ?? null
   } catch (error) {
     logger.error('Error getting usable organization subscription', { error, organizationId })
+    if (onError === 'throw') {
+      throw error
+    }
     return null
   }
 }
@@ -337,91 +347,6 @@ export async function isEnterpriseOrgAdminOrOwner(userId: string): Promise<boole
 }
 
 /**
- * Check if user is an admin or owner of a team or enterprise organization
- * Returns true if:
- * - User is a member of a team/enterprise organization AND
- * - User's role in that organization is 'owner' or 'admin'
- *
- * In non-production environments, returns true for convenience.
- */
-export async function isTeamOrgAdminOrOwner(userId: string): Promise<boolean> {
-  try {
-    if (!isBillingEnabled) {
-      return true
-    }
-
-    const [memberRecord] = await db
-      .select({
-        organizationId: member.organizationId,
-        role: member.role,
-      })
-      .from(member)
-      .where(eq(member.userId, userId))
-      .limit(1)
-
-    if (!memberRecord) {
-      return false
-    }
-
-    if (memberRecord.role !== 'owner' && memberRecord.role !== 'admin') {
-      return false
-    }
-
-    const billingStatus = await getEffectiveBillingStatus(userId)
-    if (billingStatus.billingBlocked) {
-      return false
-    }
-
-    const orgSub = await getOrganizationSubscriptionUsable(memberRecord.organizationId)
-
-    const hasTeamPlan = orgSub && (checkTeamPlan(orgSub) || checkEnterprisePlan(orgSub))
-
-    if (hasTeamPlan) {
-      logger.info('User is team org admin/owner', {
-        userId,
-        organizationId: memberRecord.organizationId,
-        role: memberRecord.role,
-        plan: orgSub.plan,
-      })
-    }
-
-    return !!hasTeamPlan
-  } catch (error) {
-    logger.error('Error checking team org admin/owner status', { error, userId })
-    return false
-  }
-}
-
-/**
- * Check if an organization has team or enterprise plan
- * Used at execution time (e.g., polling services) to check org billing directly
- */
-export async function isOrganizationOnTeamOrEnterprisePlan(
-  organizationId: string
-): Promise<boolean> {
-  try {
-    if (!isBillingEnabled) {
-      return true
-    }
-
-    if (isCredentialSetsEnabled && !isHosted) {
-      return true
-    }
-
-    if (await isOrganizationBillingBlocked(organizationId)) {
-      return false
-    }
-
-    const orgSub = await getOrganizationSubscriptionUsable(organizationId)
-
-    return !!orgSub && (checkTeamPlan(orgSub) || checkEnterprisePlan(orgSub))
-  } catch (error) {
-    logger.error('Error checking organization plan status', { error, organizationId })
-    return false
-  }
-}
-
-/**
  * Check if an organization has an enterprise plan
  * Used for Access Control (Permission Groups) feature gating
  */
@@ -444,27 +369,6 @@ export async function isOrganizationOnEnterprisePlan(organizationId: string): Pr
     return !!orgSub && checkEnterprisePlan(orgSub)
   } catch (error) {
     logger.error('Error checking organization enterprise plan status', { error, organizationId })
-    return false
-  }
-}
-
-/**
- * Check if user has access to credential sets (email polling) feature
- * Returns true if:
- * - CREDENTIAL_SETS_ENABLED env var is set (self-hosted override), OR
- * - User is admin/owner of a team/enterprise organization
- *
- * In non-production environments, returns true for convenience.
- */
-export async function hasCredentialSetsAccess(userId: string): Promise<boolean> {
-  try {
-    if (isCredentialSetsEnabled && !isHosted) {
-      return true
-    }
-
-    return isTeamOrgAdminOrOwner(userId)
-  } catch (error) {
-    logger.error('Error checking credential sets access', { error, userId })
     return false
   }
 }
@@ -511,7 +415,7 @@ export async function isWorkspaceOnEnterprisePlan(workspaceId: string): Promise<
       return isOrganizationOnEnterprisePlan(ws.organizationId)
     }
 
-    const billedSub = await getHighestPrioritySubscription(ws.billedAccountUserId)
+    const billedSub = await getHighestPriorityPersonalSubscription(ws.billedAccountUserId)
     return !!billedSub && checkEnterprisePlan(billedSub)
   } catch (error) {
     logger.error('Error checking workspace enterprise plan status', { error, workspaceId })
@@ -560,7 +464,7 @@ export async function hasWorkspaceInboxAccess(workspaceId: string): Promise<bool
     }
 
     const [billedSub, billingStatus] = await Promise.all([
-      getHighestPrioritySubscription(ws.billedAccountUserId),
+      getHighestPriorityPersonalSubscription(ws.billedAccountUserId),
       getEffectiveBillingStatus(ws.billedAccountUserId),
     ])
     if (!billedSub) return false
@@ -599,7 +503,7 @@ export async function hasWorkspaceInboxGraceAccess(workspaceId: string): Promise
       return !!orgSub && isInboxEntitledPlan(orgSub.plan)
     }
 
-    const billedSub = await getHighestPrioritySubscription(ws.billedAccountUserId)
+    const billedSub = await getHighestPriorityPersonalSubscription(ws.billedAccountUserId)
     return !!billedSub && isInboxEntitledPlan(billedSub.plan)
   } catch (error) {
     logger.error('Error checking workspace inbox grace access', { error, workspaceId })
@@ -608,25 +512,43 @@ export async function hasWorkspaceInboxGraceAccess(workspaceId: string): Promise
 }
 
 /**
- * Check if user has access to live sync (every 5 minutes) for KB connectors
- * Returns true if:
- * - Self-hosted deployment, OR
- * - User has a Max plan (credits >= 25000) or enterprise plan
+ * Checks whether the exact workspace payer can use five-minute connector sync.
  */
-export async function hasLiveSyncAccess(userId: string): Promise<boolean> {
+export async function hasWorkspaceLiveSyncAccess(workspaceId: string): Promise<boolean> {
   try {
-    if (!isHosted) {
-      return true
+    if (!isHosted || !isBillingEnabled) return true
+
+    const { getWorkspaceWithOwner } = await import('@/lib/workspaces/permissions/utils')
+    const ws = await getWorkspaceWithOwner(workspaceId, { includeArchived: true })
+    if (!ws) return false
+
+    if (ws.organizationId) {
+      const [billingBlocked, orgSub] = await Promise.all([
+        isOrganizationBillingBlocked(ws.organizationId),
+        getOrganizationSubscriptionUsable(ws.organizationId),
+      ])
+      if (!orgSub) return false
+      if (!hasUsableSubscriptionAccess(orgSub.status, billingBlocked)) return false
+      return isInboxEntitledPlan(orgSub.plan)
     }
-    const [sub, billingStatus] = await Promise.all([
-      getHighestPrioritySubscription(userId),
-      getEffectiveBillingStatus(userId),
+
+    const [billedSub, billedStatusRows] = await Promise.all([
+      getHighestPriorityPersonalSubscription(ws.billedAccountUserId),
+      db
+        .select({ billingBlocked: userStats.billingBlocked })
+        .from(userStats)
+        .where(eq(userStats.userId, ws.billedAccountUserId))
+        .limit(1),
     ])
-    if (!sub) return false
-    if (!hasUsableSubscriptionAccess(sub.status, billingStatus.billingBlocked)) return false
-    return getPlanTierCredits(sub.plan) >= 25000 || checkEnterprisePlan(sub)
+    if (!billedSub) return false
+    if (
+      !hasUsableSubscriptionAccess(billedSub.status, Boolean(billedStatusRows[0]?.billingBlocked))
+    ) {
+      return false
+    }
+    return isInboxEntitledPlan(billedSub.plan)
   } catch (error) {
-    logger.error('Error checking live sync access', { error, userId })
+    logger.error('Error checking workspace live sync access', { error, workspaceId })
     return false
   }
 }

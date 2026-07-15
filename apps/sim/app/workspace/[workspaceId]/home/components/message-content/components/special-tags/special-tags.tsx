@@ -14,13 +14,18 @@ import {
   toast,
 } from '@sim/emcn'
 import { useParams } from 'next/navigation'
+import { ThinkingLoader } from '@/components/ui'
+import { useSession } from '@/lib/auth/auth-client'
+import { canManageWorkspaceBilling } from '@/lib/billing/workspace-permissions'
 import { canonicalWorkspaceFilePath } from '@/lib/copilot/vfs/path-utils'
+import { isSafeHttpUrl } from '@/lib/core/utils/urls'
 import { OAUTH_PROVIDERS } from '@/lib/oauth/oauth'
 import { ContextMentionIcon } from '@/app/workspace/[workspaceId]/home/components/context-mention-icon'
 import type {
   ChatMessageContext,
   MothershipResource,
 } from '@/app/workspace/[workspaceId]/home/types'
+import { useWorkspaceHostContext } from '@/app/workspace/[workspaceId]/providers/workspace-host-provider'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import {
   usePersonalEnvironment,
@@ -31,6 +36,7 @@ import { useKnowledgeBasesQuery } from '@/hooks/queries/kb/knowledge'
 import { useTablesList } from '@/hooks/queries/tables'
 import { useWorkflows } from '@/hooks/queries/workflows'
 import { useWorkspaceFiles } from '@/hooks/queries/workspace-files'
+import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
 
 export interface OptionsItemData {
   title: string
@@ -389,13 +395,6 @@ export function parseSpecialTags(content: string, isStreaming: boolean): ParsedS
   return { segments, hasPendingTag }
 }
 
-const THINKING_BLOCKS = [
-  { color: '#2ABBF8', delay: '0s' },
-  { color: '#00F701', delay: '0.2s' },
-  { color: '#FA4EDF', delay: '0.6s' },
-  { color: '#FFCC02', delay: '0.4s' },
-] as const
-
 interface SpecialTagsProps {
   segment: Exclude<ContentSegment, { type: 'text' }>
   onOptionSelect?: (id: string) => void
@@ -434,17 +433,8 @@ export function SpecialTags({
  */
 export function PendingTagIndicator() {
   return (
-    <div className='flex animate-stream-fade-in items-center gap-2 py-2'>
-      <div className='grid size-[16px] grid-cols-2 gap-[1.5px]'>
-        {THINKING_BLOCKS.map((block, i) => (
-          <div
-            key={i}
-            className='animate-thinking-block rounded-xs'
-            style={{ backgroundColor: block.color, animationDelay: block.delay }}
-          />
-        ))}
-      </div>
-      <span className='text-[var(--text-body)] text-sm'>Thinking…</span>
+    <div className='animate-stream-fade-in py-2'>
+      <ThinkingLoader size={20} startVariant='corners' label='Thinking…' labelRatio={0.7} />
     </div>
   )
 }
@@ -754,6 +744,9 @@ function CredentialDisplay({ data }: { data: CredentialTagData }) {
   if (data.type === 'link') {
     // Connecting a credential mutates the workspace — hide it from read-only members.
     if (!data.provider || !canEdit) return null
+    // The connect link value comes from the streamed model output, so only
+    // render it as a clickable link when it resolves to a real http(s) URL.
+    if (!data.value || !isSafeHttpUrl(data.value)) return null
     const Icon = getCredentialIcon(data.provider) ?? LockIcon
     return (
       <a
@@ -783,9 +776,15 @@ function MothershipErrorDisplay({ data }: { data: MothershipErrorTagData }) {
 }
 
 function UsageUpgradeDisplay({ data }: { data: UsageUpgradeTagData }) {
-  const { workspaceId } = useParams<{ workspaceId: string }>()
-  const settingsPath = `/workspace/${workspaceId}/settings/billing`
+  const { data: session } = useSession()
+  const hostContext = useWorkspaceHostContext()
+  const { getSettingsHref } = useSettingsNavigation()
+  const settingsPath = getSettingsHref({ section: 'billing' })
   const buttonLabel = data.action === 'upgrade_plan' ? 'Upgrade Plan' : 'Increase Limit'
+  const canManageBilling = canManageWorkspaceBilling(hostContext, session?.user?.id)
+  const unavailableMessage = hostContext.hostOrganizationId
+    ? 'Contact an organization admin to manage this workspace’s usage limits.'
+    : 'Only the workspace owner can manage this workspace’s usage limits.'
 
   return (
     <div className='rounded-xl border border-amber-300/40 bg-amber-50/50 px-4 py-3 dark:border-amber-500/20 dark:bg-amber-950/20'>
@@ -812,13 +811,19 @@ function UsageUpgradeDisplay({ data }: { data: UsageUpgradeTagData }) {
       <p className='mt-1.5 text-amber-700/90 text-small leading-[20px] dark:text-amber-400/80'>
         {data.message}
       </p>
-      <a
-        href={settingsPath}
-        className='mt-2 inline-flex items-center gap-1 font-[500] text-amber-700 text-small underline decoration-dashed underline-offset-2 transition-colors hover-hover:text-amber-900 dark:text-amber-300 dark:hover-hover:text-amber-200'
-      >
-        {buttonLabel}
-        <ArrowRight className='size-3' />
-      </a>
+      {canManageBilling ? (
+        <a
+          href={settingsPath}
+          className='mt-2 inline-flex items-center gap-1 font-[500] text-amber-700 text-small underline decoration-dashed underline-offset-2 transition-colors hover-hover:text-amber-900 dark:text-amber-300 dark:hover-hover:text-amber-200'
+        >
+          {buttonLabel}
+          <ArrowRight className='size-3' />
+        </a>
+      ) : (
+        <p className='mt-2 font-[500] text-amber-700 text-small dark:text-amber-300'>
+          {unavailableMessage}
+        </p>
+      )}
     </div>
   )
 }

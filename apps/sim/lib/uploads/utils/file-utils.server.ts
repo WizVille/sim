@@ -12,7 +12,6 @@ import {
   consumeOrCancelBody,
   readResponseToBufferWithLimit,
 } from '@/lib/core/utils/stream-limits'
-import type { StorageContext } from '@/lib/uploads'
 import { StorageService } from '@/lib/uploads'
 import { isExecutionFile } from '@/lib/uploads/contexts/execution/utils'
 import {
@@ -23,6 +22,7 @@ import {
   isInternalFileUrl,
   processSingleFileToUserFile,
   type RawFileInput,
+  resolveTrustedFileContext,
 } from '@/lib/uploads/utils/file-utils'
 import { verifyFileAccess } from '@/app/api/files/authorization'
 import type { UserFile } from '@/executor/types'
@@ -49,6 +49,12 @@ export interface ResolveFileInputOptions {
   userId: string
   requestId: string
   logger: Logger
+  /**
+   * Expiry for presigned URLs minted for stored files, in seconds.
+   * Defaults to 5 minutes; raise it only when the external service fetches
+   * the URL later than the current request (e.g. scheduled publishing).
+   */
+  presignExpirySeconds?: number
 }
 
 /**
@@ -62,7 +68,7 @@ export interface ResolveFileInputOptions {
 export async function resolveFileInputToUrl(
   options: ResolveFileInputOptions
 ): Promise<FileResolutionResult> {
-  const { file, filePath, userId, requestId, logger } = options
+  const { file, filePath, userId, requestId, logger, presignExpirySeconds = 5 * 60 } = options
 
   if (file) {
     let userFile: UserFile
@@ -77,20 +83,12 @@ export async function resolveFileInputToUrl(
       }
     }
 
-    let fileUrl = userFile.url || ''
-
-    // Handle internal URLs
-    if (fileUrl && isInternalFileUrl(fileUrl)) {
-      const resolution = await resolveInternalFileUrl(fileUrl, userId, requestId, logger)
-      if (resolution.error) {
-        return { error: resolution.error }
-      }
-      fileUrl = resolution.fileUrl || ''
-    }
-
-    // Generate presigned URL if we have a key but no URL
-    if (!fileUrl && userFile.key) {
-      const context = (userFile.context as StorageContext) || inferContextFromKey(userFile.key)
+    // A stored file always gets a freshly minted presigned URL scoped to the
+    // requested expiry — an embedded url (internal serve path or a previously
+    // minted presigned link) may be stale, shorter-lived than required, or
+    // point at a different object than the verified key.
+    if (userFile.key) {
+      const context = resolveTrustedFileContext(userFile.key, userFile.context)
       const hasAccess = await verifyFileAccess(userFile.key, userId, undefined, context, false)
 
       if (!hasAccess) {
@@ -102,7 +100,30 @@ export async function resolveFileInputToUrl(
         return { error: { status: 404, message: 'File not found' } }
       }
 
-      fileUrl = await StorageService.generatePresignedDownloadUrl(userFile.key, context, 5 * 60)
+      const fileUrl = await StorageService.generatePresignedDownloadUrl(
+        userFile.key,
+        context,
+        presignExpirySeconds
+      )
+      return { fileUrl }
+    }
+
+    let fileUrl = userFile.url || ''
+
+    // Without a key, the schema guarantees the url references an uploaded
+    // file, so resolve the internal serve path to a presigned URL.
+    if (fileUrl && isInternalFileUrl(fileUrl)) {
+      const resolution = await resolveInternalFileUrl(
+        fileUrl,
+        userId,
+        requestId,
+        logger,
+        presignExpirySeconds
+      )
+      if (resolution.error) {
+        return { error: resolution.error }
+      }
+      fileUrl = resolution.fileUrl || ''
     }
 
     return { fileUrl }
@@ -112,7 +133,13 @@ export async function resolveFileInputToUrl(
     let fileUrl = filePath
 
     if (isInternalFileUrl(filePath)) {
-      const resolution = await resolveInternalFileUrl(filePath, userId, requestId, logger)
+      const resolution = await resolveInternalFileUrl(
+        filePath,
+        userId,
+        requestId,
+        logger,
+        presignExpirySeconds
+      )
       if (resolution.error) {
         return { error: resolution.error }
       }
@@ -227,7 +254,8 @@ export async function resolveInternalFileUrl(
   filePath: string,
   userId: string,
   requestId: string,
-  logger: Logger
+  logger: Logger,
+  presignExpirySeconds = 5 * 60
 ): Promise<{ fileUrl?: string; error?: { status: number; message: string } }> {
   if (!isInternalFileUrl(filePath)) {
     return { fileUrl: filePath }
@@ -247,7 +275,11 @@ export async function resolveInternalFileUrl(
       return { error: { status: 404, message: 'File not found' } }
     }
 
-    const fileUrl = await StorageService.generatePresignedDownloadUrl(storageKey, context, 5 * 60)
+    const fileUrl = await StorageService.generatePresignedDownloadUrl(
+      storageKey,
+      context,
+      presignExpirySeconds
+    )
     logger.info(`[${requestId}] Generated presigned URL for ${context} file`)
     return { fileUrl }
   } catch (error) {
@@ -281,10 +313,8 @@ export async function downloadFileFromStorage(
     )
     buffer = await downloadExecutionFile(userFile, { maxBytes: options.maxBytes })
   } else if (userFile.key) {
-    const context = (userFile.context as StorageContext) || inferContextFromKey(userFile.key)
-    logger.info(
-      `[${requestId}] Downloading from ${context} storage (${userFile.context ? 'explicit' : 'inferred'}): ${userFile.key}`
-    )
+    const context = resolveTrustedFileContext(userFile.key, userFile.context)
+    logger.info(`[${requestId}] Downloading from ${context} storage: ${userFile.key}`)
 
     const { downloadFile } = await import('@/lib/uploads/core/storage-service')
     buffer = await downloadFile({

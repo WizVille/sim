@@ -97,3 +97,7 @@ RunFile.rb
 
 # Personal Cursor Skills
 .cursor/skills/ask-sim/
+
+# Python (apps/pii tests/tooling)
+__pycache__/
+.pytest_cache/

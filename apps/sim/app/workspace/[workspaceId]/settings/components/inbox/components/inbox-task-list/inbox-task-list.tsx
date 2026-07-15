@@ -5,7 +5,7 @@ import { Badge, ChipInput, ChipSelect, Search } from '@sim/emcn'
 import { formatRelativeTime } from '@sim/utils/formatting'
 import { ArrowRight, Paperclip } from 'lucide-react'
 import { useParams, useRouter } from 'next/navigation'
-import { debounce, useQueryStates } from 'nuqs'
+import { useQueryStates } from 'nuqs'
 import {
   type InboxStatusFilter,
   inboxTaskParsers,
@@ -14,6 +14,7 @@ import {
 import { SettingsEmptyState } from '@/app/workspace/[workspaceId]/settings/components/settings-empty-state'
 import type { InboxTaskItem } from '@/hooks/queries/inbox'
 import { useInboxConfig, useInboxTasks } from '@/hooks/queries/inbox'
+import { useDebouncedSearchSetter } from '@/hooks/use-debounced-search-setter'
 
 const STATUS_OPTIONS = [
   { value: 'all', label: 'All statuses' },
@@ -25,9 +26,6 @@ const STATUS_OPTIONS = [
 ] as const
 
 type StatusFilter = InboxStatusFilter
-
-/** Debounce window for `search` URL writes; the input itself stays instant. */
-const SEARCH_DEBOUNCE_MS = 300 as const
 
 const STATUS_BADGES: Record<
   string,
@@ -55,15 +53,8 @@ export function InboxTaskList() {
    * write is debounced. Filtering below is cheap in-memory over the loaded
    * tasks, so it reads the instant value too.
    */
-  const setSearchTerm = useCallback(
-    (value: string) => {
-      const next = value.length > 0 ? value : null
-      setInboxFilters(
-        { search: next },
-        next === null ? undefined : { limitUrlUpdates: debounce(SEARCH_DEBOUNCE_MS) }
-      )
-    },
-    [setInboxFilters]
+  const setSearchTerm = useDebouncedSearchSetter((value, options) =>
+    setInboxFilters({ search: value }, options)
   )
 
   const { data: config } = useInboxConfig(workspaceId)
@@ -74,7 +65,7 @@ export function InboxTaskList() {
   const filteredTasks = useMemo(() => {
     if (!tasksData?.tasks) return []
     if (!searchTerm.trim()) return tasksData.tasks
-    const term = searchTerm.toLowerCase()
+    const term = searchTerm.trim().toLowerCase()
     return tasksData.tasks.filter(
       (t) =>
         t.subject?.toLowerCase().includes(term) ||
@@ -142,28 +133,28 @@ export function InboxTaskList() {
                 <>
                   <div className='flex min-w-0 flex-1 flex-col'>
                     <div className='flex min-w-0 items-center gap-1.5'>
-                      <span className='truncate text-[14px] text-[var(--text-body)]'>
+                      <span className='truncate text-[var(--text-body)] text-sm'>
                         {task.subject}
                       </span>
                       {task.hasAttachments && (
                         <Paperclip className='size-[12px] flex-shrink-0 text-[var(--text-muted)]' />
                       )}
                     </div>
-                    <span className='truncate text-[12px] text-[var(--text-muted)]'>
+                    <span className='truncate text-[var(--text-muted)] text-caption'>
                       {task.fromName || task.fromEmail}
                     </span>
                     {task.status === 'rejected' && task.rejectionReason && (
-                      <span className='truncate text-[12px] text-[var(--text-muted)] line-through'>
+                      <span className='truncate text-[var(--text-muted)] text-caption line-through'>
                         {formatRejectionReason(task.rejectionReason)}
                       </span>
                     )}
                     {task.status === 'failed' && task.errorMessage && (
-                      <span className='truncate text-[12px] text-[var(--text-error)]'>
+                      <span className='truncate text-[var(--text-error)] text-caption'>
                         {task.errorMessage}
                       </span>
                     )}
                     {task.status === 'completed' && task.resultSummary && (
-                      <span className='truncate text-[12px] text-[var(--text-muted)]'>
+                      <span className='truncate text-[var(--text-muted)] text-caption'>
                         {task.resultSummary}
                       </span>
                     )}
@@ -171,13 +162,13 @@ export function InboxTaskList() {
                       task.status !== 'failed' &&
                       task.status !== 'rejected' &&
                       task.bodyPreview && (
-                        <span className='truncate text-[12px] text-[var(--text-muted)]'>
+                        <span className='truncate text-[var(--text-muted)] text-caption'>
                           {task.bodyPreview}
                         </span>
                       )}
                   </div>
                   <div className='flex flex-shrink-0 items-center gap-2'>
-                    <span className='whitespace-nowrap text-[12px] text-[var(--text-muted)]'>
+                    <span className='whitespace-nowrap text-[var(--text-muted)] text-caption'>
                       {formatRelativeTime(task.createdAt)}
                     </span>
                     <Badge variant={statusBadge.variant} className='text-xs'>

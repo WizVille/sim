@@ -29,13 +29,13 @@ const logger = createLogger('StorageService')
  * @throws Error if required properties are missing
  */
 function createBlobConfig(config: StorageConfig): BlobConfig {
-  if (!config.containerName || !config.accountName) {
-    throw new Error('Blob configuration missing required properties: containerName and accountName')
+  if (!config.containerName) {
+    throw new Error('Blob configuration missing required property: containerName')
   }
 
-  if (!config.connectionString && !config.accountKey) {
+  if (!config.connectionString && !(config.accountName && config.accountKey)) {
     throw new Error(
-      'Blob configuration missing authentication: either connectionString or accountKey must be provided'
+      'Blob configuration missing authentication: either connectionString or both accountName and accountKey must be provided'
     )
   }
 
@@ -90,7 +90,16 @@ async function insertFileMetadataHelper(
  * Upload a file to the configured storage provider with context-aware configuration
  */
 export async function uploadFile(options: UploadFileOptions): Promise<FileInfo> {
-  const { file, fileName, contentType, context, preserveKey, customKey, metadata } = options
+  const {
+    file,
+    fileName,
+    contentType,
+    context,
+    preserveKey,
+    customKey,
+    metadata,
+    persistMetadata = true,
+  } = options
 
   logger.info(`Uploading file to ${context} storage: ${fileName}`)
 
@@ -110,7 +119,7 @@ export async function uploadFile(options: UploadFileOptions): Promise<FileInfo> 
       metadata
     )
 
-    if (metadata) {
+    if (metadata && persistMetadata) {
       await insertFileMetadataHelper(
         uploadResult.key,
         metadata,
@@ -136,7 +145,7 @@ export async function uploadFile(options: UploadFileOptions): Promise<FileInfo> 
       metadata
     )
 
-    if (metadata) {
+    if (metadata && persistMetadata) {
       await insertFileMetadataHelper(
         uploadResult.key,
         metadata,
@@ -162,7 +171,7 @@ export async function uploadFile(options: UploadFileOptions): Promise<FileInfo> 
 
   await writeFile(filesystemPath, file)
 
-  if (metadata) {
+  if (metadata && persistMetadata) {
     await insertFileMetadataHelper(
       storageKey,
       metadata,
@@ -635,7 +644,9 @@ async function generateBlobPresignedUrl(
   },
   expirationSeconds: number
 ): Promise<PresignedUrlResponse> {
-  const { getBlobServiceClient } = await import('@/lib/uploads/providers/blob/client')
+  const { getBlobServiceClient, parseConnectionString } = await import(
+    '@/lib/uploads/providers/blob/client'
+  )
   const { BlobSASPermissions, generateBlobSASQueryParameters, StorageSharedKeyCredential } =
     await import('@azure/storage-blob')
 
@@ -650,26 +661,29 @@ async function generateBlobPresignedUrl(
   const startsOn = new Date()
   const expiresOn = new Date(startsOn.getTime() + expirationSeconds * 1000)
 
-  let sasToken: string
-
-  if (config.accountName && config.accountKey) {
-    const sharedKeyCredential = new StorageSharedKeyCredential(
-      config.accountName,
-      config.accountKey
-    )
-    sasToken = generateBlobSASQueryParameters(
-      {
-        containerName: config.containerName,
-        blobName: key,
-        permissions: BlobSASPermissions.parse('w'), // write permission for upload
-        startsOn,
-        expiresOn,
-      },
-      sharedKeyCredential
-    ).toString()
-  } else {
-    throw new Error('Azure Blob SAS generation requires accountName and accountKey')
+  let accountName = config.accountName
+  let accountKey = config.accountKey
+  if ((!accountName || !accountKey) && config.connectionString) {
+    ;({ accountName, accountKey } = parseConnectionString(config.connectionString))
   }
+
+  if (!accountName || !accountKey) {
+    throw new Error(
+      'Azure Blob SAS generation requires accountName/accountKey or a connectionString'
+    )
+  }
+
+  const sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey)
+  const sasToken = generateBlobSASQueryParameters(
+    {
+      containerName: config.containerName,
+      blobName: key,
+      permissions: BlobSASPermissions.parse('w'), // write permission for upload
+      startsOn,
+      expiresOn,
+    },
+    sharedKeyCredential
+  ).toString()
 
   return {
     url: `${blobClient.url}?${sasToken}`,

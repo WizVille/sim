@@ -1,6 +1,7 @@
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
 import type { NextRequest } from 'next/server'
+import { resolveWebhookProviderConfig } from '@/lib/webhooks/env-resolver'
 import { getProviderHandler } from '@/lib/webhooks/providers'
 
 const logger = createLogger('WebhookProviderSubscriptions')
@@ -17,7 +18,7 @@ type RecreateCheckInput = {
   nextConfig: Record<string, unknown>
 }
 
-/** System-managed fields that shouldn't trigger recreation */
+/** System-managed fields that should not trigger recreation. */
 const SYSTEM_MANAGED_FIELDS = new Set([
   'externalId',
   'externalSubscriptionId',
@@ -31,6 +32,29 @@ const SYSTEM_MANAGED_FIELDS = new Set([
   'setupCompleted',
   'userId',
 ])
+
+/** Returns true when user-controlled persisted webhook configuration changed. */
+export function hasWebhookConfigChanged(
+  previousConfig: Record<string, unknown>,
+  nextConfig: Record<string, unknown>
+): boolean {
+  const allKeys = new Set([...Object.keys(previousConfig), ...Object.keys(nextConfig)])
+
+  for (const key of allKeys) {
+    if (SYSTEM_MANAGED_FIELDS.has(key)) continue
+
+    const previousValue = previousConfig[key]
+    const nextValue = nextConfig[key]
+    const previousComparable =
+      typeof previousValue === 'object' ? JSON.stringify(previousValue ?? null) : previousValue
+    const nextComparable =
+      typeof nextValue === 'object' ? JSON.stringify(nextValue ?? null) : nextValue
+
+    if (previousComparable !== nextComparable) return true
+  }
+
+  return false
+}
 
 /**
  * Determine whether a webhook with provider-managed registration should be
@@ -58,28 +82,20 @@ export function shouldRecreateExternalWebhookSubscription({
     return false
   }
 
-  const allKeys = new Set([...Object.keys(previousConfig), ...Object.keys(nextConfig)])
-
-  for (const key of allKeys) {
-    if (SYSTEM_MANAGED_FIELDS.has(key)) continue
-
-    const prevVal = previousConfig[key]
-    const nextVal = nextConfig[key]
-
-    const prevStr = typeof prevVal === 'object' ? JSON.stringify(prevVal ?? null) : prevVal
-    const nextStr = typeof nextVal === 'object' ? JSON.stringify(nextVal ?? null) : nextVal
-
-    if (prevStr !== nextStr) {
-      return true
-    }
-  }
-
-  return false
+  return hasWebhookConfigChanged(previousConfig, nextConfig)
 }
 
 /**
  * Ask the provider handler to create an external webhook subscription, if that
  * provider supports automatic registration.
+ *
+ * `providerConfig` may contain unresolved `{{ENV_VAR}}` references (e.g. an
+ * API key field backed by an environment variable) — these are resolved here
+ * before the provider call so deploy-triggered registration (this function is
+ * also called from the async deployment outbox, not just the interactive
+ * webhook-save route) behaves the same as a manual save. The persisted
+ * `providerConfig` returned to the caller stays unresolved; only the
+ * provider-managed fields from `result.providerConfigUpdates` get merged in.
  *
  * The returned provider-managed fields are merged back into `providerConfig`
  * by the caller.
@@ -99,8 +115,16 @@ export async function createExternalWebhookSubscription(
     return { updatedProviderConfig: providerConfig, externalSubscriptionCreated: false }
   }
 
+  const workspaceId = typeof workflow.workspaceId === 'string' ? workflow.workspaceId : undefined
+
+  const resolvedProviderConfig = await resolveWebhookProviderConfig(
+    providerConfig,
+    userId,
+    workspaceId
+  )
+
   const result = await handler.createSubscription({
-    webhook: webhookData,
+    webhook: { ...webhookData, providerConfig: resolvedProviderConfig },
     workflow,
     userId,
     requestId,

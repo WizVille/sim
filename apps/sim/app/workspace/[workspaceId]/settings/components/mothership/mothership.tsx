@@ -2,7 +2,7 @@
 
 import { useCallback, useMemo, useState } from 'react'
 import { Badge, Button, ChipInput, ChipSelect, cn, Label, Skeleton } from '@sim/emcn'
-import { useParams } from 'next/navigation'
+import { formatDateTime } from '@sim/utils/formatting'
 import { useQueryStates } from 'nuqs'
 import { AnthropicIcon, OpenAIIcon } from '@/components/icons'
 import {
@@ -78,7 +78,9 @@ function formatCost(cost: number) {
 
 function formatDate(d: string | null | undefined) {
   if (!d) return '—'
-  return new Date(d).toLocaleString()
+  const date = new Date(d)
+  if (Number.isNaN(date.getTime())) return '—'
+  return formatDateTime(date)
 }
 
 function Divider() {
@@ -162,8 +164,8 @@ export function Mothership() {
 }
 
 function ByokTab() {
-  const params = useParams()
-  const workspaceId = (params?.workspaceId as string) || ''
+  const [targetWorkspaceId, setTargetWorkspaceId] = useState('')
+  const workspaceId = targetWorkspaceId.trim()
 
   const { data, isLoading } = useMothershipByokKeys(workspaceId)
   const upsert = useUpsertMothershipByok()
@@ -175,21 +177,38 @@ function ByokTab() {
   )
 
   return (
-    <BYOKKeyManager
-      providers={ENTERPRISE_BYOK_PROVIDERS}
-      configuredProviderIds={configuredProviderIds}
-      isLoading={isLoading}
-      isSaving={upsert.isPending}
-      isDeleting={del.isPending}
-      showSearch={false}
-      description="Store a customer-provided Anthropic or OpenAI key for this workspace. It is encrypted at rest in the mothership and used only for this workspace's enterprise requests."
-      onSave={async (provider, apiKey) => {
-        await upsert.mutateAsync({ workspaceId, provider, apiKey })
-      }}
-      onDelete={async (provider) => {
-        await del.mutateAsync({ workspaceId, provider })
-      }}
-    />
+    <div className='flex flex-col gap-4'>
+      <div className='flex items-center gap-2'>
+        <Label className='text-[var(--text-secondary)] text-sm'>Target workspace</Label>
+        <ChipInput
+          value={targetWorkspaceId}
+          onChange={(event) => setTargetWorkspaceId(event.target.value)}
+          placeholder='Workspace ID'
+          className='w-[280px]'
+        />
+      </div>
+      {workspaceId ? (
+        <BYOKKeyManager
+          providers={ENTERPRISE_BYOK_PROVIDERS}
+          configuredProviderIds={configuredProviderIds}
+          isLoading={isLoading}
+          isSaving={upsert.isPending}
+          isDeleting={del.isPending}
+          showSearch={false}
+          description="Store a customer-provided Anthropic or OpenAI key for this workspace. It is encrypted at rest in the mothership and used only for this workspace's enterprise requests."
+          onSave={async (provider, apiKey) => {
+            await upsert.mutateAsync({ workspaceId, provider, apiKey })
+          }}
+          onDelete={async (provider) => {
+            await del.mutateAsync({ workspaceId, provider })
+          }}
+        />
+      ) : (
+        <SettingsEmptyState variant='inline'>
+          Enter a workspace ID to manage its Mothership BYOK keys.
+        </SettingsEmptyState>
+      )}
+    </div>
   )
 }
 
@@ -279,7 +298,7 @@ function OverviewTab({
                 key={u.user_id}
                 className='flex items-center gap-3 border-[var(--border-secondary)] border-b px-3 py-2 text-small last:border-b-0'
               >
-                <span className='flex-1 truncate font-mono text-[12px] text-[var(--text-primary)]'>
+                <span className='flex-1 truncate font-mono text-[var(--text-primary)] text-caption'>
                   {u.user_id}
                 </span>
                 <span className='w-[100px] text-right text-[var(--text-secondary)]'>
@@ -335,7 +354,7 @@ function OverviewTab({
                     key={r.request_id}
                     className='flex items-center gap-3 border-[var(--border-secondary)] border-b px-3 py-1.5 text-small last:border-b-0'
                   >
-                    <span className='w-[180px] truncate font-mono text-[11px] text-[var(--text-primary)]'>
+                    <span className='w-[180px] truncate font-mono text-[var(--text-primary)] text-xs'>
                       {r.request_id ?? '—'}
                     </span>
                     <span className='w-[80px] truncate text-[var(--text-secondary)] text-caption'>
@@ -437,7 +456,7 @@ function LicensesTab({ environment }: { environment: MothershipEnv }) {
           <p className='mb-1 text-[var(--text-secondary)] text-caption'>
             License key (only shown once):
           </p>
-          <code className='block break-all font-mono text-[12px] text-[var(--text-primary)]'>
+          <code className='block break-all font-mono text-[var(--text-primary)] text-caption'>
             {generatedKey}
           </code>
         </div>
@@ -515,7 +534,7 @@ function StatCard({
       {loading ? (
         <Skeleton className='mt-1 h-[24px] w-[80px] rounded-sm' />
       ) : (
-        <p className='mt-1 font-medium text-[18px] text-[var(--text-primary)]'>{value ?? '—'}</p>
+        <p className='mt-1 font-medium text-[var(--text-primary)] text-lg'>{value ?? '—'}</p>
       )}
     </div>
   )

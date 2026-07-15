@@ -49,6 +49,10 @@ export const env = createEnv({
 
     // Copilot
     COPILOT_API_KEY:                       z.string().min(1).optional(),           // Secret for internal sim agent API authentication
+    /** Enables attributed-v1 only after compatible Copilot instances are deployed. */
+    COPILOT_BILLING_ATTRIBUTION_V1_ENABLED: z.boolean().optional(),
+    /** Rejects markerless old-Go billing traffic only when explicitly enabled. */
+    COPILOT_BILLING_PROTOCOL_REQUIRED:     z.boolean().optional(),
     SIM_AGENT_API_URL:                     z.string().url().optional(),            // URL for internal sim agent API
     COPILOT_SOURCE_ENV:                    z.enum(['dev', 'staging', 'prod']).optional(), // Source Sim environment sent to mothership for callbacks
     COPILOT_DEV_URL:                       z.string().url().optional(),            // Sim agent API URL for the dev mothership environment
@@ -68,7 +72,7 @@ export const env = createEnv({
     STRIPE_WEBHOOK_SECRET:                 z.string().min(1).optional(),           // General Stripe webhook secret
     STRIPE_FREE_PRICE_ID:                  z.string().min(1).optional(),           // Stripe price ID for free tier
     FREE_TIER_COST_LIMIT:                  z.number().optional(),                  // Cost limit for free tier users
-    FREE_STORAGE_LIMIT_GB:                 z.number().optional().default(5),       // Storage limit in GB for free tier users
+    FREE_STORAGE_LIMIT_GB:                 z.number().optional(),                  // Free-tier storage limit in GB (default 5). With billing disabled, setting it explicitly opts into storage enforcement
     STRIPE_PRO_PRICE_ID:                   z.string().min(1).optional(),           // Stripe price ID for pro tier
     PRO_TIER_COST_LIMIT:                   z.number().optional(),                  // Cost limit for pro tier users
     PRO_STORAGE_LIMIT_GB:                  z.number().optional().default(50),      // Storage limit in GB for pro tier users
@@ -78,9 +82,11 @@ export const env = createEnv({
     STRIPE_ENTERPRISE_PRICE_ID:            z.string().min(1).optional(),           // Stripe price ID for enterprise tier
     ENTERPRISE_TIER_COST_LIMIT:            z.number().optional(),                  // Cost limit for enterprise tier users
     ENTERPRISE_STORAGE_LIMIT_GB:           z.number().optional().default(500),     // Default storage limit in GB for enterprise tier (can be overridden per org)
+    BILLING_CONCURRENCY_LIMIT_FREE:         z.string().optional(),                  // In-flight executions per free billing account
+    BILLING_CONCURRENCY_LIMIT_PRO:          z.string().optional(),                  // In-flight executions per Pro-tier billing account (Pro and Pro for Teams)
+    BILLING_CONCURRENCY_LIMIT_TEAM:         z.string().optional(),                  // In-flight executions per Max-tier billing account (Max and Max for Teams)
+    BILLING_CONCURRENCY_LIMIT_ENTERPRISE:   z.string().optional(),                  // In-flight executions per Enterprise billing account (metadata-overridable)
     BILLING_ENABLED:                       z.boolean().optional(),                 // Enable billing enforcement and usage tracking
-    FREE_API_DEPLOYMENT_GATE_ENABLED:      z.boolean().optional(),                 // Block free-plan accounts from programmatic execution (API/MCP/generic webhooks/chat embeds). Requires BILLING_ENABLED. Off by default for dark rollout
-    TABLES_FRACTIONAL_ORDERING:            z.boolean().optional(),                 // Order table rows by fractional order_key (O(1) insert/delete) instead of integer position
     TABLE_SNAPSHOT_CACHE:                  z.boolean().optional(),                 // Mount tables into sandboxes by reference via a version-keyed CSV snapshot in object storage instead of draining the whole table into web-process heap
     PII_REDACTION:                         z.boolean().optional(),                 // Redact PII from workflow logs via configurable Data Retention rules (Presidio at the logger persist choke point) and expose the Data Retention config UI
     PII_GRANULAR_REDACTION:                z.boolean().optional(),                 // Expose the execution-altering PII redaction stages (redact workflow input + block outputs in-flight) in the Data Retention config; layered on top of PII_REDACTION
@@ -96,6 +102,7 @@ export const env = createEnv({
     ENTERPRISE_TABLES_LIMIT:               z.number().optional(),                  // Max user tables per workspace on enterprise tier (default: 10000)
     ENTERPRISE_TABLE_ROWS_LIMIT:           z.number().optional(),                  // Max rows per table on enterprise tier (default: 1000000)
     TABLE_MAX_ROW_SIZE_BYTES:              z.number().optional(),                  // Max serialized size in bytes of a single user-table row (default: 409600)
+    TABLE_MAX_PAGE_BYTES:                  z.number().optional(),                  // Dev-preview: byte budget per row-page read; pages cut early past it (unset = disabled)
 
     // Credit-tier Stripe prices (monthly)
     STRIPE_PRICE_TIER_25_MO:               z.string().min(1).optional(),           // Pro: $25/mo (6,000 credits)
@@ -144,6 +151,12 @@ export const env = createEnv({
     GEMINI_API_KEY_1:                      z.string().min(1).optional(),           // Primary Gemini API key
     GEMINI_API_KEY_2:                      z.string().min(1).optional(),           // Additional Gemini API key for load balancing
     GEMINI_API_KEY_3:                      z.string().min(1).optional(),           // Additional Gemini API key for load balancing
+    ZAI_API_KEY_1:                         z.string().min(1).optional(),           // Primary Z.ai API key for load balancing
+    ZAI_API_KEY_2:                         z.string().min(1).optional(),           // Additional Z.ai API key for load balancing
+    ZAI_API_KEY_3:                         z.string().min(1).optional(),           // Additional Z.ai API key for load balancing
+    XAI_API_KEY_1:                         z.string().min(1).optional(),           // Primary xAI API key for load balancing
+    XAI_API_KEY_2:                         z.string().min(1).optional(),           // Additional xAI API key for load balancing
+    XAI_API_KEY_3:                         z.string().min(1).optional(),           // Additional xAI API key for load balancing
     OLLAMA_URL:                            z.string().url().optional(),            // Ollama local LLM server URL
     VLLM_BASE_URL:                         z.string().url().optional(),            // vLLM self-hosted base URL (OpenAI-compatible)
     VLLM_API_KEY:                          z.string().optional(),                  // Optional bearer token for vLLM
@@ -163,6 +176,7 @@ export const env = createEnv({
     BLACKLISTED_MODELS:                    z.string().optional(),                  // Comma-separated model names/prefixes to hide (e.g., "gpt-4,claude-*")
     ALLOWED_MCP_DOMAINS:                   z.string().optional(),                  // Comma-separated domains for MCP servers (e.g., "internal.company.com,mcp.example.org"). Empty = all allowed.
     ALLOWED_INTEGRATIONS:                  z.string().optional(),                  // Comma-separated block types to allow (e.g., "slack,github,agent"). Empty = all allowed.
+    PREVIEW_BLOCKS:                        z.string().optional(),                  // Comma-separated preview block types to reveal off-AppConfig (e.g., "gmail_v2,notion_v3"). Empty = all preview blocks hidden.
 
     // Azure Configuration - Shared credentials with feature-specific models
     AZURE_OPENAI_ENDPOINT:                 z.string().url().optional(),            // Shared Azure OpenAI service endpoint
@@ -269,8 +283,9 @@ export const env = createEnv({
     // Rate Limiting Configuration
     RATE_LIMIT_WINDOW_MS:                  z.string().optional().default('60000'), // Rate limit window duration in milliseconds (default: 1 minute)
     MANUAL_EXECUTION_LIMIT:                z.string().optional().default('999999'),// Manual execution bypass value (effectively unlimited)
-    RATE_LIMIT_FREE_SYNC:                  z.string().optional().default('50'),    // Free tier sync API executions per minute
-    RATE_LIMIT_FREE_ASYNC:                 z.string().optional().default('200'),   // Free tier async API executions per minute
+    RATE_LIMIT_FREE_SYNC:                  z.string().optional(),                  // Free tier sync API executions per minute (default 50). With billing disabled, setting it explicitly opts into rate limiting
+    RATE_LIMIT_FREE_ASYNC:                 z.string().optional(),                  // Free tier async API executions per minute (default 200). With billing disabled, setting it explicitly opts into rate limiting
+    RATE_LIMIT_FREE_API_ENDPOINT:          z.string().optional(),                  // Free tier v1 API endpoint requests per minute (default 30). With billing disabled, setting it explicitly opts into rate limiting
     RATE_LIMIT_PRO_SYNC:                   z.string().optional().default('150'),   // Pro tier sync API executions per minute
     RATE_LIMIT_PRO_ASYNC:                  z.string().optional().default('1000'),  // Pro tier async API executions per minute
     RATE_LIMIT_TEAM_SYNC:                  z.string().optional().default('300'),   // Team tier sync API executions per minute
@@ -278,11 +293,11 @@ export const env = createEnv({
     RATE_LIMIT_ENTERPRISE_SYNC:            z.string().optional().default('600'),   // Enterprise tier sync API executions per minute
     RATE_LIMIT_ENTERPRISE_ASYNC:           z.string().optional().default('5000'),  // Enterprise tier async API executions per minute
     // Timeout Configuration
-    EXECUTION_TIMEOUT_FREE:                z.string().optional().default('300'),   // 5 minutes
+    EXECUTION_TIMEOUT_FREE:                z.string().optional(),                  // Free tier sync timeout in seconds (default 300). With billing disabled, setting it explicitly opts into sync timeouts
     EXECUTION_TIMEOUT_PRO:                 z.string().optional().default('3000'),  // 50 minutes
     EXECUTION_TIMEOUT_TEAM:                z.string().optional().default('3000'),  // 50 minutes
     EXECUTION_TIMEOUT_ENTERPRISE:          z.string().optional().default('3000'),  // 50 minutes
-    EXECUTION_TIMEOUT_ASYNC_FREE:          z.string().optional().default('5400'),  // 90 minutes
+    EXECUTION_TIMEOUT_ASYNC_FREE:          z.string().optional(),                  // Free tier async timeout in seconds (default 5400). With billing disabled, setting it explicitly opts into async timeouts
     EXECUTION_TIMEOUT_ASYNC_PRO:           z.string().optional().default('5400'),  // 90 minutes
     EXECUTION_TIMEOUT_ASYNC_TEAM:          z.string().optional().default('5400'),  // 90 minutes
     EXECUTION_TIMEOUT_ASYNC_ENTERPRISE:    z.string().optional().default('5400'),  // 90 minutes
@@ -327,7 +342,9 @@ export const env = createEnv({
     INTERNAL_API_BASE_URL:                 z.string().optional(),                  // Optional internal base URL for server-side self-calls; must include protocol if set (e.g., http://sim-app.namespace.svc.cluster.local:3000)
     ALLOWED_ORIGINS:                       z.string().optional(),                  // CORS allowed origins
     PII_URL:                               z.string().optional(),                  // Presidio PII service base URL serving /analyze + /anonymize (standalone ECS service; default http://localhost:5001 for local dev)
-    PII_MASK_CHUNK_CONCURRENCY:            z.coerce.number().int().positive().optional(), // Max in-flight mask-batch requests per redaction (default 4); raise for a scaled-out Presidio service, lower to 1 for a single instance
+    PII_MASK_CHUNK_CONCURRENCY:            z.coerce.number().int().positive().optional(), // Max in-flight mask-batch requests per redaction (default 64); tune to the Presidio fleet size behind the internal ALB, lower to 1 for a single instance
+    PII_REF_CONCURRENCY:                   z.coerce.number().int().positive().optional(), // Max large-value refs hydrated+masked+re-stored in parallel per payload (default 4); multiplies with PII_MASK_CHUNK_CONCURRENCY for total in-flight Presidio load
+    PII_SERVICE_CHUNK_CONCURRENCY:         z.coerce.number().int().positive().optional(), // Max Presidio requests in flight from a single mask-batch call (route -> Presidio fan-out, default 4); inner to PII_MASK_CHUNK_CONCURRENCY
 
     // OAuth Integration Credentials - All optional, enables third-party integrations
     GOOGLE_CLIENT_ID:                      z.string().optional(),                  // Google OAuth client ID for Google services
@@ -341,6 +358,8 @@ export const env = createEnv({
 
     X_CLIENT_ID:                           z.string().optional(),                  // X (Twitter) OAuth client ID
     X_CLIENT_SECRET:                       z.string().optional(),                  // X (Twitter) OAuth client secret
+    TIKTOK_CLIENT_ID:                      z.string().optional(),                  // TikTok OAuth client key (TikTok calls this "client_key")
+    TIKTOK_CLIENT_SECRET:                  z.string().optional(),                  // TikTok OAuth client secret
     CONFLUENCE_CLIENT_ID:                  z.string().optional(),                  // Atlassian Confluence OAuth client ID
     CONFLUENCE_CLIENT_SECRET:              z.string().optional(),                  // Atlassian Confluence OAuth client secret
     JIRA_CLIENT_ID:                        z.string().optional(),                  // Atlassian Jira OAuth client ID
@@ -378,6 +397,7 @@ export const env = createEnv({
     DROPBOX_CLIENT_SECRET:                 z.string().optional(),                  // Dropbox OAuth client secret
     SLACK_CLIENT_ID:                       z.string().optional(),                  // Slack OAuth client ID
     SLACK_CLIENT_SECRET:                   z.string().optional(),                  // Slack OAuth client secret
+    SLACK_SIGNING_SECRET:                  z.string().optional(),                  // Official Sim Slack app signing secret (verifies inbound events for the native OAuth trigger)
     REDDIT_CLIENT_ID:                      z.string().optional(),                  // Reddit OAuth client ID
     REDDIT_CLIENT_SECRET:                  z.string().optional(),                  // Reddit OAuth client secret
     WEBFLOW_CLIENT_ID:                     z.string().optional(),                  // Webflow OAuth client ID
@@ -409,9 +429,6 @@ export const env = createEnv({
     MOTHERSHIP_E2B_DOC_TEMPLATE_ID:         z.string().optional(),                  // Dedicated E2B template with python-pptx/docx/openpyxl/reportlab for document generation; when set (and E2B enabled), docs compile via Python instead of the JS isolated-vm path
     E2B_PI_TEMPLATE_ID:                     z.string().optional(),                  // E2B template ID/alias with the Pi CLI + git baked in (Pi Coding Agent cloud mode)
 
-    // Credential Sets (Email Polling) - for self-hosted deployments
-    CREDENTIAL_SETS_ENABLED:               z.boolean().optional(),                 // Enable credential sets on self-hosted (bypasses plan requirements)
-
     // Access Control (Permission Groups) - for self-hosted deployments
     ACCESS_CONTROL_ENABLED:                z.boolean().optional(),                 // Enable access control on self-hosted (bypasses plan requirements)
 
@@ -421,6 +438,7 @@ export const env = createEnv({
     DATA_RETENTION_ENABLED:               z.boolean().optional(),                 // Enable data retention settings on self-hosted (bypasses hosted requirements)
     DATA_DRAINS_ENABLED:                  z.boolean().optional(),                 // Enable data drains on self-hosted (bypasses hosted requirements)
     FORKING_ENABLED:                      z.boolean().optional(),                 // Enable workspace forking on self-hosted (bypasses hosted requirements)
+    DEPLOY_AS_BLOCK:                      z.boolean().optional(),                 // Enable deploy-as-block (publish a workflow as a reusable org-wide custom block)
 
     // Organizations - for self-hosted deployments
     ORGANIZATIONS_ENABLED:                 z.boolean().optional(),                 // Enable organizations on self-hosted (bypasses plan requirements)
@@ -514,8 +532,8 @@ export const env = createEnv({
 
     // Feature Flags
     NEXT_PUBLIC_SSO_ENABLED:               z.boolean().optional(),                   // Enable SSO login UI components
-    NEXT_PUBLIC_CREDENTIAL_SETS_ENABLED:   z.boolean().optional(),                   // Enable credential sets (email polling) on self-hosted
     NEXT_PUBLIC_ACCESS_CONTROL_ENABLED:    z.boolean().optional(),                   // Enable access control (permission groups) on self-hosted
+    NEXT_PUBLIC_CUSTOM_BLOCKS_ENABLED:     z.boolean().optional(),                   // Enable custom blocks (deploy-as-block) settings on self-hosted
     NEXT_PUBLIC_WHITELABELING_ENABLED:     z.boolean().optional(),                   // Enable whitelabeling on self-hosted (bypasses hosted requirements)
     NEXT_PUBLIC_AUDIT_LOGS_ENABLED:        z.boolean().optional(),                   // Enable audit logs on self-hosted (bypasses hosted requirements)
     NEXT_PUBLIC_DATA_RETENTION_ENABLED:   z.boolean().optional(),                   // Enable data retention settings on self-hosted (bypasses hosted requirements)
@@ -554,8 +572,8 @@ export const env = createEnv({
     NEXT_PUBLIC_BRAND_ACCENT_HOVER_COLOR: process.env.NEXT_PUBLIC_BRAND_ACCENT_HOVER_COLOR,
     NEXT_PUBLIC_BRAND_BACKGROUND_COLOR: process.env.NEXT_PUBLIC_BRAND_BACKGROUND_COLOR,
     NEXT_PUBLIC_SSO_ENABLED: process.env.NEXT_PUBLIC_SSO_ENABLED,
-    NEXT_PUBLIC_CREDENTIAL_SETS_ENABLED: process.env.NEXT_PUBLIC_CREDENTIAL_SETS_ENABLED,
     NEXT_PUBLIC_ACCESS_CONTROL_ENABLED: process.env.NEXT_PUBLIC_ACCESS_CONTROL_ENABLED,
+    NEXT_PUBLIC_CUSTOM_BLOCKS_ENABLED: process.env.NEXT_PUBLIC_CUSTOM_BLOCKS_ENABLED,
     NEXT_PUBLIC_WHITELABELING_ENABLED: process.env.NEXT_PUBLIC_WHITELABELING_ENABLED,
     NEXT_PUBLIC_AUDIT_LOGS_ENABLED: process.env.NEXT_PUBLIC_AUDIT_LOGS_ENABLED,
     NEXT_PUBLIC_DATA_RETENTION_ENABLED: process.env.NEXT_PUBLIC_DATA_RETENTION_ENABLED,

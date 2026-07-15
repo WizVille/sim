@@ -1,12 +1,17 @@
 import { createSign } from 'crypto'
 import { db } from '@sim/db'
-import { account, credential, credentialSetMember } from '@sim/db/schema'
+import { account, credential } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
-import { toError } from '@sim/utils/errors'
-import { and, desc, eq, inArray } from 'drizzle-orm'
+import { getPostgresErrorCode, toError } from '@sim/utils/errors'
+import { and, desc, eq } from 'drizzle-orm'
 import { withLeaderLock } from '@/lib/concurrency/leader-lock'
 import { coalesceLocally } from '@/lib/concurrency/singleflight'
 import { decryptSecret } from '@/lib/core/security/encryption'
+import { isTokenServiceAccountProviderId } from '@/lib/credentials/token-service-accounts/descriptors'
+import {
+  parseTokenServiceAccountSecretBlob,
+  type TokenServiceAccountSecretBlob,
+} from '@/lib/credentials/token-service-accounts/server'
 import { refreshOAuthToken } from '@/lib/oauth'
 import {
   getMicrosoftRefreshTokenExpiry,
@@ -21,6 +26,8 @@ import {
 import {
   ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID,
   ATLASSIAN_SERVICE_ACCOUNT_SECRET_TYPE,
+  GOOGLE_SERVICE_ACCOUNT_PROVIDER_ID,
+  SLACK_CUSTOM_BOT_PROVIDER_ID,
 } from '@/lib/oauth/types'
 
 const logger = createLogger('OAuthUtilsAPI')
@@ -222,6 +229,64 @@ export async function getServiceAccountToken(
   return tokenData.access_token
 }
 
+export interface SlackBotCredentialSecrets {
+  signingSecret: string
+  botToken: string
+  teamId: string
+  botUserId?: string
+  teamName?: string
+  /** Owning workspace — callers with a user/workflow context must verify it. */
+  workspaceId: string | null
+}
+
+/**
+ * Decrypt a reusable custom Slack bot credential — a `service_account` credential
+ * with `providerId='slack-custom-bot'` whose encrypted blob holds the bring-your-own
+ * app's signing secret + bot token + derived team_id/bot_user_id. Returns null if
+ * the id is not such a credential (or its blob is incomplete).
+ *
+ * @remarks Server-internal. The native custom ingest route authenticates each
+ * request via the app's signing secret (not a user session), so this reader does
+ * no per-user authorization; callers with a user context authorize separately.
+ */
+export async function getSlackBotCredential(
+  credentialId: string
+): Promise<SlackBotCredentialSecrets | null> {
+  const [row] = await db
+    .select({
+      type: credential.type,
+      providerId: credential.providerId,
+      encryptedServiceAccountKey: credential.encryptedServiceAccountKey,
+      workspaceId: credential.workspaceId,
+    })
+    .from(credential)
+    .where(eq(credential.id, credentialId))
+    .limit(1)
+
+  if (
+    !row ||
+    row.type !== 'service_account' ||
+    row.providerId !== SLACK_CUSTOM_BOT_PROVIDER_ID ||
+    !row.encryptedServiceAccountKey
+  ) {
+    return null
+  }
+
+  const { decrypted } = await decryptSecret(row.encryptedServiceAccountKey)
+  const blob = JSON.parse(decrypted) as Partial<SlackBotCredentialSecrets>
+  if (!blob.signingSecret || !blob.botToken || !blob.teamId) {
+    return null
+  }
+  return {
+    signingSecret: blob.signingSecret,
+    botToken: blob.botToken,
+    teamId: blob.teamId,
+    botUserId: blob.botUserId,
+    teamName: blob.teamName,
+    workspaceId: row.workspaceId ?? null,
+  }
+}
+
 interface AtlassianServiceAccountSecret {
   type: typeof ATLASSIAN_SERVICE_ACCOUNT_SECRET_TYPE
   apiToken: string
@@ -260,13 +325,102 @@ export async function getAtlassianServiceAccountSecret(
 }
 
 /**
- * For Atlassian service accounts, the API token IS the access token —
- * blocks call api.atlassian.com/ex/jira/{cloudId}/... with `Authorization: Bearer {apiToken}`.
- * No exchange or refresh is needed; we just decrypt and return the raw token.
+ * Result of resolving a `service_account` credential into a usable token. For
+ * Atlassian and the token-paste providers, the stored token IS the access
+ * token — no exchange or refresh is needed; Google mints a short-lived token
+ * via the JWT-bearer flow instead.
  */
-async function getAtlassianServiceAccountToken(credentialId: string): Promise<string> {
-  const secret = await getAtlassianServiceAccountSecret(credentialId)
-  return secret.apiToken
+export interface ServiceAccountTokenResult {
+  accessToken: string
+  /** Atlassian only — the resolved Jira/Confluence cloud id. */
+  cloudId?: string
+  /** Atlassian and domain-scoped token providers (e.g. Shopify) — the site/store domain. */
+  domain?: string
+}
+
+/**
+ * Loads and parses the decrypted secret blob for a token service-account
+ * credential (pasted long-lived provider token). Throws if the credential is
+ * missing or the blob doesn't belong to the expected provider.
+ */
+async function getTokenServiceAccountSecret(
+  credentialId: string,
+  providerId: string
+): Promise<TokenServiceAccountSecretBlob> {
+  const [credentialRow] = await db
+    .select({ encryptedServiceAccountKey: credential.encryptedServiceAccountKey })
+    .from(credential)
+    .where(eq(credential.id, credentialId))
+    .limit(1)
+
+  if (!credentialRow?.encryptedServiceAccountKey) {
+    throw new Error('Token service account secret not found')
+  }
+
+  const { decrypted } = await decryptSecret(credentialRow.encryptedServiceAccountKey)
+  return parseTokenServiceAccountSecretBlob(decrypted, providerId)
+}
+
+interface ServiceAccountTokenOptions {
+  scopes?: string[]
+  impersonateEmail?: string
+}
+
+type ServiceAccountTokenResolver = (
+  credentialId: string,
+  options: ServiceAccountTokenOptions
+) => Promise<ServiceAccountTokenResult>
+
+/**
+ * Resolver registry for the bespoke service-account providers. Token-paste
+ * providers (registered in `TOKEN_SERVICE_ACCOUNT_DESCRIPTORS`) resolve
+ * generically: the stored token IS the access token.
+ */
+const SERVICE_ACCOUNT_TOKEN_RESOLVERS: Record<string, ServiceAccountTokenResolver> = {
+  [ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID]: async (credentialId) => {
+    const secret = await getAtlassianServiceAccountSecret(credentialId)
+    return { accessToken: secret.apiToken, cloudId: secret.cloudId, domain: secret.domain }
+  },
+  [SLACK_CUSTOM_BOT_PROVIDER_ID]: async (credentialId) => {
+    const botCredential = await getSlackBotCredential(credentialId)
+    if (!botCredential) {
+      throw new Error('Slack bot credential not found')
+    }
+    return { accessToken: botCredential.botToken }
+  },
+  [GOOGLE_SERVICE_ACCOUNT_PROVIDER_ID]: async (credentialId, { scopes, impersonateEmail }) => {
+    if (!scopes?.length) {
+      throw new Error('Scopes are required for service account credentials')
+    }
+    return { accessToken: await getServiceAccountToken(credentialId, scopes, impersonateEmail) }
+  },
+}
+
+/**
+ * Single dispatch point for turning a `service_account` credential into an
+ * access token, keyed on `providerId`. Both `refreshAccessTokenIfNeeded` and the
+ * `POST /api/auth/oauth/token` route go through here, so a new service-account
+ * provider is one registry entry and an unknown provider fails loudly instead
+ * of silently attempting a Google JWT.
+ */
+export async function resolveServiceAccountToken(
+  credentialId: string,
+  providerId: string | null | undefined,
+  scopes?: string[],
+  impersonateEmail?: string
+): Promise<ServiceAccountTokenResult> {
+  if (providerId && isTokenServiceAccountProviderId(providerId)) {
+    const secret = await getTokenServiceAccountSecret(credentialId, providerId)
+    return { accessToken: secret.apiToken, domain: secret.domain }
+  }
+  const resolver =
+    providerId && Object.hasOwn(SERVICE_ACCOUNT_TOKEN_RESOLVERS, providerId)
+      ? SERVICE_ACCOUNT_TOKEN_RESOLVERS[providerId]
+      : undefined
+  if (!resolver) {
+    throw new Error(`Unsupported service-account provider: ${providerId ?? 'unknown'}`)
+  }
+  return resolver(credentialId, { scopes, impersonateEmail })
 }
 
 /**
@@ -281,7 +435,7 @@ export async function safeAccountInsert(
     await db.insert(account).values(data)
     logger.info(`Created new ${context.provider} account for user`, { userId: data.userId })
   } catch (error: any) {
-    if (error?.code === '23505') {
+    if (getPostgresErrorCode(error) === '23505') {
       logger.error(`Duplicate ${context.provider} account detected, credential already exists`, {
         userId: data.userId,
         identifier: context.identifier,
@@ -511,15 +665,14 @@ export async function refreshAccessTokenIfNeeded(
   }
 
   if (resolved.credentialType === 'service_account' && resolved.credentialId) {
-    if (resolved.providerId === ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID) {
-      logger.info(`[${requestId}] Using Atlassian service account token for credential`)
-      return getAtlassianServiceAccountToken(resolved.credentialId)
-    }
-    if (!scopes?.length) {
-      throw new Error('Scopes are required for service account credentials')
-    }
     logger.info(`[${requestId}] Using service account token for credential`)
-    return getServiceAccountToken(resolved.credentialId, scopes, impersonateEmail)
+    const { accessToken } = await resolveServiceAccountToken(
+      resolved.credentialId,
+      resolved.providerId,
+      scopes,
+      impersonateEmail
+    )
+    return accessToken
   }
 
   // Use the already-resolved account ID to avoid a redundant resolveOAuthAccountId query
@@ -638,90 +791,4 @@ export async function refreshTokenIfNeeded(
     return { accessToken: credential.accessToken, refreshed: false }
   }
   throw new Error('Failed to refresh token')
-}
-
-export interface CredentialSetCredential {
-  userId: string
-  credentialId: string
-  accessToken: string
-  providerId: string
-}
-
-export async function getCredentialsForCredentialSet(
-  credentialSetId: string,
-  providerId: string
-): Promise<CredentialSetCredential[]> {
-  logger.info(`Getting credentials for credential set ${credentialSetId}, provider ${providerId}`)
-
-  const members = await db
-    .select({ userId: credentialSetMember.userId })
-    .from(credentialSetMember)
-    .where(
-      and(
-        eq(credentialSetMember.credentialSetId, credentialSetId),
-        eq(credentialSetMember.status, 'active')
-      )
-    )
-
-  logger.info(`Found ${members.length} active members in credential set ${credentialSetId}`)
-
-  if (members.length === 0) {
-    logger.warn(`No active members found for credential set ${credentialSetId}`)
-    return []
-  }
-
-  const userIds = members.map((m) => m.userId)
-  logger.debug(`Member user IDs: ${userIds.join(', ')}`)
-
-  const credentials = await db
-    .select({
-      id: account.id,
-      userId: account.userId,
-      providerId: account.providerId,
-      accessToken: account.accessToken,
-      refreshToken: account.refreshToken,
-      accessTokenExpiresAt: account.accessTokenExpiresAt,
-    })
-    .from(account)
-    .where(and(inArray(account.userId, userIds), eq(account.providerId, providerId)))
-
-  logger.info(
-    `Found ${credentials.length} credentials with provider ${providerId} for ${members.length} members`
-  )
-
-  const results: CredentialSetCredential[] = []
-
-  for (const cred of credentials) {
-    const now = new Date()
-    const tokenExpiry = cred.accessTokenExpiresAt
-    const shouldRefresh =
-      !!cred.refreshToken && (!cred.accessToken || (tokenExpiry && tokenExpiry < now))
-
-    let accessToken = cred.accessToken
-
-    if (shouldRefresh && cred.refreshToken) {
-      const fresh = await performCoalescedRefresh({
-        accountId: cred.id,
-        providerId,
-        refreshToken: cred.refreshToken,
-        userId: cred.userId,
-      })
-      if (fresh) accessToken = fresh
-    }
-
-    if (accessToken) {
-      results.push({
-        userId: cred.userId,
-        credentialId: cred.id,
-        accessToken,
-        providerId,
-      })
-    }
-  }
-
-  logger.info(
-    `Found ${results.length} valid credentials for credential set ${credentialSetId}, provider ${providerId}`
-  )
-
-  return results
 }

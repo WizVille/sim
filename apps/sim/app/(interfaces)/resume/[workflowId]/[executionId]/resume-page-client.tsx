@@ -18,6 +18,7 @@ import {
   TableRow,
   Tooltip,
 } from '@sim/emcn'
+import { formatDateTime } from '@sim/utils/formatting'
 import { useQueryClient } from '@tanstack/react-query'
 import { RefreshCw } from 'lucide-react'
 import { useRouter } from 'next/navigation'
@@ -68,7 +69,7 @@ const STATUS_BADGE_VARIANT: Record<string, 'orange' | 'blue' | 'green' | 'red' |
 function formatDate(value: string | null): string {
   if (!value) return '—'
   try {
-    return new Date(value).toLocaleString()
+    return formatDateTime(new Date(value))
   } catch {
     return value
   }
@@ -817,6 +818,18 @@ export default function ResumeExecutionPage({
                     )}
                   </div>
                 </div>
+
+                {selectedDetail.pausePoint.automaticResumeWaitingReason && (
+                  <div className='rounded-[8px] border border-[var(--border)] bg-[var(--surface-1)] px-4 py-3'>
+                    <Label>Waiting to resume automatically</Label>
+                    <p className='mt-1 text-[13px] text-[var(--text-secondary)]'>
+                      {selectedDetail.pausePoint.automaticResumeWaitingReason}
+                    </p>
+                    <p className='mt-1 text-[12px] text-[var(--text-muted)]'>
+                      Sim will retry automatically.
+                    </p>
+                  </div>
+                )}
 
                 {/* Already resolved - show form fields with submitted values */}
                 {selectedStatus === 'resumed' || selectedStatus === 'failed' ? (

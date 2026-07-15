@@ -24,6 +24,7 @@ import { BrandfetchBlock, BrandfetchBlockMeta } from '@/blocks/blocks/brandfetch
 import { BrexBlock, BrexBlockMeta } from '@/blocks/blocks/brex'
 import { BrightDataBlock, BrightDataBlockMeta } from '@/blocks/blocks/brightdata'
 import { BrowserUseBlock, BrowserUseBlockMeta } from '@/blocks/blocks/browser_use'
+import { BufferBlock, BufferBlockMeta } from '@/blocks/blocks/buffer'
 import { CalComBlock, CalComBlockMeta } from '@/blocks/blocks/calcom'
 import { CalendlyBlock, CalendlyBlockMeta } from '@/blocks/blocks/calendly'
 import { ChatTriggerBlock } from '@/blocks/blocks/chat_trigger'
@@ -78,6 +79,7 @@ import {
   FirefliesV2Block,
   FirefliesV2BlockMeta,
 } from '@/blocks/blocks/fireflies'
+import { FlintBlock, FlintBlockMeta } from '@/blocks/blocks/flint'
 import { FunctionBlock } from '@/blocks/blocks/function'
 import { GammaBlock, GammaBlockMeta } from '@/blocks/blocks/gamma'
 import { GenericWebhookBlock } from '@/blocks/blocks/generic_webhook'
@@ -156,6 +158,7 @@ import {
   JiraServiceManagementBlock,
   JiraServiceManagementBlockMeta,
 } from '@/blocks/blocks/jira_service_management'
+import { JupyterBlock, JupyterBlockMeta } from '@/blocks/blocks/jupyter'
 import {
   KalshiBlock,
   KalshiBlockMeta,
@@ -271,7 +274,7 @@ import { ShopifyBlock, ShopifyBlockMeta } from '@/blocks/blocks/shopify'
 import { SimWorkspaceEventBlock } from '@/blocks/blocks/sim_workspace_event'
 import { SimilarwebBlock, SimilarwebBlockMeta } from '@/blocks/blocks/similarweb'
 import { SixtyfourBlock, SixtyfourBlockMeta } from '@/blocks/blocks/sixtyfour'
-import { SlackBlock, SlackBlockMeta } from '@/blocks/blocks/slack'
+import { SlackBlock, SlackBlockMeta, SlackV2Block } from '@/blocks/blocks/slack'
 import { SmtpBlock, SmtpBlockMeta } from '@/blocks/blocks/smtp'
 import { SportmonksBlock, SportmonksBlockMeta } from '@/blocks/blocks/sportmonks'
 import { SpotifyBlock, SpotifyBlockMeta } from '@/blocks/blocks/spotify'
@@ -293,6 +296,7 @@ import { TemporalBlock, TemporalBlockMeta } from '@/blocks/blocks/temporal'
 import { TextractBlock, TextractBlockMeta, TextractV2Block } from '@/blocks/blocks/textract'
 import { ThinkingBlock } from '@/blocks/blocks/thinking'
 import { ThriveBlock, ThriveBlockMeta } from '@/blocks/blocks/thrive'
+import { TikTokBlock, TikTokBlockMeta } from '@/blocks/blocks/tiktok'
 import { TinybirdBlock, TinybirdBlockMeta } from '@/blocks/blocks/tinybird'
 import { TranslateBlock } from '@/blocks/blocks/translate'
 import { TrelloBlock, TrelloBlockMeta } from '@/blocks/blocks/trello'
@@ -360,6 +364,7 @@ export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   brex: BrexBlock,
   brightdata: BrightDataBlock,
   browser_use: BrowserUseBlock,
+  buffer: BufferBlock,
   calcom: CalComBlock,
   calendly: CalendlyBlock,
   chat_trigger: ChatTriggerBlock,
@@ -420,6 +425,7 @@ export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   firecrawl: FirecrawlBlock,
   fireflies: FirefliesBlock,
   fireflies_v2: FirefliesV2Block,
+  flint: FlintBlock,
   function: FunctionBlock,
   gamma: GammaBlock,
   generic_webhook: GenericWebhookBlock,
@@ -477,6 +483,7 @@ export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   jina: JinaBlock,
   jira: JiraBlock,
   jira_service_management: JiraServiceManagementBlock,
+  jupyter: JupyterBlock,
   kalshi: KalshiBlock,
   kalshi_v2: KalshiV2Block,
   ketch: KetchBlock,
@@ -579,6 +586,7 @@ export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   similarweb: SimilarwebBlock,
   sixtyfour: SixtyfourBlock,
   slack: SlackBlock,
+  slack_v2: SlackV2Block,
   smtp: SmtpBlock,
   sportmonks: SportmonksBlock,
   spotify: SpotifyBlock,
@@ -602,6 +610,7 @@ export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   textract_v2: TextractV2Block,
   thinking: ThinkingBlock,
   thrive: ThriveBlock,
+  tiktok: TikTokBlock,
   tinybird: TinybirdBlock,
   translate: TranslateBlock,
   trello: TrelloBlock,
@@ -675,6 +684,7 @@ export const BLOCK_META_REGISTRY: Record<string, BlockMeta> = {
   brex: BrexBlockMeta,
   brightdata: BrightDataBlockMeta,
   browser_use: BrowserUseBlockMeta,
+  buffer: BufferBlockMeta,
   calcom: CalComBlockMeta,
   calendly: CalendlyBlockMeta,
   circleback: CirclebackBlockMeta,
@@ -719,6 +729,7 @@ export const BLOCK_META_REGISTRY: Record<string, BlockMeta> = {
   firecrawl: FirecrawlBlockMeta,
   fireflies: FirefliesBlockMeta,
   fireflies_v2: FirefliesV2BlockMeta,
+  flint: FlintBlockMeta,
   gamma: GammaBlockMeta,
   github: GitHubBlockMeta,
   github_v2: GitHubV2BlockMeta,
@@ -769,6 +780,7 @@ export const BLOCK_META_REGISTRY: Record<string, BlockMeta> = {
   jina: JinaBlockMeta,
   jira: JiraBlockMeta,
   jira_service_management: JiraServiceManagementBlockMeta,
+  jupyter: JupyterBlockMeta,
   kalshi: KalshiBlockMeta,
   kalshi_v2: KalshiV2BlockMeta,
   ketch: KetchBlockMeta,
@@ -868,6 +880,7 @@ export const BLOCK_META_REGISTRY: Record<string, BlockMeta> = {
   temporal: TemporalBlockMeta,
   textract: TextractBlockMeta,
   thrive: ThriveBlockMeta,
+  tiktok: TikTokBlockMeta,
   tinybird: TinybirdBlockMeta,
   trello: TrelloBlockMeta,
   trigger_dev: TriggerDevBlockMeta,
