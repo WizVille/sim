@@ -8,6 +8,47 @@ import {
 } from '@/lib/mcp/types'
 import { isMcpTool, MCP } from '@/executor/constants'
 
+export const MCP_FORWARD_MARKER_HEADER = 'X-Sim-Forward'
+
+function forwardMarkerEntry(
+  headers: Record<string, string> | undefined
+): [string, string] | undefined {
+  return Object.entries(headers ?? {}).find(
+    ([name]) => name.toLowerCase() === MCP_FORWARD_MARKER_HEADER.toLowerCase()
+  )
+}
+
+export function stripForwardMarkerHeader(
+  headers: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  if (!headers || !forwardMarkerEntry(headers)) return headers
+  return Object.fromEntries(
+    Object.entries(headers).filter(
+      ([name]) => name.toLowerCase() !== MCP_FORWARD_MARKER_HEADER.toLowerCase()
+    )
+  )
+}
+
+export function applyForwardedAuthorization(
+  headers: Record<string, string> | undefined,
+  forwardedAuthorization: string | undefined
+): Record<string, string> | undefined {
+  const marker = forwardMarkerEntry(headers)
+  const stripped = stripForwardMarkerHeader(headers)
+  if (!marker || !forwardedAuthorization) return stripped
+
+  const optsIn = marker[1]
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .includes('authorization')
+  if (!optsIn) return stripped
+
+  const withoutAuthorization = Object.fromEntries(
+    Object.entries(stripped ?? {}).filter(([name]) => name.toLowerCase() !== 'authorization')
+  )
+  return { ...withoutAuthorization, Authorization: forwardedAuthorization }
+}
+
 export const MCP_CONSTANTS = {
   EXECUTION_TIMEOUT: DEFAULT_EXECUTION_TIMEOUT_MS,
   CACHE_TIMEOUT: 5 * 60 * 1000,

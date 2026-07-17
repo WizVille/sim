@@ -904,6 +904,7 @@ const MCP_SYSTEM_PARAMETERS = new Set([
   'blockData',
   'blockNameMapping',
   '_toolSchema',
+  '_mcpAuthorization',
 ])
 
 /**
@@ -2161,6 +2162,13 @@ async function executeMcpTool(
       arguments: toolArguments,
       workflowId: mcpScope.workflowId,
       workspaceId: mcpScope.workspaceId,
+    }
+
+    if (typeof params._mcpAuthorization === 'string' && params._mcpAuthorization.trim() !== '') {
+      const credential = params._mcpAuthorization.trim()
+      requestBody.forwardedAuthorization = /^(bearer|basic)\s/i.test(credential)
+        ? credential
+        : `Bearer ${credential}`
     }
 
     const body = JSON.stringify(requestBody)

@@ -28,7 +28,7 @@ import {
   type McpToolsChangedCallback,
   type McpVersionInfo,
 } from '@/lib/mcp/types'
-import { MCP_CLIENT_CONSTANTS } from '@/lib/mcp/utils'
+import { MCP_CLIENT_CONSTANTS, stripForwardMarkerHeader } from '@/lib/mcp/utils'
 
 const logger = createLogger('McpClient')
 
@@ -47,7 +47,7 @@ export class McpClient {
   private isConnected = false
 
   constructor(options: McpClientOptions) {
-    this.config = options.config
+    this.config = { ...options.config, headers: stripForwardMarkerHeader(options.config.headers) }
     this.securityPolicy = options.securityPolicy ?? {
       requireConsent: true,
       auditLevel: 'basic',

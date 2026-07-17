@@ -85,7 +85,8 @@ export class AgentBlockHandler implements BlockHandler {
       ctx,
       filteredInputs.tools || [],
       block.canonicalModes,
-      toolIndexByRef
+      toolIndexByRef,
+      filteredInputs.apiKey
     )
 
     const skillInputs = filteredInputs.skills ?? []
@@ -221,7 +222,8 @@ export class AgentBlockHandler implements BlockHandler {
     ctx: ExecutionContext,
     inputTools: ToolInput[],
     canonicalModes?: Record<string, 'basic' | 'advanced'>,
-    toolIndexByRef?: Map<ToolInput, number>
+    toolIndexByRef?: Map<ToolInput, number>,
+    apiKey?: string
   ): Promise<any[]> {
     if (!Array.isArray(inputTools)) return []
 
@@ -234,7 +236,11 @@ export class AgentBlockHandler implements BlockHandler {
 
     for (const entry of filtered) {
       if (entry.tool.type === 'mcp') {
-        mcpTools.push(entry.tool)
+        mcpTools.push(
+          apiKey
+            ? { ...entry.tool, params: { ...entry.tool.params, _mcpAuthorization: apiKey } }
+            : entry.tool
+        )
       } else {
         otherTools.push(entry)
       }
@@ -1021,6 +1027,7 @@ export class AgentBlockHandler implements BlockHandler {
         blockNameMapping,
         isDeployedContext: ctx.isDeployedContext,
         callChain: ctx.callChain,
+        billingAttribution: ctx.metadata.billingAttribution,
         reasoningEffort: providerRequest.reasoningEffort,
         verbosity: providerRequest.verbosity,
         thinkingLevel: providerRequest.thinkingLevel,

@@ -1,3 +1,4 @@
+import type { BillingAttributionSnapshot } from '@/lib/billing/core/billing-attribution'
 import type { ProviderTimingSegment, StreamingExecution, UserFile } from '@/executor/types'
 
 export type ProviderId =
@@ -185,6 +186,7 @@ export interface ProviderRequest {
   thinkingLevel?: string
   isDeployedContext?: boolean
   callChain?: string[]
+  billingAttribution?: BillingAttributionSnapshot
   /** Previous interaction ID for multi-turn Interactions API requests (deep research follow-ups) */
   previousInteractionId?: string
   abortSignal?: AbortSignal

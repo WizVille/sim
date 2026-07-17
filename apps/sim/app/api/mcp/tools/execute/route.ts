@@ -212,13 +212,15 @@ export const POST = withRouteHandler(
           extraHeaders[SIM_VIA_HEADER] = simViaHeader
         }
 
+
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined
         const executePromise = mcpService.executeTool(
           userId,
           serverId,
           toolCall,
           workspaceId,
-          extraHeaders
+          extraHeaders,
+          body.forwardedAuthorization
         )
         // A zero timeout means "no timeout" (billing-disabled deployments).
         const result = await (executionTimeout > 0

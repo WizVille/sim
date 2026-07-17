@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const {
   MockMcpClient,
   mockListTools,
+  mockCallTool,
   mockConnect,
   mockDisconnect,
   mockGetWorkspaceServersRows,
@@ -16,6 +17,7 @@ const {
   mockCacheAdapter,
 } = vi.hoisted(() => {
   const mockListTools = vi.fn()
+  const mockCallTool = vi.fn()
   const mockConnect = vi.fn()
   const mockDisconnect = vi.fn()
   // In-memory cache adapter so the service never touches the real Redis the
@@ -52,6 +54,7 @@ const {
             connect: mockConnect,
             disconnect: mockDisconnect,
             listTools: mockListTools,
+            callTool: mockCallTool,
             hasListChangedCapability: vi.fn(() => false),
             onClose: vi.fn(),
             getNegotiatedVersion: vi.fn(() => '2025-06-18'),
@@ -60,6 +63,7 @@ const {
       }
     ),
     mockListTools,
+    mockCallTool,
     mockConnect,
     mockDisconnect,
     mockGetWorkspaceServersRows: vi.fn(),
@@ -365,5 +369,83 @@ describe('McpService.discoverTools per-server caching', () => {
     const after = await mcpService.discoverTools(USER_ID, WORKSPACE_ID)
     expect(after.map((t) => t.name)).toEqual(['a1'])
     expect(mockListTools).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('McpService.executeTool — forwarded Authorization (X-Sim-Forward)', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    mockIsDomainAllowed.mockReturnValue(true)
+    mockValidateSsrf.mockResolvedValue(null)
+    mockResolveEnvVars.mockImplementation(async (config: unknown) => ({
+      config,
+      missingVars: [],
+    }))
+    mockCallTool.mockResolvedValue({ content: [], isError: false })
+    await mockCacheAdapter.clear()
+  })
+
+  function clientHeaders(): Record<string, string> | undefined {
+    const clientArgs = MockMcpClient.mock.calls.at(-1)?.[0] as {
+      config: { headers?: Record<string, string> }
+    }
+    return clientArgs.config.headers
+  }
+
+  it('overrides Authorization with the forwarded credential when the server opts in via X-Sim-Forward', async () => {
+    mockGetWorkspaceServersRows.mockResolvedValue([
+      dbRow('server-fwd', 'wizville', {
+        headers: { Authorization: 'Bearer static-config', 'X-Sim-Forward': 'Authorization' },
+      }),
+    ])
+
+    await mcpService.executeTool(
+      USER_ID,
+      'server-fwd',
+      { name: 'run_query', arguments: {} },
+      WORKSPACE_ID,
+      undefined,
+      'Bearer caller-credential'
+    )
+
+    expect(clientHeaders()?.Authorization).toBe('Bearer caller-credential')
+    expect(clientHeaders()?.['X-Sim-Forward']).toBeUndefined()
+  })
+
+  it('keeps the static header when no credential is forwarded (discovery, manual runs)', async () => {
+    mockGetWorkspaceServersRows.mockResolvedValue([
+      dbRow('server-fwd', 'wizville', {
+        headers: { Authorization: 'Bearer static-config', 'X-Sim-Forward': 'Authorization' },
+      }),
+    ])
+
+    await mcpService.executeTool(
+      USER_ID,
+      'server-fwd',
+      { name: 'run_query', arguments: {} },
+      WORKSPACE_ID
+    )
+
+    expect(clientHeaders()?.Authorization).toBe('Bearer static-config')
+    expect(clientHeaders()?.['X-Sim-Forward']).toBeUndefined()
+  })
+
+  it('ignores the forwarded credential when the server does not opt in', async () => {
+    mockGetWorkspaceServersRows.mockResolvedValue([
+      dbRow('server-fwd', 'wizville', {
+        headers: { Authorization: 'Bearer static-config' },
+      }),
+    ])
+
+    await mcpService.executeTool(
+      USER_ID,
+      'server-fwd',
+      { name: 'run_query', arguments: {} },
+      WORKSPACE_ID,
+      undefined,
+      'Bearer caller-credential'
+    )
+
+    expect(clientHeaders()?.Authorization).toBe('Bearer static-config')
   })
 })

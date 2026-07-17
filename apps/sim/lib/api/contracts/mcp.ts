@@ -201,6 +201,7 @@ export const mcpToolExecutionBodySchema = z
     toolName: z.string().min(1),
     arguments: z.record(z.string(), z.unknown()).optional(),
     workflowId: z.string().optional(),
+    forwardedAuthorization: z.string().min(1).max(4096).optional(),
   })
   .passthrough()
 export type McpToolExecutionBody = z.input<typeof mcpToolExecutionBodySchema>

@@ -1260,6 +1260,34 @@ describe('Tool Management', () => {
 })
 
 describe('prepareToolExecution', () => {
+  describe('execution-only context threading', () => {
+    it.concurrent('threads billingAttribution into _context without exposing it in toolParams', () => {
+      const billingAttribution = {
+        actorUserId: 'user-1',
+        payerUserId: 'user-1',
+        workspaceId: 'ws-1',
+      } as any
+      const tool = { params: { channel: '#general' } }
+      const request = { workflowId: 'wf-123', billingAttribution }
+
+      const { toolParams, executionParams } = prepareToolExecution(tool, {}, request)
+
+      expect(executionParams._context.billingAttribution).toEqual(billingAttribution)
+      expect(toolParams.billingAttribution).toBeUndefined()
+    })
+
+    it.concurrent('keeps _mcpAuthorization out of toolParams but in executionParams', () => {
+      const tool = { params: { _mcpAuthorization: 'sk-caller-key', channel: '#general' } }
+      const request = { workflowId: 'wf-123' }
+
+      const { toolParams, executionParams } = prepareToolExecution(tool, {}, request)
+
+      expect(toolParams._mcpAuthorization).toBeUndefined()
+      expect(executionParams._mcpAuthorization).toBe('sk-caller-key')
+      expect(toolParams.channel).toBe('#general')
+    })
+  })
+
   describe('basic parameter merging', () => {
     it.concurrent('should merge LLM args with user params', () => {
       const tool = {

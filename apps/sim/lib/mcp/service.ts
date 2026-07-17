@@ -38,7 +38,11 @@ import {
   type McpToolResult,
   type McpTransport,
 } from '@/lib/mcp/types'
-import { MCP_CLIENT_CONSTANTS, MCP_CONSTANTS } from '@/lib/mcp/utils'
+import {
+  applyForwardedAuthorization,
+  MCP_CLIENT_CONSTANTS,
+  MCP_CONSTANTS,
+} from '@/lib/mcp/utils'
 
 const logger = createLogger('McpService')
 
@@ -251,7 +255,8 @@ class McpService {
     serverId: string,
     toolCall: McpToolCall,
     workspaceId: string,
-    extraHeaders?: Record<string, string>
+    extraHeaders?: Record<string, string>,
+    forwardedAuthorization?: string
   ): Promise<McpToolResult> {
     const requestId = generateRequestId()
     const maxRetries = 2
@@ -275,6 +280,10 @@ class McpService {
         if (extraHeaders && Object.keys(extraHeaders).length > 0) {
           resolvedConfig.headers = { ...resolvedConfig.headers, ...extraHeaders }
         }
+        resolvedConfig.headers = applyForwardedAuthorization(
+          resolvedConfig.headers,
+          forwardedAuthorization
+        )
         const client = await this.createClient(resolvedConfig, resolvedIP, userId)
 
         try {
