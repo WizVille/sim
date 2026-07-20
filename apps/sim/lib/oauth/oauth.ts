@@ -1,5 +1,6 @@
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
+import { truncate } from '@sim/utils/string'
 import {
   AirtableIcon,
   AsanaIcon,
@@ -7,6 +8,7 @@ import {
   AzureIcon,
   BoxCompanyIcon,
   CalComIcon,
+  ClickUpIcon,
   ConfluenceIcon,
   DocuSignIcon,
   DropboxIcon,
@@ -24,6 +26,7 @@ import {
   GoogleSheetsIcon,
   GoogleTasksIcon,
   HubspotIcon,
+  InstagramIcon,
   JiraIcon,
   LinearIcon,
   LinkedInIcon,
@@ -53,6 +56,11 @@ import {
   ZoomIcon,
 } from '@/components/icons'
 import { env } from '@/lib/core/config/env'
+import {
+  DEFAULT_MAX_ERROR_BODY_BYTES,
+  readResponseTextWithLimit,
+} from '@/lib/core/utils/stream-limits'
+import { parseInstagramLongLivedToken } from '@/lib/oauth/instagram'
 import type { OAuthProviderConfig } from './types'
 
 const logger = createLogger('OAuth')
@@ -619,6 +627,22 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
     },
     defaultService: 'notion',
   },
+  clickup: {
+    name: 'ClickUp',
+    icon: ClickUpIcon,
+    services: {
+      clickup: {
+        name: 'ClickUp',
+        description: 'Manage tasks, lists, and comments in ClickUp.',
+        providerId: 'clickup',
+        serviceAccountProviderId: 'clickup-service-account',
+        icon: ClickUpIcon,
+        baseProviderIcon: ClickUpIcon,
+        scopes: [],
+      },
+    },
+    defaultService: 'clickup',
+  },
   linear: {
     name: 'Linear',
     icon: LinearIcon,
@@ -670,6 +694,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
         icon: BoxCompanyIcon,
         baseProviderIcon: BoxCompanyIcon,
         scopes: ['root_readwrite', 'sign_requests.readwrite'],
+        serviceAccountProviderId: 'box-service-account',
       },
     },
     defaultService: 'box',
@@ -923,6 +948,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
         name: 'Pipedrive',
         description: 'Manage deals, contacts, and sales pipeline in Pipedrive CRM.',
         providerId: 'pipedrive',
+        serviceAccountProviderId: 'pipedrive-service-account',
         icon: PipedriveIcon,
         baseProviderIcon: PipedriveIcon,
         scopes: [
@@ -990,6 +1016,27 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
     },
     defaultService: 'linkedin',
   },
+  instagram: {
+    name: 'Instagram',
+    icon: InstagramIcon,
+    services: {
+      instagram: {
+        name: 'Instagram',
+        description: 'Publish content, moderate comments, and message on Instagram.',
+        providerId: 'instagram',
+        icon: InstagramIcon,
+        baseProviderIcon: InstagramIcon,
+        scopes: [
+          'instagram_business_basic',
+          'instagram_business_content_publish',
+          'instagram_business_manage_comments',
+          'instagram_business_manage_messages',
+          'instagram_business_manage_insights',
+        ],
+      },
+    },
+    defaultService: 'instagram',
+  },
   salesforce: {
     name: 'Salesforce',
     icon: SalesforceIcon,
@@ -998,6 +1045,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
         name: 'Salesforce',
         description: 'Access and manage your Salesforce CRM data.',
         providerId: 'salesforce',
+        serviceAccountProviderId: 'salesforce-service-account',
         icon: SalesforceIcon,
         baseProviderIcon: SalesforceIcon,
         scopes: ['api', 'refresh_token', 'openid'],
@@ -1028,6 +1076,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
           'cloud_recording:read:list_recording_files',
           'cloud_recording:delete:recording_file',
         ],
+        serviceAccountProviderId: 'zoom-service-account',
       },
     },
     defaultService: 'zoom',
@@ -1099,6 +1148,12 @@ interface ProviderAuthConfig {
    * instead of the default application/x-www-form-urlencoded. Used by Notion.
    */
   useJsonBody?: boolean
+  /**
+   * Token refresh strategy. `instagram_long_lived` uses Meta's GET
+   * `refresh_access_token?grant_type=ig_refresh_token` flow instead of a
+   * standard OAuth refresh_token POST.
+   */
+  refreshStrategy?: 'standard' | 'instagram_long_lived'
   /**
    * Body param name to use for the client identifier instead of the standard `client_id`.
    * TikTok requires `client_key` instead.
@@ -1234,6 +1289,19 @@ function getProviderAuthConfig(provider: string): ProviderAuthConfig {
         clientSecret,
         useBasicAuth: false,
         supportsRefreshTokenRotation: true,
+      }
+    }
+    case 'clickup': {
+      const { clientId, clientSecret } = getCredentials(
+        env.CLICKUP_CLIENT_ID,
+        env.CLICKUP_CLIENT_SECRET
+      )
+      return {
+        tokenEndpoint: 'https://api.clickup.com/api/v2/oauth/token',
+        clientId,
+        clientSecret,
+        useBasicAuth: false,
+        supportsRefreshTokenRotation: false,
       }
     }
     case 'linear': {
@@ -1402,6 +1470,20 @@ function getProviderAuthConfig(provider: string): ProviderAuthConfig {
         supportsRefreshTokenRotation: false,
       }
     }
+    case 'instagram': {
+      const { clientId, clientSecret } = getCredentials(
+        env.INSTAGRAM_CLIENT_ID,
+        env.INSTAGRAM_CLIENT_SECRET
+      )
+      return {
+        tokenEndpoint: 'https://graph.instagram.com/refresh_access_token',
+        clientId,
+        clientSecret,
+        useBasicAuth: false,
+        supportsRefreshTokenRotation: true,
+        refreshStrategy: 'instagram_long_lived',
+      }
+    }
     case 'salesforce': {
       const { clientId, clientSecret } = getCredentials(
         env.SALESFORCE_CLIENT_ID,
@@ -1559,8 +1641,12 @@ export type RefreshTokenResult = RefreshTokenSuccess | RefreshTokenFailure
 
 function extractErrorCode(value: unknown): string | undefined {
   if (value && typeof value === 'object' && 'error' in value) {
-    const code = (value as { error: unknown }).error
-    if (typeof code === 'string') return code
+    const error = (value as { error: unknown }).error
+    if (typeof error === 'string') return error
+    if (error && typeof error === 'object' && 'code' in error) {
+      const code = (error as { code: unknown }).code
+      if (typeof code === 'string' || typeof code === 'number') return String(code)
+    }
   }
   return undefined
 }
@@ -1574,6 +1660,68 @@ function extractErrorCode(value: unknown): string | undefined {
  */
 const TOKEN_REFRESH_TIMEOUT_MS = 15_000
 
+async function refreshInstagramLongLivedToken(
+  config: ProviderAuthConfig,
+  longLivedToken: string,
+  providerId: string
+): Promise<RefreshTokenResult> {
+  const url = new URL(config.tokenEndpoint)
+  url.searchParams.set('grant_type', 'ig_refresh_token')
+  url.searchParams.set('access_token', longLivedToken)
+
+  const response = await fetch(url.toString(), {
+    method: 'GET',
+    signal: AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS),
+  })
+
+  const responseText = await readResponseTextWithLimit(response, {
+    maxBytes: DEFAULT_MAX_ERROR_BODY_BYTES,
+    label: 'Instagram token refresh response',
+  })
+  let responseData: unknown = responseText
+  try {
+    responseData = JSON.parse(responseText)
+  } catch {
+    responseData = responseText
+  }
+
+  if (!response.ok) {
+    const errorSummary = truncate(responseText, 1000)
+    logger.error('Instagram long-lived token refresh failed:', {
+      status: response.status,
+      statusText: response.statusText,
+      error: errorSummary,
+      parsedError: responseData,
+      providerId,
+      tokenEndpoint: config.tokenEndpoint,
+    })
+    return {
+      ok: false,
+      errorCode: extractErrorCode(responseData),
+      message: `Failed to refresh token: ${response.status} ${errorSummary}`,
+    }
+  }
+
+  const payload = parseInstagramLongLivedToken(responseData)
+  if (!payload) {
+    logger.warn('Invalid Instagram refresh response', { providerId })
+    return { ok: false, message: 'Invalid Instagram token refresh response' }
+  }
+
+  logger.info('Instagram long-lived token refreshed successfully', {
+    expiresIn: payload.expires_in,
+    providerId,
+  })
+
+  // Instagram returns a new long-lived token; store it as both access and refresh.
+  return {
+    ok: true,
+    accessToken: payload.access_token,
+    expiresIn: payload.expires_in,
+    refreshToken: payload.access_token,
+  }
+}
+
 export async function refreshOAuthToken(
   providerId: string,
   refreshToken: string
@@ -1582,6 +1730,10 @@ export async function refreshOAuthToken(
     const provider = getBaseProviderForService(providerId)
 
     const config = getProviderAuthConfig(provider)
+
+    if (config.refreshStrategy === 'instagram_long_lived') {
+      return await refreshInstagramLongLivedToken(config, refreshToken, providerId)
+    }
 
     const { headers, bodyParams, useJsonBody } = buildAuthRequest(config, refreshToken)
 

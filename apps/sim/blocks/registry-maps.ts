@@ -32,6 +32,7 @@ import { CirclebackBlock, CirclebackBlockMeta } from '@/blocks/blocks/circleback
 import { ClayBlock, ClayBlockMeta } from '@/blocks/blocks/clay'
 import { ClerkBlock, ClerkBlockMeta } from '@/blocks/blocks/clerk'
 import { ClickHouseBlock, ClickHouseBlockMeta } from '@/blocks/blocks/clickhouse'
+import { ClickUpBlock, ClickUpBlockMeta } from '@/blocks/blocks/clickup'
 import { CloudflareBlock, CloudflareBlockMeta } from '@/blocks/blocks/cloudflare'
 import { CloudFormationBlock, CloudFormationBlockMeta } from '@/blocks/blocks/cloudformation'
 import { CloudWatchBlock, CloudWatchBlockMeta } from '@/blocks/blocks/cloudwatch'
@@ -127,7 +128,7 @@ import { GoogleTasksBlock, GoogleTasksBlockMeta } from '@/blocks/blocks/google_t
 import { GoogleTranslateBlock, GoogleTranslateBlockMeta } from '@/blocks/blocks/google_translate'
 import { GoogleVaultBlock, GoogleVaultBlockMeta } from '@/blocks/blocks/google_vault'
 import { GrafanaBlock, GrafanaBlockMeta } from '@/blocks/blocks/grafana'
-import { GrainBlock, GrainBlockMeta } from '@/blocks/blocks/grain'
+import { GrainBlock, GrainBlockMeta, GrainV2Block, GrainV2BlockMeta } from '@/blocks/blocks/grain'
 import { GranolaBlock, GranolaBlockMeta } from '@/blocks/blocks/granola'
 import { GreenhouseBlock, GreenhouseBlockMeta } from '@/blocks/blocks/greenhouse'
 import { GreptileBlock, GreptileBlockMeta } from '@/blocks/blocks/greptile'
@@ -145,6 +146,7 @@ import { ImapBlock, ImapBlockMeta } from '@/blocks/blocks/imap'
 import { IncidentioBlock, IncidentioBlockMeta } from '@/blocks/blocks/incidentio'
 import { InfisicalBlock, InfisicalBlockMeta } from '@/blocks/blocks/infisical'
 import { InputTriggerBlock } from '@/blocks/blocks/input_trigger'
+import { InstagramBlock, InstagramBlockMeta } from '@/blocks/blocks/instagram'
 import { InstantlyBlock, InstantlyBlockMeta } from '@/blocks/blocks/instantly'
 import {
   IntercomBlock,
@@ -252,6 +254,7 @@ import { ResendBlock, ResendBlockMeta } from '@/blocks/blocks/resend'
 import { ResponseBlock } from '@/blocks/blocks/response'
 import { RevenueCatBlock, RevenueCatBlockMeta } from '@/blocks/blocks/revenuecat'
 import { RipplingBlock, RipplingBlockMeta } from '@/blocks/blocks/rippling'
+import { RocketlaneBlock, RocketlaneBlockMeta } from '@/blocks/blocks/rocketlane'
 import { RootlyBlock, RootlyBlockMeta } from '@/blocks/blocks/rootly'
 import { RouterBlock, RouterV2Block } from '@/blocks/blocks/router'
 import { RssBlock, RssBlockMeta } from '@/blocks/blocks/rss'
@@ -372,6 +375,7 @@ export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   clay: ClayBlock,
   clerk: ClerkBlock,
   clickhouse: ClickHouseBlock,
+  clickup: ClickUpBlock,
   cloudflare: CloudflareBlock,
   cloudformation: CloudFormationBlock,
   cloudwatch: CloudWatchBlock,
@@ -459,6 +463,7 @@ export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   google_vault: GoogleVaultBlock,
   grafana: GrafanaBlock,
   grain: GrainBlock,
+  grain_v2: GrainV2Block,
   granola: GranolaBlock,
   greenhouse: GreenhouseBlock,
   greptile: GreptileBlock,
@@ -477,6 +482,7 @@ export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   incidentio: IncidentioBlock,
   infisical: InfisicalBlock,
   input_trigger: InputTriggerBlock,
+  instagram: InstagramBlock,
   instantly: InstantlyBlock,
   intercom: IntercomBlock,
   intercom_v2: IntercomV2Block,
@@ -561,6 +567,7 @@ export const BLOCK_REGISTRY: Record<string, BlockConfig> = {
   response: ResponseBlock,
   revenuecat: RevenueCatBlock,
   rippling: RipplingBlock,
+  rocketlane: RocketlaneBlock,
   rootly: RootlyBlock,
   router: RouterBlock,
   router_v2: RouterV2Block,
@@ -691,6 +698,7 @@ export const BLOCK_META_REGISTRY: Record<string, BlockMeta> = {
   clay: ClayBlockMeta,
   clerk: ClerkBlockMeta,
   clickhouse: ClickHouseBlockMeta,
+  clickup: ClickUpBlockMeta,
   cloudflare: CloudflareBlockMeta,
   cloudformation: CloudFormationBlockMeta,
   cloudwatch: CloudWatchBlockMeta,
@@ -761,6 +769,7 @@ export const BLOCK_META_REGISTRY: Record<string, BlockMeta> = {
   google_vault: GoogleVaultBlockMeta,
   grafana: GrafanaBlockMeta,
   grain: GrainBlockMeta,
+  grain_v2: GrainV2BlockMeta,
   granola: GranolaBlockMeta,
   greenhouse: GreenhouseBlockMeta,
   greptile: GreptileBlockMeta,
@@ -774,6 +783,7 @@ export const BLOCK_META_REGISTRY: Record<string, BlockMeta> = {
   imap: ImapBlockMeta,
   incidentio: IncidentioBlockMeta,
   infisical: InfisicalBlockMeta,
+  instagram: InstagramBlockMeta,
   instantly: InstantlyBlockMeta,
   intercom: IntercomBlockMeta,
   intercom_v2: IntercomV2BlockMeta,
@@ -845,6 +855,7 @@ export const BLOCK_META_REGISTRY: Record<string, BlockMeta> = {
   resend: ResendBlockMeta,
   revenuecat: RevenueCatBlockMeta,
   rippling: RipplingBlockMeta,
+  rocketlane: RocketlaneBlockMeta,
   rootly: RootlyBlockMeta,
   rss: RssBlockMeta,
   s3: S3BlockMeta,

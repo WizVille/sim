@@ -59,6 +59,7 @@ vi.mock('@/ee/whitelabeling/components/branding-provider', () => ({
 
 vi.mock('@/app/workspace/[workspaceId]/components/impersonation-banner', () => ({
   ImpersonationBanner: () => null,
+  ImpersonationExpired: () => null,
 }))
 
 vi.mock('@/app/workspace/[workspaceId]/components/workspace-chrome', () => ({
@@ -156,7 +157,8 @@ describe('WorkspaceLayout host context', () => {
       expect.anything(),
       'workspace-b',
       'viewer-1',
-      HOST_CONTEXT
+      HOST_CONTEXT,
+      'org-a'
     )
     expect(mockBrandingProvider).toHaveBeenCalledWith(
       expect.objectContaining({
