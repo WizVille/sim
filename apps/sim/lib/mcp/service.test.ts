@@ -449,3 +449,87 @@ describe('McpService.executeTool — forwarded Authorization (X-Sim-Forward)', (
     expect(clientHeaders()?.Authorization).toBe('Bearer static-config')
   })
 })
+
+describe('McpService.discoverServerTools — per-user cache scope (X-Sim-Forward)', () => {
+  const USER_A = 'user-a'
+  const USER_B = 'user-b'
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    mockListTools.mockReset()
+    mockIsDomainAllowed.mockReturnValue(true)
+    mockValidateSsrf.mockResolvedValue('1.2.3.4')
+    mockValidateDomain.mockImplementation(() => undefined)
+    mockResolveEnvVars.mockImplementation((config: { url: string }) =>
+      Promise.resolve({ config: { ...config }, missingVars: [] })
+    )
+    mockConnect.mockResolvedValue(undefined)
+    mockDisconnect.mockResolvedValue(undefined)
+    await mcpService.clearCache()
+  })
+
+  function lastClientHeaders(): Record<string, string> | undefined {
+    const clientArgs = MockMcpClient.mock.calls.at(-1)?.[0] as {
+      config: { headers?: Record<string, string> }
+    }
+    return clientArgs.config.headers
+  }
+
+  it('isolates cached tools per user so one user never reads another user’s listing', async () => {
+    mockGetWorkspaceServersRows.mockResolvedValue([
+      dbRow('server-fwd', 'wizville', { headers: { 'X-Sim-Forward': 'Authorization' } }),
+    ])
+    mockListTools
+      .mockResolvedValueOnce([tool('a-tool', 'server-fwd')])
+      .mockResolvedValueOnce([tool('b-tool', 'server-fwd')])
+
+    const aTools = await mcpService.discoverServerTools(
+      USER_A,
+      'server-fwd',
+      WORKSPACE_ID,
+      false,
+      'Bearer A'
+    )
+    expect(aTools.map((t) => t.name)).toEqual(['a-tool'])
+    expect(lastClientHeaders()?.Authorization).toBe('Bearer A')
+
+    // User B must NOT be served user A's cache entry — a fresh listing runs
+    // under B's forwarded identity.
+    const bTools = await mcpService.discoverServerTools(
+      USER_B,
+      'server-fwd',
+      WORKSPACE_ID,
+      false,
+      'Bearer B'
+    )
+    expect(bTools.map((t) => t.name)).toEqual(['b-tool'])
+    expect(lastClientHeaders()?.Authorization).toBe('Bearer B')
+    expect(mockListTools).toHaveBeenCalledTimes(2)
+
+    // User A's own follow-up hits their scoped cache — no new upstream call.
+    mockListTools.mockClear()
+    const aAgain = await mcpService.discoverServerTools(
+      USER_A,
+      'server-fwd',
+      WORKSPACE_ID,
+      false,
+      'Bearer A'
+    )
+    expect(aAgain.map((t) => t.name)).toEqual(['a-tool'])
+    expect(mockListTools).not.toHaveBeenCalled()
+  })
+
+  it('keeps the workspace-shared cache for plain servers (no marker)', async () => {
+    mockGetWorkspaceServersRows.mockResolvedValue([dbRow('server-plain', 'plain')])
+    mockListTools.mockResolvedValueOnce([tool('shared', 'server-plain')])
+
+    const aTools = await mcpService.discoverServerTools(USER_A, 'server-plain', WORKSPACE_ID)
+    expect(aTools.map((t) => t.name)).toEqual(['shared'])
+
+    // A different user reuses the same workspace-scoped entry — no re-list.
+    mockListTools.mockClear()
+    const bTools = await mcpService.discoverServerTools(USER_B, 'server-plain', WORKSPACE_ID)
+    expect(bTools.map((t) => t.name)).toEqual(['shared'])
+    expect(mockListTools).not.toHaveBeenCalled()
+  })
+})

@@ -40,18 +40,28 @@ import {
 } from '@/lib/mcp/types'
 import {
   applyForwardedAuthorization,
+  hasForwardMarker,
   MCP_CLIENT_CONSTANTS,
   MCP_CONSTANTS,
 } from '@/lib/mcp/utils'
 
 const logger = createLogger('McpService')
 
-function serverCacheKey(workspaceId: string, serverId: string): string {
-  return `workspace:${workspaceId}:server:${serverId}`
+/**
+ * Cache key for a server's discovered tools.
+ *
+ * `userScope` is set only for forward-auth servers (`X-Sim-Forward`), whose tool
+ * listing depends on the calling user's forwarded credential. Scoping keeps each
+ * user's view isolated so concurrent callers never race on — or read — another
+ * user's cached listing. Plain (workspace-shared) servers pass no scope.
+ */
+function serverCacheKey(workspaceId: string, serverId: string, userScope?: string): string {
+  const base = `workspace:${workspaceId}:server:${serverId}`
+  return userScope ? `${base}:user:${userScope}` : base
 }
 
-function failureCacheKey(workspaceId: string, serverId: string): string {
-  return `workspace:${workspaceId}:server:${serverId}:failure`
+function failureCacheKey(workspaceId: string, serverId: string, userScope?: string): string {
+  return `${serverCacheKey(workspaceId, serverId, userScope)}:failure`
 }
 
 const FAILURE_CACHE_SENTINEL: McpTool[] = []
@@ -82,6 +92,8 @@ class McpService {
     logger.info(`MCP Service initialized with ${getMcpCacheType()} cache`)
 
     if (mcpConnectionManager) {
+      // listChanged carries no user, so only the workspace-shared entry is
+      // invalidated here. Per-user forward-auth entries self-heal via TTL.
       this.unsubscribeConnectionManager = mcpConnectionManager.subscribe((event) => {
         this.cacheAdapter
           .delete(serverCacheKey(event.workspaceId, event.serverId))
@@ -399,14 +411,15 @@ class McpService {
   private async markServerUnhealthy(
     workspaceId: string,
     serverId: string,
-    error: unknown
+    error: unknown,
+    userScope?: string
   ): Promise<void> {
     if (error instanceof McpOauthAuthorizationRequiredError || error instanceof UnauthorizedError) {
       return
     }
     try {
       await this.cacheAdapter.set(
-        failureCacheKey(workspaceId, serverId),
+        failureCacheKey(workspaceId, serverId, userScope),
         FAILURE_CACHE_SENTINEL,
         MCP_CLIENT_CONSTANTS.FAILURE_CACHE_TTL_MS
       )
@@ -415,18 +428,26 @@ class McpService {
     }
   }
 
-  private async isServerUnhealthy(workspaceId: string, serverId: string): Promise<boolean> {
+  private async isServerUnhealthy(
+    workspaceId: string,
+    serverId: string,
+    userScope?: string
+  ): Promise<boolean> {
     try {
-      const entry = await this.cacheAdapter.get(failureCacheKey(workspaceId, serverId))
+      const entry = await this.cacheAdapter.get(failureCacheKey(workspaceId, serverId, userScope))
       return entry !== null
     } catch {
       return false
     }
   }
 
-  private async clearServerFailure(workspaceId: string, serverId: string): Promise<void> {
+  private async clearServerFailure(
+    workspaceId: string,
+    serverId: string,
+    userScope?: string
+  ): Promise<void> {
     try {
-      await this.cacheAdapter.delete(failureCacheKey(workspaceId, serverId))
+      await this.cacheAdapter.delete(failureCacheKey(workspaceId, serverId, userScope))
     } catch (err) {
       logger.warn(`Failed to clear failure cache for server ${serverId}:`, err)
     }
@@ -451,7 +472,8 @@ class McpService {
 
       const outcomes = await Promise.all(
         servers.map(async (config): Promise<DiscoveryOutcome> => {
-          const cacheKey = serverCacheKey(workspaceId, config.id)
+          const userScope = hasForwardMarker(config.headers) ? userId : undefined
+          const cacheKey = serverCacheKey(workspaceId, config.id, userScope)
 
           if (!forceRefresh) {
             try {
@@ -463,7 +485,7 @@ class McpService {
                 error
               )
             }
-            if (await this.isServerUnhealthy(workspaceId, config.id)) {
+            if (await this.isServerUnhealthy(workspaceId, config.id, userScope)) {
               logger.info(
                 `[${requestId}] Skipping recently-failed server ${config.name} (negative-cache hit)`
               )
@@ -516,6 +538,7 @@ class McpService {
 
       outcomes.forEach((outcome, index) => {
         const server = servers[index]
+        const userScope = hasForwardMarker(server.headers) ? userId : undefined
         if (outcome.kind === 'cached') {
           cachedCount++
           allTools.push(...outcome.tools)
@@ -529,12 +552,12 @@ class McpService {
           )
           cacheWrites.push(
             this.cacheAdapter
-              .set(serverCacheKey(workspaceId, server.id), outcome.tools, this.cacheTimeout)
+              .set(serverCacheKey(workspaceId, server.id, userScope), outcome.tools, this.cacheTimeout)
               .catch((err) =>
                 logger.warn(`[${requestId}] Cache write failed for ${server.name}:`, err)
               )
           )
-          deferredSideEffects.push(this.clearServerFailure(workspaceId, server.id))
+          deferredSideEffects.push(this.clearServerFailure(workspaceId, server.id, userScope))
           liveConnections.push({
             resolvedConfig: outcome.resolvedConfig,
             resolvedIP: outcome.resolvedIP,
@@ -571,9 +594,9 @@ class McpService {
         )
         deferredSideEffects.push(
           this.updateServerStatus(server.id, workspaceId, false, outcome.message),
-          this.markServerUnhealthy(workspaceId, server.id, outcome.originalError),
+          this.markServerUnhealthy(workspaceId, server.id, outcome.originalError, userScope),
           this.cacheAdapter
-            .delete(serverCacheKey(workspaceId, server.id))
+            .delete(serverCacheKey(workspaceId, server.id, userScope))
             .catch((err) =>
               logger.warn(`[${requestId}] Cache delete failed for ${server.name}:`, err)
             )
@@ -613,16 +636,22 @@ class McpService {
    * Discover tools from one server. Cache-aside by default; pass
    * `forceRefresh: true` from explicit-refresh paths (refresh button, OAuth
    * callback) to bypass both positive and negative caches. Concurrent callers
-   * for the same `(workspaceId, serverId, userId, forceRefresh)` share one
-   * upstream request.
+   * for the same `(workspaceId, serverId, userId, forceRefresh, forwarded)`
+   * share one upstream request.
+   *
+   * `forwardedAuthorization` is the caller's forwarded credential for
+   * `X-Sim-Forward` servers; when set, the listing reflects that identity and is
+   * cached under a per-user key so it never leaks to another user.
    */
   async discoverServerTools(
     userId: string,
     serverId: string,
     workspaceId: string,
-    forceRefresh = false
+    forceRefresh = false,
+    forwardedAuthorization?: string
   ): Promise<McpTool[]> {
-    const inflightKey = `${workspaceId}:${serverId}:${userId}:${forceRefresh ? 'force' : 'cache'}`
+    const forwardTag = forwardedAuthorization ? 'fwd' : 'nofwd'
+    const inflightKey = `${workspaceId}:${serverId}:${userId}:${forceRefresh ? 'force' : 'cache'}:${forwardTag}`
     const existing = this.inflightServerDiscovery.get(inflightKey)
     if (existing) return existing
 
@@ -630,7 +659,8 @@ class McpService {
       userId,
       serverId,
       workspaceId,
-      forceRefresh
+      forceRefresh,
+      forwardedAuthorization
     ).finally(() => {
       this.inflightServerDiscovery.delete(inflightKey)
     })
@@ -642,14 +672,23 @@ class McpService {
     userId: string,
     serverId: string,
     workspaceId: string,
-    forceRefresh: boolean
+    forceRefresh: boolean,
+    forwardedAuthorization?: string
   ): Promise<McpTool[]> {
     const requestId = generateRequestId()
     const maxRetries = 2
 
+    // Load config up front: whether the server forwards per-user credentials
+    // decides the cache scope, so it must be known before any cache read.
+    const config = await this.getServerConfig(serverId, workspaceId)
+    if (!config) {
+      throw new Error(`Server ${serverId} not found or not accessible`)
+    }
+    const userScope = hasForwardMarker(config.headers) ? userId : undefined
+
     if (!forceRefresh) {
       try {
-        const cached = await this.cacheAdapter.get(serverCacheKey(workspaceId, serverId))
+        const cached = await this.cacheAdapter.get(serverCacheKey(workspaceId, serverId, userScope))
         if (cached) {
           logger.debug(`[${requestId}] Cache hit for server ${serverId}`)
           return cached.tools
@@ -657,7 +696,7 @@ class McpService {
       } catch (error) {
         logger.warn(`[${requestId}] Cache read failed for server ${serverId}:`, error)
       }
-      if (await this.isServerUnhealthy(workspaceId, serverId)) {
+      if (await this.isServerUnhealthy(workspaceId, serverId, userScope)) {
         logger.info(`[${requestId}] Skipping recently-failed server ${serverId} (negative-cache)`)
         throw new McpConnectionError(
           'Server recently failed and is in cooldown — try again shortly.',
@@ -672,15 +711,14 @@ class McpService {
           `[${requestId}] Discovering tools from server ${serverId} for user ${userId}${attempt > 0 ? ` (attempt ${attempt + 1})` : ''}`
         )
 
-        const config = await this.getServerConfig(serverId, workspaceId)
-        if (!config) {
-          throw new Error(`Server ${serverId} not found or not accessible`)
-        }
-
         const { config: resolvedConfig, resolvedIP } = await this.resolveConfigEnvVars(
           config,
           userId,
           workspaceId
+        )
+        resolvedConfig.headers = applyForwardedAuthorization(
+          resolvedConfig.headers,
+          forwardedAuthorization
         )
         const client = await this.createClient(resolvedConfig, resolvedIP, userId)
 
@@ -689,11 +727,11 @@ class McpService {
           logger.info(`[${requestId}] Discovered ${tools.length} tools from server ${config.name}`)
           await Promise.allSettled([
             this.cacheAdapter
-              .set(serverCacheKey(workspaceId, serverId), tools, this.cacheTimeout)
+              .set(serverCacheKey(workspaceId, serverId, userScope), tools, this.cacheTimeout)
               .catch((err) =>
                 logger.warn(`[${requestId}] Cache write failed for ${config.name}:`, err)
               ),
-            this.clearServerFailure(workspaceId, serverId),
+            this.clearServerFailure(workspaceId, serverId, userScope),
             this.updateServerStatus(serverId, workspaceId, true, undefined, tools.length),
           ])
           return tools
@@ -712,11 +750,11 @@ class McpService {
         // Drop positive cache so a follow-up doesn't return stale tools.
         await Promise.allSettled([
           this.cacheAdapter
-            .delete(serverCacheKey(workspaceId, serverId))
+            .delete(serverCacheKey(workspaceId, serverId, userScope))
             .catch((err) =>
               logger.warn(`[${requestId}] Cache delete failed for ${serverId}:`, err)
             ),
-          this.markServerUnhealthy(workspaceId, serverId, error),
+          this.markServerUnhealthy(workspaceId, serverId, error, userScope),
         ])
         throw error
       }

@@ -18,6 +18,15 @@ function forwardMarkerEntry(
   )
 }
 
+/**
+ * Whether the config opts into per-user credential forwarding via the
+ * `X-Sim-Forward` marker. Such servers present a per-user identity upstream, so
+ * their tool listings must never be cached under a workspace-shared key.
+ */
+export function hasForwardMarker(headers: Record<string, string> | undefined): boolean {
+  return forwardMarkerEntry(headers) !== undefined
+}
+
 export function stripForwardMarkerHeader(
   headers: Record<string, string> | undefined
 ): Record<string, string> | undefined {

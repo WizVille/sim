@@ -105,7 +105,13 @@ export const POST = withRouteHandler(
 
         let tool: McpTool | null = null
         try {
-          const tools = await mcpService.discoverServerTools(userId, serverId, workspaceId)
+          const tools = await mcpService.discoverServerTools(
+            userId,
+            serverId,
+            workspaceId,
+            false,
+            body.forwardedAuthorization
+          )
           tool = tools.find((t) => t.name === toolName) ?? null
 
           if (!tool) {
