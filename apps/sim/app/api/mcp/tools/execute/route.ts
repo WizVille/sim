@@ -13,6 +13,7 @@ import { getExecutionTimeout } from '@/lib/core/execution-limits'
 import type { SubscriptionPlan } from '@/lib/core/rate-limiter/types'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { SIM_VIA_HEADER } from '@/lib/execution/call-chain'
+import { extractExecutionIdentityHeaders } from '@/lib/execution/execution-identity'
 import {
   mcpBodyReadErrorResponse,
   readMcpJsonBodyWithLimit,
@@ -213,11 +214,12 @@ export const POST = withRouteHandler(
         )
 
         const simViaHeader = request.headers.get(SIM_VIA_HEADER)
-        const extraHeaders: Record<string, string> = {}
+        const extraHeaders: Record<string, string> = extractExecutionIdentityHeaders(
+          request.headers
+        )
         if (simViaHeader) {
           extraHeaders[SIM_VIA_HEADER] = simViaHeader
         }
-
 
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined
         const executePromise = mcpService.executeTool(

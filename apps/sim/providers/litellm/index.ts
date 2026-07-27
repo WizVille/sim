@@ -3,6 +3,7 @@ import { getErrorMessage, toError } from '@sim/utils/errors'
 import OpenAI from 'openai'
 import type { ChatCompletionCreateParamsStreaming } from 'openai/resources/chat/completions'
 import { env } from '@/lib/core/config/env'
+import { buildExecutionIdentityHeaders } from '@/lib/execution/execution-identity'
 import type { StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
 import { formatMessagesForProvider } from '@/providers/attachments'
@@ -107,6 +108,11 @@ export const litellmProvider: ProviderConfig = {
     const litellm = new OpenAI({
       apiKey,
       baseURL: `${baseUrl}/v1`,
+      defaultHeaders: buildExecutionIdentityHeaders({
+        workflowId: request.workflowId,
+        blockId: request.blockId,
+        executionId: request.executionId,
+      }),
     })
 
     const allMessages: Message[] = []

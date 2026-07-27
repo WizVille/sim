@@ -264,6 +264,19 @@ describe('AgentBlockHandler', () => {
       expect(result).toEqual(expectedOutput)
     })
 
+    it('should forward the block id and execution id to the provider', async () => {
+      const inputs = { model: 'gpt-4o', userPrompt: 'Hello!', apiKey: 'test-api-key' }
+
+      mockGetProviderFromModel.mockReturnValue('openai')
+
+      await handler.execute({ ...mockContext, executionId: 'test-execution' }, mockBlock, inputs)
+
+      const requestBody = mockExecuteProviderRequest.mock.calls[0][1]
+      expect(requestBody.blockId).toBe('test-agent-block')
+      expect(requestBody.executionId).toBe('test-execution')
+      expect(requestBody.workflowId).toBe('test-workflow')
+    })
+
     it('should attach files to the last user message only', async () => {
       const inputs = {
         model: 'gpt-4o',

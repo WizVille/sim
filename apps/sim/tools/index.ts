@@ -26,6 +26,7 @@ import { getBaseUrl, getInternalApiBaseUrl } from '@/lib/core/utils/urls'
 import { isUserFile } from '@/lib/core/utils/user-file'
 import { isSameOrigin } from '@/lib/core/utils/validation'
 import { SIM_VIA_HEADER, serializeCallChain } from '@/lib/execution/call-chain'
+import { buildExecutionIdentityHeaders } from '@/lib/execution/execution-identity'
 import { parseMcpToolId } from '@/lib/mcp/utils'
 import { hostedKeyMetrics } from '@/lib/monitoring/metrics'
 import { resolveWorkspaceFileReference } from '@/lib/uploads/contexts/workspace/workspace-file-manager'
@@ -54,6 +55,7 @@ interface ToolExecutionScope {
   workflowId?: string
   userId?: string
   executionId?: string
+  blockId?: string
   callChain?: string[]
   isDeployedContext?: boolean
   enforceCredentialAccess?: boolean
@@ -71,6 +73,7 @@ function resolveToolScope(
     workflowId: (executionContext?.workflowId ?? ctx?.workflowId) as string | undefined,
     userId: (executionContext?.userId ?? ctx?.userId) as string | undefined,
     executionId: (executionContext?.executionId ?? ctx?.executionId) as string | undefined,
+    blockId: ctx?.blockId as string | undefined,
     callChain: (executionContext?.callChain ?? ctx?.callChain) as string[] | undefined,
     isDeployedContext: (executionContext?.isDeployedContext ?? ctx?.isDeployedContext) as
       | boolean
@@ -2141,6 +2144,14 @@ async function executeMcpTool(
     if (mcpScope.callChain && mcpScope.callChain.length > 0) {
       headers[SIM_VIA_HEADER] = serializeCallChain(mcpScope.callChain)
     }
+    Object.assign(
+      headers,
+      buildExecutionIdentityHeaders({
+        workflowId: mcpScope.workflowId,
+        blockId: mcpScope.blockId,
+        executionId: mcpScope.executionId,
+      })
+    )
     if (mcpScope.billingAttribution) {
       headers[BILLING_ATTRIBUTION_HEADER] = serializeBillingAttributionHeader(
         mcpScope.billingAttribution

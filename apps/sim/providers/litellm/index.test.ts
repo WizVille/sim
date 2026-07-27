@@ -68,6 +68,7 @@ vi.mock('@/providers/utils', () => ({
   enforceStrictSchema: vi.fn((schema) => ({ ...schema, additionalProperties: false })),
 }))
 
+import OpenAI from 'openai'
 import { litellmProvider } from '@/providers/litellm'
 import { ProviderError } from '@/providers/types'
 
@@ -101,6 +102,7 @@ function run(request: Record<string, unknown>) {
   } as never) as Promise<any>
 }
 
+const clientOptions = () => vi.mocked(OpenAI).mock.calls[0][0] as Record<string, unknown>
 const firstPayload = () => mockCreate.mock.calls[0][0]
 const lastPayload = () => mockCreate.mock.calls.at(-1)![0]
 
@@ -283,6 +285,22 @@ describe('litellmProvider.executeRequest', () => {
     expect(firstPayload().stream_options).toEqual({ include_usage: true })
     expect(result.stream).toBeInstanceOf(ReadableStream)
     expect(result.execution.isStreaming).toBe(true)
+  })
+
+  it('forwards the execution identity as default headers', async () => {
+    await run({ workflowId: 'wf-1', blockId: 'block-1', executionId: 'exec-1' })
+
+    expect(clientOptions().defaultHeaders).toEqual({
+      'X-Sim-Workflow-Id': 'wf-1',
+      'X-Sim-Block-Id': 'block-1',
+      'X-Sim-Execution-Id': 'exec-1',
+    })
+  })
+
+  it('omits identity headers that are absent from the request', async () => {
+    await run({ workflowId: 'wf-1' })
+
+    expect(clientOptions().defaultHeaders).toEqual({ 'X-Sim-Workflow-Id': 'wf-1' })
   })
 
   it('wraps API errors in a ProviderError using the error envelope message', async () => {

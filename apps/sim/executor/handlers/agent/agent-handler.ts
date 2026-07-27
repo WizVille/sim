@@ -1019,6 +1019,8 @@ export class AgentBlockHandler implements BlockHandler {
         workflowId: providerRequest.workflowId,
         workspaceId: ctx.workspaceId,
         userId: ctx.userId,
+        blockId: block.id,
+        executionId: ctx.executionId,
         stream: providerRequest.stream,
         messages: 'messages' in providerRequest ? providerRequest.messages : undefined,
         environmentVariables: normalizeStringRecord(ctx.environmentVariables),
