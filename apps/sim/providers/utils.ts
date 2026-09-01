@@ -1561,8 +1561,6 @@ export function prepareToolExecution(
     workspaceId?: string
     chatId?: string
     userId?: string
-    blockId?: string
-    executionId?: string
     environmentVariables?: Record<string, any>
     workflowVariables?: Record<string, any>
     blockData?: Record<string, any>
@@ -1652,9 +1650,7 @@ export function prepareToolExecution(
 
   const executionParams = {
     ...toolParams,
-    ...(typeof _mcpAuthorization === 'string' && _mcpAuthorization
-      ? { _mcpAuthorization }
-      : {}),
+    ...(typeof _mcpAuthorization === 'string' && _mcpAuthorization ? { _mcpAuthorization } : {}),
     ...(request.workflowId || request.billingAttribution
       ? {
           _context: {
@@ -1662,8 +1658,6 @@ export function prepareToolExecution(
             ...(request.workspaceId ? { workspaceId: request.workspaceId } : {}),
             ...(request.chatId ? { chatId: request.chatId } : {}),
             ...(request.userId ? { userId: request.userId } : {}),
-            ...(request.blockId ? { blockId: request.blockId } : {}),
-            ...(request.executionId ? { executionId: request.executionId } : {}),
             ...(request.isDeployedContext !== undefined
               ? { isDeployedContext: request.isDeployedContext }
               : {}),

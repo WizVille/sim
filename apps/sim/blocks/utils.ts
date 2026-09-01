@@ -12,7 +12,6 @@ import type { SubBlockConfig } from '@/blocks/types'
 import {
   getBaseModelProviders,
   getHostedModels,
-  getModelSunsetStatus,
   getProviderIcon,
   getProviderModels,
   isAutoModel,
@@ -77,7 +76,7 @@ export function getModelOptions() {
       ...togetherModels,
       ...basetenModels,
     ])
-  ).filter(m => !m.includes('fallback'))
+  ).filter((m) => !m.includes('fallback'))
 
   const options = litellmModels.map((model) => {
     const icon = getProviderIcon(model)
@@ -289,7 +288,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       required: false,
       condition: {
         field: 'model',
-        value: [] || VERTEX_MODELS,
+        value: [],
       },
     },
     {
@@ -302,7 +301,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       required: false,
       condition: {
         field: 'model',
-        value: [] || VERTEX_MODELS,
+        value: [],
       },
     },
     {
@@ -313,7 +312,6 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       password: true,
       connectionDroppable: false,
       required: false,
-      condition: [] || getApiKeyCondition(),
     },
     {
       id: 'azureEndpoint',
@@ -325,7 +323,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       hideWhenEnvSet: 'NEXT_PUBLIC_AZURE_CONFIGURED',
       condition: {
         field: 'model',
-        value: [] || AZURE_MODELS,
+        value: [],
       },
     },
     {
@@ -337,7 +335,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       hideWhenEnvSet: 'NEXT_PUBLIC_AZURE_CONFIGURED',
       condition: {
         field: 'model',
-        value: [] || AZURE_MODELS,
+        value: [],
       },
     },
     {
@@ -350,7 +348,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       required: false,
       condition: {
         field: 'model',
-        value: [] || VERTEX_MODELS,
+        value: [],
       },
     },
     {
@@ -362,7 +360,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       required: false,
       condition: {
         field: 'model',
-        value: [] || VERTEX_MODELS,
+        value: [],
       },
     },
     {

@@ -149,7 +149,10 @@ export async function checkSessionOrInternalAuth(
       const userId = new URL(request.url).searchParams.get('userId')
 
       if (verification.valid) {
-        return resolveUserFromJwt({ ...verification, userId: verification.userId || userId || null }, options)
+        return resolveUserFromJwt(
+          { ...verification, userId: verification.userId || userId || undefined },
+          options
+        )
       }
     }
 

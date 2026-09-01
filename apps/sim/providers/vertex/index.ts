@@ -1,7 +1,7 @@
 import { GoogleGenAI } from '@google/genai'
 import { createLogger } from '@sim/logger'
 import { OAuth2Client } from 'google-auth-library'
-import { getEnv, env } from '@/lib/core/config/env'
+import { env, getEnv } from '@/lib/core/config/env'
 import {
   validateGoogleCloudLocation,
   validateGoogleCloudProject,
@@ -14,15 +14,17 @@ import type { ProviderConfig, ProviderRequest, ProviderResponse } from '@/provid
 const logger = createLogger('VertexProvider')
 
 const getAccessToken = async (): Promise<string> => {
-  const endpoint = getEnv('NEXT_PUBLIC_WIZVILLE_APP_URL') || getEnv('NEXT_PUBLIC_APP_URL').replace("ai.", "app.").replace("3003", "3000")
+  const endpoint =
+    getEnv('NEXT_PUBLIC_WIZVILLE_APP_URL') ||
+    (getEnv('NEXT_PUBLIC_APP_URL') ?? '').replace('ai.', 'app.').replace('3003', '3000')
   const response = await fetch(
     `${endpoint}/api/ilovellm/google_access_token?hsa=${getEnv('NEXT_PUBLIC_HELICONE_SA')}`,
     {
       headers: {
         'Content-Type': 'application/json',
-      }
+      },
     }
-  );
+  )
   const body = await response.json()
   return body.token
 }

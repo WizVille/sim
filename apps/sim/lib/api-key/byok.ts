@@ -395,5 +395,8 @@ export async function getApiKeyWithBYOK(
     // throw new Error(`API key is required for ${provider} ${model}`)
   }
 
-  return { apiKey: userProvidedKey, isBYOK: false }
+  // Non-null assertion rather than a default, so the runtime value is unchanged: the throw above
+  // is commented out on purpose (the LiteLLM gateway supplies the credential), which is what lets
+  // this return with no key. Mirrors `getApiKey` in `@/providers/utils`.
+  return { apiKey: userProvidedKey!, isBYOK: false }
 }

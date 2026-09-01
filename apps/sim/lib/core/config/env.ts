@@ -79,7 +79,13 @@ function readDocumentPublicEnv(): Record<string, string> | null {
  */
 const getEnv = (variable: string): string | undefined => {
   if (typeof window === 'undefined') return process.env[variable]
-  return window.__ENV?.[variable] ?? readDocumentPublicEnv()?.[variable] ?? process.env[variable] ?? env[variable as keyof typeof env]
+  const parsed = env[variable as keyof typeof env]
+  return (
+    window.__ENV?.[variable] ??
+    readDocumentPublicEnv()?.[variable] ??
+    process.env[variable] ??
+    (parsed === undefined ? undefined : String(parsed))
+  )
 }
 
 /**

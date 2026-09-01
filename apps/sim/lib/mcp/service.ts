@@ -490,7 +490,8 @@ class McpService {
     workspaceId: string,
     extraHeaders?: Record<string, string>,
     onResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceCallback,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    forwardedAuthorization?: string
   ): () => Promise<McpClient> {
     return async () => {
       const {
@@ -506,6 +507,13 @@ class McpService {
       if (extraHeaders) {
         resolvedConfig.headers = { ...resolvedConfig.headers, ...extraHeaders }
       }
+      // Unconditional: `applyForwardedAuthorization` also strips the opt-in marker header, which
+      // is Sim's own configuration signal and must never reach the server — including on the
+      // discovery path, where no caller credential is forwarded.
+      resolvedConfig.headers = applyForwardedAuthorization(
+        resolvedConfig.headers,
+        forwardedAuthorization
+      )
       return this.createClient(
         resolvedConfig,
         resolvedIP,
@@ -528,7 +536,8 @@ class McpService {
     userId: string,
     workspaceId: string,
     onResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceCallback,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    forwardedAuthorization?: string
   ): Promise<McpTool[]> {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted()
@@ -537,7 +546,7 @@ class McpService {
           {
             key: this.poolKey(config.id, workspaceId, userId),
             serverId: config.id,
-            allowPool: true,
+            allowPool: !forwardedAuthorization,
           },
           this.buildClient(
             config,
@@ -545,7 +554,8 @@ class McpService {
             workspaceId,
             undefined,
             onResolvedSecretTraceProvenance,
-            signal
+            signal,
+            forwardedAuthorization
           ),
           (client) => {
             reportRetainedClientProvenance(
@@ -617,12 +627,12 @@ class McpService {
     workspaceId: string,
     extraHeaders?: Record<string, string>,
     onResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceCallback,
-    options: McpToolExecutionOptions = {},
-    forwardedAuthorization?: string
+    options: McpToolExecutionOptions & { forwardedAuthorization?: string } = {}
   ): Promise<McpToolResult> {
     const requestId = generateRequestId()
     const maxRetries = 2
     const reportProvenance = createInvocationProvenanceReporter(onResolvedSecretTraceProvenance)
+    const forwardedAuthorization = options.forwardedAuthorization
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       options.signal?.throwIfAborted()
@@ -641,7 +651,9 @@ class McpService {
           {
             key: this.poolKey(serverId, workspaceId, userId),
             serverId,
-            allowPool: !hasExtraHeaders,
+            // A forwarded caller credential is per-request and can be rotated between two calls
+            // by the same user, so the connection carrying it must not outlive the call.
+            allowPool: !hasExtraHeaders && !forwardedAuthorization,
           },
           this.buildClient(
             config,
@@ -649,7 +661,8 @@ class McpService {
             workspaceId,
             hasExtraHeaders ? extraHeaders : undefined,
             reportProvenance,
-            options.signal
+            options.signal,
+            forwardedAuthorization
           ),
           (client) => {
             reportRetainedClientProvenance(
@@ -661,22 +674,8 @@ class McpService {
             return client.callTool(toolCall, options)
           }
         )
-        if (extraHeaders && Object.keys(extraHeaders).length > 0) {
-          resolvedConfig.headers = { ...resolvedConfig.headers, ...extraHeaders }
-        }
-        resolvedConfig.headers = applyForwardedAuthorization(
-          resolvedConfig.headers,
-          forwardedAuthorization
-        )
-        const client = await this.createClient(resolvedConfig, resolvedIP, userId)
-
-        try {
-          const result = await client.callTool(toolCall, options)
-          logger.info(`[${requestId}] Successfully executed tool ${toolCall.name}`)
-          return result
-        } finally {
-          await client.disconnect()
-        }
+        logger.info(`[${requestId}] Successfully executed tool ${toolCall.name}`)
+        return result
       } catch (error) {
         options.signal?.throwIfAborted()
         // A stale session (400/404) or a rotated/revoked credential (401) is rejected
@@ -916,7 +915,10 @@ class McpService {
             }
           }
 
-          if (refresh !== 'force' && (await this.isServerUnhealthy(workspaceId, config.id, userScope))) {
+          if (
+            refresh !== 'force' &&
+            (await this.isServerUnhealthy(workspaceId, config.id, userScope))
+          ) {
             logger.info(
               `[${requestId}] Skipping recently-failed server ${config.name} (negative-cache hit)`
             )
@@ -970,7 +972,11 @@ class McpService {
           )
           cacheWrites.push(
             this.cacheAdapter
-              .set(serverCacheKey(workspaceId, server.id, userScope), outcome.tools, this.cacheTimeout)
+              .set(
+                serverCacheKey(workspaceId, server.id, userScope),
+                outcome.tools,
+                this.cacheTimeout
+              )
               .catch((err) =>
                 logger.warn(`[${requestId}] Cache write failed for ${server.name}:`, err)
               )
@@ -1173,34 +1179,24 @@ class McpService {
           userId,
           workspaceId,
           onResolvedSecretTraceProvenance,
-          signal
-        )
-        resolvedConfig.headers = applyForwardedAuthorization(
-          resolvedConfig.headers,
+          signal,
           forwardedAuthorization
         )
-        const client = await this.createClient(resolvedConfig, resolvedIP, userId)
-
-        try {
-          const tools = await client.listTools()
-          logger.info(`[${requestId}] Discovered ${tools.length} tools from server ${config.name}`)
-          await Promise.allSettled([
-            this.cacheAdapter
-              .set(serverCacheKey(workspaceId, serverId, userScope), tools, this.cacheTimeout)
-              .catch((err) =>
-                logger.warn(`[${requestId}] Cache write failed for ${config.name}:`, err)
-              ),
-            this.clearServerFailure(workspaceId, serverId, userScope),
-            this.updateServerStatus(serverId, workspaceId, {
-              outcome: 'connected',
-              toolCount: tools.length,
-              discoveryStartedAt,
-            }),
-          ])
-          return tools
-        } finally {
-          await client.disconnect()
-        }
+        logger.info(`[${requestId}] Discovered ${tools.length} tools from server ${config.name}`)
+        await Promise.allSettled([
+          this.cacheAdapter
+            .set(serverCacheKey(workspaceId, serverId, userScope), tools, this.cacheTimeout)
+            .catch((err) =>
+              logger.warn(`[${requestId}] Cache write failed for ${config.name}:`, err)
+            ),
+          this.clearServerFailure(workspaceId, serverId, userScope),
+          this.updateServerStatus(serverId, workspaceId, {
+            outcome: 'connected',
+            toolCount: tools.length,
+            discoveryStartedAt,
+          }),
+        ])
+        return tools
       } catch (error) {
         signal?.throwIfAborted()
         if (isRetryableDiscoveryError(error) && attempt < maxRetries - 1) {

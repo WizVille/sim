@@ -318,7 +318,6 @@ export class GenericBlockHandler implements BlockHandler {
             userId: ctx.userId,
             isDeployedContext: ctx.isDeployedContext,
             enforceCredentialAccess: ctx.enforceCredentialAccess,
-            blockId: block.id,
             /*
              * The identity a `keyed` tool derives its provider idempotency token
              * from. `executionOrder` is assigned before the block executor's

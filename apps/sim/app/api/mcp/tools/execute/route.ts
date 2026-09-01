@@ -110,8 +110,9 @@ export const POST = withRouteHandler(
             userId,
             serverId,
             workspaceId,
-            false,
-            body.forwardedAuthorization
+            'cache-aside',
+            undefined,
+            { forwardedAuthorization: body.forwardedAuthorization }
           )
           tool = tools.find((t) => t.name === toolName) ?? null
 
@@ -228,7 +229,8 @@ export const POST = withRouteHandler(
           toolCall,
           workspaceId,
           extraHeaders,
-          body.forwardedAuthorization
+          undefined,
+          { forwardedAuthorization: body.forwardedAuthorization }
         )
         // A zero timeout means "no timeout" (billing-disabled deployments).
         const result = await (executionTimeout > 0

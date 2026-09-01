@@ -716,6 +716,8 @@ describe('McpService.discoverTools per-server caching', () => {
 describe('McpService.executeTool — forwarded Authorization (X-Sim-Forward)', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
+    resetDbChainMock()
+    wireSelectsToWorkspaceRows()
     mockIsDomainAllowed.mockReturnValue(true)
     mockValidateSsrf.mockResolvedValue(null)
     mockResolveEnvVars.mockImplementation(async (config: unknown) => ({
@@ -746,7 +748,8 @@ describe('McpService.executeTool — forwarded Authorization (X-Sim-Forward)', (
       { name: 'run_query', arguments: {} },
       WORKSPACE_ID,
       undefined,
-      'Bearer caller-credential'
+      undefined,
+      { forwardedAuthorization: 'Bearer caller-credential' }
     )
 
     expect(clientHeaders()?.Authorization).toBe('Bearer caller-credential')
@@ -784,7 +787,8 @@ describe('McpService.executeTool — forwarded Authorization (X-Sim-Forward)', (
       { name: 'run_query', arguments: {} },
       WORKSPACE_ID,
       undefined,
-      'Bearer caller-credential'
+      undefined,
+      { forwardedAuthorization: 'Bearer caller-credential' }
     )
 
     expect(clientHeaders()?.Authorization).toBe('Bearer static-config')
@@ -797,6 +801,8 @@ describe('McpService.discoverServerTools — per-user cache scope (X-Sim-Forward
 
   beforeEach(async () => {
     vi.clearAllMocks()
+    resetDbChainMock()
+    wireSelectsToWorkspaceRows()
     mockListTools.mockReset()
     mockIsDomainAllowed.mockReturnValue(true)
     mockValidateSsrf.mockResolvedValue('1.2.3.4')
@@ -828,8 +834,9 @@ describe('McpService.discoverServerTools — per-user cache scope (X-Sim-Forward
       USER_A,
       'server-fwd',
       WORKSPACE_ID,
-      false,
-      'Bearer A'
+      'cache-aside',
+      undefined,
+      { forwardedAuthorization: 'Bearer A' }
     )
     expect(aTools.map((t) => t.name)).toEqual(['a-tool'])
     expect(lastClientHeaders()?.Authorization).toBe('Bearer A')
@@ -840,8 +847,9 @@ describe('McpService.discoverServerTools — per-user cache scope (X-Sim-Forward
       USER_B,
       'server-fwd',
       WORKSPACE_ID,
-      false,
-      'Bearer B'
+      'cache-aside',
+      undefined,
+      { forwardedAuthorization: 'Bearer B' }
     )
     expect(bTools.map((t) => t.name)).toEqual(['b-tool'])
     expect(lastClientHeaders()?.Authorization).toBe('Bearer B')
@@ -853,8 +861,9 @@ describe('McpService.discoverServerTools — per-user cache scope (X-Sim-Forward
       USER_A,
       'server-fwd',
       WORKSPACE_ID,
-      false,
-      'Bearer A'
+      'cache-aside',
+      undefined,
+      { forwardedAuthorization: 'Bearer A' }
     )
     expect(aAgain.map((t) => t.name)).toEqual(['a-tool'])
     expect(mockListTools).not.toHaveBeenCalled()

@@ -63,6 +63,9 @@ export async function validateUrlWithDNS(
   const cleanHostname = unwrapIpv6Brackets(hostnameLower)
 
   const isLocalhost = cleanHostname === 'localhost' || isLoopbackIp(cleanHostname)
+  // The local gateway answers on a private, non-loopback address, so it needs an exemption of
+  // its own. Safe to leave ungated: a `.localhost` name is only ever answered by the resolver
+  // on the machine making the request.
   const isWizvilleLocalhost = cleanHostname === 'app.wizville.localhost'
 
   try {
@@ -73,17 +76,13 @@ export async function validateUrlWithDNS(
     // public one — with no operator opt-out on this path.
     const { addresses } = await resolveHostAddresses(cleanHostname)
     const usable = addresses.filter(
-      (address) => !isPrivateIp(address) || (isLocalhost && !isHosted && isLoopbackIp(address))
+      (address) =>
+        !isPrivateIp(address) ||
+        isWizvilleLocalhost ||
+        (isLocalhost && !isHosted && isLoopbackIp(address))
     )
 
-    const resolvedIsLoopback = isLoopbackIp(address)
-
-    if (
-      usable.length === 0 ||
-      (!isWizvilleLocalhost &&
-        isPrivateOrReservedIP(address) &&
-        !(isLocalhost && resolvedIsLoopback && !isHosted))
-    ) {
+    if (usable.length === 0) {
       logger.warn('URL resolves to blocked IP address', {
         paramName,
         hostname,
@@ -1048,7 +1047,9 @@ export async function secureFetchWithPinnedIP(
     }
 
     const { 'accept-encoding': _, ...sanitizedHeaders } = options.headers ?? {}
-    const requestOptions: http.RequestOptions = {
+    // `https.RequestOptions` rather than `http`'s: it is the one that carries the TLS options,
+    // and `http.request` ignores them when the target is plain http.
+    const requestOptions: https.RequestOptions = {
       hostname: parsed.hostname,
       port,
       path: parsed.pathname + parsed.search,
@@ -1056,7 +1057,7 @@ export async function secureFetchWithPinnedIP(
       headers: sanitizedHeaders,
       agent,
       timeout: options.timeout || 300000,
-      rejectUnauthorized: (parsed.hostname.endsWith('.wizville.localhost') ? false : true),
+      rejectUnauthorized: !parsed.hostname.endsWith('.wizville.localhost'),
     }
 
     const protocol = isHttps ? https : http

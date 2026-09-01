@@ -180,10 +180,6 @@ export interface ProviderRequest {
   workspaceId?: string
   chatId?: string
   userId?: string
-  /** ID of the block that issued this request, propagated to tools it invokes */
-  blockId?: string
-  /** ID of the workflow execution this request belongs to */
-  executionId?: string
   stream?: boolean
   /**
    * Run-level agent-events opt-in. Lets providers request streamable thinking

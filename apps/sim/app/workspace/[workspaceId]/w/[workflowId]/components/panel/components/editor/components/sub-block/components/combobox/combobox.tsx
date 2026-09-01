@@ -16,6 +16,7 @@ import { useAccessibleReferencePrefixes } from '@/app/workspace/[workspaceId]/w/
 import type { SubBlockConfig } from '@/blocks/types'
 import type { SelectorKey } from '@/hooks/selectors/types'
 import { usePermissionConfig } from '@/hooks/use-permission-config'
+import { useProvidersStore } from '@/stores/providers/store'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
 import { useSubBlockStore } from '@/stores/workflows/subblock/store'
 
@@ -125,6 +126,21 @@ export const ComboBox = memo(function ComboBox({
       : undefined
   )
 
+  /**
+   * Subscription that lets an options *function* see models discovered after mount.
+   *
+   * The dynamic providers (Ollama, vLLM, LiteLLM, OpenRouter, …) land in the providers store once
+   * `ProviderModelsLoader` has fetched them, routinely after this control mounts, and
+   * `getModelOptions` reads that store imperatively — so without a subscription the memo below
+   * keeps the snapshot it took on its first run. A deployment whose model dropdown is built
+   * entirely from a dynamic provider then shows an empty list for as long as the control stays
+   * mounted. `null` for a static list, so those controls keep their current render count;
+   * `state.providers` is reference-stable between store writes.
+   */
+  const providerModels = useProvidersStore((state) =>
+    typeof options === 'function' ? state.providers : null
+  )
+
   const staticOptions = useMemo(() => {
     const opts =
       typeof options === 'function'
@@ -136,7 +152,7 @@ export const ComboBox = memo(function ComboBox({
     }
 
     return opts
-  }, [options, blockValues, subBlockId, isModelUsable])
+  }, [options, blockValues, subBlockId, isModelUsable, providerModels])
 
   const {
     fetchedOptions,
