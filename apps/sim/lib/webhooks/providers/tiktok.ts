@@ -1,6 +1,7 @@
 import { createLogger } from '@sim/logger'
 import { safeCompare } from '@sim/security/compare'
 import { hmacSha256Hex } from '@sim/security/hmac'
+import { toRecord, toRecordOrNull } from '@sim/utils/object'
 import { NextResponse } from 'next/server'
 import { env } from '@/lib/core/config/env'
 import type {
@@ -93,20 +94,15 @@ export function verifyTikTokSignature(
   return null
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  return value as Record<string, unknown>
-}
-
 /**
  * Parse the TikTok envelope `content` field (a JSON string) into an object.
  */
 export function parseTikTokContent(content: unknown): Record<string, unknown> {
   if (typeof content !== 'string' || content.length === 0) {
-    return asRecord(content) ?? {}
+    return toRecord(content)
   }
   try {
-    return asRecord(JSON.parse(content)) ?? {}
+    return toRecord(JSON.parse(content))
   } catch {
     logger.warn('Failed to parse TikTok webhook content JSON string')
     return {}
@@ -141,7 +137,7 @@ export const tiktokHandler: WebhookProviderHandler = {
     if (!triggerId) return true
 
     const { isTikTokEventMatch } = await import('@/triggers/tiktok/utils')
-    const event = stringField(asRecord(body) ?? {}, 'event')
+    const event = stringField(toRecord(body), 'event')
     if (!isTikTokEventMatch(triggerId, event)) {
       logger.debug(
         `[${requestId}] TikTok event mismatch for trigger ${triggerId}. Event: ${event}. Skipping.`
@@ -152,7 +148,7 @@ export const tiktokHandler: WebhookProviderHandler = {
   },
 
   async formatInput({ body }: FormatInputContext): Promise<FormatInputResult> {
-    const envelope = asRecord(body) ?? {}
+    const envelope = toRecord(body)
     const content = parseTikTokContent(envelope.content)
     const event = typeof envelope.event === 'string' ? envelope.event : ''
     const commonInput: Record<string, unknown> = {
@@ -201,20 +197,11 @@ export const tiktokHandler: WebhookProviderHandler = {
       }
     }
 
-    if (event === 'video.publish.completed' || event === 'video.upload.failed') {
-      return {
-        input: {
-          ...commonInput,
-          shareId: stringField(content, 'share_id') ?? null,
-        },
-      }
-    }
-
     return { input: commonInput }
   },
 
   extractIdempotencyId(body: unknown) {
-    const envelope = asRecord(body)
+    const envelope = toRecordOrNull(body)
     if (!envelope) return null
 
     const event = typeof envelope.event === 'string' ? envelope.event : null
@@ -224,7 +211,6 @@ export const tiktokHandler: WebhookProviderHandler = {
     const content = parseTikTokContent(envelope.content)
     const publishId = stringField(content, 'publish_id')
     const postId = stringField(content, 'post_id')
-    const shareId = stringField(content, 'share_id')
     const createTime =
       typeof envelope.create_time === 'number' || typeof envelope.create_time === 'string'
         ? String(envelope.create_time)
@@ -236,7 +222,7 @@ export const tiktokHandler: WebhookProviderHandler = {
     } else if (event === 'post.publish.complete' && publishId && createTime) {
       unique = `${publishId}:${createTime}`
     } else {
-      unique = publishId ?? shareId ?? createTime
+      unique = publishId ?? createTime
     }
     if (!unique) return null
 

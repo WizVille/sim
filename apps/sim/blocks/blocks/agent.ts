@@ -3,8 +3,10 @@ import { AgentIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
 import {
+  getModelCapabilityCondition,
   getModelOptions,
   getProviderCredentialSubBlocks,
+  getSerializedModelProviderId,
   normalizeFileInput,
   RESPONSE_FORMAT_WAND_CONFIG,
 } from '@/blocks/utils'
@@ -13,22 +15,26 @@ import {
   getMaxTemperature,
   getModelsWithDeepResearch,
   getModelsWithoutMemory,
+  getModelsWithPromptCaching,
   getModelsWithReasoningEffort,
   getModelsWithThinking,
   getModelsWithVerbosity,
   getReasoningEffortValuesForModel,
   getThinkingLevelsForModel,
   getVerbosityValuesForModel,
+  isAutoModel,
   supportsTemperature,
 } from '@/providers/models'
-import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
-import { useSubBlockStore } from '@/stores/workflows/subblock/store'
 import type { ToolResponse } from '@/tools/types'
 
 const logger = createLogger('AgentBlock')
+
+/** Model the agent block falls back to when `model` is unset or the auto pseudo-model. */
+const AGENT_FALLBACK_MODEL = 'claude-sonnet-5'
 const MODELS_WITH_REASONING_EFFORT = getModelsWithReasoningEffort()
 const MODELS_WITH_VERBOSITY = getModelsWithVerbosity()
 const MODELS_WITH_THINKING = getModelsWithThinking()
+const MODELS_WITH_PROMPT_CACHING = getModelsWithPromptCaching()
 const MODELS_WITH_DEEP_RESEARCH = getModelsWithDeepResearch()
 const MODELS_WITHOUT_MEMORY = getModelsWithoutMemory()
 
@@ -82,6 +88,16 @@ export const AgentBlock: BlockConfig<AgentResponse> = {
   integrationType: IntegrationType.AI,
   bgColor: 'var(--brand)',
   icon: AgentIcon,
+  canvasPresentation: {
+    defaultTitle: 'Agent',
+    sentences: {
+      default: [
+        { text: 'Prompt', field: 'model', core: true },
+        { text: 'with', field: 'messages' },
+        { text: ', using', field: 'tools' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'messages',
@@ -156,156 +172,78 @@ Return ONLY the JSON array.`,
     {
       id: 'reasoningEffort',
       title: 'Reasoning Effort',
-      type: 'dropdown',
-      placeholder: 'Select reasoning effort...',
-      options: [
-        { label: 'auto', id: 'auto' },
-        { label: 'low', id: 'low' },
-        { label: 'medium', id: 'medium' },
-        { label: 'high', id: 'high' },
-      ],
+      type: 'combobox',
+      placeholder: 'Type or select reasoning effort...',
       dependsOn: ['model'],
-      fetchOptions: async (blockId: string) => {
+      options: (params) => {
         const autoOption = { label: 'auto', id: 'auto' }
-
-        const activeWorkflowId = useWorkflowRegistry.getState().activeWorkflowId
-        if (!activeWorkflowId) {
-          return [
-            autoOption,
-            { label: 'low', id: 'low' },
-            { label: 'medium', id: 'medium' },
-            { label: 'high', id: 'high' },
-          ]
-        }
-
-        const workflowValues = useSubBlockStore.getState().workflowValues[activeWorkflowId]
-        const blockValues = workflowValues?.[blockId]
-        const modelValue = blockValues?.model as string
-
-        if (!modelValue) {
-          return [
-            autoOption,
-            { label: 'low', id: 'low' },
-            { label: 'medium', id: 'medium' },
-            { label: 'high', id: 'high' },
-          ]
-        }
-
+        const fallback = [
+          autoOption,
+          { label: 'low', id: 'low' },
+          { label: 'medium', id: 'medium' },
+          { label: 'high', id: 'high' },
+        ]
+        const modelValue = params?.values.model
+        if (typeof modelValue !== 'string' || !modelValue) return fallback
         const validOptions = getReasoningEffortValuesForModel(modelValue)
-        if (!validOptions) {
-          return [
-            autoOption,
-            { label: 'low', id: 'low' },
-            { label: 'medium', id: 'medium' },
-            { label: 'high', id: 'high' },
-          ]
-        }
-
+        if (!validOptions) return fallback
         return [autoOption, ...validOptions.map((opt) => ({ label: opt, id: opt }))]
       },
       mode: 'advanced',
-      condition: {
-        field: 'model',
-        value: MODELS_WITH_REASONING_EFFORT,
-      },
+      condition: getModelCapabilityCondition(MODELS_WITH_REASONING_EFFORT),
     },
     {
       id: 'verbosity',
       title: 'Verbosity',
-      type: 'dropdown',
-      placeholder: 'Select verbosity...',
-      options: [
-        { label: 'auto', id: 'auto' },
-        { label: 'low', id: 'low' },
-        { label: 'medium', id: 'medium' },
-        { label: 'high', id: 'high' },
-      ],
+      type: 'combobox',
+      placeholder: 'Type or select verbosity...',
       dependsOn: ['model'],
-      fetchOptions: async (blockId: string) => {
+      options: (params) => {
         const autoOption = { label: 'auto', id: 'auto' }
-
-        const activeWorkflowId = useWorkflowRegistry.getState().activeWorkflowId
-        if (!activeWorkflowId) {
-          return [
-            autoOption,
-            { label: 'low', id: 'low' },
-            { label: 'medium', id: 'medium' },
-            { label: 'high', id: 'high' },
-          ]
-        }
-
-        const workflowValues = useSubBlockStore.getState().workflowValues[activeWorkflowId]
-        const blockValues = workflowValues?.[blockId]
-        const modelValue = blockValues?.model as string
-
-        if (!modelValue) {
-          return [
-            autoOption,
-            { label: 'low', id: 'low' },
-            { label: 'medium', id: 'medium' },
-            { label: 'high', id: 'high' },
-          ]
-        }
-
+        const fallback = [
+          autoOption,
+          { label: 'low', id: 'low' },
+          { label: 'medium', id: 'medium' },
+          { label: 'high', id: 'high' },
+        ]
+        const modelValue = params?.values.model
+        if (typeof modelValue !== 'string' || !modelValue) return fallback
         const validOptions = getVerbosityValuesForModel(modelValue)
-        if (!validOptions) {
-          return [
-            autoOption,
-            { label: 'low', id: 'low' },
-            { label: 'medium', id: 'medium' },
-            { label: 'high', id: 'high' },
-          ]
-        }
-
+        if (!validOptions) return fallback
         return [autoOption, ...validOptions.map((opt) => ({ label: opt, id: opt }))]
       },
       mode: 'advanced',
-      condition: {
-        field: 'model',
-        value: MODELS_WITH_VERBOSITY,
-      },
+      condition: getModelCapabilityCondition(MODELS_WITH_VERBOSITY),
     },
     {
       id: 'thinkingLevel',
       title: 'Thinking Level',
-      type: 'dropdown',
-      placeholder: 'Select thinking level...',
-      options: [
-        { label: 'none', id: 'none' },
-        { label: 'minimal', id: 'minimal' },
-        { label: 'low', id: 'low' },
-        { label: 'medium', id: 'medium' },
-        { label: 'high', id: 'high' },
-        { label: 'max', id: 'max' },
-      ],
+      type: 'combobox',
+      placeholder: 'Type or select thinking level...',
       dependsOn: ['model'],
-      fetchOptions: async (blockId: string) => {
+      options: (params) => {
         const noneOption = { label: 'none', id: 'none' }
-
-        const activeWorkflowId = useWorkflowRegistry.getState().activeWorkflowId
-        if (!activeWorkflowId) {
-          return [noneOption, { label: 'low', id: 'low' }, { label: 'high', id: 'high' }]
-        }
-
-        const workflowValues = useSubBlockStore.getState().workflowValues[activeWorkflowId]
-        const blockValues = workflowValues?.[blockId]
-        const modelValue = blockValues?.model as string
-
-        if (!modelValue) {
-          return [noneOption, { label: 'low', id: 'low' }, { label: 'high', id: 'high' }]
-        }
-
+        const fallback = [noneOption, { label: 'low', id: 'low' }, { label: 'high', id: 'high' }]
+        const modelValue = params?.values.model
+        if (typeof modelValue !== 'string' || !modelValue) return fallback
         const validOptions = getThinkingLevelsForModel(modelValue)
-        if (!validOptions) {
-          return [noneOption, { label: 'low', id: 'low' }, { label: 'high', id: 'high' }]
-        }
-
+        if (!validOptions) return fallback
         return [noneOption, ...validOptions.map((opt) => ({ label: opt, id: opt }))]
       },
       mode: 'advanced',
+      condition: getModelCapabilityCondition(MODELS_WITH_THINKING),
+    },
+    {
+      id: 'promptCaching',
+      title: 'Prompt Caching',
+      type: 'switch',
+      description:
+        'Cache the system prompt and tool definitions so repeat runs reuse them at a reduced rate. Writing the cache costs more than a normal request, so this pays off when the same prompt runs repeatedly.',
+      defaultValue: false,
+      mode: 'advanced',
       condition: {
         field: 'model',
-        value: MODELS_WITH_THINKING,
+        value: MODELS_WITH_PROMPT_CACHING,
       },
     },
 
@@ -503,15 +441,10 @@ Return ONLY the JSON array.`,
     ],
     config: {
       tool: (params: Record<string, any>) => {
-        const model = params.model || 'claude-sonnet-5'
-        if (!model) {
-          throw new Error('No model selected')
-        }
-        const tool = getBaseModelProviders()[model]
-        if (!tool) {
-          throw new Error(`Invalid model selected: ${model}`)
-        }
-        return tool
+        const model = params.model || AGENT_FALLBACK_MODEL
+        // sim-auto has no provider of its own until the pool resolves it at execution time.
+        const lookupModel = isAutoModel(model) ? AGENT_FALLBACK_MODEL : model
+        return getSerializedModelProviderId(lookupModel, AGENT_FALLBACK_MODEL)
       },
       params: (params: Record<string, any>) => {
         const normalizedFiles = normalizeFileInput(params.files)
@@ -640,11 +573,18 @@ Return ONLY the JSON array.`,
     },
     temperature: { type: 'number', description: 'Response randomness level' },
     maxTokens: { type: 'number', description: 'Maximum number of tokens in the response' },
-    reasoningEffort: { type: 'string', description: 'Reasoning effort level for GPT-5 models' },
+    reasoningEffort: {
+      type: 'string',
+      description: 'Reasoning effort level for models that support it',
+    },
     verbosity: { type: 'string', description: 'Verbosity level for GPT-5 models' },
     thinkingLevel: {
       type: 'string',
       description: 'Thinking level for models with extended thinking (Anthropic Claude, Gemini 3)',
+    },
+    promptCaching: {
+      type: 'boolean',
+      description: 'Cache the system prompt and tool definitions on models that support it',
     },
     tools: { type: 'json', description: 'Available tools configuration' },
     skills: { type: 'json', description: 'Selected skills configuration' },

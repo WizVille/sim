@@ -1,10 +1,9 @@
 'use client'
 
 import { memo, useCallback, useMemo, useRef, useState } from 'react'
-import { chipVariants, cn } from '@sim/emcn'
-import { Lock } from '@sim/emcn/icons'
+import { chipVariants, cn, OverflowText } from '@sim/emcn'
+import { Lock, MoreHorizontal } from '@sim/emcn/icons'
 import clsx from 'clsx'
-import { MoreHorizontal } from 'lucide-react'
 import Link from 'next/link'
 import { SIM_RESOURCES_DRAG_TYPE } from '@/lib/copilot/resource-types'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
@@ -12,7 +11,6 @@ import { ContextMenu } from '@/app/workspace/[workspaceId]/w/components/sidebar/
 import { DeleteModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workflow-list/components/delete-modal/delete-modal'
 import { Avatars } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workflow-list/components/workflow-item/avatars/avatars'
 import {
-  useContextMenu,
   useItemDrag,
   useItemRename,
   useSidebarListContext,
@@ -38,6 +36,7 @@ import {
 } from '@/hooks/queries/utils/folder-tree'
 import { getWorkflows } from '@/hooks/queries/utils/workflow-cache'
 import { useUpdateWorkflow } from '@/hooks/queries/workflows'
+import { useContextMenu } from '@/hooks/use-context-menu'
 import { useFolderStore } from '@/stores/folders/store'
 import type { WorkflowMetadata } from '@/stores/workflows/registry/types'
 
@@ -201,6 +200,10 @@ export const WorkflowItem = memo(function WorkflowItem({
   const isMixedSelection = useMemo(() => {
     return capturedSelectionRef.current?.isMixed ?? false
   }, [isContextMenuOpen])
+  const contextMenuSelectedCount = capturedSelectionRef.current
+    ? capturedSelectionRef.current.workflowIds.length +
+      capturedSelectionRef.current.folderIds.length
+    : 1
 
   const captureSelectionState = useCallback(() => {
     const store = useFolderStore.getState()
@@ -438,11 +441,8 @@ export const WorkflowItem = memo(function WorkflowItem({
                 spellCheck='false'
               />
             ) : (
-              <div
-                className='min-w-0 truncate text-[var(--text-body)]'
-                onDoubleClick={handleDoubleClick}
-              >
-                {workflow.name}
+              <div className='min-w-0' onDoubleClick={handleDoubleClick}>
+                <OverflowText label={workflow.name} className='block text-[var(--text-body)]' />
               </div>
             )}
             {!isEditing && <Avatars workflowId={workflow.id} />}
@@ -504,6 +504,7 @@ export const WorkflowItem = memo(function WorkflowItem({
         showLock={!isMixedSelection && selectedWorkflows.size <= 1}
         disableLock={!userPermissions.canAdmin || inheritedFolderLocked}
         isLocked={effectiveLocked}
+        selectedCount={contextMenuSelectedCount}
       />
 
       <DeleteModal

@@ -30,10 +30,10 @@ vi.mock('@/lib/table/service', () => ({
 }))
 vi.mock('@/lib/table/jobs/service', () => ({
   selectExportRowPage: mockSelectExportRowPage,
-  updateJobProgress: mockUpdateJobProgress,
-  markJobReady: mockMarkJobReady,
-  markJobFailed: mockMarkJobFailed,
-  setJobResultKey: mockSetJobResultKey,
+  updateJobProgressInWorkspace: mockUpdateJobProgress,
+  markJobReadyInWorkspace: mockMarkJobReady,
+  markJobFailedInWorkspace: mockMarkJobFailed,
+  setJobResultKeyInWorkspace: mockSetJobResultKey,
 }))
 vi.mock('@/lib/table/events', () => ({ appendTableEvent: mockAppendTableEvent }))
 vi.mock('@/lib/uploads/core/storage-service', () => ({
@@ -47,7 +47,21 @@ const table = {
   id: 'tbl_1',
   name: 'People',
   workspaceId: 'ws_1',
-  schema: { columns: [{ id: 'col_name', name: 'name', type: 'string' }] },
+  schema: {
+    columns: [
+      { id: 'col_name', name: 'name', type: 'string' },
+      {
+        id: 'col_tags',
+        name: 'tags',
+        type: 'select',
+        multiple: true,
+        options: [
+          { id: 'opt_a', name: 'Alpha' },
+          { id: 'opt_b', name: 'Beta' },
+        ],
+      },
+    ],
+  },
 }
 
 const payload = { jobId: 'job_1', tableId: 'tbl_1', workspaceId: 'ws_1', format: 'csv' as const }
@@ -70,7 +84,7 @@ describe('runTableExport', () => {
     mockUpdateJobProgress.mockResolvedValue(true)
     mockMarkJobReady.mockResolvedValue(true)
     mockMarkJobFailed.mockResolvedValue(undefined)
-    mockSetJobResultKey.mockResolvedValue(undefined)
+    mockSetJobResultKey.mockResolvedValue(true)
     mockDeleteFile.mockResolvedValue(undefined)
     // A handle that records every write so tests can assert the streamed bytes, and echoes the
     // pinned key back from `complete` like the real uploader does.
@@ -93,7 +107,7 @@ describe('runTableExport', () => {
       return Promise.resolve(handle)
     })
     mockSelectExportRowPage.mockResolvedValue([
-      { id: 'r1', data: { col_name: 'Ada' }, orderKey: 'a0' },
+      { id: 'r1', data: { col_name: 'Ada', col_tags: ['opt_a', 'opt_b'] }, orderKey: 'a0' },
     ])
   })
 
@@ -102,27 +116,31 @@ describe('runTableExport', () => {
 
     expect(mockCreateMultipartUpload).toHaveBeenCalledTimes(1)
     const init = mockCreateMultipartUpload.mock.calls[0][0]
+    expect(init.completionPolicy).toBe('replace')
     expect(init.key).toBe('workspace/ws_1/exports/tbl_1/job_1/People.csv')
     expect(init.context).toBe('workspace')
     expect(init.contentType).toContain('text/csv')
 
-    expect(lastHandle?.content).toBe('name\nAda\n')
+    // Select cells export as option names, comma-joined — never the stored ids.
+    expect(lastHandle?.content).toBe('name,tags\nAda,"Alpha, Beta"\n')
     expect(lastHandle?.complete).toHaveBeenCalledTimes(1)
     expect(lastHandle?.abort).not.toHaveBeenCalled()
 
-    expect(mockSetJobResultKey).toHaveBeenCalledWith('tbl_1', 'job_1', init.key)
-    expect(mockMarkJobReady).toHaveBeenCalledWith('tbl_1', 'job_1')
+    expect(mockSetJobResultKey).toHaveBeenCalledWith('tbl_1', 'ws_1', 'job_1', init.key)
+    expect(mockMarkJobReady).toHaveBeenCalledWith('tbl_1', 'ws_1', 'job_1')
     expect(mockAppendTableEvent).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'job', type: 'export', status: 'ready', progress: 1 })
     )
     expect(mockDeleteFile).not.toHaveBeenCalled()
   })
 
-  it('serializes JSON exports with display-name keys', async () => {
+  it('serializes JSON exports with display-name keys and option names', async () => {
     await runTableExport({ ...payload, format: 'json' })
     const init = mockCreateMultipartUpload.mock.calls[0][0]
     expect(init.key.endsWith('/People.json')).toBe(true)
-    expect(JSON.parse(lastHandle?.content ?? '')).toEqual([{ name: 'Ada' }])
+    expect(JSON.parse(lastHandle?.content ?? '')).toEqual([
+      { name: 'Ada', tags: ['Alpha', 'Beta'] },
+    ])
   })
 
   it('aborts the upload and never completes when ownership is lost (cancel)', async () => {
@@ -168,7 +186,7 @@ describe('runTableExport', () => {
     await runTableExport(payload)
 
     expect(lastHandle?.abort).toHaveBeenCalledTimes(1)
-    expect(mockMarkJobFailed).toHaveBeenCalledWith('tbl_1', 'job_1', 'boom')
+    expect(mockMarkJobFailed).toHaveBeenCalledWith('tbl_1', 'ws_1', 'job_1', 'boom')
     expect(mockAppendTableEvent).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'job', type: 'export', status: 'failed', error: 'boom' })
     )

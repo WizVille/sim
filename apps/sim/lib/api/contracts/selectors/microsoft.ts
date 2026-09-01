@@ -56,25 +56,29 @@ export const microsoftFileQuerySchema = credentialIdQuerySchema.extend({
   workflowId: optionalString,
 })
 
-export const onedriveFolderQuerySchema = z.object({
-  credentialId: z.preprocess(
-    (value) => value ?? '',
-    z.string().min(1, 'Credential ID and File ID are required')
-  ),
-  fileId: z.preprocess(
-    (value) => value ?? '',
-    z.string().min(1, 'Credential ID and File ID are required')
-  ),
-})
-
 export const onedriveFilesQuerySchema = credentialIdQueryWithSearchSchema
-export const onedriveFoldersQuerySchema = credentialIdQueryWithSearchSchema
+/**
+ * Folder listing is drive-scoped like the file listing above: without `driveId`
+ * the picker would always show the signed-in user's OneDrive, even for a block
+ * pointed at a SharePoint document library.
+ */
+export const onedriveFoldersQuerySchema = credentialIdQueryWithSearchSchema.extend({
+  driveId: z.string().optional(),
+})
 export const outlookFoldersQuerySchema = credentialIdQuerySchema
 
 export const outlookFoldersSelectorContract = defineGetSelector(
   '/api/tools/outlook/folders',
   outlookFoldersQuerySchema,
   z.object({ folders: z.array(z.object({ id: z.string(), name: z.string() }).passthrough()) })
+)
+
+export const outlookCalendarsQuerySchema = credentialIdQuerySchema
+
+export const outlookCalendarsSelectorContract = defineGetSelector(
+  '/api/tools/outlook/calendars',
+  outlookCalendarsQuerySchema,
+  z.object({ calendars: z.array(z.object({ id: z.string(), name: z.string() }).passthrough()) })
 )
 
 export const microsoftTeamsSelectorContract = definePostSelector(
@@ -128,12 +132,6 @@ export const onedriveFoldersSelectorContract = defineGetSelector(
   '/api/tools/onedrive/folders',
   onedriveFoldersQuerySchema,
   z.object({ files: z.array(fileOptionSchema) })
-)
-
-export const onedriveFolderSelectorContract = defineGetSelector(
-  '/api/tools/onedrive/folder',
-  onedriveFolderQuerySchema,
-  z.object({ file: fileOptionSchema.optional() }).passthrough()
 )
 
 export const microsoftExcelSheetsSelectorContract = defineGetSelector(
@@ -206,10 +204,6 @@ export type OnedriveFoldersSelectorResponse = ContractJsonResponse<
   typeof onedriveFoldersSelectorContract
 >
 export type OnedriveFoldersSelectorQuery = ContractQuery<typeof onedriveFoldersSelectorContract>
-export type OnedriveFolderSelectorResponse = ContractJsonResponse<
-  typeof onedriveFolderSelectorContract
->
-export type OnedriveFolderSelectorQuery = ContractQuery<typeof onedriveFolderSelectorContract>
 export type MicrosoftExcelSheetsSelectorResponse = ContractJsonResponse<
   typeof microsoftExcelSheetsSelectorContract
 >

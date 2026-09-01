@@ -24,7 +24,8 @@ export const incidentioConnectorMeta: ConnectorMeta = {
       required: false,
       mode: 'advanced',
       options: [
-        { label: 'All', id: '' },
+        { label: 'All except canceled (default)', id: '' },
+        { label: 'All (including canceled)', id: 'all' },
         { label: 'Live (active)', id: 'live' },
         { label: 'Paused', id: 'paused' },
         { label: 'Closed', id: 'closed' },
@@ -35,7 +36,7 @@ export const incidentioConnectorMeta: ConnectorMeta = {
         { label: 'Canceled', id: 'canceled' },
       ],
       description:
-        'Only sync incidents in this status category. Leave as All to sync every category.',
+        'Only sync incidents in this status category. The default skips canceled incidents, which is how incident.io hides an incident since it has no delete. Choose "All (including canceled)" to sync every category.',
     },
     {
       id: 'mode',
@@ -44,14 +45,14 @@ export const incidentioConnectorMeta: ConnectorMeta = {
       required: false,
       mode: 'advanced',
       options: [
-        { label: 'All', id: '' },
+        { label: 'Standard and retrospective (default)', id: '' },
         { label: 'Standard (real incidents)', id: 'standard' },
         { label: 'Retrospective', id: 'retrospective' },
         { label: 'Test', id: 'test' },
         { label: 'Tutorial', id: 'tutorial' },
       ],
       description:
-        'Only sync incidents of this mode. Use Standard to exclude test/tutorial incidents.',
+        'Only sync incidents of this mode. Leaving this unset uses the incident.io default, which covers standard and retrospective incidents and excludes test and tutorial ones.',
     },
     {
       id: 'maxIncidents',

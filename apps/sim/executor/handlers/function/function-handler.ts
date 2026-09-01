@@ -1,3 +1,5 @@
+import { normalizeSecretMountPolicy } from '@/lib/copilot/secret-mount-policy'
+import { getRemainingExecutionMs } from '@/lib/core/execution-limits'
 import {
   normalizeRecord,
   normalizeStringRecord,
@@ -5,6 +7,7 @@ import {
 } from '@/lib/core/utils/records'
 import { DEFAULT_EXECUTION_TIMEOUT_MS } from '@/lib/execution/constants'
 import { DEFAULT_CODE_LANGUAGE } from '@/lib/execution/languages'
+import { NonRetryableExecutionError } from '@/lib/execution/non-retryable-error'
 import { mergeFileKeys, mergeLargeValueKeys } from '@/lib/execution/payloads/access-keys'
 import { BlockType } from '@/executor/constants'
 import type { BlockHandler, ExecutionContext } from '@/executor/types'
@@ -53,12 +56,38 @@ export class FunctionBlockHandler implements BlockHandler {
     const { blockNameMapping, blockOutputSchemas } = collectBlockData(ctx)
 
     const contextVariables = normalizeRecord(inputs[FUNCTION_BLOCK_CONTEXT_VARS_KEY])
+    const requestedTimeout =
+      typeof inputs.timeout === 'number' && Number.isFinite(inputs.timeout) && inputs.timeout > 0
+        ? inputs.timeout
+        : undefined
+    const remainingExecutionMs = getRemainingExecutionMs(ctx.abortSignal)
+    const timeout =
+      remainingExecutionMs === undefined
+        ? (requestedTimeout ?? DEFAULT_EXECUTION_TIMEOUT_MS)
+        : Math.max(
+            1,
+            requestedTimeout === undefined
+              ? remainingExecutionMs
+              : Math.min(requestedTimeout, remainingExecutionMs)
+          )
+    const secretMountPolicy =
+      inputs.secretScope === undefined
+        ? undefined
+        : normalizeSecretMountPolicy({
+            secretScope: inputs.secretScope,
+            mountedSecrets: inputs.mountedSecrets,
+          })
+
+    const unredactedSecretNames = ctx.resolvedSecretTraceRegistry?.getUnredactedSecretNames() ?? []
 
     const toolParams = {
       code: codeContent,
       ...(sourceCode ? { sourceCode } : {}),
       language: inputs.language || DEFAULT_CODE_LANGUAGE,
-      timeout: inputs.timeout || DEFAULT_EXECUTION_TIMEOUT_MS,
+      timeout,
+      ...(inputs.sandboxId ? { sandboxId: inputs.sandboxId } : {}),
+      ...(secretMountPolicy ?? {}),
+      ...(unredactedSecretNames.length > 0 ? { unredactedSecretNames } : {}),
       envVars: normalizeStringRecord(ctx.environmentVariables),
       workflowVariables: normalizeWorkflowVariables(ctx.workflowVariables),
       blockData: {},
@@ -82,6 +111,9 @@ export class FunctionBlockHandler implements BlockHandler {
     const result = await executeTool('function_execute', toolParams, { executionContext: ctx })
 
     if (!result.success) {
+      if (result.retryable === false) {
+        throw new NonRetryableExecutionError(result.error || 'Function execution is indeterminate')
+      }
       throw new Error(result.error || 'Function execution failed')
     }
 

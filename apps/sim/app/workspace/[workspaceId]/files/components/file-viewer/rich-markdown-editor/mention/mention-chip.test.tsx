@@ -18,9 +18,6 @@ vi.mock('next/navigation', () => ({
 }))
 
 // Override the global `getAllBlocks: () => ({})` stub — `getIconColorMap` iterates it as an array.
-vi.mock('@/blocks/registry', () => ({
-  getAllBlocks: () => [],
-}))
 
 const { MentionChipView } = await import('./mention-chip')
 
@@ -29,7 +26,7 @@ function fakeNode(attrs: Record<string, unknown>) {
 }
 
 function fakeEditor(): Editor {
-  return { storage: { mention: { navigable: false } } } as unknown as Editor
+  return { storage: { mentionMenu: { navigable: false } } } as unknown as Editor
 }
 
 let container: HTMLDivElement | null = null
@@ -75,7 +72,11 @@ describe('MentionChipView', () => {
       .filter((cls) => cls.startsWith('text-') || cls.startsWith('[&]:text-'))
     expect(ownTextUtilities).toEqual([])
 
-    // The icon's own monochrome fallback is unrelated and must be untouched by this fix.
-    expect(chip.className).toContain('[&>svg]:text-[var(--text-icon)]')
+    // The icon's monochrome fallback moved into `BrandIcon`, which owns the glyph color for every
+    // surface. A descendant color rule here would be a second, silently-losing source of truth.
+    expect(chip.className).not.toContain('[&>svg]:text-')
+    expect(container?.querySelector('svg')?.getAttribute('class')).toContain(
+      'text-[var(--text-icon)]'
+    )
   })
 })

@@ -7,19 +7,18 @@ const { mockGetEnv } = vi.hoisted(() => ({
   mockGetEnv: vi.fn<(key: string) => string | undefined>(),
 }))
 
+vi.unmock('@/lib/core/utils/urls')
 vi.mock('@/lib/core/config/env', () => ({
   env: {},
   getEnv: mockGetEnv,
 }))
 
-vi.mock('@/lib/core/config/env-flags', () => ({
-  isProd: false,
-}))
-
 import {
+  getBaseUrl,
   getBrowserOrigin,
   getSocketUrl,
   isLocalhostUrl,
+  isNonCanonicalSimHost,
   isSafeHttpUrl,
   parseOriginList,
 } from '@/lib/core/utils/urls'
@@ -36,6 +35,78 @@ describe('getBrowserOrigin', () => {
   it('returns the page origin in the browser', () => {
     setLocation('https://example.com/some/path')
     expect(getBrowserOrigin()).toBe('https://example.com')
+  })
+})
+
+describe('getBaseUrl', () => {
+  beforeEach(() => {
+    mockGetEnv.mockReset()
+    mockGetEnv.mockReturnValue(undefined)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('uses NEXT_PUBLIC_APP_URL when set', () => {
+    mockGetEnv.mockImplementation((key) =>
+      key === 'NEXT_PUBLIC_APP_URL' ? 'https://app.example.com' : undefined
+    )
+    setLocation('https://other.example.com/workspace/w/1')
+    expect(getBaseUrl()).toBe('https://app.example.com')
+  })
+
+  /**
+   * Call sites build `${getBaseUrl()}/path`, so a trailing slash would give them
+   * a `//path` pathname that matches no route — and would break the
+   * `startsWith(`${base}/`)` prefix checks that decide whether a redirect target
+   * is our own, silently sending those redirects to their fallback instead.
+   */
+  it('strips trailing slashes so concatenated paths stay single-slashed', () => {
+    for (const configured of ['https://app.example.com/', 'https://app.example.com///']) {
+      mockGetEnv.mockImplementation((key) =>
+        key === 'NEXT_PUBLIC_APP_URL' ? configured : undefined
+      )
+      expect(getBaseUrl()).toBe('https://app.example.com')
+      expect(new URL(`${getBaseUrl()}/desktop/connect/complete`).pathname).toBe(
+        '/desktop/connect/complete'
+      )
+    }
+  })
+
+  /**
+   * Pins the trim's shape — it must not eat more than the trailing slashes.
+   * Not a claim that a path-prefixed deployment works: the app declares no Next
+   * `basePath`, so such a value could not address its routes either way.
+   */
+  it('trims only trailing slashes, never interior ones', () => {
+    mockGetEnv.mockImplementation((key) =>
+      key === 'NEXT_PUBLIC_APP_URL' ? 'https://example.com/a/b/' : undefined
+    )
+    expect(getBaseUrl()).toBe('https://example.com/a/b')
+  })
+
+  it('adds the protocol and strips the trailing slash together', () => {
+    mockGetEnv.mockImplementation((key) =>
+      key === 'NEXT_PUBLIC_APP_URL' ? 'app.example.com/' : undefined
+    )
+    expect(getBaseUrl()).toBe('http://app.example.com')
+  })
+
+  /**
+   * Never guesses from `window.location.origin`: an opaque origin (a sandboxed
+   * iframe) serializes to the truthy string `'null'`, which would silently
+   * produce `null/api/...` rather than surfacing the misconfiguration.
+   */
+  it('throws in the browser rather than guessing from the page origin', () => {
+    setLocation('https://www.sim.ai/workspace/ws-1/w/wf-1')
+    expect(() => getBaseUrl()).toThrow('NEXT_PUBLIC_APP_URL must be configured')
+  })
+
+  it('treats a whitespace-only NEXT_PUBLIC_APP_URL as unset', () => {
+    mockGetEnv.mockImplementation((key) => (key === 'NEXT_PUBLIC_APP_URL' ? '   ' : undefined))
+    setLocation('https://www.sim.ai/')
+    expect(() => getBaseUrl()).toThrow('NEXT_PUBLIC_APP_URL must be configured')
   })
 })
 
@@ -164,5 +235,43 @@ describe('isSafeHttpUrl', () => {
 
   it('rejects unparseable absolute input without throwing', () => {
     expect(isSafeHttpUrl('http://')).toBe(false)
+  })
+})
+
+describe('isNonCanonicalSimHost', () => {
+  it.each(['www.sim.ai', 'sim.ai', 'WWW.SIM.AI', 'www.sim.ai:443'])(
+    'treats %s as the canonical marketing site',
+    (host) => {
+      expect(isNonCanonicalSimHost(host)).toBe(false)
+    }
+  )
+
+  it.each(['dev.sim.ai', 'www.dev.sim.ai', 'staging.sim.ai', 'prod.sockets.sim.ai'])(
+    'treats %s as non-canonical',
+    (host) => {
+      expect(isNonCanonicalSimHost(host)).toBe(true)
+    }
+  )
+
+  it.each(['sim.example.com', 'localhost:3000', 'notsim.ai', 'sim.ai.evil.com'])(
+    'leaves %s alone',
+    (host) => {
+      expect(isNonCanonicalSimHost(host)).toBe(false)
+    }
+  )
+
+  it.each(['www.sim.ai, dev.sim.ai', 'sim.ai,dev.sim.ai', '  www.sim.ai , staging.sim.ai'])(
+    'classifies a comma-joined forwarded host by its first entry (%s)',
+    (host) => {
+      expect(isNonCanonicalSimHost(host)).toBe(false)
+    }
+  )
+
+  it('still flags a comma-joined host whose first entry is non-canonical', () => {
+    expect(isNonCanonicalSimHost('dev.sim.ai, www.sim.ai')).toBe(true)
+  })
+
+  it('does not throw on an empty host', () => {
+    expect(isNonCanonicalSimHost('')).toBe(false)
   })
 })

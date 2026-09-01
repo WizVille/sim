@@ -1,7 +1,9 @@
+import type { Principal } from '@sim/auth/principal'
 import { createLogger } from '@sim/logger'
-import { executeInE2B } from '@/lib/execution/e2b'
+import { DocCompileUserError } from '@/lib/copilot/tools/server/files/doc-compile-error'
 import { CodeLanguage } from '@/lib/execution/languages'
-import { compileDoc, DocCompileUserError } from './doc-compile'
+import { executeInSandbox } from '@/lib/execution/remote-sandbox'
+import { compileDoc } from './doc-compile'
 
 const logger = createLogger('CopilotDocRecalc')
 
@@ -50,7 +52,7 @@ for ws in wb.worksheets:
 print("__SIM_RESULT__=" + json.dumps({"ok": len(errors) == 0, "errors": errors[:${MAX_REPORTED_ERRORS}]}))
 `.trim()
 
-  const result = await executeInE2B({
+  const result = await executeInSandbox({
     code: script,
     language: CodeLanguage.Python,
     timeoutMs: RECALC_TIMEOUT_MS,
@@ -101,12 +103,14 @@ export async function runE2BCompiledCheck(args: {
   fileName: string
   workspaceId: string
   ext: string
+  principal: Principal
 }): Promise<CompiledCheckResult> {
   try {
     const compiled = await compileDoc({
       source: args.source,
       fileName: args.fileName,
       workspaceId: args.workspaceId,
+      filePrincipal: args.principal,
     })
     if (args.ext === 'xlsx') {
       const recalc = await recalcXlsx({ binary: compiled.buffer, workspaceId: args.workspaceId })

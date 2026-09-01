@@ -1,8 +1,19 @@
 import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
+import type { Principal } from '@sim/auth/principal'
 import { db } from '@sim/db'
-import { workflow, workspaceFiles } from '@sim/db/schema'
+import {
+  folder as folderTable,
+  type WorkspaceFileRow,
+  workflow,
+  workspaceFiles,
+} from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
-import { getErrorMessage, toError } from '@sim/utils/errors'
+import {
+  getErrorMessage,
+  getPostgresConstraintName,
+  getPostgresErrorCode,
+  toError,
+} from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { and, eq, isNull, sql } from 'drizzle-orm'
 import {
@@ -11,20 +22,40 @@ import {
   maybeNotifyStorageLimitForBillingContext,
   resolveStorageBillingContext,
 } from '@/lib/billing/storage'
+import { resolveCopilotFilePrincipal } from '@/lib/copilot/auth/file-delegation'
 import type { ExecutionContext, ToolCallResult } from '@/lib/copilot/request/types'
+import { ensureWorkspaceAccess } from '@/lib/copilot/tools/handlers/access'
 import { findMothershipUploadRowByChatAndName } from '@/lib/copilot/tools/handlers/upload-file-reader'
-import { canonicalWorkspaceFilePath } from '@/lib/copilot/vfs/path-utils'
+import { canonicalWorkspaceFilePath, encodeVfsPathSegments } from '@/lib/copilot/vfs/path-utils'
 import { getServePathPrefix } from '@/lib/uploads'
-import { fetchWorkspaceFileBuffer } from '@/lib/uploads/contexts/workspace/workspace-file-manager'
+import {
+  ArchiveError,
+  type DecompressResult,
+  decompressArchiveBufferToWorkspaceFiles,
+  MAX_ARCHIVE_BYTES,
+} from '@/lib/uploads/archive'
+import { findWorkspaceFileFolderIdByPath } from '@/lib/uploads/contexts/workspace/workspace-file-folder-manager'
+import {
+  allocateUniqueWorkspaceFileName,
+  fetchWorkspaceFileBuffer,
+} from '@/lib/uploads/contexts/workspace/workspace-file-manager'
+import { getBoundWorkspaceFileSecretProvenance } from '@/lib/uploads/contexts/workspace/workspace-file-secret-provenance'
 import { hasCloudStorage, headObject } from '@/lib/uploads/core/storage-service'
+import { getWorkspaceFileSize } from '@/lib/uploads/shared/types'
+import { isArchiveFileName } from '@/lib/uploads/utils/file-utils'
 import { parseWorkflowJson } from '@/lib/workflows/operations/import-export'
+import { MAX_IMPORT_BODY_BYTES } from '@/lib/workflows/operations/import-workflow'
 import { saveWorkflowToNormalizedTables } from '@/lib/workflows/persistence/utils'
 import { deduplicateWorkflowName } from '@/lib/workflows/utils'
+import { admitCreateWorkspaceFile } from '@/lib/workspace-files/application/create-workspace-file'
+import { readWorkspaceFileMetadata } from '@/lib/workspace-files/application/read-workspace-file-metadata'
 import { extractWorkflowMetadata } from '@/app/api/v1/admin/types'
 
-const logger = createLogger('MaterializeFile')
+const logger = createLogger('SaveUpload')
+const MAX_MATERIALIZE_NAME_RETRIES = 8
+const WORKSPACE_FILE_NAME_UNIQUE_INDEX = 'workspace_files_workspace_folder_name_active_unique'
 
-function toFileRecord(row: typeof workspaceFiles.$inferSelect) {
+function toFileRecord(row: WorkspaceFileRow) {
   const pathPrefix = getServePathPrefix()
   return {
     id: row.id,
@@ -32,7 +63,7 @@ function toFileRecord(row: typeof workspaceFiles.$inferSelect) {
     name: row.displayName ?? row.originalName,
     key: row.key,
     path: `${pathPrefix}${encodeURIComponent(row.key)}?context=mothership`,
-    size: row.size,
+    size: getWorkspaceFileSize(row),
     type: row.contentType,
     uploadedBy: row.userId,
     deletedAt: row.deletedAt,
@@ -42,10 +73,25 @@ function toFileRecord(row: typeof workspaceFiles.$inferSelect) {
   }
 }
 
+/**
+ * Cross-workspace ownership guard shared by every operation. The resolver is
+ * chat-scoped and current write paths always stamp matching workspaceIds, so
+ * this is defense in depth — but it must hold uniformly: without it, save would
+ * flip a foreign-workspace row into this workspace and import would read its
+ * bytes, the exact leak extract blocks.
+ */
+function uploadBelongsToWorkspace(
+  row: { workspaceId: string | null },
+  workspaceId: string
+): boolean {
+  return row.workspaceId === workspaceId
+}
+
 async function executeSave(
   fileName: string,
   chatId: string,
-  workspaceId: string
+  workspaceId: string,
+  principal: Principal
 ): Promise<ToolCallResult> {
   const row = await findMothershipUploadRowByChatAndName(chatId, fileName)
   if (!row) {
@@ -54,15 +100,23 @@ async function executeSave(
       error: `Upload not found: "${fileName}". Use glob("uploads/*") to list available uploads.`,
     }
   }
-  if (row.workspaceId !== workspaceId) {
+  if (!uploadBelongsToWorkspace(row, workspaceId)) {
     return { success: false, error: `Upload not found: "${fileName}".` }
+  }
+
+  const displayName = row.displayName ?? row.originalName
+  if (isArchiveFileName(displayName)) {
+    return {
+      success: false,
+      error: `"${fileName}" is a .zip archive — save it by extracting instead: save_upload(fileNames: ["${fileName}"], operation: "extract") unpacks it into files/ where the contents stay readable. The raw .zip remains in uploads/ for this chat.`,
+    }
   }
 
   const head = await headObject(row.key, 'mothership')
   if (!head && hasCloudStorage()) {
     return { success: false, error: `Upload object not found: "${fileName}".` }
   }
-  const verifiedSize = head?.size ?? row.size
+  const verifiedSize = head?.size ?? getWorkspaceFileSize(row)
   const billingContext = await resolveStorageBillingContext(workspaceId)
   const quotaCheck = await checkStorageQuotaForBillingContext(billingContext, verifiedSize)
   if (!quotaCheck.allowed) {
@@ -76,46 +130,82 @@ async function executeSave(
    * workspace lock before locking its payer. Any quota/stale-payer failure
    * rolls back the row transition.
    */
-  const transition = await db.transaction(async (tx) => {
-    await tx.execute(sql`SELECT 1 FROM workspace WHERE id = ${workspaceId} FOR UPDATE`)
+  let transition: {
+    updated: { id: string; originalName: string }
+    updatedUsage: number | undefined
+  } | null = null
 
-    const [updated] = await tx
-      .update(workspaceFiles)
-      .set({
-        context: 'workspace',
-        // A workspace file has no birth chat or message — clear both provenance
-        // fields so the row reads as workspace-owned, not stale chat-owned.
-        chatId: null,
-        messageId: null,
-        originalName: row.displayName ?? row.originalName,
-        size: verifiedSize,
-      })
-      .where(
-        and(
-          eq(workspaceFiles.id, row.id),
-          eq(workspaceFiles.workspaceId, workspaceId),
-          eq(workspaceFiles.chatId, chatId),
-          eq(workspaceFiles.context, 'mothership'),
-          isNull(workspaceFiles.deletedAt)
+  for (let attempt = 0; attempt < MAX_MATERIALIZE_NAME_RETRIES; attempt++) {
+    const materializedName = await allocateUniqueWorkspaceFileName(workspaceId, displayName, null)
+
+    try {
+      transition = await db.transaction(async (tx) => {
+        /** `FOR NO KEY UPDATE`: see the module header of `lib/billing/storage/tracking.ts`. */
+        await tx.execute(sql`SELECT 1 FROM workspace WHERE id = ${workspaceId} FOR NO KEY UPDATE`)
+
+        const [updated] = await tx
+          .update(workspaceFiles)
+          .set({
+            context: 'workspace',
+            // A workspace file has no birth chat or message — clear both provenance
+            // fields so the row reads as workspace-owned, not stale chat-owned.
+            chatId: null,
+            messageId: null,
+            originalName: materializedName,
+            displayName: materializedName,
+            sizeBytes: verifiedSize,
+          })
+          .where(
+            and(
+              eq(workspaceFiles.id, row.id),
+              eq(workspaceFiles.workspaceId, workspaceId),
+              eq(workspaceFiles.chatId, chatId),
+              eq(workspaceFiles.context, 'mothership'),
+              isNull(workspaceFiles.deletedAt)
+            )
+          )
+          .returning({ id: workspaceFiles.id, originalName: workspaceFiles.originalName })
+
+        if (!updated) {
+          return null
+        }
+
+        const updatedUsage = await incrementStorageUsageForBillingContextInTx(
+          tx,
+          billingContext,
+          verifiedSize
         )
-      )
-      .returning({ id: workspaceFiles.id, originalName: workspaceFiles.originalName })
-
-    if (!updated) {
-      return null
+        return { updated, updatedUsage }
+      })
+      break
+    } catch (error) {
+      const isNameCollision =
+        getPostgresErrorCode(error) === '23505' &&
+        getPostgresConstraintName(error) === WORKSPACE_FILE_NAME_UNIQUE_INDEX
+      if (!isNameCollision || attempt === MAX_MATERIALIZE_NAME_RETRIES - 1) {
+        throw error
+      }
+      logger.warn('Workspace file name was claimed during materialization; retrying', {
+        fileName,
+        materializedName,
+        attempt: attempt + 1,
+      })
     }
+  }
 
-    const updatedUsage = await incrementStorageUsageForBillingContextInTx(
-      tx,
-      billingContext,
-      verifiedSize
-    )
-    return { updated, updatedUsage }
-  })
-
-  const updated = transition?.updated ?? {
-    id: row.id,
-    originalName: row.displayName ?? row.originalName,
+  const replayedFile = transition
+    ? null
+    : (
+        await readWorkspaceFileMetadata.execute({
+          principal,
+          input: { fileId: row.id, assertedWorkspaceId: workspaceId },
+        })
+      ).file
+  const updated =
+    transition?.updated ??
+    (replayedFile ? { id: replayedFile.id, originalName: replayedFile.name } : null)
+  if (!updated) {
+    return { success: false, error: `Upload no longer available: "${fileName}".` }
   }
   if (transition?.updatedUsage !== undefined) {
     void maybeNotifyStorageLimitForBillingContext(billingContext, transition.updatedUsage)
@@ -158,8 +248,24 @@ async function executeImport(
       error: `Upload not found: "${fileName}". Use glob("uploads/*") to list available uploads.`,
     }
   }
+  if (!uploadBelongsToWorkspace(row, workspaceId)) {
+    return {
+      success: false,
+      error: `Upload "${fileName}" does not belong to this workspace.`,
+    }
+  }
+  if (isArchiveFileName(row.displayName ?? row.originalName)) {
+    return {
+      success: false,
+      error: `"${fileName}" is a .zip archive, not a workflow JSON. Extract it first: save_upload(fileNames: ["${fileName}"], operation: "extract").`,
+    }
+  }
 
-  const buffer = await fetchWorkspaceFileBuffer(toFileRecord(row))
+  // The bytes are headed straight for `parseWorkflowJson`, so the import body ceiling is
+  // the real limit here — a larger file could not be imported even if it were read.
+  const buffer = await fetchWorkspaceFileBuffer(toFileRecord(row), {
+    maxBytes: MAX_IMPORT_BODY_BYTES,
+  })
   const content = buffer.toString('utf-8')
 
   let parsed: unknown
@@ -254,35 +360,234 @@ async function executeImport(
   }
 }
 
+/**
+ * Fold a zip display name into a safe extraction folder name. Mirrors the VFS
+ * segment normalization (NFC, control-char strip) and rejects the degenerate
+ * names the folder layer throws plain Errors for (dot segments, separators,
+ * empty), so a hostile upload name like `..zip` or `\x01.zip` lands in the
+ * `archive` fallback instead of surfacing a raw internal error — and so the
+ * VFS-encoded destination path can be computed before anything is extracted.
+ */
+function archiveFolderBaseName(displayName: string): string {
+  const stripped = displayName
+    .replace(/\.zip$/i, '')
+    .normalize('NFC')
+    .replace(/[\x00-\x1f\x7f]/g, '')
+    .replace(/[/\\]/g, '-')
+    .trim()
+  if (!stripped || stripped === '.' || stripped === '..') {
+    return 'archive'
+  }
+  return stripped
+}
+
+/**
+ * Decompress an uploaded `.zip` into the workspace `files/<archive>/` folder tree
+ * (reusing the shared, capped, zip-slip/bomb-safe extractor). The raw archive
+ * stays in uploads/; the extracted files persist in the workspace so the agent
+ * can read them with the normal files/ tooling. This is the explicit "extract
+ * before reading a zip" step.
+ */
+async function executeExtract(
+  fileName: string,
+  chatId: string,
+  workspaceId: string,
+  userId: string,
+  principal: Principal
+): Promise<ToolCallResult> {
+  const row = await findMothershipUploadRowByChatAndName(chatId, fileName)
+  if (!row) {
+    return {
+      success: false,
+      error: `Upload not found: "${fileName}". Use glob("uploads/*") to list available uploads.`,
+    }
+  }
+
+  if (!uploadBelongsToWorkspace(row, workspaceId)) {
+    return {
+      success: false,
+      error: `Upload "${fileName}" does not belong to this workspace.`,
+    }
+  }
+
+  const displayName = row.displayName ?? row.originalName
+  if (!isArchiveFileName(displayName)) {
+    return {
+      success: false,
+      error: `"${fileName}" is not a .zip archive — only .zip uploads can be extracted. Read it directly with read("uploads/${fileName}").`,
+    }
+  }
+
+  const record = toFileRecord(row)
+  if (record.size > MAX_ARCHIVE_BYTES) {
+    return {
+      success: false,
+      error: `Archive too large to extract: "${fileName}" (${Math.round(
+        record.size / 1024 / 1024
+      )}MB, limit ${MAX_ARCHIVE_BYTES / 1024 / 1024}MB).`,
+    }
+  }
+
+  // Resolve the destination up front (the encoded path is a pure function of the
+  // hardened base name), so nothing can throw after files have been written.
+  const baseName = archiveFolderBaseName(displayName)
+  const folderPath = `files/${encodeVfsPathSegments([baseName])}`
+
+  // Re-running extract must not silently duplicate the tree with " (1)"-suffixed
+  // copies: when the destination folder already holds content, report it as
+  // already extracted instead of extracting beside the previous run. Direct
+  // files AND direct subfolders both count — extraction roots its whole tree
+  // here, so a prior run of a nested-only zip (e.g. src/index.ts) leaves a
+  // subfolder even when no file sits at the top level.
+  const existingFolderId = await findWorkspaceFileFolderIdByPath(workspaceId, [baseName])
+  if (existingFolderId) {
+    const [[existingFile], [existingSubfolder]] = await Promise.all([
+      db
+        .select({ id: workspaceFiles.id })
+        .from(workspaceFiles)
+        .where(
+          and(
+            eq(workspaceFiles.folderId, existingFolderId),
+            eq(workspaceFiles.context, 'workspace'),
+            isNull(workspaceFiles.deletedAt)
+          )
+        )
+        .limit(1),
+      db
+        .select({ id: folderTable.id })
+        .from(folderTable)
+        .where(
+          and(
+            eq(folderTable.parentId, existingFolderId),
+            eq(folderTable.resourceType, 'file'),
+            isNull(folderTable.deletedAt)
+          )
+        )
+        .limit(1),
+    ])
+    if (existingFile || existingSubfolder) {
+      return {
+        success: false,
+        error: `"${fileName}" appears to be already extracted — ${folderPath}/ exists and contains content. List it with glob("${folderPath}/**"). To re-extract, delete that folder first.`,
+      }
+    }
+  }
+
+  let result: DecompressResult
+  try {
+    const buffer = await fetchWorkspaceFileBuffer(record, { maxBytes: MAX_ARCHIVE_BYTES })
+    const secretProvenance = await getBoundWorkspaceFileSecretProvenance(workspaceId, {
+      fileId: row.id,
+      key: row.key,
+      context: 'mothership',
+    })
+    result = await decompressArchiveBufferToWorkspaceFiles(buffer, {
+      workspaceId,
+      principal,
+      rootFolderSegments: [baseName],
+      // The agent-facing extract drops macOS/Windows filesystem cruft so the
+      // unpacked files/ tree only contains meaningful entries.
+      skipNoiseEntries: true,
+      secretProvenance,
+    })
+  } catch (err) {
+    if (err instanceof ArchiveError) {
+      // Reads sniff small uploads' magic bytes, so a mislabeled ".zip" that
+      // fails to parse here is genuinely readable via read() — say so instead
+      // of bouncing the model between extract and read forever.
+      const mislabeledHint =
+        err.reason === 'invalid'
+          ? ` If the file is not actually a zip archive, read it directly with read("uploads/${fileName}").`
+          : ''
+      return {
+        success: false,
+        error: `Cannot extract "${fileName}": ${err.message}${mislabeledHint}`,
+      }
+    }
+    throw err
+  }
+
+  if (result.extracted.length === 0) {
+    return { success: false, error: `No files could be extracted from "${fileName}".` }
+  }
+
+  const count = result.extracted.length
+
+  if (result.skippedUnsafePaths.length > 0) {
+    logger.warn('Skipped unsafe archive entries during extract', {
+      fileName,
+      chatId,
+      entryNames: result.skippedUnsafePaths,
+    })
+  }
+
+  logger.info('Extracted archive into workspace files', {
+    fileName,
+    chatId,
+    folder: baseName,
+    extractedCount: count,
+    skipped: result.skipped,
+  })
+
+  return {
+    success: true,
+    output: {
+      message: `Extracted ${count} file${count === 1 ? '' : 's'} from "${fileName}" into ${folderPath}/. They now persist in the workspace — list them with glob("${folderPath}/**") and read one with read("${folderPath}/<path>/content").`,
+      fileCount: count,
+      path: folderPath,
+    },
+    resources: result.extracted.map((f) => ({ type: 'file' as const, id: f.id, title: f.name })),
+  }
+}
+
 export async function executeMaterializeFile(
   params: Record<string, unknown>,
   context: ExecutionContext
 ): Promise<ToolCallResult> {
-  const fileNames: string[] =
-    (params.fileNames as string[] | undefined) ??
-    ([params.fileName as string | undefined].filter(Boolean) as string[])
+  // Dedupe: a repeated name in one call would re-run the operation against the
+  // same upload (for extract, duplicating the unpacked tree with " (1)" copies).
+  const fileNames: string[] = Array.from(
+    new Set(
+      (params.fileNames as string[] | undefined) ??
+        ([params.fileName as string | undefined].filter(Boolean) as string[])
+    )
+  )
 
   if (fileNames.length === 0) {
     return { success: false, error: "Missing required parameter 'fileNames'" }
   }
 
   if (!context.chatId) {
-    return { success: false, error: 'No chat context available for materialize_file' }
+    return { success: false, error: 'No chat context available for save_upload' }
   }
 
   if (!context.workspaceId) {
-    return { success: false, error: 'No workspace context available for materialize_file' }
+    return { success: false, error: 'No workspace context available for save_upload' }
   }
 
+  const principal = resolveCopilotFilePrincipal(context)
+
   const operation = (params.operation as string | undefined) || 'save'
-  // Only save/import are implemented. Reject anything else with guidance instead of
-  // silently falling back to save (table/knowledge_base are handled by their subagents).
-  if (operation !== 'save' && operation !== 'import') {
+  // save (promote upload → workspace file), import (JSON → workflow), and extract
+  // (decompress a .zip upload → workspace files/) are implemented. Reject anything
+  // else with guidance instead of silently falling back to save.
+  if (operation !== 'save' && operation !== 'import' && operation !== 'extract') {
     return {
       success: false,
-      error: `Unsupported materialize_file operation "${operation}". Use "save" or "import". For CSV/TSV/JSON → use the table subagent; for documents → use the knowledge subagent.`,
+      error: `Unsupported save_upload operation "${operation}". Use "save", "import", or "extract". For CSV/TSV/JSON → use the table subagent; for documents → use the knowledge subagent.`,
     }
   }
+
+  try {
+    if (operation === 'import') {
+      await ensureWorkspaceAccess(context.workspaceId, context.userId, 'write')
+    } else {
+      await admitCreateWorkspaceFile(principal, context.workspaceId)
+    }
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error, 'Workspace write access required') }
+  }
+
   const succeeded: string[] = []
   const failed: Array<{ fileName: string; error: string }> = []
   const resources: NonNullable<ToolCallResult['resources']> = []
@@ -292,22 +597,36 @@ export async function executeMaterializeFile(
       let result: ToolCallResult
       if (operation === 'import') {
         result = await executeImport(fileName, context.chatId, context.workspaceId, context.userId)
+      } else if (operation === 'extract') {
+        result = await executeExtract(
+          fileName,
+          context.chatId,
+          context.workspaceId,
+          context.userId,
+          principal
+        )
       } else {
-        result = await executeSave(fileName, context.chatId, context.workspaceId)
+        result = await executeSave(fileName, context.chatId, context.workspaceId, principal)
       }
 
       if (result.success) {
-        succeeded.push(fileName)
+        const materializedName =
+          operation === 'save'
+            ? result.resources?.find((resource) => resource.type === 'file')?.title
+            : undefined
+        succeeded.push(materializedName ?? fileName)
         if (result.resources) resources.push(...result.resources)
       } else {
         failed.push({ fileName, error: result.error ?? 'Failed to materialize file' })
       }
     } catch (err) {
-      logger.error('materialize_file failed', {
+      logger.error('save_upload failed', {
         fileName,
         operation,
         chatId: context.chatId,
         error: toError(err).message,
+        postgresCode: getPostgresErrorCode(err),
+        postgresConstraint: getPostgresConstraintName(err),
       })
       failed.push({
         fileName,

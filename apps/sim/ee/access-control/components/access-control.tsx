@@ -12,15 +12,31 @@ import {
   ChipTag,
   Label,
 } from '@sim/emcn'
+import { Plus } from '@sim/emcn/icons'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
-import { ArrowRight, Plus } from 'lucide-react'
 import { useParams } from 'next/navigation'
+import { useQueryState } from 'nuqs'
 import { isEnterprise } from '@/lib/billing/plan-helpers'
-import { getEnv, isTruthy } from '@/lib/core/config/env'
+import { isAccessControlEnabled } from '@/lib/core/config/env-flags'
+import {
+  groupIdParam,
+  groupIdUrlKeys,
+  groupSearchParam,
+  groupSearchUrlKeys,
+  groupStatusParam,
+  groupStatusUrlKeys,
+  groupTabParam,
+  groupTabUrlKeys,
+} from '@/app/workspace/[workspaceId]/settings/[section]/search-params'
 import { SettingsEmptyState } from '@/app/workspace/[workspaceId]/settings/components/settings-empty-state'
 import { SettingsPanel } from '@/app/workspace/[workspaceId]/settings/components/settings-panel'
+import {
+  RESOURCE_LIST_STACK,
+  SettingsResourceRow,
+} from '@/app/workspace/[workspaceId]/settings/components/settings-resource-row'
 import { SettingsSection } from '@/app/workspace/[workspaceId]/settings/components/settings-section/settings-section'
+import { useSettingsSearch } from '@/app/workspace/[workspaceId]/settings/components/use-settings-search'
 import { GroupDetail } from '@/ee/access-control/components/group-detail'
 import { WorkspaceSelect } from '@/ee/access-control/components/workspace-select'
 import {
@@ -51,7 +67,9 @@ export function AccessControl({ isOrganizationAdmin, organizationId }: AccessCon
   const { data: userPermissionConfig, isPending: entitlementLoading } =
     useUserPermissionConfig(workspaceId)
   const { data: organizationBillingData, isPending: organizationBillingLoading } =
-    useOrganizationBilling(organizationId)
+    useOrganizationBilling(organizationId, {
+      enabled: !isAccessControlEnabled && !userPermissionConfig?.entitled,
+    })
   const currentUserIsOrgAdmin = isOrganizationAdmin
 
   const { data: permissionGroups = [], isPending: groupsLoading } = usePermissionGroups(
@@ -61,21 +79,71 @@ export function AccessControl({ isOrganizationAdmin, organizationId }: AccessCon
   const { data: organizationWorkspaces = [], isPending: workspacesLoading } =
     useOrganizationWorkspaces(organizationId, !!organizationId && currentUserIsOrgAdmin)
 
-  const accessControlEnabledLocally = isTruthy(getEnv('NEXT_PUBLIC_ACCESS_CONTROL_ENABLED'))
+  /**
+   * Must be the resolved flag, not the raw `NEXT_PUBLIC_ACCESS_CONTROL_ENABLED`
+   * read. The settings nav decides visibility from the same resolver, so
+   * reading the bare var here let a deployment with only `ENTERPRISE_ENABLED`
+   * set show the section and then refuse to manage it.
+   */
   const isEntitled =
-    accessControlEnabledLocally ||
+    isAccessControlEnabled ||
     !!userPermissionConfig?.entitled ||
     isEnterprise(organizationBillingData?.data?.subscriptionPlan)
   const canManage = isEntitled && currentUserIsOrgAdmin && !!organizationId
+  const organizationEntitlementLoading =
+    !isAccessControlEnabled && !userPermissionConfig?.entitled && organizationBillingLoading
 
   const isLoading =
-    (workspaceId ? entitlementLoading : organizationBillingLoading) ||
+    (workspaceId ? entitlementLoading : false) ||
+    organizationEntitlementLoading ||
     (!!organizationId && currentUserIsOrgAdmin && groupsLoading)
 
   const createPermissionGroup = useCreatePermissionGroup()
 
-  const [searchTerm, setSearchTerm] = useState('')
-  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null)
+  const [searchTerm, setSearchTerm] = useSettingsSearch()
+  const [selectedGroupId, setSelectedGroupId] = useQueryState(groupIdParam.key, {
+    ...groupIdParam.parser,
+    ...groupIdUrlKeys,
+  })
+
+  // Params scoped to the detail sub-view are cleared alongside the group id, so
+  // a tab/search/filter can't linger on the list URL after going back. nuqs
+  // batches these same-tick writes into a single URL update.
+  const [, setGroupTab] = useQueryState(groupTabParam.key, {
+    ...groupTabParam.parser,
+    ...groupTabUrlKeys,
+  })
+  const [, setGroupSearch] = useQueryState(groupSearchParam.key, {
+    ...groupSearchParam.parser,
+    ...groupSearchUrlKeys,
+  })
+  const [, setGroupStatus] = useQueryState(groupStatusParam.key, {
+    ...groupStatusParam.parser,
+    ...groupStatusUrlKeys,
+  })
+
+  /**
+   * The detail view's tab/search/status params are scoped to one group, so both
+   * transitions reset them — otherwise a stale `group-id` that never resolves
+   * leaves them in the URL and the next group opens on the previous group's tab
+   * and filters. nuqs batches these same-tick writes into one URL update.
+   */
+  const openGroupDetail = useCallback(
+    (groupId: string) => {
+      void setSelectedGroupId(groupId)
+      void setGroupTab(null)
+      void setGroupSearch(null)
+      void setGroupStatus(null)
+    },
+    [setSelectedGroupId, setGroupTab, setGroupSearch, setGroupStatus]
+  )
+
+  const closeGroupDetail = useCallback(() => {
+    void setSelectedGroupId(null, { history: 'replace' })
+    void setGroupTab(null)
+    void setGroupSearch(null)
+    void setGroupStatus(null)
+  }, [setSelectedGroupId, setGroupTab, setGroupSearch, setGroupStatus])
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [newGroupName, setNewGroupName] = useState('')
   const [newGroupDescription, setNewGroupDescription] = useState('')
@@ -137,8 +205,25 @@ export function AccessControl({ isOrganizationAdmin, organizationId }: AccessCon
     setCreateError(null)
   }, [])
 
+  const listSearch = {
+    value: searchTerm,
+    onChange: setSearchTerm,
+    placeholder: 'Search permission groups...',
+    disabled: isLoading,
+  }
+  const listActions = [
+    {
+      id: 'create-group',
+      text: 'Create group',
+      icon: Plus,
+      variant: 'primary' as const,
+      onSelect: () => setShowCreateModal(true),
+      disabled: isLoading,
+    },
+  ]
+
   if (isLoading) {
-    return null
+    return <SettingsPanel search={listSearch} actions={listActions} />
   }
 
   if (!canManage) {
@@ -160,29 +245,15 @@ export function AccessControl({ isOrganizationAdmin, organizationId }: AccessCon
         workspaceOptions={workspaceOptions}
         organizationWorkspaces={organizationWorkspaces}
         workspacesLoading={workspacesLoading}
-        onBack={() => setSelectedGroupId(null)}
-        onDeleted={() => setSelectedGroupId(null)}
+        onBack={closeGroupDetail}
+        onDeleted={closeGroupDetail}
       />
     )
   }
 
   return (
     <>
-      <SettingsPanel
-        search={{
-          value: searchTerm,
-          onChange: setSearchTerm,
-          placeholder: 'Search permission groups...',
-        }}
-        actions={[
-          {
-            text: 'Create group',
-            icon: Plus,
-            variant: 'primary',
-            onSelect: () => setShowCreateModal(true),
-          },
-        ]}
-      >
+      <SettingsPanel search={listSearch} actions={listActions}>
         <SettingsSection label={`Permission groups (${permissionGroups.length})`}>
           {permissionGroups.length === 0 ? (
             <SettingsEmptyState variant='inline'>
@@ -193,37 +264,27 @@ export function AccessControl({ isOrganizationAdmin, organizationId }: AccessCon
               No groups found matching "{searchTerm}"
             </SettingsEmptyState>
           ) : (
-            <div className='-mx-2 flex flex-col gap-y-0.5'>
+            <div className={RESOURCE_LIST_STACK}>
               {filteredGroups.map((group) => (
-                <button
+                <SettingsResourceRow
                   key={group.id}
-                  type='button'
-                  onClick={() => setSelectedGroupId(group.id)}
-                  className='flex items-center gap-2.5 rounded-lg p-2 text-left transition-colors hover-hover:bg-[var(--surface-active)]'
-                >
-                  <div className='flex min-w-0 flex-1 flex-col'>
-                    <div className='flex items-center gap-2'>
-                      <span className='truncate text-[var(--text-body)] text-sm'>{group.name}</span>
-                      {group.isDefault && (
-                        <ChipTag variant='gray' className='flex-shrink-0'>
-                          Default
-                        </ChipTag>
-                      )}
-                    </div>
-                    <span className='truncate text-[var(--text-muted)] text-caption'>
-                      {group.isDefault
-                        ? 'Everyone in the organization'
-                        : `${
-                            group.memberCount === 0
-                              ? 'All members'
-                              : `${group.memberCount} member${group.memberCount === 1 ? '' : 's'}`
-                          } · ${group.workspaces.length} workspace${
-                            group.workspaces.length === 1 ? '' : 's'
-                          }`}
-                    </span>
-                  </div>
-                  <ArrowRight className='size-4 flex-shrink-0 text-[var(--text-icon)]' />
-                </button>
+                  title={group.name}
+                  description={
+                    group.isDefault
+                      ? 'Everyone in the organization'
+                      : `${
+                          group.memberCount === 0
+                            ? 'All members'
+                            : `${group.memberCount} member${group.memberCount === 1 ? '' : 's'}`
+                        } · ${group.workspaces.length} workspace${
+                          group.workspaces.length === 1 ? '' : 's'
+                        }`
+                  }
+                  badge={group.isDefault ? <ChipTag variant='gray'>Default</ChipTag> : undefined}
+                  onClick={() => openGroupDetail(group.id)}
+                  clickLabel={`Open ${group.name}`}
+                  navigable
+                />
               ))}
             </div>
           )}

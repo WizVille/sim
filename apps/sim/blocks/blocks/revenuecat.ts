@@ -17,6 +17,56 @@ export const RevenueCatBlock: BlockConfig<RevenueCatResponse> = {
   bgColor: '#F25A5A',
   iconColor: '#F25A5A',
   icon: RevenueCatIcon,
+  canvasPresentation: {
+    defaultTitle: 'RevenueCat',
+    triggerSentences: {
+      default: [
+        'Run on',
+        { field: 'selectedTriggerId', core: true },
+        { text: 'in project', field: 'projectId' },
+      ],
+    },
+    sentences: {
+      byOperation: {
+        get_customer: [{ text: 'Read customer', field: 'appUserId', core: true }],
+        delete_customer: [{ text: 'Delete customer', field: 'appUserId', core: true }],
+        create_purchase: [
+          { text: 'Record a purchase of', field: 'productId', core: true },
+          { text: 'for customer', field: 'appUserId', core: true },
+          { text: ', priced', field: 'price' },
+        ],
+        grant_entitlement: [
+          { text: 'Grant entitlement', field: 'entitlementIdentifier', core: true },
+          { text: 'to customer', field: 'appUserId' },
+          { text: ', lasting', field: 'duration' },
+        ],
+        revoke_entitlement: [
+          { text: 'Revoke entitlement', field: 'entitlementIdentifier', core: true },
+          { text: 'from customer', field: 'appUserId' },
+        ],
+        list_offerings: [
+          { text: 'List offerings available to', field: 'appUserId', core: true },
+          { text: ', on', field: 'platform' },
+        ],
+        update_subscriber_attributes: [
+          { text: 'Update attributes on customer', field: 'appUserId', core: true },
+        ],
+        defer_google_subscription: [
+          { text: 'Defer Google Play subscription', field: 'productId', core: true },
+          { text: 'for customer', field: 'appUserId' },
+          { text: ', by', field: 'extendByDays', after: 'days' },
+        ],
+        refund_google_subscription: [
+          { text: 'Refund store transaction', field: 'productId', core: true },
+          { text: 'for customer', field: 'appUserId' },
+        ],
+        revoke_google_subscription: [
+          { text: 'Revoke Google Play subscription', field: 'productId', core: true },
+          { text: 'from customer', field: 'appUserId' },
+        ],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -523,7 +573,7 @@ export const RevenueCatBlockMeta = {
     },
     {
       icon: RevenueCatIcon,
-      title: 'Entitlement granter',
+      title: 'RevenueCat entitlement granter',
       prompt:
         'Create a workflow that listens for a customer-success approval — for example a Slack reaction or a row in a table — looks up the RevenueCat subscriber, grants a promotional entitlement with the right expiry, and logs the grant in an audit table for compliance.',
       modules: ['tables', 'agent', 'workflows'],
@@ -533,7 +583,7 @@ export const RevenueCatBlockMeta = {
     },
     {
       icon: RevenueCatIcon,
-      title: 'Failed renewal recovery',
+      title: 'RevenueCat renewal recovery',
       prompt:
         'Build a scheduled workflow that lists RevenueCat subscribers with failed renewals, segments them by plan and tenure, drafts a tailored win-back email, sends it via Gmail, and tracks recovery outcomes in a table with retry cadence rules.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -543,7 +593,7 @@ export const RevenueCatBlockMeta = {
     },
     {
       icon: RevenueCatIcon,
-      title: 'Subscriber attribute sync',
+      title: 'RevenueCat attribute sync',
       prompt:
         'Create a workflow that listens for changes in your customer table — like email, display name, or company — and updates the matching RevenueCat subscriber attributes so analytics and targeted offers always reflect the latest customer state.',
       modules: ['tables', 'agent', 'workflows'],
@@ -552,7 +602,7 @@ export const RevenueCatBlockMeta = {
     },
     {
       icon: RevenueCatIcon,
-      title: 'Trial expiry digest',
+      title: 'RevenueCat trial expiry digest',
       prompt:
         'Build a scheduled daily workflow that lists RevenueCat subscribers whose trials expire in the next three days, ranks them by engagement, drafts a personalized conversion nudge, and emails the success team a prioritized list to call.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -562,7 +612,7 @@ export const RevenueCatBlockMeta = {
     },
     {
       icon: RevenueCatIcon,
-      title: 'Google Play refund operator',
+      title: 'RevenueCat Google Play refund',
       prompt:
         'Create a workflow that takes a refund approval from a support ticket, calls the RevenueCat Google Play refund operation with the right transaction identifier, revokes access, posts the outcome back on the ticket, and logs the action in a compliance table.',
       modules: ['tables', 'agent', 'workflows'],
@@ -572,7 +622,7 @@ export const RevenueCatBlockMeta = {
     },
     {
       icon: RevenueCatIcon,
-      title: 'Offering performance report',
+      title: 'RevenueCat offering report',
       prompt:
         'Build a scheduled weekly workflow that pulls RevenueCat offerings and recent purchases, computes conversion rate per offering and per package, writes a narrative analysis file with recommendations, and Slacks growth leadership the top findings.',
       modules: ['scheduled', 'agent', 'files', 'workflows'],

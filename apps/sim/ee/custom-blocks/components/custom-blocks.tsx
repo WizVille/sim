@@ -2,14 +2,23 @@
 
 import { useMemo, useState } from 'react'
 import { ChipTag } from '@sim/emcn'
-import { ArrowRight, Plus } from 'lucide-react'
+import { Plus } from '@sim/emcn/icons'
 import { useParams } from 'next/navigation'
+import { useQueryState } from 'nuqs'
 import { canMutateWorkspaceSettingsSection } from '@/components/settings/navigation'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
+import {
+  customBlockIdParam,
+  customBlockIdUrlKeys,
+} from '@/app/workspace/[workspaceId]/settings/[section]/search-params'
 import { SettingsEmptyState } from '@/app/workspace/[workspaceId]/settings/components/settings-empty-state'
 import { SettingsPanel } from '@/app/workspace/[workspaceId]/settings/components/settings-panel'
-import { SettingsResourceRow } from '@/app/workspace/[workspaceId]/settings/components/settings-resource-row/settings-resource-row'
+import {
+  RESOURCE_LIST_STACK,
+  SettingsResourceRow,
+} from '@/app/workspace/[workspaceId]/settings/components/settings-resource-row'
 import { SettingsSection } from '@/app/workspace/[workspaceId]/settings/components/settings-section/settings-section'
+import { useSettingsSearch } from '@/app/workspace/[workspaceId]/settings/components/use-settings-search'
 import { getCustomBlockIcon } from '@/blocks/custom/custom-block-icon'
 import { CustomBlockDetail } from '@/ee/custom-blocks/components/custom-block-detail'
 import { useOrgBrandConfig } from '@/ee/whitelabeling/components/branding-provider'
@@ -21,6 +30,7 @@ export function CustomBlocks() {
   const workspaceId = typeof params?.workspaceId === 'string' ? params.workspaceId : undefined
   const workspacePermissions = useUserPermissionsContext()
   const canAdmin = canMutateWorkspaceSettingsSection('custom-blocks', workspacePermissions)
+  const permissionsLoading = workspacePermissions.isLoading
 
   const { data: canManage = false, isLoading } = useCanPublishCustomBlock(workspaceId)
   const { data: blocks = [] } = useCustomBlocks(workspaceId)
@@ -40,8 +50,13 @@ export function CustomBlocks() {
   )
   const fallbackIconUrl = useOrgBrandConfig().logoUrl ?? null
 
-  const [searchTerm, setSearchTerm] = useState('')
-  const [selected, setSelected] = useState<string | 'new' | null>(null)
+  const [searchTerm, setSearchTerm] = useSettingsSearch()
+  const [selectedBlockId, setSelectedBlockId] = useQueryState(customBlockIdParam.key, {
+    ...customBlockIdParam.parser,
+    ...customBlockIdUrlKeys,
+  })
+  /** The create flow has no entity id and is not deep-linkable — stays local. */
+  const [isCreating, setIsCreating] = useState(false)
 
   const filtered = useMemo(() => {
     if (!searchTerm.trim()) return blocks
@@ -49,7 +64,16 @@ export function CustomBlocks() {
     return blocks.filter((b) => b.name.toLowerCase().includes(q))
   }, [blocks, searchTerm])
 
-  if (isLoading) return null
+  /** Open the detail only once the deep-linked id resolves to a loaded block. */
+  const selectedBlock = selectedBlockId ? blocks.find((b) => b.id === selectedBlockId) : undefined
+
+  /**
+   * Hold the first paint while a deep-linked id could still resolve — the
+   * blocks query (`isLoading`, shared with `useCanPublishCustomBlock`) and the
+   * permissions context both gate the detail, so a valid link never flashes
+   * the list before jumping to it. A dead id still falls back to the list.
+   */
+  if (isLoading || (selectedBlockId !== null && permissionsLoading)) return null
 
   if (!canManage) {
     return (
@@ -59,13 +83,16 @@ export function CustomBlocks() {
     )
   }
 
-  if (selected !== null && workspaceId) {
+  if ((isCreating || (selectedBlock && canAdmin)) && workspaceId) {
     return (
       <CustomBlockDetail
-        key={selected}
-        blockId={selected === 'new' ? null : selected}
+        key={isCreating ? 'new' : selectedBlock?.id}
+        blockId={isCreating ? null : (selectedBlock?.id ?? null)}
         workspaceId={workspaceId}
-        onBack={() => setSelected(null)}
+        onBack={() => {
+          setIsCreating(false)
+          void setSelectedBlockId(null, { history: 'replace' })
+        }}
       />
     )
   }
@@ -84,7 +111,7 @@ export function CustomBlocks() {
                 text: 'Create block',
                 icon: Plus,
                 variant: 'primary',
-                onSelect: () => setSelected('new'),
+                onSelect: () => setIsCreating(true),
               },
             ]
           : []
@@ -102,30 +129,21 @@ export function CustomBlocks() {
             No blocks found matching "{searchTerm}"
           </SettingsEmptyState>
         ) : (
-          <div className='-mx-2 flex flex-col gap-y-0.5'>
+          <div className={RESOURCE_LIST_STACK}>
             {filtered.map((cb) => {
               const Icon = getCustomBlockIcon(cb.iconUrl, fallbackIconUrl)
               return (
-                <button
+                <SettingsResourceRow
                   key={cb.id}
-                  type='button'
-                  onClick={() => canAdmin && setSelected(cb.id)}
-                  className='w-full rounded-lg p-2 text-left transition-colors hover-hover:bg-[var(--surface-active)]'
-                  disabled={!canAdmin}
-                >
-                  <SettingsResourceRow
-                    icon={<Icon />}
-                    iconFill
-                    title={cb.name}
-                    description={cb.description || undefined}
-                    trailing={
-                      <div className='flex flex-shrink-0 items-center gap-2'>
-                        {!cb.enabled && <ChipTag variant='gray'>Disabled</ChipTag>}
-                        {canAdmin && <ArrowRight className='size-4 text-[var(--text-icon)]' />}
-                      </div>
-                    }
-                  />
-                </button>
+                  icon={<Icon />}
+                  iconFill
+                  title={cb.name}
+                  description={cb.description || undefined}
+                  onClick={canAdmin ? () => void setSelectedBlockId(cb.id) : undefined}
+                  clickLabel={`Open ${cb.name}`}
+                  navigable={canAdmin}
+                  badge={!cb.enabled ? <ChipTag variant='gray'>Disabled</ChipTag> : undefined}
+                />
               )
             })}
           </div>

@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import {
+  organizationRoleSchema,
   type PiiRedactionSettings,
   piiRedactionSettingsSchema,
   retentionOverridesSchema,
@@ -9,23 +10,12 @@ import { defineRouteContract } from '@/lib/api/contracts/types'
 import { workspacePermissionSchema } from '@/lib/api/contracts/workspaces'
 import { HEX_COLOR_REGEX } from '@/lib/branding'
 
-const booleanQueryParamSchema = z
-  .preprocess((value) => {
-    if (value === 'true') return true
-    if (value === 'false') return false
-    return value
-  }, z.boolean())
-  .optional()
-
 const numericResponseSchema = z.preprocess((value) => {
   if (typeof value !== 'string') return value
   const parsed = Number.parseFloat(value)
   return Number.isFinite(parsed) ? parsed : value
 }, z.number())
 
-export const organizationRoleSchema = z.enum(['owner', 'admin', 'member'], {
-  error: 'Invalid role',
-})
 export const organizationParamsSchema = z.object({
   id: z.string().min(1),
 })
@@ -37,14 +27,11 @@ export const organizationMemberParamsSchema = z.object({
 
 export const organizationMemberQuerySchema = z
   .object({
-    include: z.string().optional(),
+    include: z.enum(['usage']).optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    offset: z.coerce.number().int().min(0).default(0),
   })
   .passthrough()
-
-export const workspaceGrantSchema = z.object({
-  workspaceId: z.string().min(1),
-  permission: workspacePermissionSchema,
-})
 
 export const createOrganizationBodySchema = z
   .object({
@@ -67,32 +54,9 @@ export const updateOrganizationBodySchema = z.object({
   logo: z.string().nullable().optional(),
 })
 
-export const createOrganizationInvitationBodySchema = z
-  .object({
-    email: z.string().optional(),
-    emails: z.array(z.string()).optional(),
-    role: z.enum(['member', 'admin'], { error: 'Invalid role' }).optional(),
-    workspaceInvitations: z.array(workspaceGrantSchema).optional(),
-  })
-  .passthrough()
-
-export const organizationInvitationsQuerySchema = z
-  .object({
-    validate: booleanQueryParamSchema,
-    batch: booleanQueryParamSchema,
-  })
-  .passthrough()
-
 export const updateOrganizationMemberRoleBodySchema = z.object({
   role: organizationRoleSchema,
 })
-
-export const inviteOrganizationMemberBodySchema = z
-  .object({
-    email: z.string({ error: 'Email is required' }).min(1, 'Email is required'),
-    role: z.enum(['admin', 'member'], { error: 'Invalid role' }).optional(),
-  })
-  .passthrough()
 
 const organizationDataRetentionHoursSchema = z
   .number()
@@ -131,8 +95,6 @@ const organizationDataRetentionDataSchema = z.object({
   defaults: organizationRetentionValuesSchema,
   configured: organizationRetentionValuesSchema,
   effective: organizationRetentionValuesSchema,
-  piiRedactionEnabled: z.boolean(),
-  piiGranularRedactionEnabled: z.boolean(),
 })
 
 export type OrganizationDataRetention = z.output<typeof organizationDataRetentionDataSchema>
@@ -140,6 +102,110 @@ export type OrganizationDataRetention = z.output<typeof organizationDataRetentio
 export const organizationDataRetentionResponseSchema = z.object({
   success: z.boolean(),
   data: organizationDataRetentionDataSchema,
+})
+
+/**
+ * Session-policy bounds — the single source for the contract validation, the
+ * server-side clamp (`@/lib/auth/session-policy`), and the settings UI.
+ * `MIN_IDLE_TIMEOUT_HOURS` is twice the session cookie-cache window (24h):
+ * cached reads never record activity, so a continuously active user only
+ * refreshes their session when the cookie cache expires. A floor of one
+ * window would sign out active users exactly at the cache boundary; two
+ * windows guarantees a DB-path refresh lands before the idle limit can.
+ */
+export const MIN_SESSION_LIFETIME_HOURS = 1
+export const MIN_IDLE_TIMEOUT_HOURS = 48
+export const MAX_SESSION_POLICY_HOURS = 8760
+
+export const updateOrganizationSessionPolicyBodySchema = z.object({
+  maxSessionHours: z
+    .number()
+    .int()
+    .min(MIN_SESSION_LIFETIME_HOURS, 'Max session lifetime must be at least 1 hour')
+    .max(MAX_SESSION_POLICY_HOURS, 'Max session lifetime cannot exceed 8760 hours (1 year)')
+    .nullable(),
+  idleTimeoutHours: z
+    .number()
+    .int()
+    .min(
+      MIN_IDLE_TIMEOUT_HOURS,
+      'Idle timeout must be at least 48 hours — session activity is recorded at most once per 24h cookie-cache window'
+    )
+    .max(MAX_SESSION_POLICY_HOURS, 'Idle timeout cannot exceed 8760 hours (1 year)')
+    .nullable(),
+})
+
+export type UpdateOrganizationSessionPolicyBody = z.input<
+  typeof updateOrganizationSessionPolicyBodySchema
+>
+
+const organizationSessionPolicyValuesSchema = z.object({
+  maxSessionHours: z.number().int().nullable(),
+  idleTimeoutHours: z.number().int().nullable(),
+})
+
+const organizationSessionPolicyDataSchema = z.object({
+  isEnterprise: z.boolean(),
+  configured: organizationSessionPolicyValuesSchema,
+})
+
+export type OrganizationSessionPolicy = z.output<typeof organizationSessionPolicyDataSchema>
+
+export const organizationSessionPolicyResponseSchema = z.object({
+  success: z.boolean(),
+  data: organizationSessionPolicyDataSchema,
+})
+
+export const MAX_ORGANIZATION_DOMAINS = 25
+
+export const organizationDomainParamsSchema = z.object({
+  id: z.string().min(1),
+  domainId: z.string().min(1),
+})
+
+export const addOrganizationDomainBodySchema = z.object({
+  domain: z.string().min(1, 'Domain is required').max(253, 'Domain is too long'),
+})
+
+export type AddOrganizationDomainBody = z.input<typeof addOrganizationDomainBodySchema>
+
+export const organizationDomainStatusSchema = z.enum(['pending', 'verified'])
+
+const organizationDomainSchema = z.object({
+  id: z.string(),
+  domain: z.string(),
+  status: organizationDomainStatusSchema,
+  verifiedAt: z.string().nullable(),
+  /** DNS host the TXT record must live on (e.g. `_sim-challenge.acme.com`). */
+  challengeHost: z.string(),
+  /** Exact TXT record value the org must publish. Null for grandfathered/verified rows. */
+  txtRecordValue: z.string().nullable(),
+})
+
+export type OrganizationDomain = z.output<typeof organizationDomainSchema>
+
+const organizationDomainsDataSchema = z.object({
+  isEnterprise: z.boolean(),
+  domains: z.array(organizationDomainSchema),
+})
+
+export type OrganizationDomains = z.output<typeof organizationDomainsDataSchema>
+
+export const listOrganizationDomainsResponseSchema = z.object({
+  success: z.boolean(),
+  data: organizationDomainsDataSchema,
+})
+
+export const organizationDomainResponseSchema = z.object({
+  success: z.boolean(),
+  data: z.object({ domain: organizationDomainSchema }),
+})
+
+export const revokeOrganizationSessionsResponseSchema = z.object({
+  success: z.boolean(),
+  data: z.object({
+    revokedSessions: z.number().int().min(0),
+  }),
 })
 
 export const updateOrganizationWhitelabelBodySchema = z.object({
@@ -191,6 +257,13 @@ export const rosterWorkspaceAccessSchema = z.object({
   workspaceId: z.string(),
   workspaceName: z.string(),
   permission: workspacePermissionSchema,
+  /**
+   * Why this role is fixed, when it is. Carried so the roster can disable the
+   * controls the workspace-permissions route refuses, the way the teammates list
+   * already does — without them it offers an edit that can only fail.
+   */
+  roleSource: z.enum(['owner', 'explicit', 'org-admin']),
+  isBilledAccount: z.boolean(),
 })
 
 export const rosterMemberSchema = z.object({
@@ -245,6 +318,12 @@ export const listOrganizationMembersResponseSchema = z
     success: z.boolean(),
     data: z.array(organizationMemberUsageSchema),
     total: z.number(),
+    pagination: z.object({
+      total: z.number().int().min(0),
+      limit: z.number().int().min(1).max(100),
+      offset: z.number().int().min(0),
+      hasMore: z.boolean(),
+    }),
     userRole: organizationRoleSchema,
     hasAdminAccess: z.boolean(),
   })
@@ -254,15 +333,6 @@ const successResponseSchema = z
   .object({
     success: z.boolean(),
     message: z.string().optional(),
-  })
-  .passthrough()
-
-const organizationInvitationValidationResponseSchema = z
-  .object({
-    success: z.literal(true),
-    data: z.unknown(),
-    validatedBy: z.string(),
-    validatedAt: z.string(),
   })
   .passthrough()
 
@@ -279,6 +349,38 @@ export const getOrganizationRosterContract = defineRouteContract({
   },
 })
 
+export const removalImpactCredentialSchema = z.object({
+  id: z.string(),
+  displayName: z.string(),
+  type: z.string(),
+  workspaceId: z.string(),
+})
+
+export const memberRemovalImpactQuerySchema = z.object({
+  userId: z.string().min(1, 'User ID is required'),
+})
+
+/**
+ * Identity-bound credentials (OAuth accounts, personal env keys) the user owns
+ * in organization workspaces. These stop working when the user's workspace
+ * access is revoked and must be reconnected by a remaining member — removal is
+ * never blocked, only disclosed.
+ */
+export const getMemberRemovalImpactContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/organizations/[id]/removal-impact',
+  params: organizationParamsSchema,
+  query: memberRemovalImpactQuerySchema,
+  response: {
+    mode: 'json',
+    schema: z.object({
+      credentials: z.array(removalImpactCredentialSchema),
+    }),
+  },
+})
+
+export type RemovalImpactCredential = z.infer<typeof removalImpactCredentialSchema>
+
 export const listOrganizationMembersContract = defineRouteContract({
   method: 'GET',
   path: '/api/organizations/[id]/members',
@@ -287,65 +389,6 @@ export const listOrganizationMembersContract = defineRouteContract({
   response: {
     mode: 'json',
     schema: listOrganizationMembersResponseSchema,
-  },
-})
-
-export const inviteOrganizationMemberContract = defineRouteContract({
-  method: 'POST',
-  path: '/api/organizations/[id]/members',
-  params: organizationParamsSchema,
-  body: inviteOrganizationMemberBodySchema,
-  response: {
-    mode: 'json',
-    schema: successResponseSchema.extend({
-      data: z
-        .object({
-          invitationId: z.string(),
-          email: z.string(),
-          role: organizationRoleSchema,
-        })
-        .passthrough()
-        .optional(),
-    }),
-  },
-})
-
-export const inviteOrganizationMembersContract = defineRouteContract({
-  method: 'POST',
-  path: '/api/organizations/[id]/invitations',
-  params: organizationParamsSchema,
-  query: organizationInvitationsQuerySchema,
-  body: createOrganizationInvitationBodySchema,
-  response: {
-    mode: 'json',
-    schema: z.union([
-      organizationInvitationValidationResponseSchema,
-      successResponseSchema.extend({
-        error: z.string().optional(),
-        data: z
-          .object({
-            invitationsSent: z.number(),
-            invitedEmails: z.array(z.string()),
-            directlyAdded: z.array(z.string()).optional(),
-            directlyAddedCount: z.number().optional(),
-            failedInvitations: z.array(z.object({ email: z.string(), error: z.string() })),
-            existingMembers: z.array(z.string()),
-            pendingInvitations: z.array(z.string()),
-            invalidEmails: z.array(z.string()),
-            workspaceGrantsPerInvite: z.number(),
-            seatInfo: z
-              .object({
-                seatsUsed: z.number(),
-                maxSeats: z.number(),
-                availableSeats: z.number(),
-              })
-              .passthrough()
-              .optional(),
-          })
-          .passthrough()
-          .optional(),
-      }),
-    ]),
   },
 })
 
@@ -488,6 +531,78 @@ export const updateOrganizationDataRetentionContract = defineRouteContract({
   response: {
     mode: 'json',
     schema: organizationDataRetentionResponseSchema,
+  },
+})
+
+export const getOrganizationSessionPolicyContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/organizations/[id]/session-policy',
+  params: organizationParamsSchema,
+  response: {
+    mode: 'json',
+    schema: organizationSessionPolicyResponseSchema,
+  },
+})
+
+export const updateOrganizationSessionPolicyContract = defineRouteContract({
+  method: 'PUT',
+  path: '/api/organizations/[id]/session-policy',
+  params: organizationParamsSchema,
+  body: updateOrganizationSessionPolicyBodySchema,
+  response: {
+    mode: 'json',
+    schema: organizationSessionPolicyResponseSchema,
+  },
+})
+
+export const revokeOrganizationSessionsContract = defineRouteContract({
+  method: 'POST',
+  path: '/api/organizations/[id]/sessions/revoke',
+  params: organizationParamsSchema,
+  response: {
+    mode: 'json',
+    schema: revokeOrganizationSessionsResponseSchema,
+  },
+})
+
+export const listOrganizationDomainsContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/organizations/[id]/domains',
+  params: organizationParamsSchema,
+  response: {
+    mode: 'json',
+    schema: listOrganizationDomainsResponseSchema,
+  },
+})
+
+export const addOrganizationDomainContract = defineRouteContract({
+  method: 'POST',
+  path: '/api/organizations/[id]/domains',
+  params: organizationParamsSchema,
+  body: addOrganizationDomainBodySchema,
+  response: {
+    mode: 'json',
+    schema: organizationDomainResponseSchema,
+  },
+})
+
+export const verifyOrganizationDomainContract = defineRouteContract({
+  method: 'POST',
+  path: '/api/organizations/[id]/domains/[domainId]/verify',
+  params: organizationDomainParamsSchema,
+  response: {
+    mode: 'json',
+    schema: organizationDomainResponseSchema,
+  },
+})
+
+export const removeOrganizationDomainContract = defineRouteContract({
+  method: 'DELETE',
+  path: '/api/organizations/[id]/domains/[domainId]',
+  params: organizationDomainParamsSchema,
+  response: {
+    mode: 'json',
+    schema: z.object({ success: z.boolean() }),
   },
 })
 

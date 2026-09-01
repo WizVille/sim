@@ -5,6 +5,12 @@ import { AuthMode, IntegrationType } from '@/blocks/types'
 import { normalizeFileInput } from '@/blocks/utils'
 import type { SquareResponse } from '@/tools/square/types'
 
+const CUSTOMER_NAME_FIELD = ['givenName', 'companyName', 'nickname'] as const
+
+const CUSTOMER_CONTACT_FIELD = ['emailAddress', 'phoneNumber'] as const
+
+const CATALOG_IMAGE_FIELD = ['uploadFile', 'fileRef'] as const
+
 export const SquareBlock: BlockConfig<SquareResponse> = {
   type: 'square',
   name: 'Square',
@@ -17,6 +23,136 @@ export const SquareBlock: BlockConfig<SquareResponse> = {
   integrationType: IntegrationType.Commerce,
   bgColor: '#000000',
   icon: SquareIcon,
+  canvasPresentation: {
+    defaultTitle: 'Square',
+    sentences: {
+      byOperation: {
+        create_payment: [
+          { text: 'Take a payment of', field: 'amount', core: true },
+          { text: 'from source', field: 'sourceId', core: true },
+          { text: ', for customer', field: 'customerId' },
+        ],
+        get_payment: [{ text: 'Fetch payment', field: 'paymentId', core: true }],
+        list_payments: [
+          'List payments',
+          { text: ', at location', field: 'locationId' },
+          { text: ', from', field: 'beginTime' },
+          { text: ', until', field: 'endTime' },
+        ],
+        cancel_payment: [{ text: 'Void authorized payment', field: 'paymentId', core: true }],
+        complete_payment: [
+          { text: 'Capture payment', field: 'paymentId', core: true },
+          { text: ', at version', field: 'versionToken' },
+        ],
+        refund_payment: [
+          { text: 'Refund payment', field: 'paymentId', core: true },
+          { text: ', for', field: 'amount' },
+          { text: ', because', field: 'reason' },
+        ],
+        get_refund: [{ text: 'Fetch refund', field: 'refundId', core: true }],
+        list_refunds: [
+          'List refunds',
+          { text: ', with status', field: 'status' },
+          { text: ', at location', field: 'locationId' },
+          { text: ', from', field: 'beginTime' },
+        ],
+        create_customer: [
+          'Create a customer profile',
+          { text: ', named', field: CUSTOMER_NAME_FIELD },
+          { text: ', reachable at', field: CUSTOMER_CONTACT_FIELD },
+        ],
+        get_customer: [{ text: 'Fetch customer', field: 'customerId', core: true }],
+        list_customers: [
+          'List customer profiles',
+          { text: ', sorted by', field: 'sortField' },
+          { text: ', up to', field: 'limit', after: 'results' },
+        ],
+        search_customers: [
+          'Search customer profiles',
+          { text: ', matching', field: 'query' },
+          { text: ', up to', field: 'limit', after: 'results' },
+        ],
+        update_customer: [
+          { text: 'Update customer', field: 'customerId', core: true },
+          { text: ', setting the name to', field: CUSTOMER_NAME_FIELD },
+          { text: ', with contact', field: CUSTOMER_CONTACT_FIELD },
+        ],
+        delete_customer: [{ text: 'Delete customer', field: 'customerId', core: true }],
+        list_locations: ['List every location on the account'],
+        get_location: [{ text: 'Fetch location', field: 'locationId', core: true }],
+        create_order: [{ text: 'Create an order from', field: 'order', core: true }],
+        get_order: [{ text: 'Fetch order', field: 'orderId', core: true }],
+        search_orders: [
+          'Search orders',
+          { text: ', at locations', field: 'locationIds' },
+          { text: ', matching', field: 'query' },
+          { text: ', up to', field: 'limit', after: 'results' },
+        ],
+        pay_order: [
+          { text: 'Pay order', field: 'orderId', core: true },
+          { text: ', with', field: 'paymentIds' },
+          { text: ', at version', field: 'orderVersion' },
+        ],
+        create_invoice: [{ text: 'Create a draft invoice from', field: 'invoice', core: true }],
+        get_invoice: [{ text: 'Fetch invoice', field: 'invoiceId', core: true }],
+        list_invoices: [
+          { text: 'List invoices at location', field: 'locationId', core: true },
+          { text: ', up to', field: 'limit', after: 'results' },
+        ],
+        search_invoices: [
+          { text: 'Search invoices at location', field: 'locationId', core: true },
+          { text: ', up to', field: 'limit', after: 'results' },
+        ],
+        publish_invoice: [
+          {
+            text: 'Publish invoice',
+            field: 'invoiceId',
+            after: 'to the customer',
+            core: true,
+          },
+          { text: ', at version', field: 'version' },
+        ],
+        cancel_invoice: [
+          { text: 'Cancel published invoice', field: 'invoiceId', core: true },
+          { text: ', at version', field: 'version' },
+        ],
+        delete_invoice: [
+          { text: 'Delete draft invoice', field: 'invoiceId', core: true },
+          { text: ', at version', field: 'version' },
+        ],
+        upsert_catalog_object: [
+          { text: 'Create or update a catalog object from', field: 'object', core: true },
+        ],
+        get_catalog_object: [{ text: 'Fetch catalog object', field: 'objectId', core: true }],
+        list_catalog: ['List catalog objects', { text: ', of type', field: 'types' }],
+        search_catalog_objects: [
+          'Search catalog objects',
+          { text: ', of type', field: 'objectTypes' },
+          { text: ', matching', field: 'query' },
+          { text: ', up to', field: 'limit', after: 'results' },
+        ],
+        create_catalog_image: [
+          { text: 'Upload', field: CATALOG_IMAGE_FIELD, core: true },
+          { text: 'to catalog object', field: 'objectId' },
+          { text: ', captioned', field: 'caption' },
+        ],
+        delete_catalog_object: [
+          {
+            text: 'Delete catalog object',
+            field: 'objectId',
+            after: 'and its children',
+            core: true,
+          },
+        ],
+        batch_retrieve_inventory_counts: [
+          'Read inventory counts',
+          { text: ', for', field: 'catalogObjectIds' },
+          { text: ', at locations', field: 'locationIds' },
+          { text: ', in state', field: 'states' },
+        ],
+      },
+    },
+  },
 
   subBlocks: [
     {
@@ -883,7 +1019,7 @@ export const SquareBlockMeta = {
   templates: [
     {
       icon: SquareIcon,
-      title: 'Daily sales summary',
+      title: 'Square daily sales summary',
       prompt:
         'Build a scheduled daily workflow that lists Square payments from the previous day across all locations, totals gross sales, refunds, and net revenue, writes the figures to a table for historical tracking, and posts a Slack summary with day-over-day trends.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -893,7 +1029,7 @@ export const SquareBlockMeta = {
     },
     {
       icon: SquareIcon,
-      title: 'Refund pattern monitor',
+      title: 'Square refund pattern monitor',
       prompt:
         'Create a scheduled weekly workflow that lists Square payments and their refunds, classifies each refund by reason and location, flags any location with an unusually high refund rate, and emails finance a narrative report with recommended actions.',
       modules: ['scheduled', 'agent', 'files', 'workflows'],
@@ -903,7 +1039,7 @@ export const SquareBlockMeta = {
     },
     {
       icon: SquareIcon,
-      title: 'New customer welcome',
+      title: 'Square new customer welcome',
       prompt:
         'Build a workflow that takes a new Square customer, creates a welcome email tailored to their purchase, adds them to an onboarding tracking table, and posts a notification to the customer success Slack channel.',
       modules: ['tables', 'agent', 'workflows'],
@@ -913,7 +1049,7 @@ export const SquareBlockMeta = {
     },
     {
       icon: SquareIcon,
-      title: 'Invoice chase automation',
+      title: 'Square invoice chase automation',
       prompt:
         'Create a scheduled workflow that lists Square invoices for a location, finds those that are unpaid past their due date, sends a polite reminder email per customer, and logs every chase action to a collections table.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -923,7 +1059,7 @@ export const SquareBlockMeta = {
     },
     {
       icon: SquareIcon,
-      title: 'Catalog image enrichment',
+      title: 'Square catalog image enrichment',
       prompt:
         'Build a workflow that lists Square catalog items missing images, generates a product image for each one, uploads it as a catalog image attached to the item, and writes a report of which items were updated.',
       modules: ['agent', 'files', 'workflows'],
@@ -932,7 +1068,7 @@ export const SquareBlockMeta = {
     },
     {
       icon: SquareIcon,
-      title: 'Low-stock reorder alerts',
+      title: 'Square low-stock reorder alerts',
       prompt:
         'Create a scheduled workflow that lists the Square catalog, identifies items flagged as low or out of stock, drafts a reorder summary grouped by supplier, and posts it to a Slack purchasing channel with the items and quantities to reorder.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -942,7 +1078,7 @@ export const SquareBlockMeta = {
     },
     {
       icon: SquareIcon,
-      title: 'Customer purchase history lookup',
+      title: 'Square purchase history lookup',
       prompt:
         'Build a workflow that searches Square customers by email, pulls their orders and payments, summarizes lifetime spend and most-purchased items, and returns a concise profile the support team can use during a conversation.',
       modules: ['agent', 'workflows'],

@@ -5,6 +5,13 @@ import { getErrorMessage } from '@sim/utils/errors'
 import { generateShortId } from '@sim/utils/id'
 import { and, eq, inArray, isNull, or } from 'drizzle-orm'
 import type { NextRequest } from 'next/server'
+import { isSlackExtendedScopesEnabled } from '@/lib/core/config/env-flags'
+import { getProviderIdFromServiceId } from '@/lib/oauth'
+import {
+  getSlackBotCredential,
+  refreshAccessTokenIfNeeded,
+  resolveOAuthAccountId,
+} from '@/lib/oauth/credential-service'
 import { WebhookPathClaimConflictError } from '@/lib/webhooks/path-claims'
 import { PendingWebhookVerificationTracker } from '@/lib/webhooks/pending-verification'
 import {
@@ -19,6 +26,7 @@ import {
   prepareStableWebhookRegistrations,
   type StableDesiredWebhookRegistration,
 } from '@/lib/webhooks/registration-service'
+import { LEGACY_SLACK_CUSTOM_BOT_INGRESS_MODE } from '@/lib/webhooks/slack-custom-ingress-constants'
 import { findConflictingWebhookPathOwner } from '@/lib/webhooks/utils.server'
 import {
   buildCanonicalIndex,
@@ -26,19 +34,15 @@ import {
   isCanonicalPair,
   resolveActiveCanonicalValue,
 } from '@/lib/workflows/subblocks/visibility'
-import {
-  getSlackBotCredential,
-  refreshAccessTokenIfNeeded,
-  resolveOAuthAccountId,
-} from '@/app/api/auth/oauth/utils'
-import { getBlock } from '@/blocks'
 import type { SubBlockConfig } from '@/blocks/types'
 import type { BlockState } from '@/stores/workflows/workflow/types'
 import { getTrigger, isTriggerValid } from '@/triggers'
 import { SYSTEM_SUBBLOCK_IDS } from '@/triggers/constants'
 import { SIM_SUBSCRIBED_EVENTS } from '@/triggers/slack/shared'
+import { resolveBlockTriggerId } from '@/triggers/webhook-url'
 
 const logger = createLogger('DeployWebhookSync')
+const TIKTOK_ACCOUNT_UUID_SUFFIX = /-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 interface TriggerSaveError {
   message: string
@@ -74,7 +78,7 @@ export async function validateTriggerWebhookConfigForDeploy(
   const triggerBlocks = Object.values(blocks || {}).filter((b) => b && b.enabled !== false)
 
   for (const block of triggerBlocks) {
-    const triggerId = resolveTriggerId(block)
+    const triggerId = resolveBlockTriggerId(block)
     if (!triggerId || !isTriggerValid(triggerId)) continue
 
     const triggerDef = getTrigger(triggerId)
@@ -171,43 +175,6 @@ function isFieldRequired(
   return evalCond(condition, subBlockValues)
 }
 
-function resolveTriggerId(block: BlockState): string | undefined {
-  const blockConfig = getBlock(block.type)
-
-  if (blockConfig?.category === 'triggers' && isTriggerValid(block.type)) {
-    return block.type
-  }
-
-  if (!block.triggerMode) {
-    return undefined
-  }
-
-  const selectedTriggerId = getSubBlockValue(block, 'selectedTriggerId')
-  if (typeof selectedTriggerId === 'string' && isTriggerValid(selectedTriggerId)) {
-    return selectedTriggerId
-  }
-
-  const storedTriggerId = getSubBlockValue(block, 'triggerId')
-  if (typeof storedTriggerId === 'string' && isTriggerValid(storedTriggerId)) {
-    return storedTriggerId
-  }
-
-  if (blockConfig?.triggers?.enabled) {
-    const configuredTriggerId =
-      typeof selectedTriggerId === 'string' ? selectedTriggerId : undefined
-    if (configuredTriggerId && isTriggerValid(configuredTriggerId)) {
-      return configuredTriggerId
-    }
-
-    const available = blockConfig.triggers?.available?.[0]
-    if (available && isTriggerValid(available)) {
-      return available
-    }
-  }
-
-  return undefined
-}
-
 function getConfigValue(block: BlockState, subBlock: SubBlockConfig): unknown {
   const fieldValue = getSubBlockValue(block, subBlock.id)
 
@@ -244,6 +211,8 @@ export function buildProviderConfig(
     Object.entries(block.subBlocks || {}).map(([key, value]) => [key, { value: value.value }])
   )
 
+  // canonical-index-unscoped: a trigger DEFINITION's subblocks are the trigger surface by
+  // construction — this never sees the host block's action fields.
   const canonicalIndex = buildCanonicalIndex(triggerDef.subBlocks)
   const satisfiedCanonicalIds = new Set<string>()
   const filledSubBlockIds = new Set<string>()
@@ -334,13 +303,16 @@ export function buildProviderConfig(
 
 /**
  * Resolves a trigger credential reference to its canonical platform credential ID while enforcing
- * that the credential belongs to the deployed workflow's workspace and OAuth service.
+ * that the credential belongs to the deployed workflow's workspace and OAuth provider.
+ *
+ * Exported for unit testing the service-to-provider boundary; not part of the public deploy API.
  */
-async function resolveTriggerCredentialId(
+export async function resolveTriggerCredentialId(
   credentialReference: string,
   workspaceId: string,
   serviceId: string
 ): Promise<string | null> {
+  const providerId = getProviderIdFromServiceId(serviceId)
   const [resolvedCredential] = await db
     .select({ id: credential.id })
     .from(credential)
@@ -348,7 +320,7 @@ async function resolveTriggerCredentialId(
       and(
         eq(credential.workspaceId, workspaceId),
         eq(credential.type, 'oauth'),
-        eq(credential.providerId, serviceId),
+        eq(credential.providerId, providerId),
         or(eq(credential.id, credentialReference), eq(credential.accountId, credentialReference))
       )
     )
@@ -357,13 +329,17 @@ async function resolveTriggerCredentialId(
   return resolvedCredential?.id ?? null
 }
 
-async function resolveWebhookConfigForBlock(input: {
+/**
+ * Resolves a trigger block to its persisted webhook config, including app-level
+ * provider routing. Exported for focused unit testing; not part of the public deploy API.
+ */
+export async function resolveWebhookConfigForBlock(input: {
   block: BlockState
   workflow: Record<string, unknown>
   userId: string
   requestId: string
 }): Promise<ResolveWebhookConfigResult | null> {
-  const triggerId = resolveTriggerId(input.block)
+  const triggerId = resolveBlockTriggerId(input.block)
   if (!triggerId || !isTriggerValid(triggerId)) return null
 
   const triggerDef = getTrigger(triggerId)
@@ -427,29 +403,132 @@ async function resolveWebhookConfigForBlock(input: {
   let effectivePath: string | null = triggerPath
   let routingKey: string | null = null
   if (triggerId === 'slack_oauth') {
-    const appType = typeof providerConfig.appType === 'string' ? providerConfig.appType : 'custom'
-    if (appType === 'sim') {
-      const eventType =
-        typeof providerConfig.eventType === 'string' ? providerConfig.eventType : null
-      if (eventType && !SIM_SUBSCRIBED_EVENTS.includes(eventType)) {
+    // One credential picker feeds two backends. The credential's resolved kind —
+    // not a UI field — picks the branch: a Slack bot credential routes by the
+    // credential id (custom bring-your-own app); an OAuth account routes by Slack
+    // team_id on the native shared Sim app.
+    const slackCredentialId =
+      typeof providerConfig.botCredential === 'string' ? providerConfig.botCredential : undefined
+    if (!slackCredentialId) {
+      return {
+        success: false,
+        error: { message: 'Select a Slack account or bot for the trigger.', status: 400 },
+      }
+    }
+    const botCredential = await getSlackBotCredential(slackCredentialId)
+    if (botCredential) {
+      // Custom bring-your-own bot: events route by the bot credential to one
+      // shared ingest URL verified with the bot's own signing secret.
+      const workflowWorkspace =
+        typeof input.workflow.workspaceId === 'string' ? input.workflow.workspaceId : undefined
+      if (!workflowWorkspace || botCredential.workspaceId !== workflowWorkspace) {
         return {
           success: false,
           error: {
-            message:
-              'This event is not available on the Sim Slack app. Use a custom app or choose a supported event.',
+            message: 'The selected Slack bot credential is not available in this workspace.',
             status: 400,
           },
         }
       }
-      if (!credentialId) {
+      if (!botCredential.signingSecret) {
         return {
           success: false,
-          error: { message: 'Select a Slack account for the trigger.', status: 400 },
+          error: {
+            message:
+              'The selected Slack bot can run actions but cannot receive events because it has no signing secret. Reconnect it with a signing secret.',
+            status: 400,
+          },
         }
       }
-
+      effectiveProvider = 'slack'
+      effectivePath = null
+      routingKey = slackCredentialId
+      providerConfig.credentialId = slackCredentialId
+      if (botCredential.botUserId) {
+        providerConfig.bot_user_id = botCredential.botUserId
+      } else if (
+        providerConfig.eventType === 'reaction_added' ||
+        providerConfig.eventType === 'reaction_removed'
+      ) {
+        try {
+          const { userId: botUserId } = await fetchSlackTeamId(botCredential.botToken)
+          if (botUserId) providerConfig.bot_user_id = botUserId
+        } catch (error: unknown) {
+          logger.error(
+            `[${input.requestId}] Slack custom bot identity resolution failed for ${input.block.id}`,
+            error
+          )
+          return {
+            success: false,
+            error: {
+              message: 'Could not verify the selected Slack bot. Reconnect it and try again.',
+              status: 400,
+            },
+          }
+        }
+      }
+    } else {
+      // getSlackBotCredential also returns null for a custom bot credential that
+      // was deleted or lost its stored secrets. Name that case so the error
+      // directs the user to reconnect the bot rather than mislabeling it an OAuth
+      // account below.
+      const resolvedKind = await resolveOAuthAccountId(slackCredentialId)
+      if (resolvedKind?.credentialType === 'service_account') {
+        return {
+          success: false,
+          error: {
+            message: 'The selected Slack bot credential is missing or invalid. Reconnect it.',
+            status: 400,
+          },
+        }
+      }
+      if (!isSlackExtendedScopesEnabled) {
+        return {
+          success: false,
+          error: {
+            message:
+              'The Sim Slack app trigger is disabled for this deployment. Select a custom bot.',
+            status: 400,
+          },
+        }
+      }
+      // Native Sim app: a workspace OAuth Slack credential. Resolve it through the
+      // same workspace/provider-scoped lookup the generic credential path uses, so
+      // a pasted foreign or other-tenant credential id can't bind here and the
+      // canonical id is what routing and runtime token resolution key on.
+      const workflowWorkspace =
+        typeof input.workflow.workspaceId === 'string' ? input.workflow.workspaceId : undefined
+      const resolvedCredentialId = workflowWorkspace
+        ? await resolveTriggerCredentialId(slackCredentialId, workflowWorkspace, 'slack')
+        : null
+      if (!resolvedCredentialId) {
+        return {
+          success: false,
+          error: {
+            message: 'The selected Slack credential is not available in this workspace.',
+            status: 400,
+          },
+        }
+      }
+      // The shared app only subscribes to a fixed event set; reject anything
+      // outside it before deriving routing.
+      const eventType =
+        typeof providerConfig.eventType === 'string' ? providerConfig.eventType : null
+      if (!eventType || !SIM_SUBSCRIBED_EVENTS.includes(eventType)) {
+        return {
+          success: false,
+          error: {
+            message:
+              'This event is not available on the Sim Slack app. Use a custom bot or choose a supported event.',
+            status: 400,
+          },
+        }
+      }
+      // Resolve the credential OWNER's token (not the deploying actor's) — in a
+      // shared workspace a teammate can deploy a trigger wired to someone else's
+      // Slack account.
       let tokenOwnerUserId = input.userId
-      const resolvedAccount = await resolveOAuthAccountId(credentialId)
+      const resolvedAccount = await resolveOAuthAccountId(resolvedCredentialId)
       if (resolvedAccount?.accountId) {
         const [owner] = await db
           .select({ userId: account.userId })
@@ -459,7 +538,7 @@ async function resolveWebhookConfigForBlock(input: {
         if (owner?.userId) tokenOwnerUserId = owner.userId
       }
       const botToken = await refreshAccessTokenIfNeeded(
-        credentialId,
+        resolvedCredentialId,
         tokenOwnerUserId,
         input.requestId
       )
@@ -491,42 +570,80 @@ async function resolveWebhookConfigForBlock(input: {
       }
       effectiveProvider = 'slack_app'
       effectivePath = null
-    } else {
-      const botCredentialId =
-        typeof providerConfig.botCredential === 'string' ? providerConfig.botCredential : undefined
-      if (!botCredentialId) {
-        return {
-          success: false,
-          error: { message: 'Select a Slack bot credential for the trigger.', status: 400 },
-        }
-      }
-      const botCredential = await getSlackBotCredential(botCredentialId)
-      if (!botCredential) {
-        return {
-          success: false,
-          error: {
-            message: 'The selected Slack bot credential is missing or invalid. Reconnect it.',
-            status: 400,
-          },
-        }
-      }
+      // Runtime token resolution and credential-disconnect cleanup key native
+      // (`slack_app`) rows on providerConfig.credentialId.
+      providerConfig.credentialId = resolvedCredentialId
+    }
+  } else if (triggerId === 'slack_webhook') {
+    const slackCredentialId =
+      typeof providerConfig.botCredential === 'string' ? providerConfig.botCredential : undefined
+
+    if (slackCredentialId) {
+      const botCredential = await getSlackBotCredential(slackCredentialId)
       const workflowWorkspace =
         typeof input.workflow.workspaceId === 'string' ? input.workflow.workspaceId : undefined
-      if (!workflowWorkspace || botCredential.workspaceId !== workflowWorkspace) {
+      if (!botCredential || !workflowWorkspace || botCredential.workspaceId !== workflowWorkspace) {
         return {
           success: false,
           error: {
-            message: 'The selected Slack bot credential is not available in this workspace.',
+            message: 'The migrated Slack bot credential is not available in this workspace.',
             status: 400,
           },
         }
       }
-      effectiveProvider = 'slack'
-      effectivePath = null
-      routingKey = botCredentialId
-      providerConfig.credentialId = botCredentialId
-      if (botCredential.botUserId) providerConfig.bot_user_id = botCredential.botUserId
+      if (!botCredential.signingSecret) {
+        return {
+          success: false,
+          error: {
+            message:
+              'The migrated Slack bot cannot receive events because it has no signing secret.',
+            status: 400,
+          },
+        }
+      }
+
+      routingKey = slackCredentialId
+      providerConfig.credentialId = slackCredentialId
+      providerConfig.ingressMode = LEGACY_SLACK_CUSTOM_BOT_INGRESS_MODE
+    } else if (providerConfig.credentialId || providerConfig.ingressMode) {
+      return {
+        success: false,
+        error: {
+          message: 'The migrated Slack webhook credential association is incomplete.',
+          status: 400,
+        },
+      }
     }
+  } else if (triggerDef.provider === 'tiktok') {
+    if (!credentialId) {
+      return {
+        success: false,
+        error: { message: 'Select a TikTok account for the trigger.', status: 400 },
+      }
+    }
+
+    const resolvedAccount = await resolveOAuthAccountId(credentialId)
+    const [tiktokAccount] = resolvedAccount?.accountId
+      ? await db
+          .select({ accountId: account.accountId })
+          .from(account)
+          .where(and(eq(account.id, resolvedAccount.accountId), eq(account.providerId, 'tiktok')))
+          .limit(1)
+      : []
+    const openId = tiktokAccount?.accountId.replace(TIKTOK_ACCOUNT_UUID_SUFFIX, '')
+
+    if (!openId || openId === tiktokAccount?.accountId) {
+      return {
+        success: false,
+        error: {
+          message: 'Could not verify the connected TikTok account. Reconnect it and try again.',
+          status: 400,
+        },
+      }
+    }
+
+    effectivePath = null
+    routingKey = openId
   }
 
   return {
@@ -645,7 +762,10 @@ export async function prepareStableTriggerWebhooksForDeploy({
       success: false,
       error: {
         message: getErrorMessage(error, 'Failed to prepare webhook registrations'),
-        status: 500,
+        // Propagate a provider-attached status (e.g. Zoho's 4xx edition/validation
+        // failures) so the deploy outbox fails terminally instead of retrying,
+        // matching the legacy save path's status-aware mapping below.
+        status: (error as { status?: number })?.status ?? 500,
       },
     }
   }
@@ -902,7 +1022,11 @@ export async function saveTriggerWebhooksForDeploy({
             (cleanupFailure as Error)?.message ||
             (error as Error)?.message ||
             'Failed to create external subscription',
-          status: 500,
+          // Propagate a 4xx from the provider handler (e.g. a permanent Zoho
+          // config/permission/invalid-data failure) so the outbox classifies it
+          // as non-retryable; anything else (network, provider 5xx) stays 500 and
+          // retryable. cleanupFailure never overrides the root cause's status.
+          status: (error as { status?: number })?.status ?? 500,
         },
       }
     }

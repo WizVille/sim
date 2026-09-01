@@ -1,9 +1,8 @@
 import { createLogger } from '@sim/logger'
-import { BLOCK_DIMENSIONS, HANDLE_POSITIONS } from '@sim/workflow-renderer'
+import { HANDLE_POSITIONS } from '@sim/workflow-renderer'
 import {
   CONTAINER_LAYOUT_OPTIONS,
   DEFAULT_LAYOUT_OPTIONS,
-  MAX_OVERLAP_ITERATIONS,
 } from '@/lib/workflows/autolayout/constants'
 import type { Edge, GraphNode, LayoutOptions } from '@/lib/workflows/autolayout/types'
 import {
@@ -22,15 +21,21 @@ const SUBFLOW_START_HANDLES = new Set(['loop-start-source', 'parallel-start-sour
 
 /**
  * Calculates the Y offset for a source handle based on block type and handle ID.
+ *
+ * Every offset here is measured against `metrics.portHeight`, the height the
+ * card paints — never `metrics.height`, which is padded for spacing. The error
+ * handle rides the painted bottom edge, and the default ports its centre, so
+ * padding either would pull the edge off the knob it terminates at.
  */
-function getSourceHandleYOffset(block: BlockState, sourceHandle?: string | null): number {
+function getSourceHandleYOffset(node: GraphNode, sourceHandle?: string | null): number {
+  const block = node.block
+
   if (sourceHandle === 'error') {
-    const blockHeight = block.height || BLOCK_DIMENSIONS.MIN_HEIGHT
-    return blockHeight - HANDLE_POSITIONS.ERROR_BOTTOM_OFFSET
+    return node.metrics.portHeight
   }
 
   if (sourceHandle && SUBFLOW_START_HANDLES.has(sourceHandle)) {
-    return HANDLE_POSITIONS.SUBFLOW_START_Y_OFFSET
+    return HANDLE_POSITIONS.SUBFLOW_CONNECTION_Y
   }
 
   if (block.type === 'condition' && sourceHandle?.startsWith(EDGE.CONDITION_PREFIX)) {
@@ -52,14 +57,27 @@ function getSourceHandleYOffset(block: BlockState, sourceHandle?: string | null)
     }
   }
 
-  return HANDLE_POSITIONS.DEFAULT_Y_OFFSET
+  return getDefaultHandleYOffset(node)
+}
+
+/**
+ * Default handle Y for a block: regular cards anchor their side ports at the
+ * vertical centre; a subflow container anchors its input and output on the
+ * centre of its inset Start card, which is a fixed inset from the container's
+ * top rather than a function of the container's height.
+ */
+function getDefaultHandleYOffset(node: GraphNode): number {
+  if (node.block.type === 'loop' || node.block.type === 'parallel') {
+    return HANDLE_POSITIONS.SUBFLOW_CONNECTION_Y
+  }
+  return node.metrics.portHeight / 2
 }
 
 /**
  * Calculates the Y offset for a target handle based on block type and handle ID.
  */
-function getTargetHandleYOffset(_block: BlockState, _targetHandle?: string | null): number {
-  return HANDLE_POSITIONS.DEFAULT_Y_OFFSET
+function getTargetHandleYOffset(node: GraphNode, _targetHandle?: string | null): number {
+  return getDefaultHandleYOffset(node)
 }
 
 /**
@@ -200,56 +218,22 @@ export function groupByLayer(nodes: Map<string, GraphNode>): Map<number, GraphNo
 }
 
 /**
- * Resolves vertical overlaps between nodes in the same layer.
+ * Resolves vertical overlaps between nodes within a single layer by pushing
+ * lower nodes down. Must run before the next layer is positioned so successors
+ * derive their Y from resolved predecessor positions — this keeps each branch
+ * in a stable row instead of re-breaking Y ties per layer.
  * X overlaps are prevented by construction via cumulative width-based positioning.
  */
-function resolveVerticalOverlaps(nodes: GraphNode[], verticalSpacing: number): void {
-  let iteration = 0
-  let hasOverlap = true
+function resolveLayerOverlaps(layerNodes: GraphNode[], verticalSpacing: number): void {
+  if (layerNodes.length < 2) return
 
-  while (hasOverlap && iteration < MAX_OVERLAP_ITERATIONS) {
-    hasOverlap = false
-    iteration++
+  const sorted = [...layerNodes].sort((a, b) => a.position.y - b.position.y)
 
-    const nodesByLayer = new Map<number, GraphNode[]>()
-    for (const node of nodes) {
-      if (!nodesByLayer.has(node.layer)) {
-        nodesByLayer.set(node.layer, [])
-      }
-      nodesByLayer.get(node.layer)!.push(node)
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const requiredY = sorted[i].position.y + sorted[i].metrics.height + verticalSpacing
+    if (sorted[i + 1].position.y < requiredY) {
+      sorted[i + 1].position.y = requiredY
     }
-
-    for (const [layer, layerNodes] of nodesByLayer) {
-      if (layerNodes.length < 2) continue
-
-      layerNodes.sort((a, b) => a.position.y - b.position.y)
-
-      for (let i = 0; i < layerNodes.length - 1; i++) {
-        const node1 = layerNodes[i]
-        const node2 = layerNodes[i + 1]
-
-        const node1Bottom = node1.position.y + node1.metrics.height
-        const requiredY = node1Bottom + verticalSpacing
-
-        if (node2.position.y < requiredY) {
-          hasOverlap = true
-          node2.position.y = requiredY
-
-          logger.debug('Resolved vertical overlap in layer', {
-            layer,
-            block1: node1.id,
-            block2: node2.id,
-            iteration,
-          })
-        }
-      }
-    }
-  }
-
-  if (hasOverlap) {
-    logger.warn('Could not fully resolve all vertical overlaps after max iterations', {
-      iterations: MAX_OVERLAP_ITERATIONS,
-    })
   }
 }
 
@@ -354,7 +338,7 @@ export function calculatePositions(
       for (const edge of incomingEdges) {
         const predecessor = allNodes.get(edge.source)
         if (predecessor) {
-          const sourceHandleOffset = getSourceHandleYOffset(predecessor.block, edge.sourceHandle)
+          const sourceHandleOffset = getSourceHandleYOffset(predecessor, edge.sourceHandle)
           const sourceHandleY = predecessor.position.y + sourceHandleOffset
 
           if (sourceHandleY > bestSourceHandleY) {
@@ -364,17 +348,25 @@ export function calculatePositions(
         }
       }
 
-      if (bestSourceHandleY < 0) {
-        bestSourceHandleY = padding.y + HANDLE_POSITIONS.DEFAULT_Y_OFFSET
-      }
+      const targetHandleOffset = getTargetHandleYOffset(node, bestEdge?.targetHandle)
 
-      const targetHandleOffset = getTargetHandleYOffset(node.block, bestEdge?.targetHandle)
+      /*
+       * No positioned predecessor (its source sits outside this layout scope),
+       * so there is no handle to line up with — fall back to the top of the
+       * content area. Anchoring at `padding.y + targetHandleOffset` keeps the
+       * subtraction below on one convention; using a bare constant here while
+       * the offset is `height / 2` pushed tall blocks above the padding, and
+       * for a container child that meant outside its own parent.
+       */
+      if (bestSourceHandleY < 0) {
+        bestSourceHandleY = padding.y + targetHandleOffset
+      }
 
       node.position = { x: xPosition, y: bestSourceHandleY - targetHandleOffset }
     }
-  }
 
-  resolveVerticalOverlaps(Array.from(layers.values()).flat(), verticalSpacing)
+    resolveLayerOverlaps(nodesInLayer, verticalSpacing)
+  }
 }
 
 /**

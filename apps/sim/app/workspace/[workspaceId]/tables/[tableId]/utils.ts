@@ -1,12 +1,7 @@
-import type { ColumnDefinition } from '@/lib/table'
-import {
-  formatDateCellDisplay,
-  getWallClockParts,
-  normalizeDateCellValue,
-  storedDateToEditable,
-} from '@/lib/table/dates'
-
-type BadgeVariant = 'green' | 'blue' | 'purple' | 'orange' | 'teal' | 'gray'
+import type { ColumnDefinition, JsonValue } from '@/lib/table'
+import type { ColumnType } from '@/lib/table/column-types'
+import { columnTypeById, columnTypeOf } from '@/lib/table/column-types'
+import { formatDateCellDisplay, getWallClockParts, normalizeDateCellValue } from '@/lib/table/dates'
 
 /**
  * Pick a fresh "untitled[_N]" name not already taken by `columns`. Used by
@@ -24,39 +19,25 @@ export function generateColumnName(columns: ReadonlyArray<{ name: string }>): st
 }
 
 /**
- * Returns the appropriate badge color variant for a column type
- */
-export function getTypeBadgeVariant(type: string): BadgeVariant {
-  switch (type) {
-    case 'string':
-      return 'green'
-    case 'number':
-      return 'blue'
-    case 'boolean':
-      return 'purple'
-    case 'json':
-      return 'orange'
-    case 'date':
-      return 'teal'
-    default:
-      return 'gray'
-  }
-}
-
-/**
- * Coerce a raw input value to the appropriate type for a column.
- * Throws on invalid JSON.
+ * Coerce a value a person typed or pasted into a cell to that column's type.
+ * Throws on invalid JSON, and answers `null` for everything else the column
+ * type can read nothing from.
+ *
+ * The result is what the server would store for the same value, which is the
+ * point: the optimistic cache and the row that comes back agree. The grid
+ * writes through a first-party route, which runs the `null` policy — so a
+ * refused value falls back to `ColumnTypeDefinition.salvage` here exactly as it
+ * does there, and a multiselect paste naming one live option and one deleted
+ * one keeps the live one instead of erasing the cell.
  */
 export function cleanCellValue(
   value: unknown,
   column: ColumnDefinition,
   timeZone?: string
 ): unknown {
-  if (column.type === 'number') {
-    if (value === '') return null
-    const num = Number(value)
-    return Number.isNaN(num) ? null : num
-  }
+  // These three read the browser's own context (the viewer's timezone, a JSON
+  // draft that must throw so the editor can show a parse error, a checkbox's
+  // truthiness) so they cannot come from the shared coercion.
   if (column.type === 'json') {
     if (typeof value === 'string') {
       if (value === '') return null
@@ -64,14 +45,20 @@ export function cleanCellValue(
     }
     return value
   }
-  if (column.type === 'boolean') {
-    return Boolean(value)
-  }
+  if (column.type === 'boolean') return Boolean(value)
   if (column.type === 'date') {
     if (value === '' || value === null || value === undefined) return null
     return displayToStorage(String(value), timeZone)
   }
-  return value || null
+  if (value === '' || value === null || value === undefined) return null
+
+  // Everything else runs the SAME coercion the server will run, so the
+  // optimistic cache holds exactly the value that gets persisted.
+  const columnType = columnTypeOf(column)
+  const coerced = columnType.coerce(value as JsonValue, column)
+  if (coerced.ok) return coerced.value
+  const salvaged = columnType.salvage?.(value as JsonValue, column)
+  return salvaged?.ok ? salvaged.value : null
 }
 
 /**
@@ -83,14 +70,15 @@ export function cleanCellValue(
  */
 export function formatValueForInput(value: unknown, type: string): string {
   if (value === null || value === undefined) return ''
-  if (type === 'json') {
-    return typeof value === 'string' ? value : JSON.stringify(value)
+  const definition = columnTypeById(type)
+  // Shape-drift guard, kept ahead of the registry: a column whose declared type
+  // lags its actual data (a workflow column mid-remap, where the schema cache
+  // hasn't refetched but row data already holds the new mapping's value) would
+  // otherwise render `[object Object]` through a scalar type's formatter.
+  if (typeof value === 'object' && !definition.storesOpaqueIds && type !== 'json') {
+    return JSON.stringify(value)
   }
-  if (type === 'date' && value) {
-    return storedDateToEditable(String(value))
-  }
-  if (typeof value === 'object') return JSON.stringify(value)
-  return String(value)
+  return definition.formatForInput(value, { name: '', type: type as ColumnType })
 }
 
 /** A canonical date-cell value split into its wall-clock editing parts. */

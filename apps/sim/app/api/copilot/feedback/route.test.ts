@@ -3,17 +3,9 @@
  *
  * @vitest-environment node
  */
-import {
-  copilotHttpMock,
-  copilotHttpMockFns,
-  dbChainMock,
-  dbChainMockFns,
-  resetDbChainMock,
-} from '@sim/testing'
+import { copilotHttpMock, copilotHttpMockFns, dbChainMockFns, resetDbChainMock } from '@sim/testing'
 import { NextRequest } from 'next/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-
-vi.mock('@sim/db', () => dbChainMock)
 
 vi.mock('@/lib/copilot/request/http', () => copilotHttpMock)
 
@@ -365,7 +357,7 @@ edges:
 
       const { eq } = await import('drizzle-orm')
       expect(dbChainMockFns.where).toHaveBeenCalled()
-      expect(eq).toHaveBeenCalledWith('userId', 'user-123')
+      expect(eq).toHaveBeenCalledWith('copilotFeedback.userId', 'user-123')
     })
 
     it('should handle database errors gracefully', async () => {

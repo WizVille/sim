@@ -37,6 +37,27 @@ import {
   azureDevOpsWorkItemCreatedTrigger,
 } from '@/triggers/azure_devops'
 import {
+  bitbucketBuildStatusCreatedTrigger,
+  bitbucketBuildStatusUpdatedTrigger,
+  bitbucketCommitCommentCreatedTrigger,
+  bitbucketPullRequestApprovalRemovedTrigger,
+  bitbucketPullRequestApprovedTrigger,
+  bitbucketPullRequestChangesRequestedTrigger,
+  bitbucketPullRequestChangesRequestRemovedTrigger,
+  bitbucketPullRequestCommentCreatedTrigger,
+  bitbucketPullRequestCommentDeletedTrigger,
+  bitbucketPullRequestCommentReopenedTrigger,
+  bitbucketPullRequestCommentResolvedTrigger,
+  bitbucketPullRequestCommentUpdatedTrigger,
+  bitbucketPullRequestCreatedTrigger,
+  bitbucketPullRequestDeclinedTrigger,
+  bitbucketPullRequestMergedTrigger,
+  bitbucketPullRequestUpdatedTrigger,
+  bitbucketPushTrigger,
+  bitbucketRepositoryForkedTrigger,
+  bitbucketRepositoryUpdatedTrigger,
+} from '@/triggers/bitbucket'
+import {
   calcomBookingCancelledTrigger,
   calcomBookingCreatedTrigger,
   calcomBookingPaidTrigger,
@@ -202,6 +223,12 @@ import {
   grainWebhookTrigger,
 } from '@/triggers/grain'
 import {
+  granolaNoteAccessGrantedTrigger,
+  granolaNoteEditedTrigger,
+  granolaNoteGeneratedTrigger,
+  granolaWebhookTrigger,
+} from '@/triggers/granola'
+import {
   greenhouseCandidateHiredTrigger,
   greenhouseCandidateRejectedTrigger,
   greenhouseCandidateStageChangeTrigger,
@@ -266,6 +293,7 @@ import {
   jiraWorklogDeletedTrigger,
   jiraWorklogUpdatedTrigger,
 } from '@/triggers/jira'
+import { jotformWebhookTrigger } from '@/triggers/jotform'
 import {
   jsmRequestCommentedTrigger,
   jsmRequestCreatedTrigger,
@@ -432,8 +460,6 @@ import {
   tiktokPostPubliclyAvailableTrigger,
   tiktokPostPublishCompleteTrigger,
   tiktokPostPublishFailedTrigger,
-  tiktokVideoPublishCompletedTrigger,
-  tiktokVideoUploadFailedTrigger,
 } from '@/triggers/tiktok'
 import { twilioSmsReceivedTrigger, twilioSmsStatusTrigger } from '@/triggers/twilio'
 import { twilioVoiceWebhookTrigger } from '@/triggers/twilio_voice'
@@ -463,6 +489,7 @@ import {
   zendeskTicketStatusChangedTrigger,
   zendeskWebhookTrigger,
 } from '@/triggers/zendesk'
+import { zohoDeskWebhookTrigger } from '@/triggers/zoho_desk'
 import {
   zoomMeetingEndedTrigger,
   zoomMeetingStartedTrigger,
@@ -507,6 +534,25 @@ export const TRIGGER_REGISTRY: TriggerRegistry = {
   attio_list_updated: attioListUpdatedTrigger,
   attio_list_deleted: attioListDeletedTrigger,
   attio_workspace_member_created: attioWorkspaceMemberCreatedTrigger,
+  bitbucket_push: bitbucketPushTrigger,
+  bitbucket_repository_forked: bitbucketRepositoryForkedTrigger,
+  bitbucket_repository_updated: bitbucketRepositoryUpdatedTrigger,
+  bitbucket_commit_comment_created: bitbucketCommitCommentCreatedTrigger,
+  bitbucket_build_status_created: bitbucketBuildStatusCreatedTrigger,
+  bitbucket_build_status_updated: bitbucketBuildStatusUpdatedTrigger,
+  bitbucket_pull_request_created: bitbucketPullRequestCreatedTrigger,
+  bitbucket_pull_request_updated: bitbucketPullRequestUpdatedTrigger,
+  bitbucket_pull_request_approved: bitbucketPullRequestApprovedTrigger,
+  bitbucket_pull_request_approval_removed: bitbucketPullRequestApprovalRemovedTrigger,
+  bitbucket_pull_request_changes_requested: bitbucketPullRequestChangesRequestedTrigger,
+  bitbucket_pull_request_changes_request_removed: bitbucketPullRequestChangesRequestRemovedTrigger,
+  bitbucket_pull_request_merged: bitbucketPullRequestMergedTrigger,
+  bitbucket_pull_request_declined: bitbucketPullRequestDeclinedTrigger,
+  bitbucket_pull_request_comment_created: bitbucketPullRequestCommentCreatedTrigger,
+  bitbucket_pull_request_comment_updated: bitbucketPullRequestCommentUpdatedTrigger,
+  bitbucket_pull_request_comment_deleted: bitbucketPullRequestCommentDeletedTrigger,
+  bitbucket_pull_request_comment_resolved: bitbucketPullRequestCommentResolvedTrigger,
+  bitbucket_pull_request_comment_reopened: bitbucketPullRequestCommentReopenedTrigger,
   calendly_webhook: calendlyWebhookTrigger,
   calendly_invitee_created: calendlyInviteeCreatedTrigger,
   calendly_invitee_canceled: calendlyInviteeCanceledTrigger,
@@ -625,6 +671,10 @@ export const TRIGGER_REGISTRY: TriggerRegistry = {
   google_sheets_poller: googleSheetsPollingTrigger,
   gong_call_completed: gongCallCompletedTrigger,
   gong_webhook: gongWebhookTrigger,
+  granola_note_generated: granolaNoteGeneratedTrigger,
+  granola_note_edited: granolaNoteEditedTrigger,
+  granola_note_access_granted: granolaNoteAccessGrantedTrigger,
+  granola_webhook: granolaWebhookTrigger,
   grain_recording_added_v2: grainRecordingAddedV2Trigger,
   grain_recording_updated_v2: grainRecordingUpdatedV2Trigger,
   grain_recording_deleted_v2: grainRecordingDeletedV2Trigger,
@@ -662,6 +712,7 @@ export const TRIGGER_REGISTRY: TriggerRegistry = {
   jira_sprint_closed: jiraSprintClosedTrigger,
   jira_project_created: jiraProjectCreatedTrigger,
   jira_version_released: jiraVersionReleasedTrigger,
+  jotform_webhook: jotformWebhookTrigger,
   jsm_request_created: jsmRequestCreatedTrigger,
   jsm_request_updated: jsmRequestUpdatedTrigger,
   jsm_request_commented: jsmRequestCommentedTrigger,
@@ -771,8 +822,6 @@ export const TRIGGER_REGISTRY: TriggerRegistry = {
   tiktok_post_publicly_available: tiktokPostPubliclyAvailableTrigger,
   tiktok_post_publish_complete: tiktokPostPublishCompleteTrigger,
   tiktok_post_publish_failed: tiktokPostPublishFailedTrigger,
-  tiktok_video_publish_completed: tiktokVideoPublishCompletedTrigger,
-  tiktok_video_upload_failed: tiktokVideoUploadFailedTrigger,
   typeform_webhook: typeformWebhookTrigger,
   whatsapp_webhook: whatsappWebhookTrigger,
   google_forms_webhook: googleFormsWebhookTrigger,
@@ -871,4 +920,5 @@ export const TRIGGER_REGISTRY: TriggerRegistry = {
   sentry_metric_alert: sentryMetricAlertTrigger,
   twilio_sms_received: twilioSmsReceivedTrigger,
   twilio_sms_status: twilioSmsStatusTrigger,
+  zoho_desk: zohoDeskWebhookTrigger,
 }

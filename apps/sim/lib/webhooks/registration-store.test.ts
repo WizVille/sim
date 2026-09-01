@@ -1,7 +1,8 @@
 /**
  * @vitest-environment node
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { dbChainMockFns, resetDbChainMock } from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 interface Condition {
   kind: string
@@ -10,26 +11,26 @@ interface Condition {
   conditions?: Condition[]
 }
 
-const { mockTransaction, mockIsDeploymentOperationCurrent, mockClaimWebhookPath } = vi.hoisted(
-  () => ({
-    mockTransaction: vi.fn(),
-    mockIsDeploymentOperationCurrent: vi.fn(),
-    mockClaimWebhookPath: vi.fn(),
-  })
-)
-
-vi.mock('@sim/db', () => ({
-  db: { transaction: mockTransaction },
+const { mockIsDeploymentOperationCurrent, mockClaimWebhookPath } = vi.hoisted(() => ({
+  mockIsDeploymentOperationCurrent: vi.fn(),
+  mockClaimWebhookPath: vi.fn(),
 }))
 
 vi.mock('drizzle-orm', () => ({
   and: (...conditions: Condition[]) => ({ kind: 'and', conditions }),
   eq: (column: unknown, value: unknown) => ({ kind: 'eq', column, value }),
+  exists: (subquery: unknown) => ({ kind: 'exists', subquery }),
   gt: (column: unknown, value: unknown) => ({ kind: 'gt', column, value }),
   inArray: (column: unknown, value: unknown) => ({ kind: 'inArray', column, value }),
   isNull: (column: unknown) => ({ kind: 'isNull', column }),
   lt: (column: unknown, value: unknown) => ({ kind: 'lt', column, value }),
   lte: (column: unknown, value: unknown) => ({ kind: 'lte', column, value }),
+  notExists: (subquery: unknown) => ({ kind: 'notExists', subquery }),
+  sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({
+    kind: 'sql',
+    strings: [...strings],
+    values,
+  }),
 }))
 
 vi.mock('@/lib/webhooks/provider-subscriptions', () => ({
@@ -42,6 +43,7 @@ vi.mock('@/lib/webhooks/path-claims', () => ({
 
 vi.mock('@/lib/workflows/persistence/deployment-operations', () => ({
   isDeploymentOperationCurrent: mockIsDeploymentOperationCurrent,
+  setDeploymentTxTimeouts: vi.fn(),
 }))
 
 import type { DbOrTx } from '@sim/workflow-persistence/types'
@@ -52,11 +54,21 @@ import {
   type WebhookRegistrationOperationFence,
 } from '@/lib/webhooks/registration-store'
 
+afterAll(resetDbChainMock)
+
 const FENCE: WebhookRegistrationOperationFence = {
   workflowId: 'workflow-1',
   operationId: 'operation-1',
   generation: 3,
   deploymentVersionId: 'version-3',
+}
+
+/** The redeploy that lands seconds after {@link FENCE} and supersedes it. */
+const NEXT_FENCE: WebhookRegistrationOperationFence = {
+  workflowId: 'workflow-1',
+  operationId: 'operation-2',
+  generation: 4,
+  deploymentVersionId: 'version-4',
 }
 
 interface UpdateCall {
@@ -121,6 +133,15 @@ function createTx(selectResults: unknown[][]) {
   return { tx: tx as unknown as DbOrTx, updates, inserts, updateResults }
 }
 
+/** Routes `db.transaction` at a queue-driven tx so store writes are observable. */
+function runInTx(selectResults: unknown[][]) {
+  const harness = createTx(selectResults)
+  dbChainMockFns.transaction.mockImplementation(
+    async (callback: (tx: DbOrTx) => Promise<unknown>) => callback(harness.tx)
+  )
+  return harness
+}
+
 function activeRow(overrides: Record<string, unknown> = {}) {
   return {
     id: 'wh-active',
@@ -146,6 +167,7 @@ function activeRow(overrides: Record<string, unknown> = {}) {
 describe('activateWebhookRegistrations', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
     mockIsDeploymentOperationCurrent.mockResolvedValue(true)
   })
 
@@ -182,22 +204,22 @@ describe('activateWebhookRegistrations', () => {
 
     await activateWebhookRegistrations(tx, FENCE)
 
-    expect(updates).toHaveLength(3)
-    expect(updates[0].payload).toEqual(
-      expect.objectContaining({ registrationStatus: 'retired', isActive: false })
+    expect(updates).toHaveLength(2)
+    /**
+     * Retire + repoint fold into one generation-conditional statement over
+     * the active rows: every mutated column is a CASE keyed on the fence
+     * generation, and the WHERE covers both phases via lte.
+     */
+    expect(updates[0].payload.registrationStatus).toEqual(expect.objectContaining({ kind: 'sql' }))
+    expect(updates[0].payload.deploymentVersionId).toEqual(
+      expect.objectContaining({ kind: 'sql', values: expect.arrayContaining(['version-3']) })
     )
-    expect(updates[0].payload.archivedAt).toBeInstanceOf(Date)
-    expect(JSON.stringify(updates[0].condition)).toContain('"lt"')
+    expect(updates[0].payload.isActive).toEqual(expect.objectContaining({ kind: 'sql' }))
+    expect(updates[0].payload.archivedAt).toEqual(expect.objectContaining({ kind: 'sql' }))
+    expect(updates[0].payload.updatedAt).toBeInstanceOf(Date)
+    expect(JSON.stringify(updates[0].condition)).toContain('"lte"')
 
     expect(updates[1].payload).toEqual(
-      expect.objectContaining({
-        deploymentVersionId: 'version-3',
-        isActive: true,
-        archivedAt: null,
-      })
-    )
-
-    expect(updates[2].payload).toEqual(
       expect.objectContaining({
         registrationStatus: 'active',
         deploymentVersionId: 'version-3',
@@ -211,20 +233,13 @@ describe('activateWebhookRegistrations', () => {
 describe('prepareWebhookRegistrationIntents', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
     mockIsDeploymentOperationCurrent.mockResolvedValue(true)
     mockClaimWebhookPath.mockResolvedValue('hooks/a')
-    mockTransaction.mockImplementation(async (callback: (tx: DbOrTx) => Promise<unknown>) => {
-      throw new Error('mockTransaction not configured for this test')
+    dbChainMockFns.transaction.mockImplementation(async () => {
+      throw new Error('db.transaction not configured for this test')
     })
   })
-
-  function runInTx(selectResults: unknown[][]) {
-    const harness = createTx(selectResults)
-    mockTransaction.mockImplementation(async (callback: (tx: DbOrTx) => Promise<unknown>) =>
-      callback(harness.tx)
-    )
-    return harness
-  }
 
   const desired = {
     blockId: 'block-1',
@@ -333,5 +348,69 @@ describe('prepareWebhookRegistrationIntents', () => {
     ).rejects.toBeInstanceOf(StaleWebhookRegistrationOperationError)
     expect(inserts).toHaveLength(0)
     expect(updates).toHaveLength(0)
+  })
+})
+
+describe('redeploys racing within seconds', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetDbChainMock()
+    mockClaimWebhookPath.mockResolvedValue('hooks/a')
+    dbChainMockFns.transaction.mockImplementation(async () => {
+      throw new Error('db.transaction not configured for this test')
+    })
+  })
+
+  const desired = {
+    blockId: 'block-1',
+    provider: 'slack',
+    path: 'hooks/a',
+    routingKey: null,
+    providerConfig: { url: 'https://example.test' },
+    configFingerprint: 'fp-new',
+  }
+
+  it('no-ops the superseded attempt and still lands the newer registration', async () => {
+    mockIsDeploymentOperationCurrent.mockResolvedValue(false)
+    const superseded = runInTx([[{ id: 'workflow-1' }]])
+
+    await expect(
+      prepareWebhookRegistrationIntents({ fence: FENCE, desired: [desired] })
+    ).rejects.toBeInstanceOf(StaleWebhookRegistrationOperationError)
+    expect(superseded.inserts).toHaveLength(0)
+    expect(superseded.updates).toHaveLength(0)
+    expect(mockClaimWebhookPath).not.toHaveBeenCalled()
+
+    mockIsDeploymentOperationCurrent.mockResolvedValue(true)
+    const winner = runInTx([[{ id: 'workflow-1' }], [], [activeRow()], [], []])
+
+    const work = await prepareWebhookRegistrationIntents({ fence: NEXT_FENCE, desired: [desired] })
+
+    expect(mockClaimWebhookPath).toHaveBeenCalledWith(expect.anything(), {
+      path: 'hooks/a',
+      workflowId: 'workflow-1',
+      generation: 4,
+    })
+    expect(work.candidates).toHaveLength(1)
+    expect(winner.inserts).toHaveLength(1)
+    expect(winner.inserts[0].values).toEqual(
+      expect.objectContaining({
+        registrationStatus: 'candidate',
+        registrationGeneration: 4,
+        deploymentVersionId: 'version-4',
+      })
+    )
+
+    const activation = createTx([[{ id: 'workflow-1' }], [], []])
+    await activateWebhookRegistrations(activation.tx, NEXT_FENCE)
+
+    expect(activation.updates[1].payload).toEqual(
+      expect.objectContaining({
+        registrationStatus: 'active',
+        deploymentVersionId: 'version-4',
+        isActive: true,
+        archivedAt: null,
+      })
+    )
   })
 })

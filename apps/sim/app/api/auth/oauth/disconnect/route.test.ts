@@ -7,13 +7,10 @@ import {
   auditMock,
   authMockFns,
   createMockRequest,
-  dbChainMock,
   dbChainMockFns,
   resetDbChainMock,
 } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-
-vi.mock('@sim/db', () => dbChainMock)
 
 vi.mock('@sim/audit', () => auditMock)
 
@@ -29,6 +26,7 @@ describe('OAuth Disconnect API Route', () => {
   it('should disconnect provider successfully', async () => {
     authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
+      session: { id: 'session-1' },
     })
 
     const req = createMockRequest('POST', {
@@ -45,6 +43,7 @@ describe('OAuth Disconnect API Route', () => {
   it('should disconnect specific provider ID successfully', async () => {
     authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
+      session: { id: 'session-1' },
     })
 
     const req = createMockRequest('POST', {
@@ -70,12 +69,13 @@ describe('OAuth Disconnect API Route', () => {
     const data = await response.json()
 
     expect(response.status).toBe(401)
-    expect(data.error).toBe('User not authenticated')
+    expect(data.error).toBe('Unauthorized')
   })
 
   it('should handle missing provider', async () => {
     authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
+      session: { id: 'session-1' },
     })
 
     const req = createMockRequest('POST', {})
@@ -90,6 +90,7 @@ describe('OAuth Disconnect API Route', () => {
   it('should handle database error', async () => {
     authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
+      session: { id: 'session-1' },
     })
 
     dbChainMockFns.where.mockRejectedValueOnce(new Error('Database error'))

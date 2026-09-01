@@ -18,7 +18,7 @@ import {
   userStats,
   workspace,
 } from '@sim/db/schema'
-import { dbChainMock, dbChainMockFns, resetDbChainMock } from '@sim/testing'
+import { dbChainMockFns, resetDbChainMock } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { mockChangeOrganizationWorkspaceBilledAccountsInTx, mockChangeWorkspaceStoragePayersInTx } =
@@ -34,15 +34,13 @@ vi.mock('@/lib/billing/storage/payer-transfer', () => ({
 }))
 
 import {
-  reapplyPaidOrgJoinBillingForExistingMember,
+  reapplyPaidOrgJoinBillingForExistingMemberTx,
   restoreUserProSubscription,
   transferOrganizationOwnership,
   withInvitationSafeOrganizationAccessMutation,
 } from '@/lib/billing/organizations/membership'
 import type { DbOrTx } from '@/lib/db/types'
 import { attachOwnedWorkspacesToOrganizationTx } from '@/lib/workspaces/organization-workspaces'
-
-vi.mock('@sim/db', () => dbChainMock)
 
 vi.mock('@/lib/core/outbox/service', () => ({
   enqueueOutboxEvent: vi.fn(),
@@ -61,8 +59,6 @@ const GENERIC_ROW = {
   status: 'active',
   cancelAtPeriodEnd: false,
   stripeSubscriptionId: 'stripe-1',
-  currentPeriodCost: '5',
-  proPeriodCostSnapshot: '0',
   storageUsedBytes: 0,
 }
 
@@ -113,25 +109,27 @@ describe('paid-org join billing lock ordering', () => {
     mockChangeWorkspaceStoragePayersInTx.mockReset()
   })
 
-  it('locks the personal subscription before mutating userStats', async () => {
+  it('locks the personal subscription before pausing it and never mutates userStats', async () => {
     const { tx, ops } = createRecordingTx()
-    dbChainMockFns.transaction.mockImplementation(async (cb: (t: unknown) => unknown) => cb(tx))
 
-    await reapplyPaidOrgJoinBillingForExistingMember('user-1', 'org-1')
+    await reapplyPaidOrgJoinBillingForExistingMemberTx(tx as DbOrTx, 'user-1', 'org-1')
 
-    const firstUserStatsUpdate = ops.findIndex((o) => o.op === 'update' && o.table === userStats)
+    const userStatsUpdate = ops.findIndex((o) => o.op === 'update' && o.table === userStats)
     const subscriptionLock = ops.findIndex((o) => o.op === 'lock' && o.table === subscriptionTable)
+    const subscriptionUpdate = ops.findIndex(
+      (o) => o.op === 'update' && o.table === subscriptionTable
+    )
 
-    expect(firstUserStatsUpdate).toBeGreaterThanOrEqual(0)
+    // Ledger entity stamps attribute usage; join billing no longer touches userStats.
+    expect(userStatsUpdate).toBe(-1)
     expect(subscriptionLock).toBeGreaterThanOrEqual(0)
-    expect(subscriptionLock).toBeLessThan(firstUserStatsUpdate)
+    expect(subscriptionUpdate).toBeGreaterThan(subscriptionLock)
   })
 
   it('still locks an already-paused personal Pro so a concurrent restore cannot pass it', async () => {
     const { tx, ops } = createRecordingTx({ ...GENERIC_ROW, cancelAtPeriodEnd: true })
-    dbChainMockFns.transaction.mockImplementation(async (cb: (t: unknown) => unknown) => cb(tx))
 
-    await reapplyPaidOrgJoinBillingForExistingMember('user-1', 'org-1')
+    await reapplyPaidOrgJoinBillingForExistingMemberTx(tx as DbOrTx, 'user-1', 'org-1')
 
     expect(ops.some((op) => op.op === 'lock' && op.table === subscriptionTable)).toBe(true)
   })
@@ -280,8 +278,9 @@ describe('workspace payer-change transaction lock ordering', () => {
     )
     const payerTransfer = ops.findIndex((entry) => entry.op === 'payer-transfer')
     expect(workspaceLock).toBeGreaterThanOrEqual(0)
-    expect(userStatsUpdate).toBeGreaterThan(workspaceLock)
-    expect(payerTransfer).toBeGreaterThan(userStatsUpdate)
+    // Ledger entity stamps attribute usage; join billing no longer touches userStats.
+    expect(userStatsUpdate).toBe(-1)
+    expect(payerTransfer).toBeGreaterThan(workspaceLock)
   })
 })
 
@@ -310,13 +309,12 @@ describe('organization ownership transfer reservation', () => {
                   payload: {
                     version: 1,
                     request: {
-                      requestKey: 'enterprise-v2:owner-1:org-1:10000:20000:20000:5',
+                      requestKey: 'enterprise-v3:owner-1:org-1:10000:20000:5',
                       ownerUserId: 'owner-1',
                       organizationId: 'org-1',
                       requestedByEmail: 'admin@sim.ai',
                       requestedByUserId: 'admin-1',
                       invoiceAmountCents: 10000,
-                      includedMonthlyCredits: 20000,
                       usageLimitCredits: 20000,
                       seats: 5,
                     },

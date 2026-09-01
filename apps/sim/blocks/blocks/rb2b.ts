@@ -32,6 +32,60 @@ export const RB2BBlock: BlockConfig<Rb2bResponse> = {
   docsLink: 'https://docs.sim.ai/integrations/rb2b',
   bgColor: '#51FF00',
   icon: RB2BIcon,
+  canvasPresentation: {
+    defaultTitle: 'RB2B',
+    sentences: {
+      byOperation: {
+        credit_check: ['Check remaining API credits'],
+        ip_to_hem: [
+          { text: 'Resolve', field: 'ip_address', after: 'to hashed emails', core: true },
+        ],
+        ip_to_maid: [
+          {
+            text: 'Resolve',
+            field: 'ip_address',
+            after: 'to mobile advertising IDs',
+            core: true,
+          },
+        ],
+        ip_to_company: [{ text: 'Identify the company behind', field: 'ip_address', core: true }],
+        hem_to_business_profile: [
+          { text: 'Read the business profile for', field: 'email', core: true },
+        ],
+        hem_to_best_linkedin: [
+          { text: 'Find the most active LinkedIn URL for', field: 'email', core: true },
+        ],
+        hem_to_linkedin: [{ text: 'Find the LinkedIn slug for', field: 'email', core: true }],
+        hem_to_maid: [{ text: 'Find mobile advertising IDs for', field: 'email', core: true }],
+        email_to_activity: [
+          { text: 'Read the last active date for', field: 'emailAddress', core: true },
+        ],
+        linkedin_to_business_profile: [
+          { text: 'Read the business profile behind', field: 'linkedin_slug', core: true },
+        ],
+        linkedin_to_best_personal_email: [
+          {
+            text: 'Find the most recently active personal email for',
+            field: 'linkedin_slug',
+            core: true,
+          },
+        ],
+        linkedin_to_personal_email: [
+          { text: 'Find personal emails for', field: 'linkedin_slug', core: true },
+        ],
+        linkedin_to_hashed_emails: [
+          { text: 'Find hashed emails for', field: 'linkedin_slug', core: true },
+        ],
+        linkedin_to_mobile_phone: [
+          { text: 'Find the mobile phone number for', field: 'linkedin_slug', core: true },
+        ],
+        linkedin_slug_search: [
+          { text: 'Find the LinkedIn profile for', field: 'first_name', core: true },
+          { text: 'at', field: 'company_domain' },
+        ],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -223,7 +277,7 @@ export const RB2BBlockMeta = {
   templates: [
     {
       icon: RB2BIcon,
-      title: 'Website visitor de-anonymizer',
+      title: 'RB2B visitor de-anonymizer',
       prompt:
         'Build a workflow that takes the IP addresses of anonymous website visitors, uses RB2B to resolve each IP to a hashed email and company domain, and writes the identified visitors into a table for the sales team.',
       modules: ['tables', 'agent', 'workflows'],
@@ -232,7 +286,7 @@ export const RB2BBlockMeta = {
     },
     {
       icon: RB2BIcon,
-      title: 'Visitor IP to LinkedIn profile',
+      title: 'RB2B IP to LinkedIn profile',
       prompt:
         'Create a workflow that resolves a visitor IP to a hashed email with RB2B, then enriches that hashed email into a LinkedIn profile and business profile so reps know exactly who visited.',
       modules: ['tables', 'agent', 'workflows'],
@@ -241,7 +295,7 @@ export const RB2BBlockMeta = {
     },
     {
       icon: RB2BIcon,
-      title: 'Hashed email enrichment pipeline',
+      title: 'RB2B hashed-email enrichment',
       prompt:
         'Build a workflow that reads hashed emails from a table, uses RB2B to enrich each into a full business profile with name, title, seniority, and company details, and writes the enriched records back to the row.',
       modules: ['tables', 'agent', 'workflows'],
@@ -250,7 +304,7 @@ export const RB2BBlockMeta = {
     },
     {
       icon: RB2BIcon,
-      title: 'LinkedIn to mobile phone finder',
+      title: 'RB2B LinkedIn phone finder',
       prompt:
         "Create a workflow that takes a list of LinkedIn profile slugs, uses RB2B to look up each prospect's mobile phone and best personal email, and writes a ready-to-contact table for outbound calling.",
       modules: ['tables', 'agent', 'workflows'],
@@ -259,7 +313,7 @@ export const RB2BBlockMeta = {
     },
     {
       icon: RB2BIcon,
-      title: 'Intent-to-CRM identity sync',
+      title: 'RB2B visitor-to-HubSpot sync',
       prompt:
         'Build a workflow that resolves visitor IPs to company domains with RB2B, enriches the matched person into a business profile, and creates or updates the matching contact and company in HubSpot.',
       modules: ['agent', 'workflows'],
@@ -269,7 +323,7 @@ export const RB2BBlockMeta = {
     },
     {
       icon: RB2BIcon,
-      title: 'High-intent visitor Slack alerts',
+      title: 'RB2B visitor Slack alerts',
       prompt:
         'Create a workflow that reads a list of website visitor IPs, uses RB2B to resolve each person and their company, and posts an alert with the identified LinkedIn profile and company to the sales Slack channel.',
       modules: ['agent', 'workflows'],
@@ -279,7 +333,7 @@ export const RB2BBlockMeta = {
     },
     {
       icon: RB2BIcon,
-      title: 'LinkedIn slug resolver',
+      title: 'RB2B LinkedIn slug resolver',
       prompt:
         'Build a workflow that takes a first name, last name, and company domain, uses RB2B LinkedIn slug search to resolve the matching profile, and enriches it into a business profile written to a prospect table.',
       modules: ['tables', 'agent', 'workflows'],
@@ -288,7 +342,7 @@ export const RB2BBlockMeta = {
     },
     {
       icon: RB2BIcon,
-      title: 'Account engagement freshness sweep',
+      title: 'RB2B engagement freshness sweep',
       prompt:
         'Create a scheduled workflow that runs my list of prospect emails through RB2B email-to-last-active-date lookups, flags recently active contacts, and logs the engagement snapshot to a table for prioritized follow-up.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],

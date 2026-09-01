@@ -3,6 +3,12 @@ import { AuthMode, type BlockConfig, type BlockMeta, IntegrationType } from '@/b
 import { normalizeFileInput } from '@/blocks/utils'
 import type { PersonaResponse } from '@/tools/persona/types'
 
+/** Canonical basic/advanced pair for the account importer's CSV. */
+const IMPORT_FILE_FIELD = ['importFile', 'importFileRef'] as const
+
+/** A screening report names its subject either as a free-form term or as name parts. */
+const REPORT_SUBJECT_FIELD = ['term', 'nameFirst'] as const
+
 export const PersonaBlock: BlockConfig<PersonaResponse> = {
   type: 'persona',
   name: 'Persona',
@@ -15,6 +21,83 @@ export const PersonaBlock: BlockConfig<PersonaResponse> = {
   bgColor: '#FFFFFF',
   icon: PersonaIcon,
   authMode: AuthMode.ApiKey,
+  canvasPresentation: {
+    defaultTitle: 'Persona',
+    sentences: {
+      byOperation: {
+        create_inquiry: [
+          { text: 'Create an inquiry from template', field: 'inquiryTemplateId', core: true },
+          { text: ', for account', field: 'accountId' },
+        ],
+        get_inquiry: [{ text: 'Read inquiry', field: 'inquiryId', core: true }],
+        list_inquiries: [
+          'List inquiries',
+          { text: ', with status', field: 'status' },
+          { text: ', for account', field: 'accountId' },
+        ],
+        update_inquiry: [
+          { text: 'Update inquiry', field: 'inquiryId', core: true },
+          { text: ', setting', field: 'fields' },
+        ],
+        approve_inquiry: [{ text: 'Approve inquiry', field: 'inquiryId', core: true }],
+        decline_inquiry: [{ text: 'Decline inquiry', field: 'inquiryId', core: true }],
+        mark_inquiry_for_review: [
+          { text: 'Mark inquiry', field: 'inquiryId', after: 'for manual review', core: true },
+        ],
+        resume_inquiry: [
+          {
+            text: 'Resume inquiry',
+            field: 'inquiryId',
+            after: 'with a new session',
+            core: true,
+          },
+        ],
+        expire_inquiry: [{ text: 'Expire inquiry', field: 'inquiryId', core: true }],
+        generate_inquiry_link: [
+          { text: 'Generate a one-time link for inquiry', field: 'inquiryId', core: true },
+          { text: ', expiring in', field: 'expiresInSeconds', after: 'seconds' },
+        ],
+        print_inquiry_pdf: [
+          { text: 'Download a PDF summary of inquiry', field: 'inquiryId', core: true },
+        ],
+        redact_inquiry: [
+          { text: 'Erase all personal data from inquiry', field: 'inquiryId', core: true },
+        ],
+        create_account: [
+          'Create an account',
+          { text: ', referenced by', field: 'referenceId' },
+          { text: ', of type', field: 'accountTypeId' },
+        ],
+        get_account: [{ text: 'Read account', field: 'accountId', core: true }],
+        list_accounts: ['List accounts', { text: ', referenced by', field: 'referenceId' }],
+        update_account: [
+          { text: 'Update account', field: 'accountId', core: true },
+          { text: ', setting', field: 'fields' },
+        ],
+        import_accounts: [
+          { text: 'Bulk-import accounts from', field: IMPORT_FILE_FIELD, core: true },
+        ],
+        redact_account: [
+          { text: 'Erase all personal data from account', field: 'accountId', core: true },
+        ],
+        list_cases: [
+          'List review cases',
+          { text: ', with status', field: 'status' },
+          { text: ', for account', field: 'accountId' },
+        ],
+        get_case: [{ text: 'Read review case', field: 'caseId', core: true }],
+        create_report: [
+          { text: 'Screen', field: REPORT_SUBJECT_FIELD, core: true },
+          { text: 'for', field: 'reportType', core: true },
+        ],
+        get_report: [{ text: 'Read screening report', field: 'reportId', core: true }],
+        list_reports: ['List screening reports', { text: ', for account', field: 'accountId' }],
+        get_verification: [{ text: 'Read verification', field: 'verificationId', core: true }],
+        get_document: [{ text: 'Read document', field: 'documentId', core: true }],
+        list_inquiry_templates: ['List inquiry templates'],
+      },
+    },
+  },
 
   subBlocks: [
     {
@@ -569,7 +652,7 @@ export const PersonaBlockMeta = {
   templates: [
     {
       icon: PersonaIcon,
-      title: 'Customer onboarding identity verification',
+      title: 'Persona onboarding verification',
       prompt:
         'Build a workflow triggered when a new customer signs up that creates a Persona inquiry from our KYC template with their name and email pre-filled, generates a one-time verification link, and emails it to the customer.',
       modules: ['workflows', 'agent'],
@@ -579,7 +662,7 @@ export const PersonaBlockMeta = {
     },
     {
       icon: PersonaIcon,
-      title: 'Verification decision router',
+      title: 'Persona decision router',
       prompt:
         'Build a workflow that takes an inquiry ID, fetches the inquiry from Persona, and routes on its status: approved customers get a welcome email, needs-review inquiries post to a compliance Slack channel with a summary, and declined inquiries update our CRM.',
       modules: ['workflows', 'agent'],
@@ -589,7 +672,7 @@ export const PersonaBlockMeta = {
     },
     {
       icon: PersonaIcon,
-      title: 'Daily pending-review digest',
+      title: 'Persona pending-review digest',
       prompt:
         'Build a scheduled workflow that runs every morning, lists Persona inquiries with needs_review status from the last 24 hours, summarizes each one, and posts a digest to the compliance team in Slack.',
       modules: ['scheduled', 'workflows', 'agent'],
@@ -599,7 +682,7 @@ export const PersonaBlockMeta = {
     },
     {
       icon: PersonaIcon,
-      title: 'Watchlist screening on signup',
+      title: 'Persona watchlist screening',
       prompt:
         "Build a workflow that takes a new user's name and birthdate, runs a Persona watchlist report against them, polls until the report is ready, and creates a case in our tracking table if the report has a match.",
       modules: ['workflows', 'tables', 'agent'],
@@ -608,7 +691,7 @@ export const PersonaBlockMeta = {
     },
     {
       icon: PersonaIcon,
-      title: 'Bulk account import from CRM export',
+      title: 'Persona bulk account import',
       prompt:
         'Build a workflow that takes an uploaded CSV export of customers, imports them into Persona as accounts using the account importer, polls the importer status, and reports how many rows succeeded, errored, or were duplicates.',
       modules: ['files', 'workflows', 'agent'],
@@ -617,7 +700,7 @@ export const PersonaBlockMeta = {
     },
     {
       icon: PersonaIcon,
-      title: 'Compliance audit PDF archive',
+      title: 'Persona audit PDF archive',
       prompt:
         'Build a workflow that takes an approved inquiry ID, downloads the inquiry summary PDF from Persona, and uploads it to a compliance archive folder in Google Drive named by customer reference ID.',
       modules: ['workflows', 'files', 'agent'],
@@ -627,7 +710,7 @@ export const PersonaBlockMeta = {
     },
     {
       icon: PersonaIcon,
-      title: 'Manual review case triage agent',
+      title: 'Persona case triage agent',
       prompt:
         'Build an agent that lists open Persona cases, fetches the linked inquiry and verification details for each, drafts a recommended approve/decline decision with reasoning, and posts the triage summary to Slack for a human reviewer.',
       modules: ['agent', 'workflows'],
@@ -637,7 +720,7 @@ export const PersonaBlockMeta = {
     },
     {
       icon: PersonaIcon,
-      title: 'Re-verification campaign for stale accounts',
+      title: 'Persona re-verification campaign',
       prompt:
         'Build a scheduled workflow that lists Persona accounts, finds ones whose latest approved inquiry is older than a year, creates a new inquiry for each from our re-verification template, and emails customers a one-time verification link.',
       modules: ['scheduled', 'workflows', 'agent'],

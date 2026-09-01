@@ -3,65 +3,64 @@
  */
 import {
   auditMock,
-  authMock,
   authMockFns,
   createMockRequest,
+  dbChainMock,
   permissionsMock,
   permissionsMockFns,
   posthogServerMock,
+  queueTableRows,
+  resetDbChainMock,
+  resetEnvFlagsMock,
   schemaMock,
+  setEnvFlags,
 } from '@sim/testing'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { DbOrTx } from '@/lib/db/types'
+import type { CreatePendingInvitationInput } from '@/lib/invitations/send'
 
 const {
+  MockConflictingPendingInvitationError,
   mockGetWorkspaceInvitePolicy,
   mockValidateInvitationsAllowed,
   mockValidateSeatAvailability,
+  mockAcquireOrganizationMutationLock,
+  mockAcquireOrganizationUserMutationLocks,
   mockGetUserOrganization,
+  mockGetEffectiveWorkspacePermission,
   mockCreatePendingInvitation,
   mockSendInvitationEmail,
   mockCancelPendingInvitation,
-  mockFindPendingGrantForWorkspaceEmail,
-  mockDbResults,
+  mockRevertPendingInvitationGrants,
+  mockFindPendingGrantWorkspaceIds,
+  mockFindPendingOrganizationInvitation,
+  mockGetInvitePlanCategoryForUser,
 } = vi.hoisted(() => ({
+  MockConflictingPendingInvitationError: class extends Error {},
   mockGetWorkspaceInvitePolicy: vi.fn(),
   mockValidateInvitationsAllowed: vi.fn().mockResolvedValue(undefined),
   mockValidateSeatAvailability: vi.fn(),
+  mockAcquireOrganizationMutationLock: vi.fn(),
+  mockAcquireOrganizationUserMutationLocks: vi.fn(),
   mockGetUserOrganization: vi.fn(),
+  mockGetEffectiveWorkspacePermission: vi.fn(),
   mockCreatePendingInvitation: vi.fn(),
   mockSendInvitationEmail: vi.fn(),
   mockCancelPendingInvitation: vi.fn(),
-  mockFindPendingGrantForWorkspaceEmail: vi.fn(),
-  mockDbResults: { value: [] as any[] },
+  mockRevertPendingInvitationGrants: vi.fn(),
+  mockFindPendingGrantWorkspaceIds: vi.fn(),
+  mockFindPendingOrganizationInvitation: vi.fn(),
+  mockGetInvitePlanCategoryForUser: vi.fn(),
 }))
 
-vi.mock('@sim/db', () => ({
-  db: {
-    select: vi.fn().mockImplementation(() => {
-      const chain: any = {}
-      chain.from = vi.fn().mockReturnValue(chain)
-      chain.innerJoin = vi.fn().mockReturnValue(chain)
-      chain.where = vi.fn().mockReturnValue(chain)
-      chain.limit = vi
-        .fn()
-        .mockImplementation(() => Promise.resolve(mockDbResults.value.shift() || []))
-      chain.then = vi.fn().mockImplementation((callback: (rows: any[]) => unknown) => {
-        const result = mockDbResults.value.shift() || []
-        return Promise.resolve(callback ? callback(result) : result)
-      })
-      return chain
-    }),
-  },
+vi.mock('@/lib/workspaces/permissions/utils', () => ({
+  ...permissionsMock,
+  getEffectiveWorkspacePermission: mockGetEffectiveWorkspacePermission,
 }))
-
-vi.mock('@sim/db/schema', () => schemaMock)
-
-vi.mock('@/lib/auth', () => authMock)
-
-vi.mock('@/lib/workspaces/permissions/utils', () => permissionsMock)
 
 vi.mock('@/lib/workspaces/policy', () => ({
   getWorkspaceInvitePolicy: mockGetWorkspaceInvitePolicy,
+  getInvitePlanCategoryForUser: mockGetInvitePlanCategoryForUser,
   isOrganizationWorkspace: (ws: {
     workspaceMode?: string | null
     organizationId?: string | null
@@ -73,14 +72,19 @@ vi.mock('@/lib/billing/validation/seat-management', () => ({
 }))
 
 vi.mock('@/lib/billing/organizations/membership', () => ({
+  acquireOrganizationMutationLock: mockAcquireOrganizationMutationLock,
+  acquireOrganizationUserMutationLocks: mockAcquireOrganizationUserMutationLocks,
   getUserOrganization: mockGetUserOrganization,
 }))
 
 vi.mock('@/lib/invitations/send', () => ({
+  ConflictingPendingInvitationError: MockConflictingPendingInvitationError,
   createPendingInvitation: mockCreatePendingInvitation,
   sendInvitationEmail: mockSendInvitationEmail,
   cancelPendingInvitation: mockCancelPendingInvitation,
-  findPendingGrantForWorkspaceEmail: mockFindPendingGrantForWorkspaceEmail,
+  revertPendingInvitationGrants: mockRevertPendingInvitationGrants,
+  findPendingGrantWorkspaceIds: mockFindPendingGrantWorkspaceIds,
+  findPendingOrganizationInvitation: mockFindPendingOrganizationInvitation,
 }))
 
 vi.mock('@/lib/invitations/core', () => ({
@@ -109,10 +113,12 @@ const mockGetWorkspaceWithOwner = permissionsMockFns.mockGetWorkspaceWithOwner
 import { UPGRADE_TO_INVITE_REASON } from '@/lib/workspaces/policy-constants'
 import { POST } from '@/app/api/workspaces/invitations/batch/route'
 
+afterAll(resetEnvFlagsMock)
+
 describe('POST /api/workspaces/invitations/batch', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockDbResults.value = []
+    resetDbChainMock()
     mockGetSession.mockResolvedValue({
       user: { id: 'user-1', email: 'owner@test.com', name: 'Owner User' },
     })
@@ -139,14 +145,32 @@ describe('POST /api/workspaces/invitations/batch', () => {
       maxSeats: 5,
       availableSeats: 4,
     })
+    mockAcquireOrganizationMutationLock.mockResolvedValue(undefined)
+    mockAcquireOrganizationUserMutationLocks.mockResolvedValue(undefined)
     mockGetUserOrganization.mockResolvedValue(null)
-    mockCreatePendingInvitation.mockResolvedValue({
-      invitationId: 'inv-1',
-      token: 'tok-1',
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-    })
+    mockGetEffectiveWorkspacePermission.mockResolvedValue('admin')
+    mockCreatePendingInvitation.mockImplementation(
+      async (input: { grants: Array<{ workspaceId: string; permission: string }> }) => ({
+        invitationId: 'inv-1',
+        token: 'tok-1',
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        created: true,
+        addedWorkspaceIds: input.grants.map((grant) => grant.workspaceId),
+        grants: input.grants,
+        mutationUpdatedAt: new Date('2026-07-30T12:00:00.000Z'),
+        mutationOrganizationId: 'org-1',
+      })
+    )
     mockSendInvitationEmail.mockResolvedValue({ success: true })
-    mockFindPendingGrantForWorkspaceEmail.mockResolvedValue(null)
+    mockCancelPendingInvitation.mockResolvedValue(true)
+    mockRevertPendingInvitationGrants.mockResolvedValue(true)
+    mockFindPendingGrantWorkspaceIds.mockResolvedValue(new Set())
+    mockFindPendingOrganizationInvitation.mockResolvedValue(null)
+    mockGetInvitePlanCategoryForUser.mockResolvedValue('free')
+  })
+
+  afterAll(() => {
+    resetDbChainMock()
   })
 
   it('blocks invites for personal workspaces with an upgrade prompt', async () => {
@@ -165,11 +189,11 @@ describe('POST /api/workspaces/invitations/batch', () => {
       organizationId: null,
       upgradeRequired: true,
     })
-    mockDbResults.value = []
 
     const request = createMockRequest('POST', {
-      workspaceId: 'workspace-1',
-      invitations: [{ email: 'new@example.com', permission: 'read' }],
+      workspaceIds: ['workspace-1'],
+      emails: ['new@example.com'],
+      permission: 'read',
     })
 
     const response = await POST(request)
@@ -196,11 +220,11 @@ describe('POST /api/workspaces/invitations/batch', () => {
       organizationId: null,
       upgradeRequired: true,
     })
-    mockDbResults.value = []
 
     const request = createMockRequest('POST', {
-      workspaceId: 'workspace-1',
-      invitations: [{ email: 'new@example.com', permission: 'read' }],
+      workspaceIds: ['workspace-1'],
+      emails: ['new@example.com'],
+      permission: 'read',
     })
 
     const response = await POST(request)
@@ -212,7 +236,7 @@ describe('POST /api/workspaces/invitations/batch', () => {
   })
 
   it('reports org-owned invites as failed when the organization has no available seats', async () => {
-    mockGetWorkspaceWithOwner.mockResolvedValueOnce({
+    mockGetWorkspaceWithOwner.mockResolvedValue({
       id: 'workspace-1',
       name: 'Org Workspace',
       ownerId: 'user-1',
@@ -234,11 +258,21 @@ describe('POST /api/workspaces/invitations/batch', () => {
       maxSeats: 5,
       availableSeats: 0,
     })
-    mockDbResults.value = [[]]
+    mockCreatePendingInvitation.mockImplementationOnce(
+      async (input: CreatePendingInvitationInput) => {
+        await input.validateLockedContext?.({
+          tx: dbChainMock.db as unknown as DbOrTx,
+          organizationId: 'org-1',
+          workspaceIds: ['workspace-1'],
+        })
+        throw new Error('unreachable')
+      }
+    )
 
     const request = createMockRequest('POST', {
-      workspaceId: 'workspace-1',
-      invitations: [{ email: 'new@example.com', permission: 'read' }],
+      workspaceIds: ['workspace-1'],
+      emails: ['new@example.com'],
+      permission: 'read',
     })
 
     const response = await POST(request)
@@ -252,8 +286,9 @@ describe('POST /api/workspaces/invitations/batch', () => {
         error: 'No available seats. Currently using 5 of 5 seats.',
       },
     ])
-    expect(mockValidateSeatAvailability).toHaveBeenCalledWith('org-1', 1)
-    expect(mockCreatePendingInvitation).not.toHaveBeenCalled()
+    expect(mockValidateSeatAvailability).toHaveBeenCalledWith('org-1', 1, {
+      executor: dbChainMock.db,
+    })
   })
 
   it('creates an external workspace invitation for users already in another organization', async () => {
@@ -277,11 +312,12 @@ describe('POST /api/workspaces/invitations/batch', () => {
       role: 'member',
       memberId: 'member-1',
     })
-    mockDbResults.value = [[{ id: 'existing-user', email: 'new@example.com' }]]
+    queueTableRows(schemaMock.user, [{ id: 'existing-user', email: 'new@example.com' }])
 
     const request = createMockRequest('POST', {
-      workspaceId: 'workspace-1',
-      invitations: [{ email: 'new@example.com', permission: 'read' }],
+      workspaceIds: ['workspace-1'],
+      emails: ['new@example.com'],
+      permission: 'read',
     })
 
     const response = await POST(request)
@@ -311,11 +347,11 @@ describe('POST /api/workspaces/invitations/batch', () => {
       workspaceMode: 'grandfathered_shared',
       billedAccountUserId: 'user-1',
     })
-    mockDbResults.value = [[]]
 
     const request = createMockRequest('POST', {
-      workspaceId: 'workspace-1',
-      invitations: [{ email: 'new@example.com', permission: 'write' }],
+      workspaceIds: ['workspace-1'],
+      emails: ['new@example.com'],
+      permission: 'write',
     })
 
     const response = await POST(request)
@@ -336,25 +372,10 @@ describe('POST /api/workspaces/invitations/batch', () => {
   })
 
   it('creates multiple workspace invitations in one batch request', async () => {
-    mockDbResults.value = [[], []]
-    mockCreatePendingInvitation
-      .mockResolvedValueOnce({
-        invitationId: 'inv-1',
-        token: 'tok-1',
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      })
-      .mockResolvedValueOnce({
-        invitationId: 'inv-2',
-        token: 'tok-2',
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      })
-
     const request = createMockRequest('POST', {
-      workspaceId: 'workspace-1',
-      invitations: [
-        { email: 'first@example.com', permission: 'read' },
-        { email: 'second@example.com', permission: 'write' },
-      ],
+      workspaceIds: ['workspace-1'],
+      emails: ['first@example.com', 'second@example.com'],
+      permission: 'read',
     })
 
     const response = await POST(request)
@@ -367,6 +388,90 @@ describe('POST /api/workspaces/invitations/batch', () => {
     expect(data.invitations).toHaveLength(2)
     expect(mockCreatePendingInvitation).toHaveBeenCalledTimes(2)
     expect(mockSendInvitationEmail).toHaveBeenCalledTimes(2)
+  })
+
+  it('coalesces several workspaces into one invitation and one email', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValue({
+      id: 'workspace-1',
+      name: 'Org Workspace',
+      ownerId: 'user-1',
+      organizationId: 'org-1',
+      workspaceMode: 'organization',
+      billedAccountUserId: 'owner-1',
+    })
+    mockGetWorkspaceInvitePolicy.mockResolvedValue({
+      allowed: true,
+      reason: null,
+      requiresSeat: false,
+      organizationId: 'org-1',
+      upgradeRequired: false,
+    })
+
+    const request = createMockRequest('POST', {
+      workspaceIds: ['workspace-1', 'workspace-2'],
+      emails: ['new@example.com'],
+      permission: 'write',
+    })
+
+    const response = await POST(request)
+    const data = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(data.success).toBe(true)
+    expect(mockCreatePendingInvitation).toHaveBeenCalledTimes(1)
+    expect(mockCreatePendingInvitation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        grants: [
+          { workspaceId: 'workspace-1', permission: 'write' },
+          { workspaceId: 'workspace-2', permission: 'write' },
+        ],
+      })
+    )
+    expect(mockSendInvitationEmail).toHaveBeenCalledTimes(1)
+    expect(data.invitations[0].workspaceIds).toEqual(['workspace-1', 'workspace-2'])
+  })
+
+  it('reports a per-email failure when an external invite targets a free account', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValueOnce({
+      id: 'workspace-1',
+      name: 'Org Workspace',
+      ownerId: 'user-1',
+      organizationId: 'org-1',
+      workspaceMode: 'organization',
+      billedAccountUserId: 'owner-1',
+    })
+    mockGetWorkspaceInvitePolicy.mockResolvedValueOnce({
+      allowed: true,
+      reason: null,
+      requiresSeat: false,
+      organizationId: 'org-1',
+      upgradeRequired: false,
+    })
+    /**
+     * The paid-plan requirement is a billing rule, so it only applies when
+     * billing is on — with billing off there are no seats to protect and every
+     * account reads as free.
+     */
+    setEnvFlags({ isBillingEnabled: true })
+    queueTableRows(schemaMock.user, [{ id: 'free-user', email: 'free@example.com' }])
+    mockGetUserOrganization.mockResolvedValueOnce(null)
+    mockGetInvitePlanCategoryForUser.mockResolvedValueOnce('free')
+
+    const request = createMockRequest('POST', {
+      workspaceIds: ['workspace-1'],
+      emails: ['free@example.com'],
+      permission: 'write',
+      membership: 'external',
+    })
+
+    const response = await POST(request)
+    const data = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(data.success).toBe(false)
+    expect(data.failed[0].email).toBe('free@example.com')
+    expect(data.failed[0].error).toContain('not on a paid Sim plan')
+    expect(mockCreatePendingInvitation).not.toHaveBeenCalled()
   })
 
   it('rolls back the unified invitation when email delivery fails', async () => {
@@ -382,11 +487,11 @@ describe('POST /api/workspaces/invitations/batch', () => {
       success: false,
       error: 'mailer unavailable',
     })
-    mockDbResults.value = [[]]
 
     const request = createMockRequest('POST', {
-      workspaceId: 'workspace-1',
-      invitations: [{ email: 'new@example.com', permission: 'read' }],
+      workspaceIds: ['workspace-1'],
+      emails: ['new@example.com'],
+      permission: 'read',
     })
 
     const response = await POST(request)
@@ -398,6 +503,9 @@ describe('POST /api/workspaces/invitations/batch', () => {
         failed: [{ email: 'new@example.com', error: 'mailer unavailable' }],
       })
     )
-    expect(mockCancelPendingInvitation).toHaveBeenCalledWith('inv-1')
+    expect(mockCancelPendingInvitation).toHaveBeenCalledWith('inv-1', {
+      expectedUpdatedAt: new Date('2026-07-30T12:00:00.000Z'),
+      expectedOrganizationId: 'org-1',
+    })
   })
 })

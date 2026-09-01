@@ -28,6 +28,43 @@ export const DevinBlock: BlockConfig = {
   integrationType: IntegrationType.DevOps,
   bgColor: '#12141A',
   icon: DevinIcon,
+  canvasPresentation: {
+    defaultTitle: 'Devin',
+    sentences: {
+      byOperation: {
+        create_session: [
+          { text: 'Start a session for', field: 'prompt', core: true },
+          { text: ', using playbook', field: 'playbookId' },
+        ],
+        get_session: [
+          { text: 'Read status and output of session', field: 'sessionId', core: true },
+        ],
+        list_sessions: ['List sessions', { text: ', up to', field: 'limit', after: 'results' }],
+        send_message: [
+          { text: 'Send', field: 'message', core: true },
+          { text: 'to session', field: 'sessionId' },
+        ],
+        list_session_messages: [
+          { text: 'List messages in session', field: 'sessionId', core: true },
+          { text: ', up to', field: 'limit', after: 'results' },
+        ],
+        list_session_attachments: [
+          { text: 'List files attached to session', field: 'sessionId', core: true },
+        ],
+        get_session_tags: [{ text: 'Read tags on session', field: 'sessionId', core: true }],
+        append_session_tags: [
+          { text: 'Add', field: 'tags', core: true },
+          { text: 'to session', field: 'sessionId', core: true },
+        ],
+        replace_session_tags: [
+          { text: 'Replace all tags with', field: 'tags', core: true },
+          { text: 'on session', field: 'sessionId', core: true },
+        ],
+        archive_session: [{ text: 'Archive session', field: 'sessionId', core: true }],
+        terminate_session: [{ text: 'Terminate session', field: 'sessionId', core: true }],
+      },
+    },
+  },
   authMode: AuthMode.ApiKey,
   subBlocks: [
     {
@@ -363,7 +400,7 @@ export const DevinBlockMeta = {
     },
     {
       icon: DevinIcon,
-      title: 'Documentation gap closer',
+      title: 'Devin documentation gap closer',
       prompt:
         'Create a workflow that scans a knowledge base of docs against the latest repo state, finds undocumented public APIs, opens a Devin session for each gap with a prompt to write documentation, and stores the produced markdown back into the knowledge base.',
       modules: ['knowledge-base', 'files', 'agent', 'workflows'],

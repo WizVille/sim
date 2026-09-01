@@ -11,40 +11,48 @@ import {
   PopoverTrigger,
   Tooltip,
 } from '@sim/emcn'
-import { Download } from '@sim/emcn/icons'
-import clsx from 'clsx'
 import {
   ArrowDown,
   ArrowUp,
   Check,
   Clipboard,
-  Database,
+  Download,
   MoreHorizontal,
   Palette,
-  Pause,
   Search,
-  Trash2,
+  Trash,
   X,
-} from 'lucide-react'
+} from '@sim/emcn/icons'
+import clsx from 'clsx'
 import Link from 'next/link'
+import {
+  AgentStreamThinkingChrome,
+  AgentStreamToolCallsChrome,
+} from '@/components/agent-stream/agent-stream-chrome'
 import {
   OutputContextMenu,
   StructuredOutput,
 } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/terminal/components/output-panel/components'
 import { ToggleButton } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/terminal/components/toggle-button'
-import { useContextMenu } from '@/app/workspace/[workspaceId]/w/components/sidebar/hooks'
 import { useCodeViewerFeatures } from '@/hooks/use-code-viewer'
+import { useContextMenu } from '@/hooks/use-context-menu'
 import type { ConsoleEntry } from '@/stores/terminal'
 import { safeConsoleStringify, useTerminalStore } from '@/stores/terminal'
 
 interface OutputCodeContentProps {
   code: string
-  language: 'javascript' | 'json'
+  language: 'javascript' | 'json' | 'python' | 'bash'
   wrapText: boolean
   searchQuery: string | undefined
   currentMatchIndex: number
   onMatchCountChange: (count: number) => void
   contentRef: React.RefObject<HTMLDivElement | null>
+}
+
+function outputCodeLanguage(language: unknown): OutputCodeContentProps['language'] {
+  if (language === 'shell') return 'bash'
+  if (language === 'python' || language === 'json' || language === 'bash') return language
+  return 'javascript'
 }
 
 const OutputCodeContent = React.memo(function OutputCodeContent({
@@ -90,9 +98,6 @@ export interface OutputPanelProps {
   setShowInput: (show: boolean) => void
   hasInputData: boolean
   isPlaygroundEnabled: boolean
-  shouldShowTrainingButton: boolean
-  isTraining: boolean
-  handleTrainingClick: (e: React.MouseEvent) => void
   showCopySuccess: boolean
   handleCopy: () => void
   hasEntries: boolean
@@ -117,9 +122,6 @@ export const OutputPanel = React.memo(function OutputPanel({
   setShowInput,
   hasInputData,
   isPlaygroundEnabled,
-  shouldShowTrainingButton,
-  isTraining,
-  handleTrainingClick,
   showCopySuccess,
   handleCopy,
   hasEntries,
@@ -344,7 +346,7 @@ export const OutputPanel = React.memo(function OutputPanel({
                     aria-label='Close search'
                     className='!p-1.5 -m-1.5'
                   >
-                    <X className='h-3.5 w-3.5' />
+                    <X className='size-[14px]' />
                   </Button>
                 </Tooltip.Trigger>
                 <Tooltip.Content>
@@ -360,7 +362,7 @@ export const OutputPanel = React.memo(function OutputPanel({
                     aria-label='Search in output'
                     className='!p-1.5 -m-1.5'
                   >
-                    <Search className='h-3.5 w-3.5' />
+                    <Search className='size-[14px]' />
                   </Button>
                 </Tooltip.Trigger>
                 <Tooltip.Content>
@@ -378,37 +380,12 @@ export const OutputPanel = React.memo(function OutputPanel({
                       aria-label='Component Playground'
                       className='!p-1.5 -m-1.5'
                     >
-                      <Palette className='h-3.5 w-3.5' />
+                      <Palette className='size-[14px]' />
                     </Button>
                   </Link>
                 </Tooltip.Trigger>
                 <Tooltip.Content>
                   <span>Component Playground</span>
-                </Tooltip.Content>
-              </Tooltip.Root>
-            )}
-
-            {shouldShowTrainingButton && (
-              <Tooltip.Root>
-                <Tooltip.Trigger asChild>
-                  <Button
-                    variant='ghost'
-                    onClick={handleTrainingClick}
-                    aria-label={isTraining ? 'Stop training' : 'Train Sim'}
-                    className={clsx(
-                      '!p-1.5 -m-1.5',
-                      isTraining && 'text-orange-600 dark:text-orange-400'
-                    )}
-                  >
-                    {isTraining ? (
-                      <Pause className='h-3.5 w-3.5' />
-                    ) : (
-                      <Database className='h-3.5 w-3.5' />
-                    )}
-                  </Button>
-                </Tooltip.Trigger>
-                <Tooltip.Content>
-                  <span>{isTraining ? 'Stop Training' : 'Train Sim'}</span>
                 </Tooltip.Content>
               </Tooltip.Root>
             )}
@@ -422,9 +399,9 @@ export const OutputPanel = React.memo(function OutputPanel({
                   className='!p-1.5 -m-1.5'
                 >
                   {showCopySuccess ? (
-                    <Check className='h-3.5 w-3.5' />
+                    <Check className='size-[14px]' />
                   ) : (
-                    <Clipboard className='h-3.5 w-3.5' />
+                    <Clipboard className='size-[14px]' />
                   )}
                 </Button>
               </Tooltip.Trigger>
@@ -442,7 +419,7 @@ export const OutputPanel = React.memo(function OutputPanel({
                       aria-label='Export console CSV'
                       className='!p-1.5 -m-1.5'
                     >
-                      <Download className='h-3.5 w-3.5' />
+                      <Download className='size-[14px]' />
                     </Button>
                   </Tooltip.Trigger>
                   <Tooltip.Content>
@@ -457,7 +434,7 @@ export const OutputPanel = React.memo(function OutputPanel({
                       aria-label='Clear console'
                       className='!p-1.5 -m-1.5'
                     >
-                      <Trash2 className='h-3.5 w-3.5' />
+                      <Trash className='size-[14px]' />
                     </Button>
                   </Tooltip.Trigger>
                   <Tooltip.Content>
@@ -474,7 +451,7 @@ export const OutputPanel = React.memo(function OutputPanel({
                   aria-label='Terminal options'
                   className='!p-1.5 -m-1.5'
                 >
-                  <MoreHorizontal className='h-3.5 w-3.5' />
+                  <MoreHorizontal className='size-[14px]' />
                 </Button>
               </PopoverTrigger>
               <PopoverContent
@@ -527,7 +504,7 @@ export const OutputPanel = React.memo(function OutputPanel({
             />
             <span
               className={clsx(
-                'w-[58px] font-medium text-xs',
+                'w-[58px] text-xs',
                 matchCount > 0 ? 'text-[var(--text-secondary)]' : 'text-[var(--text-tertiary)]'
               )}
             >
@@ -540,7 +517,7 @@ export const OutputPanel = React.memo(function OutputPanel({
               className='!p-1.5 -m-1.5'
               disabled={matchCount === 0}
             >
-              <ArrowUp className='h-3.5 w-3.5' />
+              <ArrowUp className='size-[14px]' />
             </Button>
             <Button
               variant='ghost'
@@ -549,7 +526,7 @@ export const OutputPanel = React.memo(function OutputPanel({
               className='!p-1.5 -m-1.5'
               disabled={matchCount === 0}
             >
-              <ArrowDown className='h-3.5 w-3.5' />
+              <ArrowDown className='size-[14px]' />
             </Button>
             <Button
               variant='ghost'
@@ -557,7 +534,7 @@ export const OutputPanel = React.memo(function OutputPanel({
               aria-label='Close search'
               className='!p-1.5 -m-1.5'
             >
-              <X className='h-3.5 w-3.5' />
+              <X className='size-[14px]' />
             </Button>
           </div>
         )}
@@ -567,10 +544,35 @@ export const OutputPanel = React.memo(function OutputPanel({
           className={clsx('flex-1 overflow-y-auto', !wrapText && 'overflow-x-auto')}
           onContextMenu={handleOutputPanelContextMenu}
         >
+          {!showInput &&
+            (selectedEntry.agentStreamThinking ||
+              (selectedEntry.agentStreamToolCalls &&
+                selectedEntry.agentStreamToolCalls.length > 0)) && (
+              <div className='border-[var(--border)] border-b px-3 pt-3'>
+                {selectedEntry.agentStreamThinking ? (
+                  <AgentStreamThinkingChrome
+                    thinking={selectedEntry.agentStreamThinking}
+                    isStreaming={Boolean(
+                      selectedEntry.isRunning && selectedEntry.agentStreamActive
+                    )}
+                  />
+                ) : null}
+                {selectedEntry.agentStreamToolCalls &&
+                selectedEntry.agentStreamToolCalls.length > 0 ? (
+                  <AgentStreamToolCallsChrome
+                    toolCalls={selectedEntry.agentStreamToolCalls}
+                    isStreaming={Boolean(
+                      selectedEntry.isRunning &&
+                        selectedEntry.agentStreamToolCalls.some((t) => t.status === 'running')
+                    )}
+                  />
+                ) : null}
+              </div>
+            )}
           {shouldShowCodeDisplay ? (
             <OutputCodeContent
               code={selectedEntry.input.code}
-              language={(selectedEntry.input.language as 'javascript' | 'json') || 'javascript'}
+              language={outputCodeLanguage(selectedEntry.input.language)}
               wrapText={wrapText}
               searchQuery={structuredSearchQuery}
               currentMatchIndex={currentMatchIndex}

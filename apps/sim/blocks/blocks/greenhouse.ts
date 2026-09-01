@@ -15,6 +15,47 @@ export const GreenhouseBlock: BlockConfig<GreenhouseResponse> = {
   bgColor: '#469776',
   iconColor: '#469776',
   icon: GreenhouseIcon,
+  canvasPresentation: {
+    defaultTitle: 'Greenhouse',
+    sentences: {
+      byOperation: {
+        greenhouse_list_candidates: [
+          'List candidates',
+          { text: ', for job', field: 'job_id' },
+          { text: ', with email', field: 'email' },
+          { text: ', created after', field: 'created_after' },
+        ],
+        greenhouse_get_candidate: [{ text: 'Fetch candidate', field: 'candidateId', core: true }],
+        greenhouse_list_jobs: [
+          'List jobs',
+          { text: ', with status', field: 'status' },
+          { text: ', in department', field: 'department_id' },
+          { text: ', at office', field: 'office_id' },
+        ],
+        greenhouse_get_job: [{ text: 'Fetch job', field: 'jobId', core: true }],
+        greenhouse_list_applications: [
+          'List applications',
+          { text: ', for job', field: 'job_id' },
+          { text: ', with status', field: 'applicationStatus' },
+          { text: ', active since', field: 'last_activity_after' },
+        ],
+        greenhouse_get_application: [
+          { text: 'Fetch application', field: 'applicationId', core: true },
+        ],
+        greenhouse_list_users: [
+          'List users',
+          { text: ', with email', field: 'email' },
+          { text: ', created after', field: 'created_after' },
+        ],
+        greenhouse_get_user: [{ text: 'Fetch user', field: 'userId', core: true }],
+        greenhouse_list_departments: ['List all departments'],
+        greenhouse_list_offices: ['List all offices'],
+        greenhouse_list_job_stages: [
+          { text: 'List interview stages for job', field: 'jobId', core: true },
+        ],
+      },
+    },
+  },
   authMode: AuthMode.ApiKey,
 
   triggers: {
@@ -427,7 +468,7 @@ export const GreenhouseBlockMeta = {
   templates: [
     {
       icon: GreenhouseIcon,
-      title: 'Recruiting pipeline automator',
+      title: 'Greenhouse pipeline monitor',
       prompt:
         'Build a scheduled workflow that syncs open jobs and candidates from Greenhouse to a tracking table daily, flags candidates who have been in the same stage for more than 5 days, and sends a Slack summary to hiring managers with pipeline stats and bottlenecks.',
       modules: ['tables', 'scheduled', 'agent', 'workflows'],

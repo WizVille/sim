@@ -1,3 +1,4 @@
+import { compileLinearRegex, isPlainText, literalRegex } from '@/lib/core/security/linear-regex'
 import {
   materializeLargeArrayManifest,
   readLargeArrayManifestSlice,
@@ -23,10 +24,28 @@ const DEFAULT_MAX_MATCHES = 50
 const DEFAULT_MAX_SNIPPET_CHARS = 500
 const DEFAULT_MAX_SLICES_SCANNED = 200
 
-// ---------------------------------------------------------------------------
-// Overview (Level 2): block tree with timing + cost, NO input/output.
-// ---------------------------------------------------------------------------
+/**
+ * Cumulative time the pattern itself may spend matching, across all spans/fields.
+ *
+ * Deliberately counts only time spent matching, not the grep's wall clock: the
+ * scan awaits blob-store reads (array slices, large-value refs) between matches,
+ * and charging that I/O to the budget would truncate slow-but-legitimate greps
+ * under load. Matching is the only part that occupies the event loop, so it is
+ * the only part worth bounding.
+ *
+ * RE2JS trades throughput for its linear-time guarantee — roughly 100x slower
+ * than the built-in engine, ~25ms per megabyte — so on a very large trace this
+ * budget is what actually caps the scan rather than a formality.
+ */
+const DEFAULT_MATCH_TIME_BUDGET_MS = 5_000
+/**
+ * Total characters a single grep may run the pattern over. Bounds the work one
+ * request can demand across every span and slice; set well above any realistic
+ * trace so normal greps never trip it.
+ */
+const DEFAULT_MAX_SCANNED_CHARS = 64 * 1024 * 1024
 
+/** Block tree with timing and cost, without input/output. */
 export interface OverviewSpan {
   id: string
   blockId?: string
@@ -55,10 +74,54 @@ export function toOverview(spans: TraceSpan[]): OverviewSpan[] {
   })
 }
 
-// ---------------------------------------------------------------------------
-// Full (Level 3): block tree WITH materialized input/output.
-// ---------------------------------------------------------------------------
+/** Condensed per-block digest: names, statuses, counts. */
+export interface TraceDigestEntry {
+  /** Block id when the spans carry one; the drill-in key for `full` blockIds. */
+  blockId?: string
+  name: string
+  type: string
+  /** How many spans (loop iterations included) this block produced. */
+  executions: number
+  /** Span count per status, e.g. { success: 498, error: 2 }. */
+  statuses: Record<string, number>
+  totalDurationMs: number
+}
 
+/**
+ * Project trace spans to a flat per-block digest in first-execution order.
+ * Every span in the tree is counted (loop iterations collapse into their
+ * block's entry), so a 500-iteration loop is one line, not 500. Never
+ * materializes refs.
+ */
+export function toTrace(spans: TraceSpan[]): TraceDigestEntry[] {
+  const byKey = new Map<string, TraceDigestEntry>()
+  const walk = (list: TraceSpan[]): void => {
+    for (const s of list) {
+      const key = s.blockId ?? `${s.type}:${s.name}`
+      let entry = byKey.get(key)
+      if (!entry) {
+        entry = {
+          ...(s.blockId ? { blockId: s.blockId } : {}),
+          name: s.name,
+          type: s.type,
+          executions: 0,
+          statuses: {},
+          totalDurationMs: 0,
+        }
+        byKey.set(key, entry)
+      }
+      entry.executions++
+      const status = s.status ?? 'unknown'
+      entry.statuses[status] = (entry.statuses[status] ?? 0) + 1
+      entry.totalDurationMs += s.duration ?? 0
+      if (s.children && s.children.length > 0) walk(s.children)
+    }
+  }
+  walk(spans)
+  return Array.from(byKey.values())
+}
+
+/** Block tree with materialized input/output. */
 export interface FullSpan extends OverviewSpan {
   startTime?: string
   endTime?: string
@@ -70,6 +133,8 @@ export interface FullSpan extends OverviewSpan {
 
 export interface BlockSelector {
   blockId?: string
+  /** Multiple drill-in targets at once (ids from the trace digest). */
+  blockIds?: string[]
   blockName?: string
 }
 
@@ -82,19 +147,76 @@ export interface BlockSelector {
 export async function toFull(
   spans: TraceSpan[],
   ctx: LogViewContext,
-  selector?: BlockSelector
+  selector?: BlockSelector,
+  fields?: string[]
 ): Promise<FullSpan[]> {
   const roots = selectSpans(spans, selector)
-  return Promise.all(roots.map((s) => fullSpan(s, ctx)))
+  const full = await Promise.all(roots.map((s) => fullSpan(s, ctx)))
+  if (!fields || fields.length === 0) return full
+  return full.map((s) => projectSpanFields(s, fields))
+}
+
+/**
+ * Narrows a full span to the requested fields so the caller loads only what it
+ * needs. A field is either a whole payload key (`input` / `output` / `error`)
+ * or a dotted path into one (`output.result.rows`); dotted selections land
+ * under `selected` keyed by the full path. Span identity/status/timing always
+ * stay, and children are projected recursively.
+ */
+function projectSpanFields(span: FullSpan, fields: string[]): FullSpan {
+  const node: FullSpan = {
+    id: span.id,
+    blockId: span.blockId,
+    name: span.name,
+    type: span.type,
+    status: span.status,
+    durationMs: span.durationMs,
+    startTime: span.startTime,
+    endTime: span.endTime,
+  }
+  if (span.cost) node.cost = span.cost
+  const selected: Record<string, unknown> = {}
+  let hasSelected = false
+  for (const field of fields) {
+    if (field === 'input' || field === 'output' || field === 'error') {
+      if (span[field] !== undefined) node[field] = span[field] as never
+      continue
+    }
+    const [head, ...rest] = field.split('.')
+    if ((head === 'input' || head === 'output') && rest.length > 0) {
+      let value: unknown = span[head]
+      for (const key of rest) {
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          value = (value as Record<string, unknown>)[key]
+        } else if (Array.isArray(value) && /^\d+$/.test(key)) {
+          value = value[Number(key)]
+        } else {
+          value = undefined
+          break
+        }
+      }
+      selected[field] = value
+      hasSelected = true
+    }
+  }
+  if (hasSelected) (node as FullSpan & { selected?: Record<string, unknown> }).selected = selected
+  if (span.children && span.children.length > 0) {
+    node.children = span.children.map((c) => projectSpanFields(c, fields))
+  }
+  return node
 }
 
 function selectSpans(spans: TraceSpan[], selector?: BlockSelector): TraceSpan[] {
-  if (!selector || (!selector.blockId && !selector.blockName)) return spans
+  if (!selector || (!selector.blockId && !selector.blockIds?.length && !selector.blockName)) {
+    return spans
+  }
+  const idSet = new Set<string>(selector.blockIds ?? [])
+  if (selector.blockId !== undefined) idSet.add(selector.blockId)
   const out: TraceSpan[] = []
   const walk = (list: TraceSpan[]): void => {
     for (const s of list) {
       const matches =
-        (selector.blockId !== undefined && s.blockId === selector.blockId) ||
+        (s.blockId !== undefined && idSet.has(s.blockId)) ||
         (selector.blockName !== undefined && s.name === selector.blockName)
       if (matches) {
         out.push(s)
@@ -157,9 +279,7 @@ async function materializeField(value: unknown, ctx: LogViewContext): Promise<un
   return value
 }
 
-// ---------------------------------------------------------------------------
 // Grep (single execution): stream large refs chunk-by-chunk, release each.
-// ---------------------------------------------------------------------------
 
 export interface GrepSpanMatch {
   spanId: string
@@ -171,40 +291,86 @@ export interface GrepSpanMatch {
 
 export interface GrepSpansResult {
   matches: GrepSpanMatch[]
+  /**
+   * Whether the scan stopped early — because a budget was exhausted, the slice
+   * cap was hit, or `maxMatches` was reached. It is a "there may be more" flag,
+   * not proof that trace was left unread: reaching `maxMatches` on the final
+   * match sets it even when nothing remained. Treat it as a prompt to narrow
+   * the pattern, never as a count.
+   */
   truncated: boolean
+  /**
+   * Present only when the pattern used syntax RE2 does not implement and was
+   * therefore matched literally. The tool catalog cannot warn up front — it is
+   * generated from a contract in another repository — so the caller is told
+   * here rather than reading zero matches as "not present in the trace".
+   */
+  patternNotice?: string
 }
 
 export interface GrepSpansOptions {
   maxMatches?: number
   maxSnippetChars?: number
   maxSlicesScanned?: number
+  maxScannedChars?: number
+  matchTimeBudgetMs?: number
 }
 
 interface GrepState {
   matches: GrepSpanMatch[]
   slicesScanned: number
+  scannedChars: number
+  matchTimeMs: number
   truncated: boolean
   maxMatches: number
   maxSnippetChars: number
   maxSlicesScanned: number
-  regex: RegExp
+  maxScannedChars: number
+  matchTimeBudgetMs: number
+  find: FindMatch
 }
 
-function escapeRegExp(input: string): string {
-  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
+/** Index of the first case-insensitive match in `text`, or -1. */
+type FindMatch = (text: string) => number
 
-function buildRegex(pattern: string): RegExp {
-  try {
-    return new RegExp(pattern, 'i')
-  } catch {
-    return new RegExp(escapeRegExp(pattern), 'i')
+/**
+ * Compile a caller-supplied grep pattern into a matcher that cannot backtrack.
+ *
+ * Trace text is attacker-influenced — a workflow can emit arbitrarily long
+ * uniform runs into its own block outputs — and matching runs synchronously on
+ * the shared event loop, so a backtracking engine lets one request stall every
+ * other request on the instance. See `@/lib/core/security/linear-regex` for why
+ * the engine changed rather than the pattern being screened.
+ *
+ * A pattern with no metacharacter takes the built-in engine, which is ~100x
+ * quicker and identical in meaning when there is nothing to interpret. Syntax
+ * RE2 cannot represent degrades to a literal with a notice, so the caller knows
+ * its regex was not applied instead of reading zero matches as "not present".
+ */
+function compilePattern(pattern: string): { find: FindMatch; notice?: string } {
+  if (isPlainText(pattern)) return { find: literalRegex(pattern, { ignoreCase: true }).find }
+
+  const compiled = compileLinearRegex(pattern, { ignoreCase: true })
+  if (compiled) return { find: compiled.find }
+
+  return {
+    find: literalRegex(pattern, { ignoreCase: true }).find,
+    notice:
+      'Pattern is not valid RE2 syntax (lookahead, lookbehind and backreferences are unsupported), so it was matched as a literal string. Rewrite it without those constructs to search by regex.',
   }
 }
 
-function snippetAround(text: string, regex: RegExp, maxChars: number): string {
-  const m = regex.exec(text)
-  const index = m ? m.index : 0
+function findTimed(text: string, state: GrepState): number {
+  const started = performance.now()
+  try {
+    return state.find(text)
+  } finally {
+    state.matchTimeMs += performance.now() - started
+  }
+}
+
+function snippetAround(text: string, index: number, state: GrepState): string {
+  const maxChars = state.maxSnippetChars
   const half = Math.floor(maxChars / 2)
   const start = Math.max(0, index - half)
   const end = Math.min(text.length, start + maxChars)
@@ -214,7 +380,12 @@ function snippetAround(text: string, regex: RegExp, maxChars: number): string {
 }
 
 function done(state: GrepState): boolean {
-  return state.truncated || state.matches.length >= state.maxMatches
+  if (state.truncated || state.matches.length >= state.maxMatches) return true
+  if (state.matchTimeMs >= state.matchTimeBudgetMs) {
+    state.truncated = true
+    return true
+  }
+  return false
 }
 
 function recordIfMatch(
@@ -224,15 +395,19 @@ function recordIfMatch(
   state: GrepState
 ): void {
   if (done(state)) return
-  state.regex.lastIndex = 0
-  if (!state.regex.test(text)) return
-  state.regex.lastIndex = 0
+  if (state.scannedChars + text.length > state.maxScannedChars) {
+    state.truncated = true
+    return
+  }
+  state.scannedChars += text.length
+  const index = findTimed(text, state)
+  if (index < 0) return
   state.matches.push({
     spanId: span.id,
     blockId: span.blockId,
     name: span.name,
     field,
-    snippet: snippetAround(text, state.regex, state.maxSnippetChars),
+    snippet: snippetAround(text, index, state),
   })
   if (state.matches.length >= state.maxMatches) state.truncated = true
 }
@@ -305,6 +480,12 @@ function safeStringify(value: unknown): string {
  * directly; large-array I/O is streamed slice-by-slice (each released before the
  * next); single large refs are materialized under a byte cap (falling back to
  * the ref preview). Only bounded match snippets are accumulated.
+ *
+ * `pattern` is matched by a non-backtracking engine — see `compilePattern` — so
+ * no pattern can blow up on any input. Two budgets bound total work on top of
+ * that: a character budget and a cumulative match-time budget. Neither counts
+ * the blob-store I/O this scan awaits, so a slow-but-legitimate grep is not
+ * truncated merely for being slow.
  */
 export async function grepSpans(
   spans: TraceSpan[],
@@ -312,14 +493,19 @@ export async function grepSpans(
   ctx: LogViewContext,
   opts?: GrepSpansOptions
 ): Promise<GrepSpansResult> {
+  const compiled = compilePattern(pattern)
   const state: GrepState = {
     matches: [],
     slicesScanned: 0,
+    scannedChars: 0,
+    matchTimeMs: 0,
     truncated: false,
     maxMatches: opts?.maxMatches ?? DEFAULT_MAX_MATCHES,
     maxSnippetChars: opts?.maxSnippetChars ?? DEFAULT_MAX_SNIPPET_CHARS,
     maxSlicesScanned: opts?.maxSlicesScanned ?? DEFAULT_MAX_SLICES_SCANNED,
-    regex: buildRegex(pattern),
+    maxScannedChars: opts?.maxScannedChars ?? DEFAULT_MAX_SCANNED_CHARS,
+    matchTimeBudgetMs: opts?.matchTimeBudgetMs ?? DEFAULT_MATCH_TIME_BUDGET_MS,
+    find: compiled.find,
   }
 
   const walk = async (list: TraceSpan[]): Promise<void> => {
@@ -335,5 +521,9 @@ export async function grepSpans(
   }
 
   await walk(spans)
-  return { matches: state.matches, truncated: state.truncated }
+  return {
+    matches: state.matches,
+    truncated: state.truncated,
+    ...(compiled.notice ? { patternNotice: compiled.notice } : {}),
+  }
 }

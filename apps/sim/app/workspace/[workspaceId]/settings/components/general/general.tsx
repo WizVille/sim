@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   Button,
+  Chip,
   ChipCombobox,
   ChipModal,
   ChipModalBody,
@@ -10,23 +11,28 @@ import {
   ChipModalFooter,
   ChipModalHeader,
   ChipSelect,
+  cn,
   Input,
   Label,
   Switch,
   Tooltip,
 } from '@sim/emcn'
+import { Camera, Check, CircleInfo, Pencil } from '@sim/emcn/icons'
 import { createLogger } from '@sim/logger'
-import { Camera, Check, Info, Pencil } from 'lucide-react'
 import Image from 'next/image'
 import { useRouter } from 'next/navigation'
-import { requestJson } from '@/lib/api/client/request'
-import { telemetryContract } from '@/lib/api/contracts/telemetry'
+import { useQueryState } from 'nuqs'
 import { signOut, useSession } from '@/lib/auth/auth-client'
 import { ANONYMOUS_USER_ID } from '@/lib/auth/constants'
-import { getEnv, isTruthy } from '@/lib/core/config/env'
 import { isHosted } from '@/lib/core/config/env-flags'
 import { getBrowserTimezone, getTimezoneOptions } from '@/lib/core/utils/timezone'
 import { getBaseUrl } from '@/lib/core/utils/urls'
+import { DeleteAccountModal } from '@/app/workspace/[workspaceId]/settings/components/general/components/delete-account-modal'
+import { PrivacyView } from '@/app/workspace/[workspaceId]/settings/components/general/components/privacy-view'
+import {
+  generalViewParam,
+  generalViewUrlKeys,
+} from '@/app/workspace/[workspaceId]/settings/components/general/search-params'
 import type { SettingsAction } from '@/app/workspace/[workspaceId]/settings/components/settings-header/settings-header'
 import { SettingsPanel } from '@/app/workspace/[workspaceId]/settings/components/settings-panel'
 import { SettingsSection } from '@/app/workspace/[workspaceId]/settings/components/settings-section/settings-section'
@@ -79,7 +85,6 @@ export function General() {
 
   const isLoading = isProfileLoading || isSettingsLoading
 
-  const isTrainingEnabled = isTruthy(getEnv('NEXT_PUBLIC_COPILOT_TRAINING_ENABLED'))
   const isAuthDisabled = session?.user?.id === ANONYMOUS_USER_ID
 
   const [name, setName] = useState(profile?.name || '')
@@ -92,8 +97,14 @@ export function General() {
     setName(profile.name)
   }
 
+  const [view, setView] = useQueryState(generalViewParam.key, {
+    ...generalViewParam.parser,
+    ...generalViewUrlKeys,
+  })
   const [showResetPasswordModal, setShowResetPasswordModal] = useState(false)
   const resetPassword = useResetPassword()
+
+  const [showDeleteAccountModal, setShowDeleteAccountModal] = useState(false)
 
   const [uploadError, setUploadError] = useState<string | null>(null)
 
@@ -219,6 +230,12 @@ export function General() {
     }
   }
 
+  const handleAutoFocusOnClickChange = async (checked: boolean) => {
+    if (checked !== settings?.autoFocusOnClick && !updateSetting.isPending) {
+      await updateSetting.mutateAsync({ key: 'autoFocusOnClick', value: checked })
+    }
+  }
+
   const handleSnapToGridChange = async (value: string) => {
     const newValue = Number.parseInt(value, 10)
     if (newValue !== settings?.snapToGridSize && !updateSetting.isPending) {
@@ -232,58 +249,44 @@ export function General() {
     }
   }
 
-  const handleTrainingControlsChange = async (checked: boolean) => {
-    if (checked !== settings?.showTrainingControls && !updateSetting.isPending) {
-      await updateSetting.mutateAsync({ key: 'showTrainingControls', value: checked })
-    }
-  }
-
   const handleErrorNotificationsChange = async (checked: boolean) => {
     if (checked !== settings?.errorNotificationsEnabled && !updateSetting.isPending) {
       await updateSetting.mutateAsync({ key: 'errorNotificationsEnabled', value: checked })
     }
   }
 
-  const handleTelemetryToggle = async (checked: boolean) => {
-    if (checked !== settings?.telemetryEnabled && !updateSetting.isPending) {
-      await updateSetting.mutateAsync({ key: 'telemetryEnabled', value: checked })
-
-      if (checked) {
-        if (typeof window !== 'undefined') {
-          requestJson(telemetryContract, {
-            body: {
-              category: 'consent',
-              action: 'enable_from_settings',
-              timestamp: new Date().toISOString(),
-            },
-          }).catch(() => {})
-        }
-      }
-    }
-  }
-
   const imageUrl = profilePictureUrl || profile?.image || brandConfig.logoUrl
 
-  if (isLoading) {
-    return null
+  if (view === 'privacy') {
+    return <PrivacyView onBack={() => setView(null)} />
   }
 
   const actions: SettingsAction[] = [
     ...(isHosted
       ? [
           {
+            id: 'home-page',
             text: 'Home page',
             onSelect: () => window.open('/?home', '_blank', 'noopener,noreferrer'),
           },
         ]
       : []),
-    ...(!isAuthDisabled
+    ...(session?.user?.id && !isAuthDisabled
       ? [
-          { text: 'Sign out', onSelect: handleSignOut },
-          { text: 'Reset password', onSelect: () => setShowResetPasswordModal(true) },
+          { id: 'sign-out', text: 'Sign out', onSelect: handleSignOut },
+          {
+            id: 'reset-password',
+            text: 'Reset password',
+            onSelect: () => setShowResetPasswordModal(true),
+            disabled: !profile?.email,
+          },
         ]
       : []),
   ]
+
+  if (isLoading) {
+    return <SettingsPanel actions={actions} />
+  }
 
   return (
     <>
@@ -295,7 +298,10 @@ export function General() {
                 <button
                   type='button'
                   aria-label='Change profile picture'
-                  className={`group relative flex size-9 flex-shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded-full transition-all hover-hover:bg-[var(--bg)] ${!imageUrl ? 'border border-[var(--border)]' : ''}`}
+                  className={cn(
+                    'group relative flex size-9 flex-shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded-full transition-colors hover-hover:bg-[var(--bg)]',
+                    !imageUrl && 'border border-[var(--border)]'
+                  )}
                   onClick={handleProfilePictureClick}
                 >
                   {(() => {
@@ -314,7 +320,7 @@ export function General() {
                       )
                     }
                     return (
-                      <span className='font-medium text-[var(--text-primary)] text-base'>
+                      <span className='text-[var(--text-primary)] text-base'>
                         {getInitials(profile?.name) || ''}
                       </span>
                     )
@@ -347,10 +353,7 @@ export function General() {
                   {isEditingName ? (
                     <>
                       <div className='relative inline-flex'>
-                        <span
-                          className='invisible whitespace-pre font-medium text-base'
-                          aria-hidden='true'
-                        >
+                        <span className='invisible whitespace-pre text-base' aria-hidden='true'>
                           {name || ' '}
                         </span>
                         <input
@@ -360,7 +363,7 @@ export function General() {
                           onChange={(e) => setName(e.target.value)}
                           onKeyDown={handleKeyDown}
                           onBlur={handleInputBlur}
-                          className='absolute top-0 left-0 h-full w-full border-0 bg-transparent p-0 font-medium text-base outline-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0'
+                          className='absolute top-0 left-0 h-full w-full border-0 bg-transparent p-0 text-base outline-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0'
                           maxLength={100}
                           disabled={updateProfile.isPending}
                           autoComplete='off'
@@ -381,7 +384,7 @@ export function General() {
                     </>
                   ) : (
                     <>
-                      <h3 className='font-medium text-base'>{profile?.name || ''}</h3>
+                      <h3 className='text-base'>{profile?.name || ''}</h3>
                       <Button
                         variant='ghost'
                         className='size-[10.5px] flex-shrink-0 p-0'
@@ -403,9 +406,10 @@ export function General() {
         <SettingsSection label='Preferences'>
           <div className='flex flex-col gap-4'>
             <div className='flex items-center justify-between'>
-              <Label htmlFor='theme-select'>Theme</Label>
+              <Label>Theme</Label>
               <div className={DROPDOWN_TRIGGER_CLASS}>
                 <ChipSelect
+                  aria-label='Theme'
                   align='start'
                   fullWidth
                   dropdownWidth='trigger'
@@ -442,7 +446,13 @@ export function General() {
                 <Label htmlFor='auto-connect'>Auto-connect on drop</Label>
                 <Tooltip.Root>
                   <Tooltip.Trigger asChild>
-                    <Info className='size-[14px] cursor-default text-[var(--text-muted)]' />
+                    <button
+                      type='button'
+                      aria-label='About auto-connect on drop'
+                      className='inline-flex cursor-default text-[var(--text-muted)]'
+                    >
+                      <CircleInfo className='size-[14px]' />
+                    </button>
                   </Tooltip.Trigger>
                   <Tooltip.Content side='bottom' align='start'>
                     <p>Automatically connect blocks when dropped near each other</p>
@@ -463,10 +473,46 @@ export function General() {
 
             <div className='flex items-center justify-between'>
               <div className='flex items-center gap-1.5'>
+                <Label htmlFor='auto-focus-on-click'>Auto-focus on click</Label>
+                <Tooltip.Root>
+                  <Tooltip.Trigger asChild>
+                    <button
+                      type='button'
+                      aria-label='About auto-focus on click'
+                      className='inline-flex cursor-default text-[var(--text-muted)]'
+                    >
+                      <CircleInfo className='size-[14px]' />
+                    </button>
+                  </Tooltip.Trigger>
+                  <Tooltip.Content side='bottom' align='start'>
+                    <p>Center the canvas on a block when you click it</p>
+                    <Tooltip.Preview
+                      src='/tooltips/auto-focus-on-click.mp4'
+                      alt='Auto-focus on click example'
+                      loop={true}
+                    />
+                  </Tooltip.Content>
+                </Tooltip.Root>
+              </div>
+              <Switch
+                id='auto-focus-on-click'
+                checked={settings?.autoFocusOnClick ?? true}
+                onCheckedChange={handleAutoFocusOnClickChange}
+              />
+            </div>
+
+            <div className='flex items-center justify-between'>
+              <div className='flex items-center gap-1.5'>
                 <Label htmlFor='error-notifications'>Canvas error notifications</Label>
                 <Tooltip.Root>
                   <Tooltip.Trigger asChild>
-                    <Info className='size-[14px] cursor-default text-[var(--text-muted)]' />
+                    <button
+                      type='button'
+                      aria-label='About canvas error notifications'
+                      className='inline-flex cursor-default text-[var(--text-muted)]'
+                    >
+                      <CircleInfo className='size-[14px]' />
+                    </button>
                   </Tooltip.Trigger>
                   <Tooltip.Content side='bottom' align='start'>
                     <p>Show error popups on blocks when a workflow run fails</p>
@@ -485,9 +531,10 @@ export function General() {
             </div>
 
             <div className='flex items-center justify-between'>
-              <Label htmlFor='snap-to-grid'>Snap to grid</Label>
+              <Label>Snap to grid</Label>
               <div className={DROPDOWN_TRIGGER_CLASS}>
                 <ChipSelect
+                  aria-label='Snap to grid'
                   align='start'
                   fullWidth
                   dropdownWidth='trigger'
@@ -514,36 +561,24 @@ export function General() {
                 onCheckedChange={handleShowActionBarChange}
               />
             </div>
-
-            {isTrainingEnabled && (
-              <div className='flex items-center justify-between'>
-                <Label htmlFor='training-controls'>Training controls</Label>
-                <Switch
-                  id='training-controls'
-                  checked={settings?.showTrainingControls ?? false}
-                  onCheckedChange={handleTrainingControlsChange}
-                />
-              </div>
-            )}
           </div>
         </SettingsSection>
 
         <SettingsSection label='Privacy'>
-          <div className='flex flex-col gap-3'>
-            <div className='flex items-center justify-between'>
-              <Label htmlFor='telemetry'>Allow anonymous telemetry</Label>
-              <Switch
-                id='telemetry'
-                checked={settings?.telemetryEnabled ?? true}
-                onCheckedChange={handleTelemetryToggle}
-              />
-            </div>
-            <p className='text-[var(--text-muted)] text-small'>
-              We use OpenTelemetry to collect anonymous usage data to improve Sim. You can opt-out
-              at any time.
-            </p>
+          <div className='flex items-center justify-between'>
+            <Label>Privacy settings</Label>
+            <Chip onClick={() => setView('privacy')}>Manage</Chip>
           </div>
         </SettingsSection>
+
+        {!isAuthDisabled && (
+          <SettingsSection label='Account'>
+            <div className='flex items-center justify-between'>
+              <Label>Delete account</Label>
+              <Chip onClick={() => setShowDeleteAccountModal(true)}>Delete</Chip>
+            </div>
+          </SettingsSection>
+        )}
       </SettingsPanel>
 
       <ChipModal
@@ -557,8 +592,8 @@ export function General() {
         <ChipModalBody>
           <p className='px-2 text-[var(--text-secondary)] text-sm'>
             A password reset link will be sent to{' '}
-            <span className='font-medium text-[var(--text-primary)]'>{profile?.email}</span>. Click
-            the link in the email to create a new password.
+            <span className='text-[var(--text-primary)]'>{profile?.email}</span>. Click the link in
+            the email to create a new password.
           </p>
           <ChipModalError>{resetPassword.error?.message}</ChipModalError>
         </ChipModalBody>
@@ -576,6 +611,12 @@ export function General() {
           }}
         />
       </ChipModal>
+
+      <DeleteAccountModal
+        open={showDeleteAccountModal}
+        onOpenChange={setShowDeleteAccountModal}
+        email={profile?.email || ''}
+      />
     </>
   )
 }

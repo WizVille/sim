@@ -1,6 +1,6 @@
 import { readResponseTextWithLimit } from '@/lib/core/utils/stream-limits'
 import type { RequestParams, RequestResponse } from '@/tools/http/types'
-import { getDefaultHeaders, processUrl } from '@/tools/http/utils'
+import { getCredentialHeaderNames, getDefaultHeaders, processUrl } from '@/tools/http/utils'
 import { transformTable } from '@/tools/shared/table'
 import type { ToolConfig } from '@/tools/types'
 
@@ -51,6 +51,11 @@ export const requestTool: ToolConfig<RequestParams, RequestResponse> = {
       visibility: 'user-or-llm',
       description: 'Form data to send (will set appropriate Content-Type)',
     },
+    proxyUrl: {
+      type: 'string',
+      visibility: 'user-only',
+      description: 'Route the request through an http:// proxy (e.g. http://user:pass@host:port).',
+    },
     timeout: {
       type: 'number',
       visibility: 'user-only',
@@ -78,9 +83,21 @@ export const requestTool: ToolConfig<RequestParams, RequestResponse> = {
       description:
         'Allow retries for non-idempotent methods like POST/PATCH (may create duplicate requests).',
     },
+    redirectPolicyVersion: {
+      type: 'string',
+      visibility: 'hidden',
+      description: 'Persisted redirect-policy compatibility version.',
+    },
+    sendCredentialsOnCrossOriginRedirect: {
+      type: 'boolean',
+      visibility: 'user-only',
+      description:
+        'Send credential-bearing headers when a redirect targets a different origin. Enabled by default for compatibility.',
+    },
   },
 
   request: {
+    allowSameOrigin: true,
     url: (params: RequestParams) => {
       return processUrl(params.url, params.pathParams, params.params)
     },
@@ -149,6 +166,13 @@ export const requestTool: ToolConfig<RequestParams, RequestResponse> = {
       initialDelayMs: 500,
       maxDelayMs: 30000,
       retryIdempotentOnly: true,
+    },
+    redirectPolicy: (params: RequestParams) => {
+      return {
+        mode: params.redirectPolicyVersion === 'standard-v1' ? 'standard' : 'legacy',
+        sendCredentialsOnCrossOriginRedirect: params.sendCredentialsOnCrossOriginRedirect !== false,
+        sensitiveHeaders: getCredentialHeaderNames(params.headers),
+      }
     },
   },
 

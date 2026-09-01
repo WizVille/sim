@@ -1,18 +1,16 @@
 /**
  * @vitest-environment node
  */
-import { createMockRequest } from '@sim/testing'
+import { authMockFns, createMockRequest } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
-  mockGetSession,
   mockValidateEnterpriseAuditAccess,
   mockBuildOrgScopeCondition,
   mockGetOrgWorkspaceIds,
   mockQueryAuditLogs,
   mockBuildFilterConditions,
 } = vi.hoisted(() => ({
-  mockGetSession: vi.fn(),
   mockValidateEnterpriseAuditAccess: vi.fn(),
   mockBuildOrgScopeCondition: vi.fn(),
   mockGetOrgWorkspaceIds: vi.fn(),
@@ -20,16 +18,11 @@ const {
   mockBuildFilterConditions: vi.fn(),
 }))
 
-vi.mock('@/lib/auth', () => ({
-  auth: { api: { getSession: vi.fn() } },
-  getSession: mockGetSession,
-}))
-
 vi.mock('@/app/api/v1/audit-logs/auth', () => ({
   validateEnterpriseAuditAccess: mockValidateEnterpriseAuditAccess,
 }))
 
-vi.mock('@/app/api/v1/audit-logs/query', () => ({
+vi.mock('@/lib/audit-logs/query', () => ({
   buildFilterConditions: mockBuildFilterConditions,
   buildOrgScopeCondition: mockBuildOrgScopeCondition,
   getOrgWorkspaceIds: mockGetOrgWorkspaceIds,
@@ -37,6 +30,8 @@ vi.mock('@/app/api/v1/audit-logs/query', () => ({
 }))
 
 import { GET } from '@/app/api/audit-logs/export/route'
+
+const mockGetSession = authMockFns.mockGetSession
 
 const ORG_ID = 'org-1'
 const MEMBER_IDS = ['admin-1']
@@ -165,6 +160,31 @@ describe('GET /api/audit-logs/export', () => {
 
   it('rejects an actorId that is not a current org member', async () => {
     const response = await GET(makeRequest('?actorId=outsider-1'))
+
+    expect(response.status).toBe(400)
+    expect(mockQueryAuditLogs).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The export has to filter by everything the on-screen feed does. It did not
+   * forward `workspaceId`, so an admin exporting from a workspace-scoped feed
+   * downloaded the whole organization — silently, because every field of
+   * `AuditLogFilterParams` is optional and dropping one still type-checks.
+   */
+  it('forwards the workspace filter the on-screen feed applies', async () => {
+    mockGetOrgWorkspaceIds.mockResolvedValue(['workspace-1'])
+
+    await GET(makeRequest('?workspaceId=workspace-1'))
+
+    expect(mockBuildFilterConditions).toHaveBeenCalledWith(
+      expect.objectContaining({ workspaceId: 'workspace-1' })
+    )
+  })
+
+  it('rejects a workspaceId outside the organization, as the list route does', async () => {
+    mockGetOrgWorkspaceIds.mockResolvedValue(['workspace-1'])
+
+    const response = await GET(makeRequest('?workspaceId=workspace-elsewhere'))
 
     expect(response.status).toBe(400)
     expect(mockQueryAuditLogs).not.toHaveBeenCalled()

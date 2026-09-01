@@ -1,10 +1,16 @@
 /**
  * @vitest-environment node
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  dbChainMock,
+  dbChainMockFns,
+  queueTableRows,
+  resetDbChainMock,
+  schemaMock,
+} from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
-  mockLimit,
   mockPrepareWebhooks,
   mockGetDeploymentOperation,
   mockMarkDeploymentComponentReadiness,
@@ -26,7 +32,6 @@ const {
   mockCaptureServerEvent,
   mockTx,
 } = vi.hoisted(() => ({
-  mockLimit: vi.fn(),
   mockPrepareWebhooks: vi.fn(),
   mockGetDeploymentOperation: vi.fn(),
   mockMarkDeploymentComponentReadiness: vi.fn(),
@@ -58,58 +63,11 @@ vi.mock('@sim/audit', () => ({
   recordAudit: mockRecordAudit,
 }))
 
-vi.mock('@sim/db', () => ({
-  db: {
-    select: vi.fn(() => ({
-      from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          limit: mockLimit,
-        })),
-      })),
-    })),
-    insert: vi.fn(),
-    update: vi.fn(),
-    delete: vi.fn(),
-    transaction: vi.fn(),
-  },
-  workflow: {
-    id: 'workflow.id',
-    isDeployed: 'workflow.isDeployed',
-  },
-  workflowDeploymentVersion: {
-    id: 'workflowDeploymentVersion.id',
-    workflowId: 'workflowDeploymentVersion.workflowId',
-    state: 'workflowDeploymentVersion.state',
-    isActive: 'workflowDeploymentVersion.isActive',
-  },
-}))
-
-vi.mock('@sim/logger', () => ({
-  createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
-}))
-
-vi.mock('drizzle-orm', () => ({
-  and: vi.fn((...args) => ({ type: 'and', args })),
-  eq: vi.fn((column, value) => ({ type: 'eq', column, value })),
-  ne: vi.fn((column, value) => ({ type: 'ne', column, value })),
-}))
-
-vi.mock('@/lib/core/config/env', () => ({
-  env: { INTERNAL_API_SECRET: 'secret' },
-}))
+vi.mock('@sim/db', () => ({ ...dbChainMock, ...schemaMock }))
 
 vi.mock('@/lib/core/outbox/service', () => ({
   enqueueOutboxEvent: vi.fn(),
   processOutboxEventById: vi.fn(),
-}))
-
-vi.mock('@/lib/core/utils/request', () => ({
-  generateRequestId: () => 'request-generated',
-}))
-
-vi.mock('@/lib/core/utils/urls', () => ({
-  getBaseUrl: () => 'http://localhost:3000',
-  getSocketServerUrl: () => 'http://localhost:3002',
 }))
 
 vi.mock('@/lib/mcp/server-locks', () => ({
@@ -150,6 +108,7 @@ vi.mock('@/lib/workflows/persistence/deployment-operations', () => ({
   markDeploymentComponentReadiness: mockMarkDeploymentComponentReadiness,
   markDeploymentOperationFailed: mockMarkDeploymentOperationFailed,
   recordDeploymentOperationRetry: mockRecordDeploymentOperationRetry,
+  setDeploymentTxTimeouts: vi.fn(),
 }))
 
 vi.mock('@/lib/workflows/schedules', () => ({
@@ -230,9 +189,21 @@ function handler() {
   })[WORKFLOW_DEPLOYMENT_OUTBOX_EVENTS.PREPARE_V2]
 }
 
+afterAll(() => {
+  resetDbChainMock()
+})
+
 describe('versioned deployment preparation outbox', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
+    /**
+     * These handlers only reach db.transaction in deferred cleanup helpers the
+     * suite intentionally keeps inert (the previous private factory returned
+     * undefined without running the callback); the default chain-mock
+     * transaction would execute the callback and consume queued select rows.
+     */
+    dbChainMockFns.transaction.mockResolvedValue(undefined)
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 200 })))
     mockPrepareWebhooks.mockResolvedValue(undefined)
     mockActivateWebhookRegistrations.mockResolvedValue(undefined)
@@ -241,6 +212,7 @@ describe('versioned deployment preparation outbox', () => {
     mockSyncMcpToolsForWorkflow.mockResolvedValue([{ serverId: 'mcp-server-1' }])
     mockSetWorkflowMcpTransactionLockTimeout.mockResolvedValue(undefined)
     mockEmitWorkflowDeployedEvent.mockResolvedValue(undefined)
+    mockCaptureServerEvent.mockReturnValue(undefined)
     mockMarkDeploymentOperationFailed.mockResolvedValue({
       success: true,
       operation: operation({ status: 'failed' }),
@@ -250,6 +222,8 @@ describe('versioned deployment preparation outbox', () => {
   })
 
   it('activates only after every preparation component is ready', async () => {
+    /** Nothing newer has been enqueued, so this deploy owns its generation. */
+    mockIsDeploymentOperationCurrent.mockResolvedValue(true)
     const preparing = operation()
     const webhooksReady = operation({
       componentReadiness: {
@@ -279,9 +253,12 @@ describe('versioned deployment preparation outbox', () => {
       completedAt: NOW,
     })
     mockGetDeploymentOperation.mockResolvedValue(preparing)
-    mockLimit
-      .mockResolvedValueOnce([{ id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' }])
-      .mockResolvedValueOnce([{ id: 'version-2', state: { blocks: {} } }])
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    queueTableRows(schemaMock.workflowDeploymentVersion, [
+      { id: 'version-2', state: { blocks: {} } },
+    ])
     mockMarkDeploymentComponentReadiness
       .mockResolvedValueOnce({ success: true, operation: webhooksReady })
       .mockResolvedValueOnce({ success: true, operation: schedulesReady })
@@ -329,6 +306,7 @@ describe('versioned deployment preparation outbox', () => {
       'workflow_deployed',
       { workflow_id: 'workflow-1', workspace_id: 'workspace-1' },
       expect.objectContaining({
+        insertId: 'event-1',
         groups: { workspace: 'workspace-1' },
         setOnce: expect.objectContaining({ first_workflow_deployed_at: expect.any(String) }),
       })
@@ -337,6 +315,33 @@ describe('versioned deployment preparation outbox', () => {
     expect(mockRecordAudit.mock.invocationCallOrder[0]).toBeGreaterThan(
       mockActivateDeploymentOperation.mock.invocationCallOrder[0]
     )
+    expect(mockCaptureServerEvent.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mockActivateDeploymentOperation.mock.invocationCallOrder[0]
+    )
+
+    /**
+     * The resume re-enters post-activation work, so the checkpoints — not the
+     * generation fence — are what must keep analytics from being captured
+     * twice.
+     */
+    mockGetDeploymentOperation.mockResolvedValue(active)
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    await handler()(
+      {
+        ...payload(),
+        checkpoints: {
+          inactiveCleanupCompleted: true,
+          auditEmitted: true,
+          analyticsCaptured: true,
+          socketNotified: true,
+          workspaceEventEmitted: true,
+        },
+      },
+      context()
+    )
+    expect(mockCaptureServerEvent).toHaveBeenCalledTimes(1)
   })
 
   it('ignores a superseded generation without preparing side effects', async () => {
@@ -348,6 +353,42 @@ describe('versioned deployment preparation outbox', () => {
     expect(mockCreateSchedulesForDeploy).not.toHaveBeenCalled()
     expect(mockMarkDeploymentComponentReadiness).not.toHaveBeenCalled()
     expect(mockActivateDeploymentOperation).not.toHaveBeenCalled()
+  })
+
+  /**
+   * Analytics was briefly flushed durably here, which put a deploy's audit
+   * trail, socket notification, and subscription cleanup behind PostHog and
+   * retried the event until it dead-lettered. Capture is fire-and-forget
+   * again: the checkpoint advances on capture, and everything the cutover
+   * actually owes still runs. `captureServerEvent` swallowing its own
+   * failures is pinned in `lib/posthog/server.test.ts`.
+   */
+  it('checkpoints analytics on capture and still finishes the deploy', async () => {
+    mockIsDeploymentOperationCurrent.mockResolvedValue(true)
+    mockGetDeploymentOperation.mockResolvedValue(operation({ status: 'active', completedAt: NOW }))
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    const outboxContext = context()
+
+    await expect(
+      handler()(
+        {
+          ...payload(),
+          checkpoints: { inactiveCleanupCompleted: true, auditEmitted: true },
+        },
+        outboxContext
+      )
+    ).resolves.toBeUndefined()
+
+    expect(mockCaptureServerEvent).toHaveBeenCalledTimes(1)
+    expect(outboxContext.checkpointPayload).toHaveBeenCalledWith(
+      expect.objectContaining({
+        checkpoints: expect.objectContaining({ analyticsCaptured: true }),
+      })
+    )
+    expect(mockEmitWorkflowDeployedEvent).toHaveBeenCalledTimes(1)
+    expect(mockCleanupRetiredWebhookRegistrations).toHaveBeenCalledTimes(1)
   })
 
   it('honors an aborted signal before starting any side effect', async () => {
@@ -365,9 +406,12 @@ describe('versioned deployment preparation outbox', () => {
   it('generation-guards failure on the final outbox attempt', async () => {
     const preparing = operation()
     mockGetDeploymentOperation.mockResolvedValue(preparing)
-    mockLimit
-      .mockResolvedValueOnce([{ id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' }])
-      .mockResolvedValueOnce([{ id: 'version-2', state: { blocks: {} } }])
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    queueTableRows(schemaMock.workflowDeploymentVersion, [
+      { id: 'version-2', state: { blocks: {} } },
+    ])
     mockPrepareWebhooks.mockRejectedValue(new Error('provider unavailable'))
 
     await expect(handler()(payload(), context(new AbortController(), 3))).rejects.toThrow(
@@ -387,9 +431,12 @@ describe('versioned deployment preparation outbox', () => {
   it('retries transient mid-attempt failures without failing the operation', async () => {
     const preparing = operation()
     mockGetDeploymentOperation.mockResolvedValue(preparing)
-    mockLimit
-      .mockResolvedValueOnce([{ id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' }])
-      .mockResolvedValueOnce([{ id: 'version-2', state: { blocks: {} } }])
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    queueTableRows(schemaMock.workflowDeploymentVersion, [
+      { id: 'version-2', state: { blocks: {} } },
+    ])
     mockPrepareWebhooks.mockRejectedValue(new Error('provider briefly unavailable'))
 
     await expect(handler()(payload(), context(new AbortController(), 0))).rejects.toThrow(
@@ -427,9 +474,12 @@ describe('versioned deployment preparation outbox', () => {
       },
     })
     mockGetDeploymentOperation.mockResolvedValue(preparing)
-    mockLimit
-      .mockResolvedValueOnce([{ id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' }])
-      .mockResolvedValueOnce([{ id: 'version-2', state: { blocks: {} } }])
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    queueTableRows(schemaMock.workflowDeploymentVersion, [
+      { id: 'version-2', state: { blocks: {} } },
+    ])
     mockMarkDeploymentComponentReadiness
       .mockResolvedValueOnce({ success: true, operation: webhooksReady })
       .mockResolvedValueOnce({ success: true, operation: schedulesReady })
@@ -463,9 +513,12 @@ describe('versioned deployment preparation outbox', () => {
   it('fails the operation immediately on a non-retryable preparation error', async () => {
     const preparing = operation()
     mockGetDeploymentOperation.mockResolvedValue(preparing)
-    mockLimit
-      .mockResolvedValueOnce([{ id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' }])
-      .mockResolvedValueOnce([{ id: 'version-2', state: { blocks: {} } }])
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    queueTableRows(schemaMock.workflowDeploymentVersion, [
+      { id: 'version-2', state: { blocks: {} } },
+    ])
     mockPrepareWebhooks.mockRejectedValue(
       new NonRetryableDeploymentError(
         'Webhook path "/leads" is already in use. Choose a different path.',
@@ -487,11 +540,91 @@ describe('versioned deployment preparation outbox', () => {
     expect(mockActivateDeploymentOperation).not.toHaveBeenCalled()
   })
 
+  /**
+   * The production shape: an attempt activates, its post-activation phase is
+   * interrupted (handler timeout), and a redeploy lands before the reaper
+   * requeues it. Every resumed attempt then re-fails the same generation
+   * fence, so without the guard it exhausts the retry budget and dead-letters.
+   */
+  it('skips the fenced cleanup once a newer deploy supersedes an activated attempt', async () => {
+    mockGetDeploymentOperation.mockResolvedValue(operation({ status: 'active', completedAt: NOW }))
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    mockCleanupRetiredWebhookRegistrations.mockRejectedValue(
+      new Error('Webhook registration operation is stale')
+    )
+
+    await expect(handler()(payload(), context(new AbortController(), 3))).resolves.toBeUndefined()
+
+    expect(mockCleanupRetiredWebhookRegistrations).not.toHaveBeenCalled()
+    expect(mockMarkDeploymentOperationFailed).not.toHaveBeenCalled()
+    expect(mockRecordDeploymentOperationRetry).not.toHaveBeenCalled()
+  })
+
+  /**
+   * `isDeploymentOperationCurrent` goes false the moment any newer generation
+   * row exists, including one still `preparing` or already `failed`. This
+   * activation is the live cutover in that window and no newer attempt will
+   * adopt its notifications, so the fence must cost it only the cleanup.
+   */
+  it('still notifies when the newer generation has not activated', async () => {
+    mockGetDeploymentOperation.mockResolvedValue(operation({ status: 'active', completedAt: NOW }))
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+
+    await expect(handler()(payload(), context())).resolves.toBeUndefined()
+
+    expect(mockRecordAudit).toHaveBeenCalledTimes(1)
+    expect(mockCaptureServerEvent).toHaveBeenCalledTimes(1)
+    expect(mockEmitWorkflowDeployedEvent).toHaveBeenCalledTimes(1)
+    expect(mockCleanupRetiredWebhookRegistrations).not.toHaveBeenCalled()
+  })
+
+  it('resumes post-activation work while the activated attempt is still current', async () => {
+    mockIsDeploymentOperationCurrent.mockResolvedValue(true)
+    mockGetDeploymentOperation.mockResolvedValue(operation({ status: 'active', completedAt: NOW }))
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+
+    await handler()(payload(), context())
+
+    expect(mockCleanupRetiredWebhookRegistrations).toHaveBeenCalledTimes(1)
+    expect(mockRecordAudit).toHaveBeenCalledTimes(1)
+    expect(mockEmitWorkflowDeployedEvent).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * Retiring the previous generation's provider subscriptions is the slowest
+   * step after cutover; a deploy that already went live must not lose its
+   * audit trail or its "deployment changed" notification when that step fails.
+   */
+  it('records and notifies an activated deploy before retiring old subscriptions', async () => {
+    mockIsDeploymentOperationCurrent.mockResolvedValue(true)
+    mockGetDeploymentOperation.mockResolvedValue(operation({ status: 'active', completedAt: NOW }))
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    mockCleanupRetiredWebhookRegistrations.mockRejectedValue(new Error('provider unavailable'))
+
+    await expect(handler()(payload(), context())).rejects.toThrow('provider unavailable')
+
+    expect(mockRecordAudit).toHaveBeenCalledTimes(1)
+    expect(mockCaptureServerEvent).toHaveBeenCalledTimes(1)
+    expect(mockEmitWorkflowDeployedEvent).toHaveBeenCalledTimes(1)
+    expect(mockRecordAudit.mock.invocationCallOrder[0]).toBeLessThan(
+      mockCleanupRetiredWebhookRegistrations.mock.invocationCallOrder[0]
+    )
+  })
+
   it('keeps v1 cleanup from deleting a candidate owned by the current v2 operation', async () => {
-    mockLimit
-      .mockResolvedValueOnce([{ id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' }])
-      .mockResolvedValueOnce([{ isActive: false }])
-      .mockResolvedValueOnce([{ isDeployed: true }])
+    queueTableRows(schemaMock.workflow, [
+      { id: 'workflow-1', name: 'Workflow', workspaceId: 'workspace-1' },
+    ])
+    queueTableRows(schemaMock.workflowDeploymentVersion, [{ isActive: false }])
+    queueTableRows(schemaMock.workflow, [{ isDeployed: true }])
     mockIsDeploymentVersionProtectedByCurrentOperation.mockResolvedValue(true)
     const cleanupHandler =
       createWorkflowDeploymentOutboxHandlers()[

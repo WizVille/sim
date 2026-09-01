@@ -48,6 +48,8 @@ export interface RunWorkflowParams {
   workflowId?: string
   workflow_input?: unknown
   input?: unknown
+  /** Queue the deployed workflow and return immediately instead of waiting for its output. */
+  async?: boolean
   /** Optional trigger block ID when the workflow has multiple entrypoints and the caller wants a specific one. */
   triggerBlockId?: string
   /** When true, run with the resolved trigger's generated mock payload instead of workflow_input. */
@@ -158,6 +160,8 @@ export interface DeployChatParams {
   subdomain?: string
   allowedEmails?: string[]
   outputConfigs?: unknown[]
+  includeThinking?: boolean
+  includeToolCalls?: boolean
 }
 
 export interface DeployMcpParams {
@@ -298,6 +302,8 @@ export interface OpenResourceItem {
   type?: OpenResourceType
   id?: string
   path?: string
+  /** Saved-view id or exact name to open a table pinned to (table type only). */
+  view?: string
 }
 
 export interface OpenResourceParams {
@@ -311,4 +317,5 @@ export interface ValidOpenResourceParams {
   type: OpenResourceType
   id?: string
   path?: string
+  view?: string
 }

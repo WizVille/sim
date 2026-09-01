@@ -1,13 +1,20 @@
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
 import OpenAI from 'openai'
+import type { ChatCompletionChunk } from 'openai/resources/chat/completions'
 import type { StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
 import { formatMessagesForProvider } from '@/providers/attachments'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
+import { createOpenAICompatAssistantHistory } from '@/providers/openai-compat/assistant-history'
+import { executeProviderTool } from '@/providers/runtime-context'
+import { createSettledAgentEventStream } from '@/providers/stream-events'
 import { createStreamingExecution } from '@/providers/streaming-execution'
+import { isAbortError, parseToolArguments } from '@/providers/streaming-tool-loop-shared'
 import { adaptOpenAIChatToolSchema } from '@/providers/tool-schema-adapter'
 import { enrichLastModelSegmentFromChatCompletions } from '@/providers/trace-enrichment'
+import { openAICompatTransport } from '@/providers/transport'
 import type {
   ProviderConfig,
   ProviderRequest,
@@ -17,13 +24,12 @@ import type {
 import { ProviderError } from '@/providers/types'
 import {
   calculateCost,
+  isFunctionToolCall,
   prepareToolExecution,
   prepareToolsWithUsageControl,
   sumToolCosts,
-  trackForcedToolUsage,
 } from '@/providers/utils'
 import { createReadableStreamFromZaiStream } from '@/providers/zai/utils'
-import { executeTool } from '@/tools'
 
 const logger = createLogger('ZaiProvider')
 
@@ -78,6 +84,7 @@ export const zaiProvider: ProviderConfig = {
 
     try {
       const zai = new OpenAI({
+        ...openAICompatTransport(),
         apiKey: request.apiKey,
         baseURL: ZAI_BASE_URL,
       })
@@ -155,6 +162,7 @@ export const zaiProvider: ProviderConfig = {
       }
 
       const deferResponseFormat = !!responseFormatPayload && hasActiveTools
+      let appliedDeferredResponseFormat = false
       if (responseFormatPayload && !deferResponseFormat) {
         payload.response_format = responseFormatPayload
         payload.messages = withSchemaGuidance(
@@ -183,35 +191,37 @@ export const zaiProvider: ProviderConfig = {
           initialTokens: { input: 0, output: 0, total: 0 },
           initialCost: { input: 0, output: 0, total: 0 },
           isStreaming: true,
+          streamFormat: 'agent-events-v1',
           createStream: ({ output }) =>
-            createReadableStreamFromZaiStream(streamResponse as any, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: usage.prompt_tokens,
-                output: usage.completion_tokens,
-                total: usage.total_tokens,
-              }
+            createReadableStreamFromZaiStream(
+              // double-cast-allowed: payload is untyped so the SDK cannot resolve the streaming overload; the stream yields OpenAI ChatCompletionChunk objects
+              streamResponse as unknown as AsyncIterable<ChatCompletionChunk>,
+              (content, usage) => {
+                output.content = content
+                output.tokens = {
+                  input: usage.prompt_tokens,
+                  output: usage.completion_tokens,
+                  total: usage.total_tokens,
+                }
 
-              const costResult = calculateCost(
-                request.model,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              output.cost = {
-                input: costResult.input,
-                output: costResult.output,
-                total: costResult.total,
+                const costResult = calculateCost(
+                  request.model,
+                  usage.prompt_tokens,
+                  usage.completion_tokens
+                )
+                output.cost = {
+                  input: costResult.input,
+                  output: costResult.output,
+                  total: costResult.total,
+                }
               }
-            }),
+            ),
         })
 
         return streamingResult
       }
 
       const initialCallTime = Date.now()
-      const originalToolChoice = payload.tool_choice
-      const forcedTools = preparedTools?.forcedTools || []
-      let usedForcedTools: string[] = []
 
       let currentResponse = await zai.chat.completions.create(
         payload,
@@ -230,7 +240,6 @@ export const zaiProvider: ProviderConfig = {
       const toolResults: Record<string, unknown>[] = []
       const currentMessages = [...formattedMessages]
       let iterationCount = 0
-      let hasUsedForcedTool = false
       let modelTime = firstResponseTime
       let toolsTime = 0
 
@@ -244,30 +253,14 @@ export const zaiProvider: ProviderConfig = {
         },
       ]
 
-      if (
-        typeof originalToolChoice === 'object' &&
-        currentResponse.choices[0]?.message?.tool_calls
-      ) {
-        const toolCallsResponse = currentResponse.choices[0].message.tool_calls
-        const result = trackForcedToolUsage(
-          toolCallsResponse,
-          originalToolChoice,
-          logger,
-          'openai',
-          forcedTools,
-          usedForcedTools
-        )
-        hasUsedForcedTool = result.hasUsedForcedTool
-        usedForcedTools = result.usedForcedTools
-      }
-
       try {
         while (iterationCount < MAX_TOOL_ITERATIONS) {
           if (currentResponse.choices[0]?.message?.content) {
             content = currentResponse.choices[0].message.content
           }
 
-          const toolCallsInResponse = currentResponse.choices[0]?.message?.tool_calls
+          const toolCallsInResponse =
+            currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
 
           enrichLastModelSegmentFromChatCompletions(
             timeSegments,
@@ -287,7 +280,7 @@ export const zaiProvider: ProviderConfig = {
             const toolName = toolCall.function.name
 
             try {
-              const toolArgs = JSON.parse(toolCall.function.arguments)
+              const toolArgs = parseToolArguments(toolCall.function.arguments, toolName)
               const tool = request.tools?.find((t) => t.id === toolName)
 
               if (!tool) {
@@ -307,22 +300,35 @@ export const zaiProvider: ProviderConfig = {
                 }
               }
 
-              const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-              const result = await executeTool(toolName, executionParams, {
-                signal: request.abortSignal,
-              })
+              const { toolParams, executionParams } = prepareToolExecution(
+                tool,
+                toolArgs,
+                request,
+                toolCall.id
+              )
+              const { rawResponse, modelResponse } = await executeProviderTool(
+                toolName,
+                executionParams,
+                {
+                  signal: request.abortSignal,
+                }
+              )
               const toolCallEndTime = Date.now()
 
               return {
                 toolCall,
                 toolName,
                 toolParams,
-                result,
+                result: rawResponse,
+                modelResult: modelResponse,
                 startTime: toolCallStartTime,
                 endTime: toolCallEndTime,
                 duration: toolCallEndTime - toolCallStartTime,
               }
             } catch (error) {
+              if (isAbortError(error) || request.abortSignal?.aborted) {
+                throw error
+              }
               const toolCallEndTime = Date.now()
               logger.error('Error processing tool call:', { error, toolName })
 
@@ -342,26 +348,23 @@ export const zaiProvider: ProviderConfig = {
             }
           })
 
-          const executionResults = await Promise.allSettled(toolExecutionPromises)
+          const executionResults = await Promise.all(toolExecutionPromises)
+          const assistantMessage = currentResponse.choices[0]?.message
+          if (assistantMessage) {
+            currentMessages.push(
+              createOpenAICompatAssistantHistory({
+                message: assistantMessage,
+                toolCalls: toolCallsInResponse,
+                reasoningFields: ['reasoning_content'],
+              })
+            )
+          }
 
-          currentMessages.push({
-            role: 'assistant',
-            content: null,
-            tool_calls: toolCallsInResponse.map((tc) => ({
-              id: tc.id,
-              type: 'function',
-              function: {
-                name: tc.function.name,
-                arguments: tc.function.arguments,
-              },
-            })),
-          })
-
-          for (const settledResult of executionResults) {
-            if (settledResult.status === 'rejected' || !settledResult.value) continue
-
+          for (const executionResult of executionResults) {
             const { toolCall, toolName, toolParams, result, startTime, endTime, duration } =
-              settledResult.value
+              executionResult
+            const modelResult =
+              'modelResult' in executionResult ? (executionResult.modelResult ?? result) : result
 
             timeSegments.push({
               type: 'tool',
@@ -372,10 +375,12 @@ export const zaiProvider: ProviderConfig = {
               toolCallId: toolCall.id,
             })
 
-            let resultContent: any
-            if (result.success && result.output) {
-              toolResults.push(result.output)
-              resultContent = result.output
+            let resultContent: unknown
+            if (result.success) {
+              if (isRecordLike(result.output)) {
+                toolResults.push(result.output)
+              }
+              resultContent = result.output ?? null
             } else {
               resultContent = {
                 error: true,
@@ -383,6 +388,13 @@ export const zaiProvider: ProviderConfig = {
                 tool: toolName,
               }
             }
+            const modelResultContent = modelResult.success
+              ? (modelResult.output ?? null)
+              : {
+                  error: true,
+                  message: modelResult.error || 'Tool execution failed',
+                  tool: toolName,
+                }
 
             toolCalls.push({
               name: toolName,
@@ -397,7 +409,7 @@ export const zaiProvider: ProviderConfig = {
             currentMessages.push({
               role: 'tool',
               tool_call_id: toolCall.id,
-              content: JSON.stringify(resultContent),
+              content: JSON.stringify(modelResultContent),
             })
           }
 
@@ -409,47 +421,11 @@ export const zaiProvider: ProviderConfig = {
             messages: currentMessages,
           }
 
-          if (
-            typeof originalToolChoice === 'object' &&
-            hasUsedForcedTool &&
-            forcedTools.length > 0
-          ) {
-            const remainingTools = forcedTools.filter((tool) => !usedForcedTools.includes(tool))
-
-            if (remainingTools.length > 0) {
-              nextPayload.tool_choice = {
-                type: 'function',
-                function: { name: remainingTools[0] },
-              }
-              logger.info(`Forcing next tool: ${remainingTools[0]}`)
-            } else {
-              nextPayload.tool_choice = 'auto'
-              logger.info('All forced tools have been used, switching to auto tool_choice')
-            }
-          }
-
           const nextModelStartTime = Date.now()
           currentResponse = await zai.chat.completions.create(
             nextPayload,
             request.abortSignal ? { signal: request.abortSignal } : undefined
           )
-
-          if (
-            typeof nextPayload.tool_choice === 'object' &&
-            currentResponse.choices[0]?.message?.tool_calls
-          ) {
-            const toolCallsResponse = currentResponse.choices[0].message.tool_calls
-            const result = trackForcedToolUsage(
-              toolCallsResponse,
-              nextPayload.tool_choice,
-              logger,
-              'openai',
-              forcedTools,
-              usedForcedTools
-            )
-            hasUsedForcedTool = result.hasUsedForcedTool
-            usedForcedTools = result.usedForcedTools
-          }
 
           const nextModelEndTime = Date.now()
           const thisModelTime = nextModelEndTime - nextModelStartTime
@@ -478,103 +454,72 @@ export const zaiProvider: ProviderConfig = {
         }
 
         if (iterationCount === MAX_TOOL_ITERATIONS) {
+          const cappedToolCalls =
+            currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
           enrichLastModelSegmentFromChatCompletions(
             timeSegments,
             currentResponse,
-            currentResponse.choices[0]?.message?.tool_calls,
+            cappedToolCalls,
             { model: request.model, provider: 'zai' }
           )
+
+          if (cappedToolCalls?.length) {
+            const finalPayload: any = {
+              ...payload,
+              messages: currentMessages,
+            }
+            finalPayload.tools = undefined
+            finalPayload.tool_choice = undefined
+            if (deferResponseFormat && responseFormatPayload) {
+              finalPayload.response_format = responseFormatPayload
+              finalPayload.messages = withSchemaGuidance(
+                finalPayload.messages,
+                buildSchemaGuidance(request.responseFormat)
+              )
+              appliedDeferredResponseFormat = true
+            }
+
+            const finalModelStartTime = Date.now()
+            currentResponse = await zai.chat.completions.create(
+              finalPayload,
+              request.abortSignal ? { signal: request.abortSignal } : undefined
+            )
+            const finalModelEndTime = Date.now()
+            const finalModelDuration = finalModelEndTime - finalModelStartTime
+
+            timeSegments.push({
+              type: 'model',
+              name: request.model,
+              startTime: finalModelStartTime,
+              endTime: finalModelEndTime,
+              duration: finalModelDuration,
+            })
+            modelTime += finalModelDuration
+
+            if (currentResponse.choices[0]?.message?.content) {
+              content = currentResponse.choices[0].message.content
+            }
+            if (currentResponse.usage) {
+              tokens.input += currentResponse.usage.prompt_tokens || 0
+              tokens.output += currentResponse.usage.completion_tokens || 0
+              tokens.total += currentResponse.usage.total_tokens || 0
+            }
+
+            enrichLastModelSegmentFromChatCompletions(
+              timeSegments,
+              currentResponse,
+              currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
+              { model: request.model, provider: 'zai' }
+            )
+            iterationCount++
+          }
         }
       } catch (error) {
         logger.error('Error in Z.ai request:', { error })
         throw error
       }
 
-      if (request.stream) {
-        logger.info('Using streaming for final Z.ai response after tool processing')
-
-        const streamingPayload: any = {
-          ...payload,
-          messages: currentMessages,
-          stream: true,
-          stream_options: { include_usage: true },
-        }
-        streamingPayload.tools = undefined
-        streamingPayload.tool_choice = undefined
-        if (deferResponseFormat && responseFormatPayload) {
-          streamingPayload.response_format = responseFormatPayload
-          streamingPayload.messages = withSchemaGuidance(
-            streamingPayload.messages,
-            buildSchemaGuidance(request.responseFormat)
-          )
-        }
-
-        const streamResponse = await zai.chat.completions.create(
-          streamingPayload,
-          request.abortSignal ? { signal: request.abortSignal } : undefined
-        )
-
-        const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
-
-        const streamingResult = createStreamingExecution({
-          model: request.model,
-          providerStartTime,
-          providerStartTimeISO,
-          timing: {
-            kind: 'accumulated',
-            modelTime,
-            toolsTime,
-            firstResponseTime,
-            iterations: iterationCount + 1,
-            timeSegments,
-          },
-          initialTokens: {
-            input: tokens.input,
-            output: tokens.output,
-            total: tokens.total,
-          },
-          initialCost: {
-            input: accumulatedCost.input,
-            output: accumulatedCost.output,
-            toolCost: undefined as number | undefined,
-            total: accumulatedCost.total,
-          },
-          toolCalls:
-            toolCalls.length > 0
-              ? {
-                  list: toolCalls,
-                  count: toolCalls.length,
-                }
-              : undefined,
-          isStreaming: true,
-          createStream: ({ output }) =>
-            createReadableStreamFromZaiStream(streamResponse as any, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: tokens.input + usage.prompt_tokens,
-                output: tokens.output + usage.completion_tokens,
-                total: tokens.total + usage.total_tokens,
-              }
-
-              const streamCost = calculateCost(
-                request.model,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              const tc = sumToolCosts(toolResults)
-              output.cost = {
-                input: accumulatedCost.input + streamCost.input,
-                output: accumulatedCost.output + streamCost.output,
-                toolCost: tc || undefined,
-                total: accumulatedCost.total + streamCost.total + tc,
-              }
-            }),
-        })
-
-        return streamingResult
-      }
-
-      if (deferResponseFormat && responseFormatPayload) {
+      if (deferResponseFormat && responseFormatPayload && !appliedDeferredResponseFormat) {
         logger.info('Applying deferred response_format after tool processing')
 
         const finalFormatStartTime = Date.now()
@@ -618,9 +563,55 @@ export const zaiProvider: ProviderConfig = {
         enrichLastModelSegmentFromChatCompletions(
           timeSegments,
           currentResponse,
-          currentResponse.choices[0]?.message?.tool_calls,
+          currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
           { model: request.model, provider: 'zai' }
         )
+      }
+
+      if (request.stream) {
+        const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
+        const toolCost = sumToolCosts(toolResults)
+
+        const streamingResult = createStreamingExecution({
+          model: request.model,
+          providerStartTime,
+          providerStartTimeISO,
+          timing: {
+            kind: 'accumulated',
+            modelTime,
+            toolsTime,
+            firstResponseTime,
+            iterations: timeSegments.filter((segment) => segment.type === 'model').length,
+            timeSegments,
+          },
+          initialTokens: {
+            input: tokens.input,
+            output: tokens.output,
+            total: tokens.total,
+          },
+          initialCost: {
+            input: accumulatedCost.input,
+            output: accumulatedCost.output,
+            toolCost: toolCost || undefined,
+            total: accumulatedCost.total + toolCost,
+          },
+          toolCalls:
+            toolCalls.length > 0
+              ? {
+                  list: toolCalls,
+                  count: toolCalls.length,
+                }
+              : undefined,
+          isStreaming: true,
+          streamFormat: 'agent-events-v1',
+          createStream: ({ output, finalizeTiming }) => {
+            output.content = content
+            finalizeTiming()
+            return createSettledAgentEventStream(content)
+          },
+        })
+
+        return streamingResult
       }
 
       const providerEndTime = Date.now()
@@ -640,7 +631,7 @@ export const zaiProvider: ProviderConfig = {
           modelTime: modelTime,
           toolsTime: toolsTime,
           firstResponseTime: firstResponseTime,
-          iterations: iterationCount + 1,
+          iterations: timeSegments.filter((segment) => segment.type === 'model').length,
           timeSegments: timeSegments,
         },
       }
@@ -653,6 +644,10 @@ export const zaiProvider: ProviderConfig = {
         error,
         duration: totalDuration,
       })
+
+      if (isAbortError(error) || request.abortSignal?.aborted) {
+        throw error
+      }
 
       throw new ProviderError(toError(error).message, {
         startTime: providerStartTimeISO,

@@ -1,9 +1,5 @@
-import type { SVGProps } from 'react'
-import { createElement } from 'react'
-import { Play } from 'lucide-react'
+import { Play } from '@sim/emcn/icons'
 import type { BlockConfig } from '@/blocks/types'
-
-const ManualTriggerIcon = (props: SVGProps<SVGSVGElement>) => createElement(Play, props)
 
 export const ManualTriggerBlock: BlockConfig = {
   type: 'manual_trigger',
@@ -18,8 +14,9 @@ export const ManualTriggerBlock: BlockConfig = {
   `,
   category: 'triggers',
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'start_trigger' },
   bgColor: '#2563EB',
-  icon: ManualTriggerIcon,
+  icon: Play,
   subBlocks: [],
   tools: {
     access: [],

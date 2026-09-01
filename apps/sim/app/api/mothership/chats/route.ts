@@ -9,6 +9,7 @@ import {
 import { parseRequest } from '@/lib/api/server'
 import { listMothershipChats } from '@/lib/copilot/chat/list-mothership-chats'
 import { chatPubSub } from '@/lib/copilot/chat-status'
+import { MOTHERSHIP_CHAT_DEFAULT_MODEL } from '@/lib/copilot/constants'
 import {
   authenticateCopilotRequestSessionOnly,
   createForbiddenResponse,
@@ -37,11 +38,11 @@ export const GET = withRouteHandler(async (request: NextRequest) => {
 
     const queryResult = await parseRequest(listMothershipChatsContract, request, {})
     if (!queryResult.success) return queryResult.response
-    const { workspaceId } = queryResult.data.query
+    const { workspaceId, scope } = queryResult.data.query
 
     await assertActiveWorkspaceAccess(workspaceId, userId)
 
-    const data = await listMothershipChats(userId, workspaceId)
+    const data = await listMothershipChats(userId, workspaceId, scope)
 
     return NextResponse.json({ success: true, data })
   } catch (error) {
@@ -78,7 +79,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
         workspaceId,
         type: 'mothership',
         title: null,
-        model: 'claude-opus-4-8',
+        model: MOTHERSHIP_CHAT_DEFAULT_MODEL,
         updatedAt: now,
         lastSeenAt: now,
       })

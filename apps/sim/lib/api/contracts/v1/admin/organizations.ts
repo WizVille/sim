@@ -1,4 +1,9 @@
 import { z } from 'zod'
+import {
+  updateOrganizationDataRetentionBodySchema,
+  updateOrganizationSessionPolicyBodySchema,
+  updateOrganizationWhitelabelBodySchema,
+} from '@/lib/api/contracts/organization'
 import { type ContractJsonResponse, defineRouteContract } from '@/lib/api/contracts/types'
 import {
   adminV1BooleanQuerySchema,
@@ -20,7 +25,6 @@ export const adminV1OrganizationSchema = z.object({
   logo: z.string().nullable(),
   orgUsageLimit: z.string().nullable(),
   storageUsedBytes: z.number(),
-  departedMemberUsage: z.string(),
   createdAt: z.string(),
   updatedAt: z.string(),
 })
@@ -132,6 +136,7 @@ export const adminV1TransferOwnershipBodySchema = z.object({
 const adminV1OrganizationMemberMutationResultSchema = adminV1MemberSchema.extend({
   action: z.enum(['created', 'updated', 'already_member']),
   billingActions: z.object({
+    /** @deprecated Always false — ledger entity stamps replaced join-time snapshots. */
     proUsageSnapshotted: z.boolean(),
     proCancelledAtPeriodEnd: z.boolean(),
   }),
@@ -142,8 +147,10 @@ const adminV1RemoveOrganizationMemberResultSchema = z.object({
   memberId: z.string(),
   userId: z.string(),
   billingActions: z.object({
-    usageCaptured: z.boolean(),
+    /** @deprecated Always 0 — a departed member's ledger rows stay stamped to the org's period. */
+    usageCaptured: z.number(),
     proRestored: z.boolean(),
+    /** @deprecated Always false — no snapshot exists to restore. */
     usageRestored: z.boolean(),
     skipBillingLogic: z.boolean(),
   }),
@@ -154,13 +161,41 @@ const adminV1OrganizationBillingUpdateResultSchema = z.object({
   orgUsageLimit: z.string().nullable(),
 })
 
+/**
+ * Deleting an organization cascades to its members, invitations, permission
+ * groups, and settings, and detaches its workspaces (`organization_id` is
+ * `ON DELETE SET NULL`). Requiring the caller to echo the slug makes that
+ * irreversible scope an explicit act rather than a mistyped id.
+ */
+export const adminV1DeleteOrganizationQuerySchema = z.object({
+  confirmSlug: z
+    .string({ error: 'confirmSlug is required and must match the organization slug' })
+    .min(1, { error: 'confirmSlug is required and must match the organization slug' }),
+})
+
+const adminV1DeleteOrganizationResultSchema = z.object({
+  success: z.literal(true),
+  organizationId: z.string(),
+  slug: z.string(),
+  membersRemoved: z.number(),
+  workspacesDetached: z.number(),
+})
+
+/** Shared result for the org-settings PATCH endpoints. */
+const adminV1OrganizationSettingsResultSchema = z.object({
+  success: z.literal(true),
+  organizationId: z.string(),
+})
+
 const adminV1TransferOwnershipResultSchema = z.object({
   organizationId: z.string(),
   currentOwnerUserId: z.string(),
   newOwnerUserId: z.string(),
   workspacesReassigned: z.number(),
-  billedAccountReassigned: z.boolean(),
-  overageMigrated: z.boolean(),
+  /** Count of workspaces whose billed account was reassigned to the new owner. */
+  billedAccountReassigned: z.number(),
+  /** Decimal-string dollar amount of overage migrated to the new owner ('0' when none). */
+  overageMigrated: z.string(),
   billingBlockInherited: z.boolean(),
 })
 
@@ -174,6 +209,24 @@ export const adminV1ListOrganizationsContract = defineRouteContract({
   },
 })
 
+/**
+ * Creates the organization and its owner membership, and deliberately nothing else.
+ *
+ * Organization settings are reached through a workspace the organization owns, so a
+ * brand-new organization with none is not yet administrable. Closing that inside
+ * this call was tried and removed: attaching the owner's existing workspaces cannot
+ * join the creation transaction (it runs its own, under a lock order that exists to
+ * avoid deadlocking against invitation acceptance), so it could only ever be
+ * best-effort — leaving a committed organization, a response that could not honestly
+ * report the outcome, and a retry blocked by the existing-membership check.
+ *
+ * This codebase already solves it properly elsewhere. `AdminMemberOperationView`
+ * tracks workspace moves with `pending | processing | dead_letter | applied` and
+ * per-workspace retry, and the enterprise-owner-claim path creates the workspace and
+ * the organization in one transaction and enqueues an outbox event for the rest.
+ * Provisioning a workspace for an organization belongs on one of those paths, not
+ * inline here.
+ */
 export const adminV1CreateOrganizationContract = defineRouteContract({
   method: 'POST',
   path: '/api/v1/admin/organizations',
@@ -337,6 +390,62 @@ export type AdminV1UpdateOrganizationBillingResponse = ContractJsonResponse<
 export type AdminV1GetOrganizationSeatsResponse = ContractJsonResponse<
   typeof adminV1GetOrganizationSeatsContract
 >
+export const adminV1DeleteOrganizationContract = defineRouteContract({
+  method: 'DELETE',
+  path: '/api/v1/admin/organizations/[id]',
+  params: adminV1IdParamsSchema,
+  query: adminV1DeleteOrganizationQuerySchema,
+  response: {
+    mode: 'json',
+    schema: adminV1SingleResponseSchema(adminV1DeleteOrganizationResultSchema),
+  },
+})
+
+export const adminV1UpdateOrganizationWhitelabelContract = defineRouteContract({
+  method: 'PATCH',
+  path: '/api/v1/admin/organizations/[id]/whitelabel',
+  params: adminV1IdParamsSchema,
+  body: updateOrganizationWhitelabelBodySchema,
+  response: {
+    mode: 'json',
+    schema: adminV1SingleResponseSchema(adminV1OrganizationSettingsResultSchema),
+  },
+})
+
+export const adminV1UpdateOrganizationDataRetentionContract = defineRouteContract({
+  method: 'PATCH',
+  path: '/api/v1/admin/organizations/[id]/data-retention',
+  params: adminV1IdParamsSchema,
+  body: updateOrganizationDataRetentionBodySchema,
+  response: {
+    mode: 'json',
+    schema: adminV1SingleResponseSchema(adminV1OrganizationSettingsResultSchema),
+  },
+})
+
+export const adminV1UpdateOrganizationSessionPolicyContract = defineRouteContract({
+  method: 'PATCH',
+  path: '/api/v1/admin/organizations/[id]/session-policy',
+  params: adminV1IdParamsSchema,
+  body: updateOrganizationSessionPolicyBodySchema,
+  response: {
+    mode: 'json',
+    schema: adminV1SingleResponseSchema(adminV1OrganizationSettingsResultSchema),
+  },
+})
+
 export type AdminV1TransferOwnershipResponse = ContractJsonResponse<
   typeof adminV1TransferOwnershipContract
+>
+export type AdminV1DeleteOrganizationResponse = ContractJsonResponse<
+  typeof adminV1DeleteOrganizationContract
+>
+export type AdminV1UpdateOrganizationWhitelabelResponse = ContractJsonResponse<
+  typeof adminV1UpdateOrganizationWhitelabelContract
+>
+export type AdminV1UpdateOrganizationDataRetentionResponse = ContractJsonResponse<
+  typeof adminV1UpdateOrganizationDataRetentionContract
+>
+export type AdminV1UpdateOrganizationSessionPolicyResponse = ContractJsonResponse<
+  typeof adminV1UpdateOrganizationSessionPolicyContract
 >

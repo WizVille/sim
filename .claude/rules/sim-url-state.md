@@ -3,6 +3,8 @@ paths:
   - "apps/sim/app/**/*.tsx"
   - "apps/sim/app/**/*.ts"
   - "apps/sim/app/**/search-params.ts"
+  - "apps/sim/ee/**/*.tsx"
+  - "apps/sim/ee/**/*.ts"
 ---
 
 # URL / Query-Param State (nuqs)
@@ -32,7 +34,7 @@ Put state in the URL **only** when it is *all* of: shareable, deep-linkable, boo
 ## Anti-patterns (forbidden)
 
 - Direct `useSearchParams().get(...)` or `new URLSearchParams(window.location.search)` to **read** state.
-- Hand-built query strings + `router.replace`/`router.push` to **mutate** state.
+- Hand-built query strings + `router.replace`/`router.push` to **mutate** state. **If the target path equals the current path, it is a query mutation, not a navigation** — even when written as a full path template. Re-serializing the path by hand is lossy by construction: it drops every param the template forgets. Use the nuqs setter (`setParams({ key: null }, { history: 'replace', scroll: false })`) — `null` always removes the key, and only the params you name are touched. Both options are already nuqs defaults (see "Conventions"); write them explicitly because a group whose shared options set `history: 'push'` (e.g. `filesUrlKeys`) would otherwise push a back-stack entry for a strip.
 - `window.history.replaceState`/`pushState` to mutate a param.
 - Duplicating URL state into a store and syncing it with effects / `popstate` listeners.
 - High-frequency or large state in the URL (cursor, pan/zoom, un-debounced keystrokes, big JSON blobs).
@@ -42,7 +44,7 @@ These reads/mutations are **not** anti-patterns and stay as-is:
 
 - **Outbound URL builders** — `new URLSearchParams({...})` to construct a `href`, a download endpoint, an external WebSocket/API URL, or a `window.open(_, '_blank')` destination.
 - **Route navigations** — `router.push('/path/[id]?folderId=x')` that changes the route *path*, not just the current query. A nuqs setter only mutates the query on the current path; cross-path navigation stays on `router`.
-- **Read-once auth / redirect signals** — `token`, `callbackUrl`, `redirect`, `error`, `invite_flow`, `upgraded`, `redirect_workflow`, etc. These are navigation signals consumed once (often read-then-strip), not synced view-state. Leave them on `useSearchParams`.
+- **Read-once auth / redirect signals** — `token`, `callbackUrl`, `redirect`, `error`, `invite_flow`, `new` (invite signup flow), `upgraded`, `redirect_workflow`, etc. These are navigation signals consumed once (often read-then-strip), not synced view-state. Leave them on `useSearchParams`. Key names are per-surface: files' `new` is a genuine nuqs param (`files/search-params.ts`), while invite's `new` is a one-shot signup signal.
 
 ## Per-feature `search-params.ts` — single source of truth
 
@@ -50,11 +52,13 @@ Co-locate a `search-params.ts` next to the feature. Export the parser map (and s
 
 Conventions:
 
-- `.withDefault(...)` on every parser so reads are non-null.
-- Filter / search / toggle / pagination options: `{ history: 'replace', shallow: true, clearOnDefault: true }` — clean URLs, no back-stack churn.
+- `.withDefault(...)` on every parser so reads are non-null. A deliberately **nullable** parser (dynamic default, custom-range-only dates, nullable sort) must carry a comment saying why.
+- Filter / search / toggle / pagination options: `{ history: 'replace', clearOnDefault: true }` — clean URLs, no back-stack churn. Note all three of `history: 'replace'`, `clearOnDefault: true`, and `shallow: true` are already the nuqs v2 defaults — writing the first two explicitly is documentation (and guards the groups whose options differ, e.g. `history: 'push'`), and `shallow: true` may be omitted entirely.
 - Navigations that belong in browser history (changing folder, opening a deep-linked entity): `{ history: 'push' }`.
-- `shallow: false` **only** when a Server Component / loader must re-read the param.
-- Short, stable, **kebab-case** URL keys. Renaming a key is a breaking change to shared links — treat it as one.
+- `shallow: false` **only** when a Server Component / loader must re-read the param. For loading states during the server re-render, pass React's `startTransition` via `.withOptions({ startTransition, shallow: false })`.
+- Short, stable, **kebab-case** URL keys. Renaming a key is a breaking change to shared links — treat it as one. When the parser-map key is camelCase (for clean destructuring), remap the wire key via the `urlKeys` option in the shared options object (see `files/search-params.ts` `uploadedBy: 'uploaded-by'`, `ee/audit-logs/search-params.ts` `timeRange: 'time-range'`); nuqs also exports a `UrlKeys<typeof parsers>` type helper for standalone mappings.
+- `throttleMs` is deprecated in nuqs — rate-limit URL writes with `limitUrlUpdates: throttle(ms)` / `debounce(ms)` (the debounced-search hook below already does this).
+- A parser **shared across surfaces with different defaults** (e.g. `parseAsTimeRange`) must `parse` unknown tokens to `null` — never to one surface's default — so each consumer's `.withDefault(...)` decides the fallback.
 - For an opaque/literal value use `parseAsStringLiteral([...] as const)`; for a custom wire format use [`createParser`](https://nuqs.dev/docs/parsers).
 - A `createParser` for a value **not** comparable with `===` (arrays, objects, `Date`) **must** define an `eq` — `clearOnDefault` uses it to detect the default, so without it an empty-array/object default never strips from the URL. Built-in `parseAsArrayOf(...)` already ships its own `eq`; only string/number/boolean custom parsers can omit it. Example (array): `eq: (a, b) => a.length === b.length && a.every((v, i) => v === b[i])`.
 
@@ -75,10 +79,11 @@ export const thingsParsers = {
 /** Clean URLs, no back-stack churn for filter changes. */
 export const thingsUrlKeys = {
   history: 'replace',
-  shallow: true,
   clearOnDefault: true,
 } as const
 ```
+
+(The `*UrlKeys` suffix is the repo's naming convention for a feature's shared **options** object — which may itself contain a nuqs `urlKeys` key-remapping entry; the two are different things.)
 
 ### Client — `useQueryStates` (grouped) / `useQueryState` (single)
 
@@ -123,7 +128,27 @@ If a client param must be re-read server-side after a change, set `shallow: fals
 
 ## Suspense boundary
 
-`useQueryState`/`useQueryStates` read `useSearchParams` internally, so any client component using them must sit under a `<Suspense>` boundary (Next.js requirement). Wrap the page entry with a real-chrome fallback so a suspend never flashes a blank frame — see `apps/sim/app/workspace/[workspaceId]/files/page.tsx`.
+`useQueryState`/`useQueryStates` read `useSearchParams` internally, so any client component using them must sit under a `<Suspense>` boundary (Next.js requirement). Wrap the page entry with a real-chrome fallback so a suspend never flashes a blank frame.
+
+**Never `fallback={null}` on a page entry.** The route's co-located `loading.tsx` default export *is* the correct fallback — one skeleton serves both the route-level navigation transition (which Next renders automatically) and the in-page suspend (which this boundary renders). If the segment has no `loading.tsx`, add one; the route transition needs it anyway. Import it absolutely (`sim-imports.md`):
+
+```typescript
+import { KnowledgeBase } from '@/app/workspace/[workspaceId]/knowledge/[id]/base'
+import KnowledgeBaseLoading from '@/app/workspace/[workspaceId]/knowledge/[id]/loading'
+
+<Suspense fallback={<KnowledgeBaseLoading />}>
+  <KnowledgeBase id={id} knowledgeBaseName={kbName || 'Knowledge Base'} />
+</Suspense>
+```
+
+Reference: `apps/sim/app/workspace/[workspaceId]/knowledge/[id]/page.tsx`.
+
+The narrow exception is a continuity-focused peer switch that deliberately keeps the current
+view mounted and follows the full-route plus critical-data intent-prefetch rule in
+`sim-react-performance.md`. It still needs a real in-page Suspense fallback; it only omits the
+route-level `loading.tsx` that would replace the current peer before the destination is ready.
+
+This applies to **page entries**. An inner `<Suspense>` wrapping a `lazy()` component is the exception: there `fallback={null}` is correct, precisely so the suspend resolves at the nearest boundary instead of flashing the whole route — see `sim-imports.md`, "Code-splitting through barrels".
 
 ## Debounced text inputs
 
@@ -174,7 +199,7 @@ const { sort, dir, activeSort, onSort, onClear } = useUrlSort(thingsSortParams, 
 Two modes, chosen by whether you pass a default:
 
 - **Defaulted (the common case)** — pass the list's existing default sort; it must match exactly. A clean URL means the default ordering; explicitly selecting the default collapses back to a clean URL (`clearOnDefault`), and "clear sort" writes the defaults back. `useUrlSort` derives `activeSort: null` for the default state.
-- **Nullable** — omit the default when "no active sort" is behaviorally distinct from explicitly sorting by the fallback column (e.g. files: with no sort, files order by updated/desc but folders by name/asc). The params carry no defaults, explicit selections always persist in the URL, and "clear sort" strips both params (`useUrlSort` writes `null`s).
+- **Nullable** — omit the default when "no active sort" is behaviorally distinct from explicitly sorting by the fallback column (e.g. document chunks: with no sort the query omits `sortBy` entirely and the server's own order applies). The params carry no defaults, explicit selections always persist in the URL, and "clear sort" strips both params (`useUrlSort` writes `null`s).
 
 Sort params live alongside — not inside — the feature's grouped filter parser map (one definition per param; `useUrlSort` owns its own `useQueryStates`, and nuqs keeps hooks on the same keys in sync). Both params carry the shared filter options (`{ history: 'replace', clearOnDefault: true }`). Free-form user-defined columns (e.g. `tables/[tableId]`) can't use `parseAsStringLiteral` and stay hand-rolled with `parseAsString` — reuse the shared `SORT_DIRECTIONS` there.
 
@@ -182,9 +207,22 @@ Sort params live alongside — not inside — the feature's grouped filter parse
 
 A date-only param (a calendar anchor, a date filter) is stored as `yyyy-MM-dd` — never serialize a full `Date`/timestamp when only the day matters.
 
-**Local vs UTC — pick the parser that matches your date math.** nuqs's built-in `parseAsIsoDate` is **UTC-based** (`serialize` via `toISOString()`, `parse` to UTC midnight). If your `Date` is local-time (e.g. produced by local-time helpers and read by `date-fns` `startOfWeek`/`isSameDay`, which are all local), `parseAsIsoDate` will shift the day by ±1 in any non-UTC timezone on reload/deep-link/back-forward. For local-time date math, use a small local-date `createParser` that serializes/parses on local calendar fields (`getFullYear`/`getMonth`/`getDate` ↔ `new Date(y, m-1, d)`) with an `eq` comparing y/m/d. Only use `parseAsIsoDate` when the value is genuinely UTC/midnight-UTC. See `scheduled-tasks/search-params.ts` (`parseAsLocalDate`).
+**Local vs UTC — pick the parser that matches your date math.** nuqs's built-in `parseAsIsoDate` is **UTC-based** (`serialize` via `toISOString().slice(0, 10)`, `parse` to UTC midnight). If your `Date` is local-time (e.g. produced by local-time helpers and read by `date-fns` `startOfWeek`/`isSameDay`, which are all local), `parseAsIsoDate` will shift the day by ±1 in any non-UTC timezone on reload/deep-link/back-forward. For local-time date math, use a small local-date `createParser` that serializes/parses on local calendar fields (`getFullYear`/`getMonth`/`getDate` ↔ `new Date(y, m-1, d)`) with an `eq` comparing y/m/d. Only use `parseAsIsoDate` when the value is genuinely UTC/midnight-UTC.
 
-When the default is **dynamic** (e.g. "today"), make the param **nullable** (omit `.withDefault`) and derive the fallback in the hook (`const anchor = param ?? today`), so a clean URL means the dynamic default and navigating back to it writes `null` (clears the param). See `scheduled-tasks/hooks/use-calendar.ts`.
+```typescript
+const parseAsLocalDate = createParser({
+  parse: (v) => {
+    const [y, m, d] = v.split('-').map(Number)
+    return y && m && d ? new Date(y, m - 1, d) : null
+  },
+  serialize: (v) =>
+    `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`,
+  eq: (a, b) =>
+    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(),
+})
+```
+
+When the default is **dynamic** (e.g. "today"), make the param **nullable** (omit `.withDefault`) and derive the fallback in the hook (`const anchor = param ?? today`), so a clean URL means the dynamic default and navigating back to it writes `null` (clears the param).
 
 ## Selected-entity deep-link (store the id, derive the object)
 
@@ -200,7 +238,11 @@ const [skillId, setSkillId] = useQueryState(skillIdParam.key, {
 const editingSkill = skillId ? (skills.find((s) => s.id === skillId) ?? null) : null
 ```
 
-Open the panel/modal when the id resolves to a loaded entity; closing it calls `setSkillId(null)`. Because this reads `useSearchParams` it needs a **Suspense** boundary on the page (see below). A separate "create new" flow has no id and stays in local `useState`.
+Open the panel/modal only when the id **resolves to a loaded entity** — never gate on the raw param alone, or a dead/stale id (deleted entity, old bookmark) renders a broken detail view and a still-loading list flashes one. A dead id simply falls back to the list; the lingering param is harmless. Because this reads `useSearchParams` it needs a **Suspense** boundary on the page (see "Suspense boundary" above). A separate "create new" flow has no id and stays in local `useState`.
+
+**Close with `replace`, open with `push`.** Opening pushed a history entry; closing must not push another. Close via the setter's per-call options — `setSkillId(null, { history: 'replace' })` — so Back from the list leaves the page instead of reopening the detail (see `mcp.tsx`, `workflow-mcp-servers.tsx`, access-control, custom-blocks, forks). Secondary params scoped to the detail view (e.g. its active tab, `server-tab`) are cleared in the same close handler with their own setter — nuqs batches same-tick writes into one URL update.
+
+**Reusable components** rendered both as a settings/list page and inside a modal (e.g. `BYOKKeyManager`) expose an optional controlled `searchTerm`/`onSearchTermChange` prop pair: the page consumer binds the URL (`useSettingsSearch()`), modal consumers omit the props and keep local state. Never bind URL state from inside a component that can mount in a non-destination context.
 
 ## Read-then-strip deep links
 
@@ -217,8 +259,8 @@ The workflow editor (`apps/sim/app/workspace/[workspaceId]/w/**`) is realtime/so
 
 Borderline candidates that *look* shareable but currently stay in Zustand because moving them fights existing machinery:
 
-- **Panel `activeTab`** and **`canvasMode`** — persisted local *preferences* wired into an SSR flash-prevention path (`data-panel-active-tab` + `_hasHydrated`). They are layout prefs, not destinations; moving them would unwind the SSR machinery and risk tab-flash on load.
-- **`focusedBlockId`** ("look at this block") — the only genuinely shareable candidate, but it is entangled with the persisted editor store and panel-open orchestration. Adding it is a *new feature*, not a migration; ship it deliberately (with runtime verification against a live socket), not as part of a sweep.
+- **Panel `activeTab`** — a persisted local *preference* wired into an SSR flash-prevention path (`data-panel-active-tab` + `_hasHydrated`); moving it would unwind that machinery and risk tab-flash on load. **Canvas mode** (`mode` on `useCanvasModeStore`) is likewise a persisted layout preference, not a destination.
+- **The panel editor's `currentBlockId`** (`stores/panel/editor/store.ts` — a would-be "look at this block" deep link) — the only genuinely shareable candidate, but it is persisted and entangled with panel-open orchestration. Adding a URL param for it is a *new feature*, not a migration; ship it deliberately (with runtime verification against a live socket), not as part of a sweep.
 
 Rule of thumb for the editor: if state is socket-coupled, high-frequency, viewport-related, or a persisted resize/preference, it stays in Zustand. When in doubt, leave it and flag it — do not force fragile URL state into the canvas.
 

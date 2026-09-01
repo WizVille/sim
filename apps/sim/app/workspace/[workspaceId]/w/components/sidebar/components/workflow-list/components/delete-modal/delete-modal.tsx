@@ -32,6 +32,9 @@ interface DeleteModalProps {
   itemName?: string | string[]
 }
 
+/** Item types that land in Recently Deleted and can be restored from Settings. */
+const RESTORABLE_TYPES = new Set<string>(['workflow', 'folder', 'mixed', 'task'])
+
 /**
  * Reusable delete confirmation modal for workflow, folder, and workspace items.
  * Displays a warning message and confirmation buttons.
@@ -65,6 +68,11 @@ export function DeleteModal({
   const isWorkspace = itemType === 'workspace'
   const workspaceName = isWorkspace && displayNames.length > 0 ? displayNames[0] : ''
   const isConfirmed = !isWorkspace || confirmationText === workspaceName
+  const defaultAction = isWorkspace
+    ? 'none'
+    : isSingle && itemType === 'task'
+      ? 'confirm'
+      : 'dismiss'
 
   let title = ''
   if (itemType === 'workflow') {
@@ -78,8 +86,6 @@ export function DeleteModal({
   } else {
     title = 'Delete workspace'
   }
-
-  const restorableTypes = new Set<string>(['workflow', 'folder', 'mixed'])
 
   const buildDescriptionSegments = (): ChipConfirmTextSegment[] => {
     if (itemType === 'workflow') {
@@ -135,7 +141,7 @@ export function DeleteModal({
 
     if (itemType === 'task') {
       const warning = {
-        text: 'This will permanently remove all conversation history.',
+        text: 'The chat and its conversation history will be archived.',
         error: true,
       }
       if (isMultiple) {
@@ -199,10 +205,11 @@ export function DeleteModal({
       onOpenChange={handleClose}
       srTitle={title}
       title={title}
+      defaultAction={defaultAction}
       text={[
         ...buildDescriptionSegments(),
         ' ',
-        restorableTypes.has(itemType)
+        RESTORABLE_TYPES.has(itemType)
           ? 'You can restore it from Recently deleted in Settings.'
           : 'This action cannot be undone.',
       ]}
@@ -220,7 +227,7 @@ export function DeleteModal({
           title={
             <span>
               Type&nbsp;
-              <span className='font-medium text-[var(--text-primary)]'>{workspaceName}</span>
+              <span className='text-[var(--text-primary)]'>{workspaceName}</span>
               &nbsp;to confirm
             </span>
           }

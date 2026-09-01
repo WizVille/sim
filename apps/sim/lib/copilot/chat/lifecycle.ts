@@ -23,8 +23,8 @@ export interface ChatLoadResult {
 
 /**
  * Minimal column set needed to perform workflow/workspace authorization for a
- * copilot chat. Heavy TOAST-able columns (messages, planArtifact, previewYaml,
- * config, resources) are intentionally excluded — callers that only need to
+ * copilot chat. Heavy TOAST-able columns (messages, previewYaml, config,
+ * resources) are intentionally excluded — callers that only need to
  * verify ownership should not pay the detoast cost for those fields.
  */
 const copilotChatAuthColumns = {
@@ -40,9 +40,8 @@ const copilotChatAuthColumns = {
  * transcript is no longer selected from `copilot_chats.messages` (JSONB) —
  * reads now source it from the normalized `copilot_messages` table via
  * `loadCopilotChatMessages`, which avoids detoasting the large messages blob on
- * every load. The copilot-only TOAST-able fields (`previewYaml`,
- * `planArtifact`, `config`) and unused metadata (`model`, `pinned`,
- * `lastSeenAt`) remain excluded.
+ * every load. The copilot-only TOAST-able fields (`previewYaml`, `config`)
+ * and unused metadata (`model`, `pinned`, `lastSeenAt`) remain excluded.
  */
 const copilotChatDetailColumns = {
   ...copilotChatAuthColumns,
@@ -55,14 +54,13 @@ const copilotChatDetailColumns = {
 
 /**
  * Column set for the legacy copilot chat detail endpoint. Extends
- * `copilotChatDetailColumns` with `model`, `planArtifact`, and `config` — the
+ * `copilotChatDetailColumns` with `model` and `config` — the
  * fields the legacy `transformChat` response shape includes. Still drops
  * `previewYaml` (JSONB), `pinned`, and `lastSeenAt`.
  */
 const copilotChatLegacyDetailColumns = {
   ...copilotChatDetailColumns,
   model: copilotChats.model,
-  planArtifact: copilotChats.planArtifact,
   config: copilotChats.config,
 } as const
 
@@ -88,6 +86,18 @@ export async function loadCopilotChatMessages(chatId: string): Promise<Persisted
   return rows.map((row) => stripToolResultOutput(row.content as PersistedMessage))
 }
 
+/**
+ * Ownership + liveness predicate shared by the accessible-chat loaders:
+ * the chat must belong to the user and not be soft-deleted.
+ */
+function ownedLiveChatWhere(chatId: string, userId: string) {
+  return and(
+    eq(copilotChats.id, chatId),
+    eq(copilotChats.userId, userId),
+    isNull(copilotChats.deletedAt)
+  )
+}
+
 type CopilotChatAuthRow = Pick<
   typeof copilotChats.$inferSelect,
   'id' | 'userId' | 'workflowId' | 'workspaceId' | 'type'
@@ -111,7 +121,7 @@ export type CopilotChatDetailRow = Pick<
 }
 
 export type CopilotChatLegacyDetailRow = CopilotChatDetailRow &
-  Pick<typeof copilotChats.$inferSelect, 'model' | 'planArtifact' | 'config'>
+  Pick<typeof copilotChats.$inferSelect, 'model' | 'config'>
 
 async function authorizeCopilotChatRow<T extends CopilotChatAuthRow>(
   chat: T | undefined,
@@ -165,7 +175,7 @@ export async function getAccessibleCopilotChatAuth(
   const [chat] = await db
     .select(copilotChatAuthColumns)
     .from(copilotChats)
-    .where(and(eq(copilotChats.id, chatId), eq(copilotChats.userId, userId)))
+    .where(ownedLiveChatWhere(chatId, userId))
     .limit(1)
 
   return authorizeCopilotChatRow(chat, chatId, userId)
@@ -173,7 +183,7 @@ export async function getAccessibleCopilotChatAuth(
 
 /**
  * Load a copilot chat row for the legacy chat detail endpoint, including the
- * transcript plus `model`, `planArtifact`, and `config`. Drops `previewYaml`
+ * transcript plus `model` and `config`. Drops `previewYaml`
  * (JSONB), `pinned`, and `lastSeenAt` — none of which the endpoint returns.
  */
 export async function getAccessibleCopilotChat(
@@ -183,7 +193,7 @@ export async function getAccessibleCopilotChat(
   const [chat] = await db
     .select(copilotChatLegacyDetailColumns)
     .from(copilotChats)
-    .where(and(eq(copilotChats.id, chatId), eq(copilotChats.userId, userId)))
+    .where(ownedLiveChatWhere(chatId, userId))
     .limit(1)
 
   const authorized = await authorizeCopilotChatRow(chat, chatId, userId)
@@ -196,25 +206,32 @@ export async function getAccessibleCopilotChat(
 /**
  * Load a copilot chat with the conversation transcript and resources after
  * authorization, omitting copilot-only TOAST-able fields (`previewYaml`,
- * `planArtifact`, `config`) and unused metadata (`model`, `pinned`,
- * `lastSeenAt`). Use this for the mothership chat detail endpoint and the
+ * `config`) and unused metadata (`model`, `pinned`, `lastSeenAt`). Use this for the mothership chat detail endpoint and the
  * shared `resolveOrCreateChat` path — every column read here is consumed
  * downstream, and dropping the others avoids per-request detoast overhead.
  */
 export async function getAccessibleCopilotChatWithMessages(
   chatId: string,
-  userId: string
+  userId: string,
+  options?: { includeTranscript?: boolean }
 ): Promise<CopilotChatDetailRow | null> {
   const [chat] = await db
     .select(copilotChatDetailColumns)
     .from(copilotChats)
-    .where(and(eq(copilotChats.id, chatId), eq(copilotChats.userId, userId)))
+    .where(ownedLiveChatWhere(chatId, userId))
     .limit(1)
 
   const authorized = await authorizeCopilotChatRow(chat, chatId, userId)
   if (!authorized) return null
 
-  const messages = await loadCopilotChatMessages(chatId)
+  /**
+   * The transcript is unbounded — no per-chat message cap on write and no
+   * pruning — so a caller that only needs the chat's scope should not pay to
+   * materialize it. Every check `resolveOrCreateChat` runs reads detail
+   * columns only, so an empty list stays a truthful "not loaded" rather than
+   * "no messages" for the callers that opt out.
+   */
+  const messages = options?.includeTranscript === false ? [] : await loadCopilotChatMessages(chatId)
   return { ...authorized, messages }
 }
 
@@ -222,6 +239,11 @@ export async function getAccessibleCopilotChatWithMessages(
  * Resolve or create a copilot chat session.
  * If chatId is provided, loads the existing chat. Otherwise creates a new one.
  * Supports both workflow-scoped and workspace-scoped chats.
+ *
+ * A resumed chat must match every scope the caller asserted — workflow,
+ * workspace, and `type`. Any mismatch resolves to `chat: null`, exactly as an
+ * unknown id does, so callers cannot distinguish the reasons a chat did not
+ * resolve. `title` is stamped only on a newly created chat.
  */
 export async function resolveOrCreateChat(params: {
   chatId?: string
@@ -230,15 +252,23 @@ export async function resolveOrCreateChat(params: {
   workspaceId?: string
   model: string
   type?: 'mothership' | 'copilot'
+  title?: string
+  /**
+   * Skips loading the transcript on the resume path. For a caller that keys
+   * continuity by `chatId` alone and never reads `conversationHistory`.
+   */
+  includeTranscript?: boolean
 }): Promise<ChatLoadResult> {
-  const { chatId, userId, workflowId, workspaceId, model, type } = params
+  const { chatId, userId, workflowId, workspaceId, model, type, title, includeTranscript } = params
 
   if (workspaceId) {
     await assertActiveWorkspaceAccess(workspaceId, userId)
   }
 
   if (chatId) {
-    const chat = await getAccessibleCopilotChatWithMessages(chatId, userId)
+    const chat = await getAccessibleCopilotChatWithMessages(chatId, userId, {
+      includeTranscript,
+    })
 
     if (chat) {
       if (workflowId && chat.workflowId !== workflowId) {
@@ -257,6 +287,16 @@ export async function resolveOrCreateChat(params: {
           userId,
           requestWorkspaceId: workspaceId,
           chatWorkspaceId: chat.workspaceId,
+        })
+        return { chatId, chat: null, conversationHistory: [], isNew: false }
+      }
+
+      if (type && chat.type !== type) {
+        logger.warn('Copilot chat type mismatch', {
+          chatId,
+          userId,
+          requestType: type,
+          chatType: chat.type,
         })
         return { chatId, chat: null, conversationHistory: [], isNew: false }
       }
@@ -290,7 +330,7 @@ export async function resolveOrCreateChat(params: {
       ...(workflowId ? { workflowId } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       type: type ?? 'copilot',
-      title: null,
+      title: title ?? null,
       model,
       lastSeenAt: now,
     })

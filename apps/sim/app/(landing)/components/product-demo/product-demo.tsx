@@ -40,13 +40,14 @@ export function ProductDemo() {
           </div>
           <h2
             id='product-demo-heading'
-            className='text-balance font-medium text-[22px] text-[var(--text-primary)] leading-[1.3] max-sm:text-[20px]'
+            className='text-balance text-[22px] text-[var(--text-primary)] leading-[1.3] max-sm:text-[20px]'
           >
             Describe it. Sim builds it.
           </h2>
           <p className='mt-3 text-pretty text-[15px] text-[var(--text-muted)] leading-[1.6]'>
-            Tell Sim what you need in plain English and it wires blocks, models, and integrations
-            into a working agent.
+            Describe what you want to automate in plain English. Sim acts as an AI agent builder,
+            connecting the right blocks, models, tools, and data into a working workflow that you
+            can review, customize, test, and deploy.
           </p>
         </div>
       </div>

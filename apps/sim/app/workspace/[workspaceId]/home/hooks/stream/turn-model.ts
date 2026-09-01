@@ -1,4 +1,4 @@
-import { isRecordLike as isRecord } from '@sim/utils/object'
+import { isRecordLike } from '@sim/utils/object'
 import { resolveStreamToolOutcome } from '@/lib/copilot/chat/stream-tool-outcome'
 import {
   MothershipStreamV1CompletionStatus,
@@ -25,11 +25,18 @@ import { CONTEXT_COMPACTION_DISPLAY_TITLE } from '@/lib/copilot/tools/tool-displ
 export const MAIN_SPAN = 'main'
 
 /**
- * Terminal-bearing status for a single node. `running` is the only
- * non-terminal value; everything else is read from an explicit wire terminal
- * (tool `result`, span `end`) or propagated from the turn terminal.
+ * Terminal-bearing status for a single node. `running` and `awaiting_approval`
+ * are the non-terminal values; everything else is read from an explicit wire
+ * terminal (tool `result`, span `end`) or propagated from the turn terminal.
  */
-export type NodeStatus = 'running' | 'success' | 'error' | 'cancelled' | 'skipped' | 'rejected'
+export type NodeStatus =
+  | 'running'
+  | 'awaiting_approval'
+  | 'success'
+  | 'error'
+  | 'cancelled'
+  | 'skipped'
+  | 'rejected'
 
 /** Turn-level status. Terminal values come from the wire `complete`/`error`. */
 export type TurnStatus = 'streaming' | 'complete' | 'error' | 'cancelled'
@@ -78,6 +85,8 @@ export interface AgentNode extends NodeBase {
   agentId: string
   /** The outer delegation tool_use that triggered this run; links the trigger tool node. */
   triggerToolCallId?: string
+  /** Orchestrator-chosen display name for this delegation (falls back to the agent label). */
+  displayName?: string
   status: NodeStatus
   /** Wire seq at which the run terminated (span end), for ordering the close marker. */
   endSeq?: number
@@ -114,7 +123,7 @@ export interface TurnModel {
   >
   /**
    * Maps a tool call id to another tool node it folds into. Used for the
-   * `edit_content` -> `workspace_file` row merge so the write streams into the
+   * `apply_file_edit` -> `prepare_file_edit` row merge so the write streams into the
    * single "writing" row rather than a second row.
    */
   toolAlias: Map<string, string>
@@ -135,16 +144,16 @@ export function createTurnModel(): TurnModel {
   }
 }
 
-const WORKSPACE_FILE_TOOL = 'workspace_file'
-const EDIT_CONTENT_TOOL = 'edit_content'
+const WORKSPACE_FILE_TOOL = 'prepare_file_edit'
+const EDIT_CONTENT_TOOL = 'apply_file_edit'
 
-/** Resolves a tool call id through the alias map (e.g. edit_content -> its workspace_file row). */
+/** Resolves a tool call id through the alias map (e.g. apply_file_edit -> its prepare_file_edit row). */
 export function resolveToolId(model: TurnModel, id: string): string {
   return model.toolAlias.get(id) ?? id
 }
 
 /**
- * Finds the most recent `workspace_file` tool node in a span so an `edit_content`
+ * Finds the most recent `prepare_file_edit` tool node in a span so an `apply_file_edit`
  * write folds into it (the single "writing" row). Co-location in the file
  * subagent's span is the link — no coupling to preview phases. The caller
  * reopens whatever this returns, including an already-settled row (an edit after
@@ -162,11 +171,11 @@ function findWorkspaceFileNodeInSpan(model: TurnModel, spanId: string): ToolNode
 }
 
 /**
- * The file agent writes a file as strictly sequential `workspace_file` +
- * `edit_content` section pairs, waiting for each to finish before the next. So
- * when a new section's `workspace_file` opens, any earlier `workspace_file` row
+ * The file agent writes a file as strictly sequential `prepare_file_edit` +
+ * `apply_file_edit` section pairs, waiting for each to finish before the next. So
+ * when a new section's `prepare_file_edit` opens, any earlier `prepare_file_edit` row
  * still `running` in the same span is a completed section whose closing
- * `edit_content` result was reordered or dropped — finalize it as success so its
+ * `apply_file_edit` result was reordered or dropped — finalize it as success so its
  * "writing" spinner resolves when the next section starts, instead of lingering
  * until the turn-terminal sweep. A no-op on the happy path (prior rows already
  * settled on their own result).
@@ -213,10 +222,10 @@ function rebindResolvedIntegrationCall(node: ToolNode, toolName: string): void {
 /**
  * Reads a wire event payload as a generic record. The payload is a wide
  * discriminated union; the reducer accesses fields uniformly, so this narrows
- * through the `unknown`-typed {@link isRecord} guard rather than a double cast.
+ * through the `unknown`-typed {@link isRecordLike} guard rather than a double cast.
  */
 function payloadRecord(payload: unknown): Record<string, unknown> {
-  return isRecord(payload) ? payload : {}
+  return isRecordLike(payload) ? payload : {}
 }
 
 /** Parses a wire `ts` to epoch ms, or undefined when absent/unparseable. */
@@ -324,8 +333,8 @@ function appendText(
 /**
  * Applies a result that raced ahead of its tool `call` (buffered under `fromId`)
  * onto `node`, then clears the buffer. Used by the normal call path and by the
- * edit_content -> workspace_file merge, where the buffer is keyed by the
- * edit_content id but folds into the workspace_file row.
+ * apply_file_edit -> prepare_file_edit merge, where the buffer is keyed by the
+ * apply_file_edit id but folds into the prepare_file_edit row.
  */
 function drainBufferedResult(model: TurnModel, fromId: string, node: ToolNode): void {
   const buffered = model.bufferedResults.get(fromId)
@@ -466,12 +475,12 @@ export function reduceEvent(model: TurnModel, envelope: PersistedStreamEventEnve
       ensureSubagentLane(model, spanId, scope, seq, tsMs)
       const phase = payload.phase
       if (phase === MothershipStreamV1ToolPhase.call) {
-        // edit_content folds into its span's workspace_file row (the write
+        // apply_file_edit folds into its span's prepare_file_edit row (the write
         // continues in the single "writing" row), reopening it for the edit.
         if (toolName === EDIT_CONTENT_TOOL) {
-          // A re-emitted edit_content call (same tool call id — duplicate/replay)
+          // A re-emitted apply_file_edit call (same tool call id — duplicate/replay)
           // must keep its ORIGINAL target row. Re-running the span lookup can
-          // return a newer workspace_file, and folding into that would leave the
+          // return a newer prepare_file_edit, and folding into that would leave the
           // first (already reopened) row running with no result ever closing it —
           // a spinner stuck until the turn-terminal sweep. So once aliased, reuse.
           const aliasedId = model.toolAlias.get(rawToolCallId)
@@ -485,7 +494,7 @@ export function reduceEvent(model: TurnModel, envelope: PersistedStreamEventEnve
             parent.status = 'running'
             parent.result = undefined
             // A result that raced ahead of this call was buffered under the
-            // edit_content id; fold it into the reopened workspace_file row.
+            // apply_file_edit id; fold it into the reopened prepare_file_edit row.
             drainBufferedResult(model, rawToolCallId, parent)
             break
           }
@@ -504,7 +513,19 @@ export function reduceEvent(model: TurnModel, envelope: PersistedStreamEventEnve
           tsMs
         )
         rebindResolvedIntegrationCall(node, toolName)
-        if (isRecord(payload.arguments)) node.args = payload.arguments
+        // Sim stamps this onto the call frame for a tool it is holding behind a
+        // permission prompt. Only ever moves a live node INTO the waiting state;
+        // a node that already has a result stays terminal, so a replayed call
+        // frame cannot reopen an answered prompt.
+        const callStatus = asString(payload.status)
+        if (callStatus === 'awaiting_approval' && !isNodeTerminal(node.status) && !node.result) {
+          node.status = 'awaiting_approval'
+        } else if (callStatus === 'executing' && node.status === 'awaiting_approval') {
+          // The user allowed it; Sim re-emits the call frame so the card turns
+          // back into an ordinary running row without waiting for the result.
+          node.status = 'running'
+        }
+        if (isRecordLike(payload.arguments)) node.args = payload.arguments
         // Only the snapshot-replay path (contentBlocksToModel) carries this
         // field — the live wire never does; it restores the rebound gateway
         // description across a preserve-state rebuild.
@@ -512,7 +533,7 @@ export function reduceEvent(model: TurnModel, envelope: PersistedStreamEventEnve
         if (restoredDescription) node.integrationDescription = restoredDescription
         // Tool-call titles are derived from the tool name (+args) at serialize
         // time; the stream only carries behavioral flags now.
-        const ui = isRecord(payload.ui) ? payload.ui : undefined
+        const ui = isRecordLike(payload.ui) ? payload.ui : undefined
         if (ui?.hidden === true) node.hidden = true
       } else if (phase === MothershipStreamV1ToolPhase.args_delta) {
         const node = upsertToolNode(
@@ -540,10 +561,11 @@ export function reduceEvent(model: TurnModel, envelope: PersistedStreamEventEnve
     case MothershipStreamV1EventType.span: {
       const payload = envelope.payload
       if (payload.kind !== MothershipStreamV1SpanPayloadKind.subagent) break
-      const data = isRecord(payload.data) ? payload.data : undefined
+      const data = isRecordLike(payload.data) ? payload.data : undefined
       const triggerToolCallId =
         scope?.parentToolCallId ?? asString(data?.tool_call_id) ?? asString(data?.toolCallId)
       const agentId = asString(payload.agent) ?? scope?.agentId ?? ''
+      const displayName = asString(data?.name)
       const resolvedSpanId =
         scope?.spanId ?? (triggerToolCallId ? `span:${triggerToolCallId}` : `span:${seq}`)
       const parentSpanId = scope?.parentSpanId ?? MAIN_SPAN
@@ -562,6 +584,7 @@ export function reduceEvent(model: TurnModel, envelope: PersistedStreamEventEnve
           // scope.agentId can name the forwarding caller (e.g. superagent),
           // while this start's payload.agent is the authoritative lane owner.
           if (agentId && existing.agentId !== agentId) existing.agentId = agentId
+          if (displayName) existing.displayName = displayName
           if (!existing.triggerToolCallId && triggerToolCallId) {
             existing.triggerToolCallId = triggerToolCallId
           }
@@ -583,6 +606,7 @@ export function reduceEvent(model: TurnModel, envelope: PersistedStreamEventEnve
           seq: seq,
           ...(tsMs !== undefined ? { startedAtMs: tsMs } : {}),
           ...(triggerToolCallId ? { triggerToolCallId } : {}),
+          ...(displayName ? { displayName } : {}),
         }
         model.nodes.set(node.id, node)
         model.order.push(node.id)
@@ -592,9 +616,24 @@ export function reduceEvent(model: TurnModel, envelope: PersistedStreamEventEnve
         if (data?.pending === true) break
         breakLane(model, resolvedSpanId, tsMs)
         const node = model.nodes.get(resolvedSpanId)
+        const spanErrored = Boolean(data && asString(data.error))
         if (node && node.kind === 'agent' && !isNodeTerminal(node.status)) {
-          node.status = data && asString(data.error) ? 'error' : 'success'
+          node.status = spanErrored ? 'error' : 'success'
           node.endSeq = seq
+        }
+        // The lane is over: settle any tool row still `running` in it (its
+        // result was dropped or reordered past the end). Left open, the row
+        // pins the whole group expanded and shimmering for the rest of the
+        // turn even though the subagent already returned. A late result event
+        // still corrects this — applyToolResult overwrites unconditionally.
+        for (const id of model.order) {
+          const stale = model.nodes.get(id)
+          if (stale?.kind === 'tool' && stale.spanId === resolvedSpanId) {
+            if (stale.status === 'running') {
+              stale.status = spanErrored ? 'error' : 'success'
+              stale.streamingArgs = undefined
+            }
+          }
         }
       }
       break
@@ -667,7 +706,7 @@ export function reduceEvent(model: TurnModel, envelope: PersistedStreamEventEnve
       const payload = payloadRecord(envelope.payload)
       // An async pause is not a turn terminal — the paused tools/subagents
       // legitimately stay open until a later resume leg completes them.
-      const response = isRecord(payload.response) ? payload.response : undefined
+      const response = isRecordLike(payload.response) ? payload.response : undefined
       if (response && 'async_pause' in response) break
       const status = payload.status
       if (status === MothershipStreamV1CompletionStatus.cancelled) {
@@ -699,7 +738,9 @@ export function applyTurnTerminal(model: TurnModel, turn: Exclude<TurnStatus, 's
   for (const id of model.order) {
     const node = model.nodes.get(id)
     if (!node || node.kind === 'text') continue
-    if (node.status === 'running') {
+    // An unanswered permission prompt is a straggler too: the turn ended, so
+    // the card must stop offering actions rather than sit there forever.
+    if (node.status === 'running' || node.status === 'awaiting_approval') {
       node.status = nodeStatus
       // Close a straggler subagent lane (no explicit span end) so the serializer
       // emits its `subagent_end` and the group resolves — otherwise the

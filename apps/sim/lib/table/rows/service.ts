@@ -11,11 +11,11 @@
  */
 
 import { db } from '@sim/db'
-import { tableJobs, userTableRows } from '@sim/db/schema'
+import { userTableRows } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
-import { toError } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
-import { and, count, eq, inArray, lte, notInArray, type SQL, sql } from 'drizzle-orm'
+import { and, asc, count, eq, inArray, type SQL, sql } from 'drizzle-orm'
+import { OrchestrationError } from '@/lib/core/orchestration/types'
 import {
   assertRowCapacity,
   getMaxRowsPerTable,
@@ -24,9 +24,24 @@ import {
   wouldExceedRowLimit,
 } from '@/lib/table/billing'
 import { getColumnId } from '@/lib/table/column-keys'
+import { columnTypeOf } from '@/lib/table/column-types'
 import { getMaxPageBytes, TABLE_LIMITS, USER_TABLE_ROWS_SQL_NAME } from '@/lib/table/constants'
+import { TableQueryValidationError } from '@/lib/table/errors'
+import {
+  assertRowDelete,
+  assertRowInsert,
+  assertRowUpdate,
+  patchColumnIds,
+} from '@/lib/table/mutation-locks'
 import { nKeysBetween } from '@/lib/table/order-key'
-import { type DbExecutor, type DbTransaction, withSeqscanOff } from '@/lib/table/planner'
+import {
+  type DbExecutor,
+  type DbTransaction,
+  withReadGuards,
+  withSeqscanOff,
+} from '@/lib/table/planner'
+import { encodeCursor } from '@/lib/table/rows/cursor'
+import { TableRowNotFoundError } from '@/lib/table/rows/errors'
 import {
   applyExecutionsPatch,
   deriveExecClearsForDataPatch,
@@ -42,9 +57,18 @@ import {
   nextRowPosition,
   resolveBatchInsertOrderKeys,
   resolveInsertOrderKey,
+  selectRowDataPage,
+  selectRowIdPage,
 } from '@/lib/table/rows/ordering'
-import { trimRowsToByteBudget } from '@/lib/table/rows/paging'
-import { buildFilterClause, buildSortClause, escapeLikePattern } from '@/lib/table/sql'
+import { pendingDeleteMask } from '@/lib/table/rows/pending-delete-mask'
+import { mutateTableRowsWithSecretProvenance } from '@/lib/table/rows/secret-provenance'
+import {
+  buildFilterClause,
+  buildPredicateClause,
+  buildSortClause,
+  escapeLikePattern,
+  fieldPredicate,
+} from '@/lib/table/sql'
 import { fireTableTrigger } from '@/lib/table/trigger'
 import { scaledStatementTimeoutMs, setTableTxTimeouts } from '@/lib/table/tx'
 import type {
@@ -67,8 +91,8 @@ import type {
   RowExecutions,
   Sort,
   TableDefinition,
-  TableDeleteJobPayload,
   TableRow,
+  TableRowsCursor,
   UpdateRowData,
   UpsertResult,
   UpsertRowData,
@@ -79,6 +103,7 @@ import {
   coerceRowToSchema,
   coerceRowValues,
   getUniqueColumns,
+  type UncoercibleValuePolicy,
   validateRowSize,
 } from '@/lib/table/validation'
 import { cancelWorkflowGroupRuns, runWorkflowColumn } from '@/lib/table/workflow-columns'
@@ -94,21 +119,38 @@ const logger = createLogger('TableRowsService')
  * @returns Inserted row
  * @throws Error if validation fails or capacity exceeded
  */
+export interface RowWriteOptions {
+  /**
+   * What this write does with a value its column's type cannot coerce. Defaults
+   * to `null` — the cell is blanked and the write succeeds, which is what every
+   * first-party surface (the workspace grid, `/api/table`, `/api/v1`, the
+   * Copilot table tools, the executor's Table block) has always done. The
+   * `/api/v2` surface opts into `reject`. See {@link UncoercibleValuePolicy}.
+   */
+  uncoercibleValues?: UncoercibleValuePolicy
+}
+
 export async function insertRow(
   data: InsertRowData,
   table: TableDefinition,
-  requestId: string
+  requestId: string,
+  options: RowWriteOptions = {}
 ): Promise<TableRow> {
+  const insertProof = assertRowInsert(table)
+
   // Validate row size
   const sizeValidation = validateRowSize(data.data)
   if (!sizeValidation.valid) {
-    throw new Error(sizeValidation.errors.join(', '))
+    throw new OrchestrationError('validation', sizeValidation.errors.join(', '))
   }
 
   // Validate against schema
-  const schemaValidation = coerceRowToSchema(data.data, table.schema)
+  const schemaValidation = coerceRowToSchema(data.data, table.schema, options.uncoercibleValues)
   if (!schemaValidation.valid) {
-    throw new Error(`Schema validation failed: ${schemaValidation.errors.join(', ')}`)
+    throw new OrchestrationError(
+      'validation',
+      `Schema validation failed: ${schemaValidation.errors.join(', ')}`
+    )
   }
 
   // Check unique constraints using optimized database query
@@ -116,7 +158,7 @@ export async function insertRow(
   if (uniqueColumns.length > 0) {
     const uniqueValidation = await checkUniqueConstraintsDb(data.tableId, data.data, table.schema)
     if (!uniqueValidation.valid) {
-      throw new Error(uniqueValidation.errors.join(', '))
+      throw new OrchestrationError('validation', uniqueValidation.errors.join(', '))
     }
   }
 
@@ -140,6 +182,8 @@ export async function insertRow(
     beforeRowId: data.beforeRowId,
     createdBy: data.userId,
     now,
+    secretProvenance: data.secretProvenance,
+    proof: insertProof,
   })
 
   notifyTableRowUsage({
@@ -195,7 +239,8 @@ export async function insertRow(
 export async function batchInsertRows(
   data: BatchInsertData,
   table: TableDefinition,
-  requestId: string
+  requestId: string,
+  options: RowWriteOptions = {}
 ): Promise<TableRow[]> {
   // Best-effort capacity check against the workspace's current plan limit. Import
   // paths call `batchInsertRowsWithTx` directly and gate capacity up front instead.
@@ -205,7 +250,9 @@ export async function batchInsertRows(
     addedRows: data.rows.length,
   })
 
-  const result = await db.transaction((trx) => batchInsertRowsWithTx(trx, data, table, requestId))
+  const result = await db.transaction((trx) =>
+    batchInsertRowsWithTx(trx, data, table, requestId, options)
+  )
   notifyTableRowUsage({
     workspaceId: table.workspaceId,
     currentRowCount: table.rowCount,
@@ -229,19 +276,28 @@ export async function batchInsertRowsWithTx(
   trx: DbTransaction,
   data: BatchInsertData,
   table: TableDefinition,
-  requestId: string
+  requestId: string,
+  options: RowWriteOptions = {}
 ): Promise<TableRow[]> {
+  assertRowInsert(table)
+
   for (let i = 0; i < data.rows.length; i++) {
     const row = data.rows[i]
 
     const sizeValidation = validateRowSize(row)
     if (!sizeValidation.valid) {
-      throw new Error(`Row ${i + 1}: ${sizeValidation.errors.join(', ')}`)
+      throw new OrchestrationError(
+        'validation',
+        `Row ${i + 1}: ${sizeValidation.errors.join(', ')}`
+      )
     }
 
-    const schemaValidation = coerceRowToSchema(row, table.schema)
+    const schemaValidation = coerceRowToSchema(row, table.schema, options.uncoercibleValues)
     if (!schemaValidation.valid) {
-      throw new Error(`Row ${i + 1}: ${schemaValidation.errors.join(', ')}`)
+      throw new OrchestrationError(
+        'validation',
+        `Row ${i + 1}: ${schemaValidation.errors.join(', ')}`
+      )
     }
   }
 
@@ -257,7 +313,7 @@ export async function batchInsertRowsWithTx(
       const errorMessages = uniqueResult.errors
         .map((e) => `Row ${e.row + 1}: ${e.errors.join(', ')}`)
         .join('; ')
-      throw new Error(errorMessages)
+      throw new OrchestrationError('validation', errorMessages)
     }
   }
 
@@ -287,7 +343,18 @@ export async function batchInsertRowsWithTx(
   const start = await nextRowPosition(trx, data.tableId)
   const positions = Array.from({ length: data.rows.length }, (_, i) => start + i)
   const rowsToInsert = data.rows.map((rowData, i) => buildRow(rowData, positions[i], orderKeys[i]))
-  const insertedRows = await trx.insert(userTableRows).values(rowsToInsert).returning()
+  const insertedRows = await mutateTableRowsWithSecretProvenance(trx, {
+    rows: rowsToInsert.map((row, index) => ({
+      rowId: row.id,
+      provenance: data.secretProvenance?.[index],
+    })),
+    rowState: 'new',
+    mode: 'replace',
+    mutate: async () => {
+      const rows = await trx.insert(userTableRows).values(rowsToInsert).returning()
+      return { value: rows, affectedRowIds: rows.map((row) => row.id) }
+    },
+  })
 
   logger.info(`[${requestId}] Batch inserted ${data.rows.length} rows into table ${data.tableId}`)
 
@@ -350,7 +417,8 @@ export function dispatchAfterBatchInsert(
 export async function replaceTableRows(
   data: ReplaceRowsData,
   table: TableDefinition,
-  requestId: string
+  requestId: string,
+  options: RowWriteOptions = {}
 ): Promise<ReplaceRowsResult> {
   // All existing rows are deleted, so the footprint is just the new set. Checked
   // before the tx opens — never inside it (the plan lookup is a separate pool read).
@@ -359,7 +427,9 @@ export async function replaceTableRows(
     currentRowCount: 0,
     addedRows: data.rows.length,
   })
-  const result = await db.transaction((trx) => replaceTableRowsWithTx(trx, data, table, requestId))
+  const result = await db.transaction((trx) =>
+    replaceTableRowsWithTx(trx, data, table, requestId, options)
+  )
   notifyTableRowUsage({
     workspaceId: table.workspaceId,
     currentRowCount: 0,
@@ -380,8 +450,12 @@ export async function replaceTableRowsWithTx(
   trx: DbTransaction,
   data: ReplaceRowsData,
   table: TableDefinition,
-  requestId: string
+  requestId: string,
+  options: RowWriteOptions = {}
 ): Promise<ReplaceRowsResult> {
+  assertRowDelete(table)
+  assertRowInsert(table)
+
   if (data.tableId !== table.id) {
     throw new Error(`Table ID mismatch: ${data.tableId} vs ${table.id}`)
   }
@@ -394,12 +468,18 @@ export async function replaceTableRowsWithTx(
 
     const sizeValidation = validateRowSize(row)
     if (!sizeValidation.valid) {
-      throw new Error(`Row ${i + 1}: ${sizeValidation.errors.join(', ')}`)
+      throw new OrchestrationError(
+        'validation',
+        `Row ${i + 1}: ${sizeValidation.errors.join(', ')}`
+      )
     }
 
-    const schemaValidation = coerceRowToSchema(row, table.schema)
+    const schemaValidation = coerceRowToSchema(row, table.schema, options.uncoercibleValues)
     if (!schemaValidation.valid) {
-      throw new Error(`Row ${i + 1}: ${schemaValidation.errors.join(', ')}`)
+      throw new OrchestrationError(
+        'validation',
+        `Row ${i + 1}: ${schemaValidation.errors.join(', ')}`
+      )
     }
   }
 
@@ -407,17 +487,22 @@ export async function replaceTableRowsWithTx(
   if (uniqueColumns.length > 0 && data.rows.length > 0) {
     const seen = new Map<string, Map<string, number>>()
     for (const col of uniqueColumns) {
-      seen.set(col.name, new Map())
+      seen.set(getColumnId(col), new Map())
     }
     for (let i = 0; i < data.rows.length; i++) {
       const row = data.rows[i]
       for (const col of uniqueColumns) {
-        const value = row[col.name]
+        // Coerced rows are keyed by column id, not display name — reading
+        // `row[col.name]` silently misses renamed columns and lets dupes through.
+        const colId = getColumnId(col)
+        const value = row[colId]
         if (value === null || value === undefined) continue
-        const normalized = typeof value === 'string' ? value.toLowerCase() : JSON.stringify(value)
-        const map = seen.get(col.name)!
+        // Case-sensitive, consistent with the unique-constraint check leaf.
+        const normalized = typeof value === 'string' ? value : JSON.stringify(value)
+        const map = seen.get(colId)!
         if (map.has(normalized)) {
-          throw new Error(
+          throw new OrchestrationError(
+            'validation',
             `Row ${i + 1}: Column "${col.name}" must be unique. Value "${String(value)}" duplicates row ${map.get(normalized)! + 1} in batch`
           )
         }
@@ -443,10 +528,23 @@ export async function replaceTableRowsWithTx(
   // the union of both row sets instead of only the last caller's rows.
   await acquireRowOrderLock(trx, data.tableId)
 
-  const deletedRows = await trx
-    .delete(userTableRows)
-    .where(eq(userTableRows.tableId, data.tableId))
-    .returning({ id: userTableRows.id })
+  const deleteCountRows = await trx.execute<{ count: number | string }>(sql`
+    WITH deleted AS (
+      DELETE FROM ${userTableRows}
+      WHERE ${and(
+        eq(userTableRows.tableId, data.tableId),
+        eq(userTableRows.workspaceId, data.workspaceId)
+      )}
+      RETURNING 1
+    )
+    SELECT count(*)::integer AS count FROM deleted
+  `)
+  const [deleteCountRow] = Array.isArray(deleteCountRows) ? deleteCountRows : []
+  if (!deleteCountRow) throw new Error('Table row replacement did not return a deleted count')
+  const deletedCount = Number(deleteCountRow.count)
+  if (!Number.isSafeInteger(deletedCount) || deletedCount < 0) {
+    throw new Error('Table row replacement returned an invalid deleted count')
+  }
 
   let insertedCount = 0
   if (data.rows.length > 0) {
@@ -464,21 +562,33 @@ export async function replaceTableRowsWithTx(
       ...(data.userId ? { createdBy: data.userId } : {}),
     }))
 
-    const batchSize = TABLE_LIMITS.MAX_BATCH_INSERT_SIZE
-    for (let i = 0; i < rowsToInsert.length; i += batchSize) {
-      const chunk = rowsToInsert.slice(i, i + batchSize)
-      const inserted = await trx.insert(userTableRows).values(chunk).returning({
-        id: userTableRows.id,
-      })
-      insertedCount += inserted.length
-    }
+    insertedCount = await mutateTableRowsWithSecretProvenance(trx, {
+      rows: rowsToInsert.map((row, index) => ({
+        rowId: row.id,
+        provenance: data.secretProvenance?.[index],
+      })),
+      rowState: 'new',
+      mode: 'replace',
+      mutate: async () => {
+        const insertedRowIds: string[] = []
+        const batchSize = TABLE_LIMITS.MAX_BATCH_INSERT_SIZE
+        for (let i = 0; i < rowsToInsert.length; i += batchSize) {
+          const chunk = rowsToInsert.slice(i, i + batchSize)
+          const inserted = await trx.insert(userTableRows).values(chunk).returning({
+            id: userTableRows.id,
+          })
+          insertedRowIds.push(...inserted.map((row) => row.id))
+        }
+        return { value: insertedRowIds.length, affectedRowIds: insertedRowIds }
+      },
+    })
   }
 
   logger.info(
-    `[${requestId}] Replaced rows in table ${data.tableId}: deleted ${deletedRows.length}, inserted ${insertedCount}`
+    `[${requestId}] Replaced rows in table ${data.tableId}: deleted ${deletedCount}, inserted ${insertedCount}`
   )
 
-  return { deletedCount: deletedRows.length, insertedCount }
+  return { deletedCount, insertedCount }
 }
 
 /**
@@ -500,13 +610,15 @@ export async function replaceTableRowsWithTx(
 export async function upsertRow(
   data: UpsertRowData,
   table: TableDefinition,
-  requestId: string
+  requestId: string,
+  options: RowWriteOptions = {}
 ): Promise<UpsertResult> {
   const schema = table.schema
   const uniqueColumns = getUniqueColumns(schema)
 
   if (uniqueColumns.length === 0) {
-    throw new Error(
+    throw new OrchestrationError(
+      'validation',
       'Upsert requires at least one unique column in the schema. Please add a unique constraint to a column or use insert instead.'
     )
   }
@@ -520,15 +632,27 @@ export async function upsertRow(
       (c) => getColumnId(c) === data.conflictTarget || c.name === data.conflictTarget
     )
     if (!col) {
-      throw new Error(
-        `Column "${data.conflictTarget}" is not a unique column. Available unique columns: ${uniqueColumns.map((c) => c.name).join(', ')}`
+      /**
+       * Name the column the way the caller does. A name-keyed surface resolves
+       * `conflictTarget` to its storage id before this call, so echoing the
+       * argument verbatim answers a request naming `email` with a `col_…` id
+       * the caller has never seen and cannot map back. Same rule as the
+       * missing-value branch below.
+       */
+      const requested =
+        schema.columns.find((c) => getColumnId(c) === data.conflictTarget)?.name ??
+        data.conflictTarget
+      throw new OrchestrationError(
+        'validation',
+        `Column "${requested}" is not a unique column. Available unique columns: ${uniqueColumns.map((c) => c.name).join(', ')}`
       )
     }
     targetColumnKey = getColumnId(col)
   } else if (uniqueColumns.length === 1) {
     targetColumnKey = getColumnId(uniqueColumns[0])
   } else {
-    throw new Error(
+    throw new OrchestrationError(
+      'validation',
       `Table has multiple unique columns (${uniqueColumns.map((c) => c.name).join(', ')}). Specify a conflict column to indicate which one to match on.`
     )
   }
@@ -536,12 +660,15 @@ export async function upsertRow(
   // Validate row data
   const sizeValidation = validateRowSize(data.data)
   if (!sizeValidation.valid) {
-    throw new Error(sizeValidation.errors.join(', '))
+    throw new OrchestrationError('validation', sizeValidation.errors.join(', '))
   }
 
-  const schemaValidation = coerceRowToSchema(data.data, schema)
+  const schemaValidation = coerceRowToSchema(data.data, schema, options.uncoercibleValues)
   if (!schemaValidation.valid) {
-    throw new Error(`Schema validation failed: ${schemaValidation.errors.join(', ')}`)
+    throw new OrchestrationError(
+      'validation',
+      `Schema validation failed: ${schemaValidation.errors.join(', ')}`
+    )
   }
 
   // Read the conflict-target value *after* coercion so `matchFilter` branches on
@@ -551,15 +678,27 @@ export async function upsertRow(
     // Surface the display name, not the internal id — v1 callers pass a name.
     const targetColumnName =
       uniqueColumns.find((c) => getColumnId(c) === targetColumnKey)?.name ?? targetColumnKey
-    throw new Error(`Upsert requires a value for the conflict target column "${targetColumnName}"`)
+    throw new OrchestrationError(
+      'validation',
+      `Upsert requires a value for the conflict target column "${targetColumnName}"`
+    )
   }
 
-  // `data->` and `data->>` accept the JSON key as a parameterized text value;
-  // no need for `sql.raw` interpolation.
-  const matchFilter =
-    typeof targetValue === 'string'
-      ? sql`${userTableRows.data}->>${targetColumnKey}::text = ${String(targetValue)}`
-      : sql`(${userTableRows.data}->${targetColumnKey}::text)::jsonb = ${JSON.stringify(targetValue)}::jsonb`
+  // Build the conflict probe through the SAME leaf as the unique-constraint check
+  // (`fieldPredicate` → case-sensitive JSONB containment). This is what makes
+  // "find the row to update" and "is this value unique" agree: a value differing
+  // only in case can no longer slip past the probe and then trip the guard.
+  // `eq` always yields a clause for a non-null value (guaranteed above).
+  const matchFilter = fieldPredicate(
+    USER_TABLE_ROWS_SQL_NAME,
+    targetColumnKey,
+    'eq',
+    targetValue,
+    table.schema.columns.find((c) => getColumnId(c) === targetColumnKey)
+  )
+  if (!matchFilter) {
+    throw new Error('Failed to build upsert conflict predicate')
+  }
 
   // Resolve the plan limit BEFORE the tx (the lookup is a separate pool read; doing
   // it inside the tx would hold a connection + the row-order lock during it). The
@@ -595,7 +734,10 @@ export async function upsertRow(
       trx
     )
     if (!uniqueValidation.valid) {
-      throw new Error(`Unique constraint violation: ${uniqueValidation.errors.join(', ')}`)
+      throw new OrchestrationError(
+        'validation',
+        `Unique constraint violation: ${uniqueValidation.errors.join(', ')}`
+      )
     }
 
     const now = new Date()
@@ -626,18 +768,36 @@ export async function upsertRow(
     }
 
     if (matchedRowId) {
-      const [updatedRow] = await trx
-        .update(userTableRows)
-        .set({ data: data.data, updatedAt: now })
-        .where(eq(userTableRows.id, matchedRowId))
-        .returning()
+      assertRowUpdate(table, patchColumnIds(data.data))
+      const updatedRow = await mutateTableRowsWithSecretProvenance(trx, {
+        rows: [{ rowId: matchedRowId, provenance: data.secretProvenance }],
+        rowState: 'existing',
+        mode: 'replace',
+        mutate: async () => {
+          const [row] = await trx
+            .update(userTableRows)
+            .set({ data: data.data, updatedAt: now })
+            .where(
+              and(
+                eq(userTableRows.id, matchedRowId),
+                eq(userTableRows.tableId, data.tableId),
+                eq(userTableRows.workspaceId, data.workspaceId)
+              )
+            )
+            .returning()
+          if (!row) return { value: undefined, affectedRowIds: [] }
+          return { value: row, affectedRowIds: [row.id] }
+        },
+      })
+      if (!updatedRow) throw new Error('Matched table row no longer exists')
 
-      const executions = await loadExecutionsForRow(trx, updatedRow.id)
+      // No executions sidecar: no upsert surface puts one on the wire, and
+      // loading it here would hold the write transaction open for a result that
+      // is discarded. See `getRowSummaryById` for the same reasoning on reads.
       return {
         row: {
           id: updatedRow.id,
           data: updatedRow.data as RowData,
-          executions,
           position: updatedRow.position,
           orderKey: updatedRow.orderKey ?? undefined,
           createdAt: updatedRow.createdAt,
@@ -648,30 +808,41 @@ export async function upsertRow(
       }
     }
 
+    assertRowInsert(table)
+
     if (wouldExceedRowLimit(rowLimit, table.rowCount, 1)) {
       throw new TableRowLimitError(rowLimit)
     }
 
-    const [insertedRow] = await trx
-      .insert(userTableRows)
-      .values({
-        id: `row_${generateId().replace(/-/g, '')}`,
-        tableId: data.tableId,
-        workspaceId: data.workspaceId,
-        data: data.data,
-        position: await nextRowPosition(trx, data.tableId),
-        orderKey: await resolveInsertOrderKey(trx, data.tableId),
-        createdAt: now,
-        updatedAt: now,
-        ...(data.userId ? { createdBy: data.userId } : {}),
-      })
-      .returning()
+    const insertedRowId = `row_${generateId().replace(/-/g, '')}`
+    const insertedRow = await mutateTableRowsWithSecretProvenance(trx, {
+      rows: [{ rowId: insertedRowId, provenance: data.secretProvenance }],
+      rowState: 'new',
+      mode: 'replace',
+      mutate: async () => {
+        const [row] = await trx
+          .insert(userTableRows)
+          .values({
+            id: insertedRowId,
+            tableId: data.tableId,
+            workspaceId: data.workspaceId,
+            data: data.data,
+            position: await nextRowPosition(trx, data.tableId),
+            orderKey: await resolveInsertOrderKey(trx, data.tableId),
+            createdAt: now,
+            updatedAt: now,
+            ...(data.userId ? { createdBy: data.userId } : {}),
+          })
+          .returning()
+        return { value: row, affectedRowIds: row ? [row.id] : [] }
+      },
+    })
+    if (!insertedRow) throw new Error('Failed to insert table row')
 
     return {
       row: {
         id: insertedRow.id,
         data: insertedRow.data as RowData,
-        executions: {},
         position: insertedRow.position,
         orderKey: insertedRow.orderKey ?? undefined,
         createdAt: insertedRow.createdAt,
@@ -759,8 +930,42 @@ export interface FindRowMatch {
   column: string
 }
 
-/** Max matching cells returned by {@link findRowMatches}; one extra is fetched to detect truncation. */
-const FIND_MATCH_LIMIT = 1000
+/**
+ * Builds a SQL text expression that resolves a scanned select cell (`kv.value`,
+ * keyed by `kv.key`) to its option **name(s)** — the label the user searches by,
+ * not the stored id. Single-select maps the id to its name; multiselect joins the
+ * array's option names. Non-select keys resolve to NULL. Returns `null` when the
+ * schema has no select columns (caller keeps the plain id match). Option ids/names
+ * are trusted schema data, escaped and embedded literally; the row alias is `o`.
+ */
+export function buildSelectFindNameExpr(columns: ColumnDefinition[]): string | null {
+  const selectColumns = columns.filter((c) => columnTypeOf(c).storesOpaqueIds)
+  if (selectColumns.length === 0) return null
+  const esc = (s: string) => s.replace(/'/g, "''")
+  const whens = selectColumns
+    .map((col) => {
+      const id = esc(getColumnId(col))
+      const caseWhens = (col.options ?? [])
+        .map((o) => `WHEN '${esc(o.id)}' THEN '${esc(o.name)}'`)
+        .join(' ')
+      const single = caseWhens ? `CASE kv.value ${caseWhens} ELSE kv.value END` : 'kv.value'
+      if (col.multiple) {
+        const elem = caseWhens ? `CASE e.v ${caseWhens} ELSE e.v END` : 'e.v'
+        // `jsonb_array_elements_text` throws "cannot extract elements from a
+        // scalar" on a JSON null — which a multiselect cell becomes when it is
+        // cleared, cut, or has its last option removed — so the array arm has to
+        // be gated on the cell actually being an array. Anything else falls back
+        // to the single mapping, which also keeps a scalar left over from a
+        // single→multi toggle searchable. Mirrors `buildSelectNameOrderExpr`.
+        // `ORDER BY e.ord` keeps the joined label in stored order, so Find matches
+        // the same text the grid renders, sorts by, and exports.
+        return `WHEN kv.key = '${id}' THEN CASE WHEN jsonb_typeof(o.data->'${id}') = 'array' THEN (SELECT string_agg(${elem}, ', ' ORDER BY e.ord) FROM jsonb_array_elements_text(o.data->'${id}') WITH ORDINALITY AS e(v, ord)) ELSE ${single} END`
+      }
+      return `WHEN kv.key = '${id}' THEN ${single}`
+    })
+    .join(' ')
+  return `CASE ${whens} ELSE NULL END`
+}
 
 /**
  * Case-insensitive substring search across every cell of a table's rows. Each
@@ -806,6 +1011,12 @@ export async function findRowMatches(
 
   const orderBySql = buildRowOrderBySql(options.sort, tableName, columns)
   const pattern = `%${escapeLikePattern(options.q)}%`
+  // Select cells store option ids; also match the resolved option name so a search
+  // for the visible label finds the cell (the raw-id match below is kept too).
+  const selectNameExpr = buildSelectFindNameExpr(columns)
+  const nameMatchClause = selectNameExpr
+    ? sql` OR (${sql.raw(selectNameExpr)}) ILIKE ${pattern}`
+    : sql``
 
   const result = await db.transaction(async (trx) => {
     // Planner flags, not correctness: `enable_* = off` only penalizes a plan shape, so a
@@ -834,16 +1045,16 @@ export async function findRowMatches(
       SELECT o.ordinal, o.id, kv.key AS column_name
       FROM ordered o
       CROSS JOIN LATERAL jsonb_each_text(o.data) kv
-      WHERE kv.value ILIKE ${pattern}
+      WHERE (kv.value ILIKE ${pattern}${nameMatchClause})
         AND ${inArray(sql`kv.key`, columnIds)}
       ORDER BY o.ordinal
-      LIMIT ${FIND_MATCH_LIMIT + 1}
+      LIMIT ${TABLE_LIMITS.MAX_FIND_MATCHES + 1}
     `)
   })
 
   const all = Array.from(result)
-  const truncated = all.length > FIND_MATCH_LIMIT
-  const sliced = truncated ? all.slice(0, FIND_MATCH_LIMIT) : all
+  const truncated = all.length > TABLE_LIMITS.MAX_FIND_MATCHES
+  const sliced = truncated ? all.slice(0, TABLE_LIMITS.MAX_FIND_MATCHES) : all
   const matches: FindRowMatch[] = sliced.map((r) => ({
     ordinal: Number(r.ordinal),
     rowId: r.id,
@@ -873,58 +1084,6 @@ export async function findRowMatches(
  * @param requestId - Request ID for logging
  * @returns Query result with rows and pagination info
  */
-/**
- * Visibility mask for a running delete job: returns a clause keeping only rows the job will NOT
- * delete, or `undefined` when no delete job is running. The job's persisted scope
- * ({@link TableDeleteJobPayload}) defines the doomed set — `matches(filter) AND created_at <=
- * cutoff AND id NOT IN excludeRowIds` — exactly what the worker's `selectRowIdPage` selects, so
- * mid-job reads (refresh, other clients, exports) are consistent with the eventual result. The
- * mask lifts automatically when the job leaves `running` (done, failed, or canceled).
- *
- * `(doomed) IS NOT TRUE` rather than `NOT (doomed)`: JSONB predicates evaluate to NULL on missing
- * cells, and those rows are NOT selected for deletion (NULL ≠ TRUE) — they must stay visible.
- */
-export async function pendingDeleteMask(table: TableDefinition): Promise<SQL | undefined> {
-  const [job] = await db
-    .select({ payload: tableJobs.payload })
-    .from(tableJobs)
-    .where(
-      and(
-        eq(tableJobs.tableId, table.id),
-        eq(tableJobs.status, 'running'),
-        eq(tableJobs.type, 'delete')
-      )
-    )
-    .limit(1)
-  if (!job?.payload) return undefined
-  const scope = job.payload as TableDeleteJobPayload
-
-  // A bounded delete (explicit limit) deletes only the first `maxRows` matches, so the filter-based
-  // mask — which hides every match — would over-hide the rows beyond the cap this job never touches.
-  // Leave those reads unmasked; the bounded delete is eventually consistent like a bounded update.
-  if (scope.maxRows !== undefined) return undefined
-
-  const doomedParts: SQL[] = []
-  if (scope.filter && Object.keys(scope.filter).length > 0) {
-    try {
-      const clause = buildFilterClause(scope.filter, USER_TABLE_ROWS_SQL_NAME, table.schema.columns)
-      if (clause) doomedParts.push(clause)
-    } catch (error) {
-      // Schema drifted mid-job (column renamed/deleted). Showing doomed rows briefly beats
-      // failing every read; the worker resolves the same way on its next page.
-      logger.warn(`Skipping delete-job mask for table ${table.id}: stale filter`, {
-        error: toError(error).message,
-      })
-      return undefined
-    }
-  }
-  if (scope.cutoff) doomedParts.push(lte(userTableRows.createdAt, new Date(scope.cutoff)))
-  if (scope.excludeRowIds && scope.excludeRowIds.length > 0) {
-    doomedParts.push(notInArray(userTableRows.id, scope.excludeRowIds))
-  }
-  if (doomedParts.length === 0) return undefined
-  return sql`(${and(...doomedParts)}) IS NOT TRUE`
-}
 
 /**
  * `COUNT(*)` for a filtered view, kept inside the tenant's rows: measured
@@ -945,12 +1104,17 @@ export async function queryRows(
 ): Promise<QueryResult> {
   const {
     filter,
+    predicate,
     sort,
-    limit = TABLE_LIMITS.DEFAULT_QUERY_LIMIT,
+    // No default: an undefined limit returns every matching row, bounded only by
+    // the MAX_QUERY_RESULT_BYTES fail-fast guard below.
+    limit,
     offset = 0,
     after,
     includeTotal = true,
     withExecutions = true,
+    runStateBudgetBytes,
+    columnIds,
   } = options
 
   const tableName = USER_TABLE_ROWS_SQL_NAME
@@ -966,104 +1130,350 @@ export async function queryRows(
     deleteMask
   )
 
+  // v2 predicate takes precedence over the legacy `$`-filter; both compile to a
+  // WHERE through the same `fieldPredicate` leaf.
+  const userClause = predicate
+    ? buildPredicateClause(predicate, tableName, columns)
+    : filter && Object.keys(filter).length > 0
+      ? buildFilterClause(filter, tableName, columns)
+      : undefined
+
   let whereClause = baseConditions
-  if (filter && Object.keys(filter).length > 0) {
-    const filterClause = buildFilterClause(filter, tableName, columns)
-    if (filterClause) {
-      whereClause = and(baseConditions, filterClause)
-    }
+  if (userClause) {
+    whereClause = and(baseConditions, userClause)
   }
 
-  // Keyset page: seek past the cursor on the default `(order_key, id)` order instead of paying
-  // OFFSET's scan-and-discard of every prior row (O(N²) across a deep scroll / full drain). Only
-  // valid without a custom sort — the contract rejects `after` + `sort` together. The count below
-  // deliberately excludes the cursor: totals cover the whole view, not the remaining pages.
-  const pageWhere =
-    after && !sort
-      ? and(
-          whereClause,
-          sql`(${userTableRows.orderKey}, ${userTableRows.id}) > (${after.orderKey}, ${after.id})`
-        )
-      : whereClause
+  // Keyset seeks are only authoritative when the page order IS the
+  // `(order_key, id)` index order: no custom sort. Order keys are NOT guaranteed
+  // present — unkeyed rows sort last and the seek admits them explicitly.
+  const keysetValid = !sort
 
-  const buildPageQuery = (executor: DbExecutor) => {
-    const query = executor
-      .select()
-      .from(userTableRows)
-      .where(pageWhere ?? baseConditions)
-      .orderBy(buildRowOrderBySql(sort, tableName, columns))
-    return after ? query.limit(limit) : query.limit(limit).offset(offset)
-  }
-
-  // Count and page fetch are independent reads — run them concurrently so the
+  // Count and page drain are independent reads — run them concurrently so the
   // `includeTotal` hot path doesn't pay two serial round-trips. Filtered counts
   // go through the tenant-bounded variant (see countRowsTenantBounded); the
   // unfiltered count already plans an index-only scan on the table_id prefix.
-  // Custom column sorts order by `data->>'col'` — unestimatable, so left alone
-  // the planner seq-scans and sorts the whole shared relation on every page
-  // (9.7s measured on a 1M-row table; 0.76s tenant-bounded). Default-order
-  // pages already stream the `(table_id, order_key, id)` index.
-  const hasFilter = Boolean(filter && Object.keys(filter).length > 0)
-  const rowsPromise = sort ? withSeqscanOff(async (trx) => buildPageQuery(trx)) : buildPageQuery(db)
+  // The count uses the full-view WHERE (no cursor seek): totals cover the whole
+  // view, not the remaining pages.
+  /**
+   * The delete mask counts as a filter: it injects JSONB predicates into `baseConditions`, which
+   * is exactly the plan shape `countRowsTenantBounded` exists to keep off a seq scan of the shared
+   * relation. Reading only `userClause` sent a masked-but-unfiltered count down the plain branch,
+   * bounded only by the statement timeout.
+   */
+  const hasFilter = Boolean(userClause || deleteMask)
   const countPromise = includeTotal
     ? hasFilter
       ? countRowsTenantBounded(whereClause)
-      : db
-          .select({ count: count() })
-          .from(userTableRows)
-          .where(whereClause ?? baseConditions)
-          .then((r) => Number(r[0].count))
+      : // Unfiltered count plans an index-only scan on the table_id prefix, but
+        // still runs under the read timeout so it can't pin a connection.
+        withReadGuards(async (trx) => {
+          const [r] = await trx
+            .select({ count: count() })
+            .from(userTableRows)
+            .where(whereClause ?? baseConditions)
+          return Number(r.count)
+        })
     : null
 
-  const [fetchedRows, totalCount] = await Promise.all([rowsPromise, countPromise])
+  // The inbound seek is honored whenever there's no custom sort; `keysetValid`
+  // only gates re-anchoring and plain-keyset cursor emission.
+  const drainPromise = fetchRowsBounded({
+    baseWhere: whereClause ?? baseConditions,
+    orderBy: buildRowOrderBySql(sort, tableName, columns),
+    sorted: Boolean(sort),
+    keysetValid,
+    seek: !sort ? after : undefined,
+    startOffset: offset,
+    limit,
+    budgetBytes: TABLE_LIMITS.MAX_QUERY_RESULT_BYTES,
+    pageCutBytes: getMaxPageBytes(),
+    columnIds,
+  })
 
-  // Dev-preview byte cut (TABLE_MAX_PAGE_BYTES, off by default): clients terminate on
-  // empty page / totalCount, never page fullness, so a short page is safe to return.
-  const maxPageBytes = getMaxPageBytes()
-  const rows = maxPageBytes === null ? fetchedRows : trimRowsToByteBudget(fetchedRows, maxPageBytes)
+  const [fetched, totalCount] = await Promise.all([drainPromise, countPromise])
+  const rows = fetched.rows
 
+  /**
+   * The budget is opt-in, not a property of reading run state.
+   *
+   * It exists for the public row reads, which publish a `413` and a documented
+   * ceiling. The first-party grid reads run state too, at five times the row
+   * limit, and has no such contract: applying the budget there turns a large
+   * page into a hard failure — with an error naming a parameter the internal
+   * route does not expose — where it previously rendered. Callers that publish
+   * the ceiling pass it; callers that do not keep the unbounded read they had.
+   */
   const executionsByRow = withExecutions
     ? await loadExecutionsByRow(
         db,
-        rows.map((r) => r.id)
+        rows.map((r) => r.id),
+        runStateBudgetBytes === undefined ? undefined : { budgetBytes: runStateBudgetBytes }
       )
     : null
 
   logger.info(
-    `[${requestId}] Queried ${rows.length} rows from table ${table.id} (total: ${totalCount})`
+    `[${requestId}] Queried ${rows.length} rows from table ${table.id} (total: ${totalCount}, bytes: ${fetched.bytes}, more: ${fetched.hasMore})`
   )
 
+  const mappedRows = rows.map((r) => ({
+    id: r.id,
+    data: r.data as RowData,
+    executions: executionsByRow?.get(r.id) ?? {},
+    position: r.position,
+    orderKey: r.orderKey ?? undefined,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  }))
+
+  // Opaque next-page cursor: non-null whenever more matching rows exist beyond
+  // this page — whether the page was cut by `limit` or by the byte budget. The
+  // drain loop proves `hasMore` with a fetched-but-unreturned witness row.
+  const lastRow = mappedRows[mappedRows.length - 1]
+  const nextCursor =
+    fetched.hasMore && lastRow
+      ? encodeCursor({
+          lastRow,
+          keysetValid,
+          nextOffset: offset + mappedRows.length,
+          seekBase: fetched.anchor
+            ? { anchor: fetched.anchor, offsetFromAnchor: fetched.anchorOffset }
+            : undefined,
+          sort,
+          predicate,
+          filter,
+        })
+      : null
+
   return {
-    rows: rows.map((r) => ({
-      id: r.id,
-      data: r.data as RowData,
-      executions: executionsByRow?.get(r.id) ?? {},
-      position: r.position,
-      orderKey: r.orderKey ?? undefined,
-      createdAt: r.createdAt,
-      updatedAt: r.updatedAt,
-    })),
+    rows: mappedRows,
     rowCount: rows.length,
     totalCount,
-    limit,
+    limit: limit ?? mappedRows.length,
     offset,
+    nextCursor,
   }
 }
 
+export interface BoundedFetchParams {
+  /** Tenant + delete-mask + user filter — WITHOUT any seek predicate. */
+  baseWhere: SQL | undefined
+  orderBy: SQL
+  /** Custom sort present → per-batch withSeqscanOff (JSONB order is unestimatable). */
+  sorted: boolean
+  /** `(order_key, id)` order is authoritative → keyset re-anchoring + seeks. */
+  keysetValid: boolean
+  /** Inbound seek anchor (decoded keyset/compound cursor), if any. */
+  seek?: TableRowsCursor
+  /** Inbound offset — the whole-view offset, or the past-anchor offset of a compound cursor. */
+  startOffset: number
+  limit?: number
+  /** Drain ceiling: sizes batches, and the fail-fast bound for an unbounded query. */
+  budgetBytes: number
+  /** Byte cut for a **bounded** page; defaults to 5MB and is environment-overridable. */
+  pageCutBytes: number
+  /** Stable column ids to keep in `data`; projected before a row is measured. */
+  columnIds?: ReadonlySet<string>
+}
+
+export interface BoundedFetchResult {
+  rows: Array<typeof userTableRows.$inferSelect>
+  bytes: number
+  /** Proven by a fetched-but-unreturned witness row — never inferred from page fullness. */
+  hasMore: boolean
+  /** Final keyset anchor, for compound-cursor emission when the last row is unkeyed. */
+  anchor?: TableRowsCursor
+  /** Rows consumed past `anchor` (0 when the anchor is the last returned row). */
+  anchorOffset: number
+}
+
+/** Keeps only `columnIds` in a stored row's data (a column a row never wrote stays absent). */
+function projectRowData(data: RowData, columnIds: ReadonlySet<string>): RowData {
+  const projected: RowData = {}
+  for (const columnId of columnIds) {
+    if (Object.hasOwn(data, columnId)) projected[columnId] = data[columnId]
+  }
+  return projected
+}
+
 /**
- * Gets a single row by ID.
+ * Drains rows in adaptively-sized bounded batches until the caller's `limit`
+ * or the byte ceiling ends the page. Never issues an unbounded SELECT: the
+ * first batch is capped so its worst-case bytes stay within ~4× the budget at
+ * the max row size, and later batches are sized from the observed average.
  *
- * @param tableId - Table ID
- * @param rowId - Row ID to fetch
- * @param workspaceId - Workspace ID for access control
- * @returns Row or null if not found
+ * Byte ceiling: an **unbounded** query (no `limit`) always fails fast at
+ * `budgetBytes` — returning part of a result that promised everything would be
+ * silent truncation. A **bounded** page cuts short at `pageCutBytes` and returns
+ * a cursor, so clients must terminate on `nextCursor === null` rather than on
+ * page fullness.
+ *
+ * Advance strategy: when `keysetValid`, the loop re-anchors on each consumed
+ * keyed row and seeks `(order_key, id) > (anchor)` — delete-tolerant and an
+ * index seek. Otherwise (custom sort, flag off) it advances by OFFSET from the
+ * inbound position; rows deleted mid-drain can skip/duplicate exactly as
+ * cross-request offset paging already does.
+ *
+ * Always returns at least one row when any match exists, even if that row
+ * alone exceeds the budget.
  */
-export async function getRowById(
-  tableId: string,
-  rowId: string,
-  workspaceId: string
-): Promise<TableRow | null> {
-  const results = await db
+export async function fetchRowsBounded(params: BoundedFetchParams): Promise<BoundedFetchResult> {
+  const { baseWhere, orderBy, sorted, keysetValid, limit, budgetBytes, pageCutBytes, columnIds } =
+    params
+
+  const firstBatchCap = Math.max(1, Math.floor((4 * budgetBytes) / TABLE_LIMITS.MAX_ROW_SIZE_BYTES))
+
+  // The byte ceiling that ends the drain: an unbounded query fails fast at the
+  // budget; a bounded page cuts at the configured page budget.
+  const cutBytes = limit === undefined ? budgetBytes : pageCutBytes
+
+  const rows: Array<typeof userTableRows.$inferSelect> = []
+  let bytes = 0
+  let maxRowBytes = 0
+  // What each consumed row cost to FETCH, as stored. With a projection the
+  // response bytes above can be tiny while the SELECT still returns whole rows,
+  // so batch sizing must be bounded by this, not by the projected average.
+  let storedBytes = 0
+  let maxStoredRowBytes = 0
+  let hasMore = false
+  let anchor = params.seek
+  let anchorOffset = params.startOffset
+  let consumedSinceAnchor = 0
+
+  const nextBatchRows = (): number => {
+    if (rows.length === 0) return Math.min(limit ?? firstBatchCap, firstBatchCap)
+    const avg = Math.max(1, bytes / rows.length)
+    // Bytes we may still fetch this batch. When a cut is active it's the
+    // remainder of that cut; otherwise each batch gets a fresh budget's worth,
+    // so a large bounded page keeps draining in real steps instead of degrading
+    // to one row per query once cumulative bytes pass the budget.
+    const remaining = Math.max(1, cutBytes === undefined ? budgetBytes : cutBytes - bytes)
+    const byAverage = Math.ceil(remaining / avg) + 1
+    const varianceCap = Math.ceil((8 * remaining) / Math.max(maxRowBytes, 1))
+    // A batch may hold about one budget's worth of rows AS STORED, whatever the
+    // projection keeps — without this a narrow selection over wide rows would
+    // size the next batch from a few projected bytes and ask for thousands of
+    // full rows. Unprojected, stored and projected bytes agree, so this is the
+    // budget-sized batch the drain already takes.
+    const fetchCap = Math.ceil(budgetBytes / Math.max(1, storedBytes / rows.length))
+    // The stored-size counterpart of varianceCap: once a wide row has been seen,
+    // assume the next batch could be all that wide, so a run of small rows
+    // cannot talk the average into an oversized SELECT.
+    const storedVarianceCap = Math.ceil((8 * budgetBytes) / Math.max(maxStoredRowBytes, 1))
+    return Math.max(
+      1,
+      Math.min(
+        byAverage,
+        TABLE_LIMITS.QUERY_BATCH_MAX_ROWS,
+        varianceCap,
+        fetchCap,
+        storedVarianceCap
+      )
+    )
+  }
+
+  const runBatch = (batchSeek: TableRowsCursor | undefined, batchOffset: number, ask: number) => {
+    const buildQuery = (executor: DbExecutor) => {
+      // `order_key` is nullable (rows predating the backfill, and forked rows that
+      // inherit a NULL key). A bare row-constructor comparison evaluates to NULL for
+      // those rows, so they are dropped by WHERE — and because NULLs sort LAST under
+      // `ORDER BY order_key, id`, the entire unkeyed tail becomes unreachable and the
+      // drain terminates early reporting `hasMore: false`. Admitting NULLs keeps the
+      // seek set exactly "the tail after the anchor", which is also what the compound
+      // `{k,i,o}` cursor's `offsetFromAnchor` accounting assumes.
+      const seekWhere = batchSeek
+        ? and(
+            baseWhere,
+            sql`(${userTableRows.orderKey} IS NULL OR (${userTableRows.orderKey}, ${userTableRows.id}) > (${batchSeek.orderKey}, ${batchSeek.id}))`
+          )
+        : baseWhere
+      const query = executor
+        .select()
+        .from(userTableRows)
+        .where(seekWhere)
+        .orderBy(orderBy)
+        .limit(ask)
+      return batchOffset > 0 ? query.offset(batchOffset) : query
+    }
+    // One tx per batch (SET LOCAL dies with it; holding a tx across JS
+    // accounting between batches would pin a pooled connection). Custom sorts
+    // order by `data->>'col'` — unestimatable — so they also penalize seq scans
+    // (9.7s→0.76s on a 1M-row table); default-order pages stream the index and
+    // just need the read timeout. Either way the batch runs under a statement
+    // timeout so a pathological filter can't scan unbounded.
+    return withReadGuards(async (trx) => buildQuery(trx), { seqscanOff: sorted })
+  }
+
+  while (true) {
+    const limitRemaining = limit === undefined ? Number.POSITIVE_INFINITY : limit - rows.length
+    const target = Math.min(nextBatchRows(), limitRemaining)
+    const ask = target + 1 // +1 = witness row proving more data exists past a cut
+    const batch = await runBatch(anchor, anchorOffset + consumedSinceAnchor, ask)
+    if (batch.length === 0) break
+
+    let cut = false
+    for (const fetchedRow of batch) {
+      // Project before measuring: the budget is a promise about the response,
+      // so columns the caller will never receive must not count against it.
+      const row = columnIds
+        ? { ...fetchedRow, data: projectRowData(fetchedRow.data as RowData, columnIds) }
+        : fetchedRow
+      const rowBytes = Buffer.byteLength(JSON.stringify(row.data))
+      const rowStoredBytes = columnIds
+        ? Buffer.byteLength(JSON.stringify(fetchedRow.data))
+        : rowBytes
+      if (cutBytes !== undefined && rows.length > 0 && bytes + rowBytes > cutBytes) {
+        // Unbounded queries promise the ENTIRE result — a partial page would be
+        // silent truncation, so fail fast instead (the drain has only fetched
+        // ~budget bytes at this point, never the whole table).
+        if (limit === undefined) {
+          throw new TableQueryValidationError(
+            `Query result exceeds the ${Math.floor(cutBytes / (1024 * 1024))}MB limit. Add a filter or a limit to narrow the result.`,
+            'TABLE_QUERY_RESULT_TOO_LARGE'
+          )
+        }
+        // Bounded page, byte cut opted in: `row` is the witness. Requires a
+        // non-empty page so a single over-budget row is still returned alone.
+        hasMore = true
+        cut = true
+        break
+      }
+      // Limit cut: `row` is the +1 peek witness.
+      if (rows.length === limit) {
+        hasMore = true
+        cut = true
+        break
+      }
+      rows.push(row)
+      bytes += rowBytes
+      storedBytes += rowStoredBytes
+      consumedSinceAnchor++
+      if (rowBytes > maxRowBytes) maxRowBytes = rowBytes
+      if (rowStoredBytes > maxStoredRowBytes) maxStoredRowBytes = rowStoredBytes
+      if (keysetValid && row.orderKey) {
+        anchor = { orderKey: row.orderKey, id: row.id }
+        anchorOffset = 0
+        consumedSinceAnchor = 0
+      }
+    }
+    if (cut) break
+    // Short batch = the source is exhausted; hasMore stays false.
+    if (batch.length < ask) break
+  }
+
+  return {
+    rows,
+    bytes,
+    hasMore,
+    anchor,
+    anchorOffset: anchorOffset + consumedSinceAnchor,
+  }
+}
+
+/** The stored row without its executions sidecar. */
+export type TableRowSummary = Omit<TableRow, 'executions'>
+
+function selectRowRecord(tableId: string, rowId: string, workspaceId: string) {
+  return db
     .select()
     .from(userTableRows)
     .where(
@@ -1074,20 +1484,119 @@ export async function getRowById(
       )
     )
     .limit(1)
+}
 
-  if (results.length === 0) return null
-
-  const row = results[0]
-  const executions = await loadExecutionsForRow(db, row.id)
+function toRowSummary(row: Awaited<ReturnType<typeof selectRowRecord>>[number]): TableRowSummary {
   return {
     id: row.id,
     data: row.data as RowData,
-    executions,
     position: row.position,
     orderKey: row.orderKey ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   }
+}
+
+/**
+ * One row without its executions sidecar, for the single-row read routes, which
+ * project `id`/`data`/`position`/`createdAt`/`updatedAt` and never put executions
+ * on the wire. Loading the sidecar for them is a query whose result is discarded.
+ *
+ * Not every `readTableRow` caller is such a surface: the Copilot `get_row` tool
+ * spreads the row straight onto its result, so it used to hand the model an
+ * executions map and no longer does. That narrowing is deliberate — the generated
+ * tool contract never described the field, and the bulk `query_rows` path has
+ * always returned an empty one — but it is a wire change, not a pure saving.
+ *
+ * Deliberately a separate function rather than a flag on {@link getRowById}: a
+ * caller that forgets to pass the flag reads an empty sidecar and cannot tell
+ * that from a row with no executions, whereas here the field simply is not on
+ * the type.
+ */
+export async function getRowSummaryById(
+  tableId: string,
+  rowId: string,
+  workspaceId: string
+): Promise<TableRowSummary | null> {
+  const [row] = await selectRowRecord(tableId, rowId, workspaceId)
+  return row ? toRowSummary(row) : null
+}
+
+/** One row with its executions sidecar, for the write and background paths. */
+export async function getRowById(
+  tableId: string,
+  rowId: string,
+  workspaceId: string
+): Promise<TableRow | null> {
+  // The executions sidecar is keyed on the row id the caller already gave us, so
+  // it does not depend on the row lookup — issuing both together makes this one
+  // round trip instead of two. A miss pays one redundant sidecar read, which is
+  // the rare path and costs no extra wall time.
+  const [results, executions] = await Promise.all([
+    selectRowRecord(tableId, rowId, workspaceId),
+    loadExecutionsForRow(db, rowId),
+  ])
+
+  if (results.length === 0) return null
+
+  return { ...toRowSummary(results[0]), executions }
+}
+
+/**
+ * Verifies an explicit row selection against the canonical table/workspace in
+ * bounded database chunks without materializing the complete row set.
+ */
+export async function requireTableRowIds(
+  tableId: string,
+  workspaceId: string,
+  rowIds: string[]
+): Promise<void> {
+  for (let index = 0; index < rowIds.length; index += TABLE_LIMITS.DELETE_BATCH_SIZE) {
+    const chunk = rowIds.slice(index, index + TABLE_LIMITS.DELETE_BATCH_SIZE)
+    const [result] = await db
+      .select({ count: count() })
+      .from(userTableRows)
+      .where(
+        and(
+          eq(userTableRows.tableId, tableId),
+          eq(userTableRows.workspaceId, workspaceId),
+          inArray(userTableRows.id, chunk)
+        )
+      )
+    if (!result || Number(result.count) !== chunk.length) {
+      throw new OrchestrationError('not_found', 'Row not found')
+    }
+  }
+}
+
+/**
+ * Fetches the `data` payloads for a set of rows by id, scoped to a table and
+ * workspace. Returns lightweight `{ id, data }` records (no executions) in the
+ * order the ids were requested, silently skipping ids that don't resolve. Used
+ * to materialize a `table_selection` chat context server-side so the agent gets
+ * fresh, authoritative cell values instead of trusting client-sent copies.
+ */
+export async function getRowsByIds(
+  tableId: string,
+  rowIds: string[],
+  workspaceId: string
+): Promise<Array<{ id: string; data: RowData }>> {
+  const uniqueIds = Array.from(new Set(rowIds))
+  if (uniqueIds.length === 0) return []
+
+  const results = await db
+    .select({ id: userTableRows.id, data: userTableRows.data })
+    .from(userTableRows)
+    .where(
+      and(
+        inArray(userTableRows.id, uniqueIds),
+        eq(userTableRows.tableId, tableId),
+        eq(userTableRows.workspaceId, workspaceId)
+      )
+    )
+
+  const byId = new Map(results.map((r) => [r.id, r.data as RowData]))
+  return uniqueIds.filter((id) => byId.has(id)).map((id) => ({ id, data: byId.get(id) as RowData }))
 }
 
 /** Internal: thrown inside `db.transaction` to roll back when the executions
@@ -1108,12 +1617,29 @@ class GuardRejected extends Error {
  * @returns Updated row
  * @throws Error if row not found or validation fails
  */
-export interface UpdateRowOptions {
+export interface UpdateRowOptions extends RowWriteOptions {
   /**
-   * `patch` sends only changed keys to Postgres via JSONB concatenation while
-   * retaining the same merged-row validation and returned shape.
+   * Marks the write as the workflow/enrichment engine filling its own output
+   * cells, which exempts it from the update lock. Set by `cell-write.ts` only —
+   * see {@link assertRowUpdate}.
    */
-  dataWriteMode?: 'replace' | 'patch'
+  computedWrite?: boolean
+}
+
+/**
+ * A row stores every cell in one jsonb `data` column, so a row update writes the changed cells as
+ * an in-DB JSONB merge (`data = data || {changed}::jsonb`) rather than replacing the whole object.
+ * Postgres evaluates the concat against the current committed row under its write lock, so
+ * concurrent edits to DIFFERENT cells of the same row both survive instead of the last writer
+ * clobbering the row from a stale read. Values come from the caller's already-coerced merged row;
+ * only the changed keys are sent, so an empty change set is a no-op on `data`. Whole-row
+ * replacement is `upsertRow`'s job, not this path (an update only ever adds/overwrites cells —
+ * it never deletes a key — so a full-object write would only differ by being racy).
+ */
+function jsonbMergePatch(changedColumnIds: string[], coercedRow: RowData): SQL {
+  const patch: RowData = {}
+  for (const columnId of changedColumnIds) patch[columnId] = coercedRow[columnId]
+  return sql`${userTableRows.data} || ${JSON.stringify(patch)}::jsonb`
 }
 
 export async function updateRow(
@@ -1122,10 +1648,15 @@ export async function updateRow(
   requestId: string,
   options: UpdateRowOptions = {}
 ): Promise<TableRow | null> {
+  assertRowUpdate(table, patchColumnIds(data.data), { computedWrite: options.computedWrite })
+
   // Get existing row
   const existingRow = await getRowById(data.tableId, data.rowId, data.workspaceId)
   if (!existingRow) {
-    throw new Error('Row not found')
+    throw new TableRowNotFoundError()
+  }
+  if (Object.keys(data.data).length === 0 && data.executionsPatch === undefined) {
+    return existingRow
   }
 
   // Merge partial update with existing row data so callers can pass only changed fields
@@ -1149,38 +1680,59 @@ export async function updateRow(
   // Validate size
   const sizeValidation = validateRowSize(mergedData)
   if (!sizeValidation.valid) {
-    throw new Error(sizeValidation.errors.join(', '))
+    throw new OrchestrationError('validation', sizeValidation.errors.join(', '))
   }
 
   // Validate against schema
-  const schemaValidation = coerceRowToSchema(mergedData, table.schema)
+  const schemaValidation = coerceRowToSchema(
+    mergedData,
+    table.schema,
+    options.uncoercibleValues,
+    Object.keys(data.data)
+  )
   if (!schemaValidation.valid) {
-    throw new Error(`Schema validation failed: ${schemaValidation.errors.join(', ')}`)
+    throw new OrchestrationError(
+      'validation',
+      `Schema validation failed: ${schemaValidation.errors.join(', ')}`
+    )
   }
 
-  // Check unique constraints using optimized database query
-  const uniqueColumns = getUniqueColumns(table.schema)
-  if (uniqueColumns.length > 0) {
+  // Scoped to the columns this patch actually writes. A merge cannot newly
+  // violate uniqueness on a column it leaves alone: that value is the one
+  // already stored, and it satisfied the constraint when it was written. The
+  // probe opens its own transaction and queries once per unique column, so on a
+  // table that has any unique column this was several round trips on every
+  // edit, including edits nowhere near one.
+  //
+  // What this does not cover is a duplicate that already exists — either from a
+  // constraint added to a column that already held one, or from two concurrent
+  // inserts both passing this probe, since uniqueness here is advisory (a
+  // SELECT, not a DB constraint). Such a row is no longer blocked from edits
+  // elsewhere in it. That is the intended outcome: an unrelated cell edit
+  // should not fail on data it did not write, and blocking it was never a
+  // repair mechanism.
+  const patchedColumnIds = new Set(Object.keys(data.data))
+  const patchedUniqueColumns = getUniqueColumns(table.schema).filter((column) =>
+    patchedColumnIds.has(getColumnId(column))
+  )
+  if (patchedUniqueColumns.length > 0) {
     const uniqueValidation = await checkUniqueConstraintsDb(
       data.tableId,
       mergedData,
-      table.schema,
+      // Narrowed to the patched unique columns, not just used as a gate: the
+      // probe issues one SELECT per unique column it is given, so a table with
+      // several would otherwise re-check all of them to validate a patch that
+      // touched one. `schema` is read only for its unique columns here.
+      { ...table.schema, columns: patchedUniqueColumns },
       data.rowId // Exclude current row
     )
     if (!uniqueValidation.valid) {
-      throw new Error(uniqueValidation.errors.join(', '))
+      throw new OrchestrationError('validation', uniqueValidation.errors.join(', '))
     }
   }
 
   const now = new Date()
-  const persistedDataPatch: RowData = {}
-  for (const columnId of Object.keys(data.data)) {
-    persistedDataPatch[columnId] = mergedData[columnId]
-  }
-  const persistedData =
-    options.dataWriteMode === 'patch'
-      ? sql`${userTableRows.data} || ${JSON.stringify(persistedDataPatch)}::jsonb`
-      : mergedData
+  const persistedData = jsonbMergePatch(Object.keys(data.data), mergedData)
 
   // Cell-task partial writes pass `cancellationGuard` so the upsert into
   // `tableRowExecutions` is a no-op when (a) a stop click already wrote
@@ -1190,33 +1742,49 @@ export async function updateRow(
   // commit in one transaction so a partial write can't leave the sidecar
   // and the row out of sync.
   const guard = data.cancellationGuard
-  const guardRejected = await db
-    .transaction(async (trx) => {
-      await trx
-        .update(userTableRows)
-        .set({ data: persistedData, updatedAt: now })
-        .where(eq(userTableRows.id, data.rowId))
+  let persistedUpdatedAt: Date
+  try {
+    persistedUpdatedAt = await db.transaction(async (trx) => {
+      return await mutateTableRowsWithSecretProvenance(trx, {
+        rows: [{ rowId: data.rowId, provenance: data.secretProvenance }],
+        rowState: 'existing',
+        mode: 'merge',
+        mutate: async () => {
+          const updatedRows = await trx
+            .update(userTableRows)
+            .set({ data: persistedData, updatedAt: now })
+            .where(
+              and(
+                eq(userTableRows.id, data.rowId),
+                eq(userTableRows.tableId, data.tableId),
+                eq(userTableRows.workspaceId, data.workspaceId)
+              )
+            )
+            .returning({ id: userTableRows.id, updatedAt: userTableRows.updatedAt })
+          const [updatedRow] = updatedRows
+          if (!updatedRow) throw new TableRowNotFoundError()
 
-      const result = await writeExecutionsPatch(
-        trx,
-        data.tableId,
-        data.rowId,
-        effectiveExecutionsPatch,
-        guard
-      )
-      if (result === 'guard-rejected') {
-        // Roll back the data update too — the worker isn't authoritative.
-        throw new GuardRejected()
-      }
-      return false
+          const result = await writeExecutionsPatch(
+            trx,
+            data.tableId,
+            data.rowId,
+            effectiveExecutionsPatch,
+            guard
+          )
+          if (result === 'guard-rejected') {
+            // Roll back the data update too — the worker isn't authoritative.
+            throw new GuardRejected()
+          }
+          return {
+            value: updatedRow.updatedAt,
+            affectedRowIds: [updatedRow.id],
+          }
+        },
+      })
     })
-    .catch((err) => {
-      if (err instanceof GuardRejected) return true
-      throw err
-    })
-
-  if (guardRejected) {
-    return null
+  } catch (err) {
+    if (err instanceof GuardRejected) return null
+    throw err
   }
 
   logger.info(`[${requestId}] Updated row ${data.rowId} in table ${data.tableId}`)
@@ -1227,7 +1795,7 @@ export async function updateRow(
     executions: mergedExecutions,
     position: existingRow.position,
     createdAt: existingRow.createdAt,
-    updatedAt: now,
+    updatedAt: persistedUpdatedAt,
   }
 
   const oldRows = new Map([[data.rowId, existingRow.data as RowData]])
@@ -1304,129 +1872,188 @@ export async function updateRow(
  * @throws Error if row not found
  */
 export async function deleteRow(
-  tableId: string,
+  table: TableDefinition,
   rowId: string,
-  workspaceId: string,
   requestId: string
 ): Promise<void> {
-  const deleted = await deleteOrderedRow({ tableId, rowId, workspaceId })
-  if (!deleted) throw new Error('Row not found')
+  const proof = assertRowDelete(table)
+  const deleted = await deleteOrderedRow({
+    tableId: table.id,
+    rowId,
+    workspaceId: table.workspaceId,
+    proof,
+  })
+  if (!deleted) throw new OrchestrationError('not_found', 'Row not found')
 
-  logger.info(`[${requestId}] Deleted row ${rowId} from table ${tableId}`)
+  logger.info(`[${requestId}] Deleted row ${rowId} from table ${table.id}`)
+}
+
+type BulkUpdateMatch = { id: string; data: RowData }
+
+function bulkUpdateValidationError(
+  table: TableDefinition,
+  row: BulkUpdateMatch,
+  patch: RowData,
+  policy: UncoercibleValuePolicy | undefined
+): string | null {
+  const mergedData = { ...row.data, ...patch }
+  const sizeValidation = validateRowSize(mergedData)
+  if (!sizeValidation.valid) return sizeValidation.errors.join(', ')
+
+  const schemaValidation = coerceRowToSchema(mergedData, table.schema, policy, Object.keys(patch))
+  return schemaValidation.valid ? null : schemaValidation.errors.join(', ')
 }
 
 /**
- * Updates multiple rows matching a filter.
+ * Validates the patch on its own, before any row is scanned, so a value the
+ * column type cannot store is answered the same way whether the filter matches
+ * rows or none. {@link validateBulkUpdateMatches} only runs once a page comes
+ * back, which left a zero-match filter reporting success for a value the write
+ * would never have accepted.
  *
- * @param table - Table definition (provides column schema for type-aware filter casts)
- * @param data - Bulk update data
- * @param requestId - Request ID for logging
- * @returns Bulk operation result
+ * Restricted to the columns the caller actually supplied a non-null value for:
+ * absent columns must not raise a missing-required error on a partial patch,
+ * and a patched null is left to the merged-row check that already polices it.
+ * Pre-existing stored values are not in scope here at all, so the patched-keys
+ * narrowing the merged check relies on is untouched.
  */
-export async function updateRowsByFilter(
+function validateBulkUpdatePatch(
   table: TableDefinition,
-  data: BulkUpdateData,
-  requestId: string
-): Promise<BulkOperationResult> {
-  const tableName = USER_TABLE_ROWS_SQL_NAME
+  patch: RowData,
+  policy: UncoercibleValuePolicy | undefined
+): void {
+  const suppliedColumns = table.schema.columns.filter((column) => {
+    const value = patch[getColumnId(column)]
+    return value !== null && value !== undefined
+  })
+  if (suppliedColumns.length === 0) return
 
-  const filterClause = buildFilterClause(data.filter, tableName, table.schema.columns)
-  if (!filterClause) {
-    throw new Error('Filter is required for bulk update')
-  }
-
-  const baseConditions = and(
-    eq(userTableRows.tableId, table.id),
-    eq(userTableRows.workspaceId, table.workspaceId)
+  const validation = coerceRowToSchema(
+    { ...patch },
+    { ...table.schema, columns: suppliedColumns },
+    policy
   )
-
-  // Tenant-bounded: the jsonb filter is unestimatable and otherwise sends the planner to a
-  // whole-shared-relation seq scan (14.4s measured on a 1M-row table).
-  const matchingRows = await withSeqscanOff(async (trx) => {
-    let query = trx
-      .select({ id: userTableRows.id, data: userTableRows.data })
-      .from(userTableRows)
-      .where(and(baseConditions, filterClause))
-    if (data.limit) {
-      query = query.limit(data.limit) as typeof query
-    }
-    return query
-  })
-
-  if (matchingRows.length === 0) {
-    return { affectedCount: 0, affectedRowIds: [] }
+  if (!validation.valid) {
+    throw new OrchestrationError('validation', validation.errors.join(', '))
   }
+}
 
-  // Coerce the patch itself in place — the write below persists `data.data`
-  // (as `patchJson`), so coercing only the per-row merged copies would be
-  // discarded. The merged validation in the loop still enforces required
-  // fields against the full row.
-  coerceRowValues(data.data, table.schema)
-
-  for (const row of matchingRows) {
-    const existingData = row.data as RowData
-    const mergedData = { ...existingData, ...data.data }
-
-    const sizeValidation = validateRowSize(mergedData)
-    if (!sizeValidation.valid) {
-      throw new Error(`Row ${row.id}: ${sizeValidation.errors.join(', ')}`)
-    }
-
-    const schemaValidation = coerceRowToSchema(mergedData, table.schema)
-    if (!schemaValidation.valid) {
-      throw new Error(`Row ${row.id}: ${schemaValidation.errors.join(', ')}`)
-    }
+/** Validates a bounded page of rows against a bulk merge patch. */
+function validateBulkUpdateMatches(
+  table: TableDefinition,
+  rows: BulkUpdateMatch[],
+  patch: RowData,
+  policy: UncoercibleValuePolicy | undefined
+): void {
+  for (const row of rows) {
+    const error = bulkUpdateValidationError(table, row, patch, policy)
+    if (error) throw new OrchestrationError('validation', `Row ${row.id}: ${error}`)
   }
+}
 
-  const uniqueColumns = getUniqueColumns(table.schema)
-  const uniqueColumnsInUpdate = uniqueColumns.filter((col) => col.name in data.data)
-  if (uniqueColumnsInUpdate.length > 0) {
-    if (matchingRows.length > 1) {
-      throw new Error(
-        `Cannot set unique column values when updating multiple rows. ` +
-          `Columns with unique constraint: ${uniqueColumnsInUpdate.map((c) => c.name).join(', ')}. ` +
-          `Updating ${matchingRows.length} rows with the same value would violate uniqueness.`
-      )
-    }
-
-    // Only one row — only the touched unique columns need re-checking.
-    const row = matchingRows[0]
-    const mergedData = { ...(row.data as RowData), ...data.data }
-    const uniqueValidation = await checkUniqueConstraintsDb(
-      table.id,
-      mergedData,
-      table.schema,
-      row.id
-    )
-    if (!uniqueValidation.valid) {
-      throw new Error(`Unique constraint violation: ${uniqueValidation.errors.join(', ')}`)
-    }
-  }
-
-  const now = new Date()
-  const ids = matchingRows.map((r) => r.id)
-  const patchJson = JSON.stringify(data.data)
-
-  await db.transaction(async (trx) => {
+/** Persists one bounded bulk-update page and returns the locked rows actually changed. */
+async function persistBulkUpdateBatch(params: {
+  table: TableDefinition
+  rows: BulkUpdateMatch[]
+  patch: RowData
+  patchJson: string
+  filterClause: SQL
+  now: Date
+  secretProvenance: BulkUpdateData['secretProvenance']
+  requestId: string
+  uncoercibleValues: UncoercibleValuePolicy | undefined
+}): Promise<{ rows: BulkUpdateMatch[]; affectedRowIds: string[] }> {
+  const {
+    table,
+    rows,
+    patch,
+    patchJson,
+    filterClause,
+    now,
+    secretProvenance,
+    requestId,
+    uncoercibleValues,
+  } = params
+  const ids = rows.map((row) => row.id)
+  const persistedRows: BulkUpdateMatch[] = []
+  const affectedRowIds = await db.transaction(async (trx) => {
     await setTableTxTimeouts(trx, { statementMs: 60_000 })
-    for (let i = 0; i < ids.length; i += TABLE_LIMITS.UPDATE_BATCH_SIZE) {
-      const batchIds = ids.slice(i, i + TABLE_LIMITS.UPDATE_BATCH_SIZE)
-      await trx
-        .update(userTableRows)
-        .set({
-          data: sql`${userTableRows.data} || ${patchJson}::jsonb`,
-          updatedAt: now,
-        })
-        .where(inArray(userTableRows.id, batchIds))
-    }
+    return mutateTableRowsWithSecretProvenance(trx, {
+      rows: ids.map((rowId) => ({ rowId, provenance: secretProvenance })),
+      rowState: 'existing',
+      mode: 'merge',
+      mutate: async () => {
+        const currentRows = await trx
+          .select({ id: userTableRows.id, data: userTableRows.data })
+          .from(userTableRows)
+          .where(
+            and(
+              eq(userTableRows.tableId, table.id),
+              eq(userTableRows.workspaceId, table.workspaceId),
+              inArray(userTableRows.id, ids),
+              filterClause
+            )
+          )
+          .orderBy(asc(userTableRows.id))
+        const skippedRowIds: string[] = []
+        for (const currentRow of currentRows) {
+          const row = { id: currentRow.id, data: currentRow.data as RowData }
+          if (bulkUpdateValidationError(table, row, patch, uncoercibleValues))
+            skippedRowIds.push(row.id)
+          else persistedRows.push(row)
+        }
+        if (skippedRowIds.length > 0) {
+          logger.warn(
+            `[${requestId}] Skipping rows concurrently changed to values that cannot accept the bulk patch`,
+            { tableId: table.id, rowIds: skippedRowIds }
+          )
+        }
+
+        const validIds = persistedRows.map((row) => row.id)
+        const affectedRowIds: string[] = []
+        for (let index = 0; index < validIds.length; index += TABLE_LIMITS.UPDATE_BATCH_SIZE) {
+          const batchIds = validIds.slice(index, index + TABLE_LIMITS.UPDATE_BATCH_SIZE)
+          const updated = await trx
+            .update(userTableRows)
+            .set({
+              data: sql`${userTableRows.data} || ${patchJson}::jsonb`,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(userTableRows.tableId, table.id),
+                eq(userTableRows.workspaceId, table.workspaceId),
+                inArray(userTableRows.id, batchIds)
+              )
+            )
+            .returning({ id: userTableRows.id })
+          affectedRowIds.push(...updated.map((row) => row.id))
+        }
+        return { value: affectedRowIds, affectedRowIds }
+      },
+    })
   })
+  return { rows: persistedRows, affectedRowIds }
+}
 
-  logger.info(`[${requestId}] Updated ${matchingRows.length} rows in table ${table.id}`)
+/** Emits trigger and enrichment side effects for one committed bulk-update page. */
+function dispatchBulkUpdateEffects(
+  table: TableDefinition,
+  rows: BulkUpdateMatch[],
+  affectedRowIds: string[],
+  patch: RowData,
+  now: Date,
+  requestId: string,
+  actorUserId: BulkUpdateData['actorUserId']
+): void {
+  const affectedRowIdSet = new Set(affectedRowIds)
+  const affectedRows = rows.filter((row) => affectedRowIdSet.has(row.id))
+  if (affectedRows.length === 0) return
 
-  const oldRows = new Map(matchingRows.map((r) => [r.id, r.data as RowData]))
-  const updatedRows: TableRow[] = matchingRows.map((r) => ({
-    id: r.id,
-    data: { ...(r.data as RowData), ...data.data },
+  const oldRows = new Map(affectedRows.map((row) => [row.id, row.data]))
+  const updatedRows: TableRow[] = affectedRows.map((row) => ({
+    id: row.id,
+    data: { ...row.data, ...patch },
     executions: {},
     position: 0,
     createdAt: now,
@@ -1444,17 +2071,227 @@ export async function updateRowsByFilter(
   void runWorkflowColumn({
     tableId: table.id,
     workspaceId: table.workspaceId,
-    rowIds: updatedRows.map((r) => r.id),
+    rowIds: affectedRowIds,
     mode: 'new',
     isManualRun: false,
     requestId,
-    triggeredByUserId: data.actorUserId,
-  }).catch((err) => logger.error(`[${requestId}] auto-dispatch (updateRowsByFilter) failed:`, err))
+    triggeredByUserId: actorUserId,
+  }).catch((error) =>
+    logger.error(`[${requestId}] auto-dispatch (updateRowsByFilter) failed:`, error)
+  )
+}
+
+/**
+ * Updates multiple rows matching a filter.
+ *
+ * @param table - Table definition (provides column schema for type-aware filter casts)
+ * @param data - Bulk update data
+ * @param requestId - Request ID for logging
+ * @returns Bulk operation result
+ */
+export async function updateRowsByFilter(
+  table: TableDefinition,
+  data: BulkUpdateData,
+  requestId: string,
+  options: RowWriteOptions = {}
+): Promise<BulkOperationResult> {
+  assertRowUpdate(table, patchColumnIds(data.data))
+  if (Object.keys(data.data).length === 0) {
+    return { affectedCount: 0, affectedRowIds: [] }
+  }
+
+  const tableName = USER_TABLE_ROWS_SQL_NAME
+
+  const filterClause = buildFilterClause(data.filter, tableName, table.schema.columns)
+  if (!filterClause) {
+    throw new OrchestrationError('validation', 'Filter is required for bulk update')
+  }
+
+  const baseConditions = and(
+    eq(userTableRows.tableId, table.id),
+    eq(userTableRows.workspaceId, table.workspaceId)
+  )
+
+  coerceRowValues(data.data, table.schema, options.uncoercibleValues)
+  validateBulkUpdatePatch(table, data.data, options.uncoercibleValues)
+  const uniqueColumns = getUniqueColumns(table.schema)
+  const uniqueColumnsInUpdate = uniqueColumns.filter((col) => getColumnId(col) in data.data)
+  const patchJson = JSON.stringify(data.data)
+  const now = new Date()
+  const limit = data.limit
+
+  if (limit === undefined) {
+    const cutoff = new Date()
+    let matchingRowCount = 0
+    let singleMatchingRow: BulkUpdateMatch | undefined
+    let afterId: string | undefined
+
+    while (true) {
+      const page = await selectRowDataPage({
+        tableId: table.id,
+        workspaceId: table.workspaceId,
+        cutoff,
+        filterClause,
+        afterId,
+        limit: TABLE_LIMITS.UPDATE_BATCH_SIZE,
+      })
+      if (page.length === 0) break
+
+      validateBulkUpdateMatches(table, page, data.data, options.uncoercibleValues)
+      matchingRowCount += page.length
+      singleMatchingRow ??= page[0]
+      afterId = page[page.length - 1].id
+      if (page.length < TABLE_LIMITS.UPDATE_BATCH_SIZE) break
+    }
+
+    if (matchingRowCount === 0) {
+      return { affectedCount: 0, affectedRowIds: [] }
+    }
+
+    if (uniqueColumnsInUpdate.length > 0) {
+      if (matchingRowCount > 1) {
+        throw new OrchestrationError(
+          'validation',
+          `Cannot set unique column values when updating multiple rows. ` +
+            `Columns with unique constraint: ${uniqueColumnsInUpdate.map((column) => column.name).join(', ')}. ` +
+            `Updating ${matchingRowCount} rows with the same value would violate uniqueness.`
+        )
+      }
+      if (!singleMatchingRow) {
+        throw new Error('Bulk update lost its selected row')
+      }
+      const uniqueValidation = await checkUniqueConstraintsDb(
+        table.id,
+        { ...singleMatchingRow.data, ...data.data },
+        table.schema,
+        singleMatchingRow.id
+      )
+      if (!uniqueValidation.valid) {
+        throw new OrchestrationError(
+          'validation',
+          `Unique constraint violation: ${uniqueValidation.errors.join(', ')}`
+        )
+      }
+    }
+
+    const affectedRowIds: string[] = []
+    afterId = undefined
+    while (true) {
+      const batchRows = await selectRowDataPage({
+        tableId: table.id,
+        workspaceId: table.workspaceId,
+        cutoff,
+        filterClause,
+        afterId,
+        limit: TABLE_LIMITS.UPDATE_BATCH_SIZE,
+      })
+      if (batchRows.length === 0) break
+
+      const nextAfterId = batchRows[batchRows.length - 1].id
+      const persisted = await persistBulkUpdateBatch({
+        table,
+        rows: batchRows,
+        patch: data.data,
+        patchJson,
+        filterClause,
+        now,
+        secretProvenance: data.secretProvenance,
+        requestId,
+        uncoercibleValues: options.uncoercibleValues,
+      })
+      affectedRowIds.push(...persisted.affectedRowIds)
+      dispatchBulkUpdateEffects(
+        table,
+        persisted.rows,
+        persisted.affectedRowIds,
+        data.data,
+        now,
+        requestId,
+        data.actorUserId
+      )
+      afterId = nextAfterId
+      if (batchRows.length < TABLE_LIMITS.UPDATE_BATCH_SIZE) break
+    }
+
+    logger.info(`[${requestId}] Updated ${affectedRowIds.length} rows in table ${table.id}`)
+    return { affectedCount: affectedRowIds.length, affectedRowIds }
+  }
+
+  const selectedRows = await withSeqscanOff(async (trx) =>
+    trx
+      .select({ id: userTableRows.id, data: userTableRows.data })
+      .from(userTableRows)
+      .where(and(baseConditions, filterClause))
+      .orderBy(buildRowOrderBySql(undefined, tableName, table.schema.columns))
+      .limit(limit)
+  )
+  const matchingRows = selectedRows.map((row) => ({ id: row.id, data: row.data as RowData }))
+  if (matchingRows.length === 0) {
+    return { affectedCount: 0, affectedRowIds: [] }
+  }
+
+  validateBulkUpdateMatches(table, matchingRows, data.data, options.uncoercibleValues)
+  if (uniqueColumnsInUpdate.length > 0) {
+    if (matchingRows.length > 1) {
+      throw new OrchestrationError(
+        'validation',
+        `Cannot set unique column values when updating multiple rows. ` +
+          `Columns with unique constraint: ${uniqueColumnsInUpdate.map((column) => column.name).join(', ')}. ` +
+          `Updating ${matchingRows.length} rows with the same value would violate uniqueness.`
+      )
+    }
+    const row = matchingRows[0]
+    const mergedData = { ...row.data, ...data.data }
+    const uniqueValidation = await checkUniqueConstraintsDb(
+      table.id,
+      mergedData,
+      table.schema,
+      row.id
+    )
+    if (!uniqueValidation.valid) {
+      throw new OrchestrationError(
+        'validation',
+        `Unique constraint violation: ${uniqueValidation.errors.join(', ')}`
+      )
+    }
+  }
+
+  const persisted = await persistBulkUpdateBatch({
+    table,
+    rows: matchingRows,
+    patch: data.data,
+    patchJson,
+    filterClause,
+    now,
+    secretProvenance: data.secretProvenance,
+    requestId,
+    uncoercibleValues: options.uncoercibleValues,
+  })
+  const { affectedRowIds } = persisted
+
+  logger.info(`[${requestId}] Updated ${affectedRowIds.length} rows in table ${table.id}`)
+  dispatchBulkUpdateEffects(
+    table,
+    persisted.rows,
+    affectedRowIds,
+    data.data,
+    now,
+    requestId,
+    data.actorUserId
+  )
 
   return {
-    affectedCount: matchingRows.length,
-    affectedRowIds: ids,
+    affectedCount: affectedRowIds.length,
+    affectedRowIds,
   }
+}
+
+export interface BatchUpdateRowsOptions extends RowWriteOptions {
+  /**
+   * Marks the batch as workflow/enrichment output cells (the backfill runner),
+   * exempting it from the update lock. See {@link assertRowUpdate}.
+   */
+  computedWrite?: boolean
 }
 
 /**
@@ -1464,11 +2301,20 @@ export async function updateRowsByFilter(
 export async function batchUpdateRows(
   data: BatchUpdateByIdData,
   table: TableDefinition,
-  requestId: string
+  requestId: string,
+  options: BatchUpdateRowsOptions = {}
 ): Promise<BulkOperationResult> {
   if (data.updates.length === 0) {
     return { affectedCount: 0, affectedRowIds: [] }
   }
+
+  // Doubles as the workflow-output backfill write path, which passes
+  // `computedWrite` so a rebuild keeps working on an update-locked table.
+  assertRowUpdate(
+    table,
+    data.updates.flatMap((u) => patchColumnIds(u.data)),
+    { computedWrite: options.computedWrite }
+  )
 
   const rowIds = data.updates.map((u) => u.rowId)
   const existingRows = await db
@@ -1500,11 +2346,12 @@ export async function batchUpdateRows(
 
   const missing = rowIds.filter((id) => !existingMap.has(id))
   if (missing.length > 0) {
-    throw new Error(`Rows not found: ${missing.join(', ')}`)
+    throw new OrchestrationError('validation', `Rows not found: ${missing.join(', ')}`)
   }
 
   const mergedUpdates: Array<{
     rowId: string
+    changedColumnIds: string[]
     mergedData: RowData
     mergedExecutions: RowExecutions
     executionsPatch?: Record<string, RowExecutionMetadata | null>
@@ -1529,16 +2376,28 @@ export async function batchUpdateRows(
 
     const sizeValidation = validateRowSize(merged)
     if (!sizeValidation.valid) {
-      throw new Error(`Row ${update.rowId}: ${sizeValidation.errors.join(', ')}`)
+      throw new OrchestrationError(
+        'validation',
+        `Row ${update.rowId}: ${sizeValidation.errors.join(', ')}`
+      )
     }
 
-    const schemaValidation = coerceRowToSchema(merged, table.schema)
+    const schemaValidation = coerceRowToSchema(
+      merged,
+      table.schema,
+      options.uncoercibleValues,
+      Object.keys(update.data)
+    )
     if (!schemaValidation.valid) {
-      throw new Error(`Row ${update.rowId}: ${schemaValidation.errors.join(', ')}`)
+      throw new OrchestrationError(
+        'validation',
+        `Row ${update.rowId}: ${schemaValidation.errors.join(', ')}`
+      )
     }
 
     mergedUpdates.push({
       rowId: update.rowId,
+      changedColumnIds: Object.keys(update.data),
       mergedData: merged,
       mergedExecutions,
       executionsPatch: effectiveExecutionsPatch,
@@ -1556,63 +2415,89 @@ export async function batchUpdateRows(
         rowId
       )
       if (!uniqueValidation.valid) {
-        throw new Error(`Row ${rowId}: ${uniqueValidation.errors.join(', ')}`)
+        throw new OrchestrationError(
+          'validation',
+          `Row ${rowId}: ${uniqueValidation.errors.join(', ')}`
+        )
       }
     }
   }
 
   const now = new Date()
 
-  await db.transaction(async (trx) => {
+  const affectedRowIds = await db.transaction(async (trx) => {
     await setTableTxTimeouts(trx, { statementMs: 60_000 })
-    for (let i = 0; i < mergedUpdates.length; i += TABLE_LIMITS.UPDATE_BATCH_SIZE) {
-      const batch = mergedUpdates.slice(i, i + TABLE_LIMITS.UPDATE_BATCH_SIZE)
-      // Update row data in parallel; sidecar exec writes are sequential per
-      // row (each goes through writeExecutionsPatch's per-key upsert).
-      const dataPromises = batch.map(({ rowId, mergedData }) =>
-        trx
-          .update(userTableRows)
-          .set({ data: mergedData, updatedAt: now })
-          .where(eq(userTableRows.id, rowId))
-      )
-      await Promise.all(dataPromises)
-      for (const { rowId, executionsPatch } of batch) {
-        await writeExecutionsPatch(trx, data.tableId, rowId, executionsPatch)
-      }
-    }
+    return mutateTableRowsWithSecretProvenance(trx, {
+      rows: mergedUpdates.map((update) => ({
+        rowId: update.rowId,
+        provenance: data.secretProvenanceByRowId?.[update.rowId],
+      })),
+      rowState: 'existing',
+      mode: 'merge',
+      mutate: async () => {
+        const affectedRowIds: string[] = []
+        for (let i = 0; i < mergedUpdates.length; i += TABLE_LIMITS.UPDATE_BATCH_SIZE) {
+          const batch = mergedUpdates.slice(i, i + TABLE_LIMITS.UPDATE_BATCH_SIZE)
+          const dataPromises = batch.map(({ rowId, changedColumnIds, mergedData }) =>
+            trx
+              .update(userTableRows)
+              .set({ data: jsonbMergePatch(changedColumnIds, mergedData), updatedAt: now })
+              .where(
+                and(
+                  eq(userTableRows.id, rowId),
+                  eq(userTableRows.tableId, data.tableId),
+                  eq(userTableRows.workspaceId, data.workspaceId)
+                )
+              )
+              .returning({ id: userTableRows.id })
+          )
+          const updatedRows = await Promise.all(dataPromises)
+          affectedRowIds.push(...updatedRows.flatMap((rows) => rows.map((row) => row.id)))
+          for (const { rowId, executionsPatch } of batch) {
+            await writeExecutionsPatch(trx, data.tableId, rowId, executionsPatch)
+          }
+        }
+        return { value: affectedRowIds, affectedRowIds }
+      },
+    })
   })
 
-  logger.info(`[${requestId}] Batch updated ${mergedUpdates.length} rows in table ${data.tableId}`)
+  logger.info(`[${requestId}] Batch updated ${affectedRowIds.length} rows in table ${data.tableId}`)
 
+  const affectedRowIdSet = new Set(affectedRowIds)
   const oldRowsForTrigger = new Map(
-    data.updates.map((u) => [u.rowId, existingMap.get(u.rowId)!.data])
+    data.updates
+      .filter((update) => affectedRowIdSet.has(update.rowId))
+      .map((update) => [update.rowId, existingMap.get(update.rowId)!.data])
   )
-  const updatedRowsForTrigger: TableRow[] = mergedUpdates.map(
-    ({ rowId, mergedData, mergedExecutions }) => ({
+  const updatedRowsForTrigger: TableRow[] = mergedUpdates
+    .filter((update) => affectedRowIdSet.has(update.rowId))
+    .map(({ rowId, mergedData, mergedExecutions }) => ({
       id: rowId,
       data: mergedData,
       executions: mergedExecutions,
       position: 0,
       createdAt: now,
       updatedAt: now,
-    })
-  )
-  void fireTableTrigger(
-    data.tableId,
-    table.name,
-    'update',
-    updatedRowsForTrigger,
-    oldRowsForTrigger,
-    table.schema,
-    requestId
-  )
+    }))
+  if (updatedRowsForTrigger.length > 0) {
+    void fireTableTrigger(
+      data.tableId,
+      table.name,
+      'update',
+      updatedRowsForTrigger,
+      oldRowsForTrigger,
+      table.schema,
+      requestId
+    )
+  }
   // Per-row cancel+rerun for in-flight downstream groups whose deps just
   // changed — same orchestration as single-row `updateRow`. Without this,
   // batch updates would leave running workflows reading stale dep values.
   // Each row needs its own cancel + manual-incomplete dispatch because
   // `cancelWorkflowGroupRuns`'s `groupIds` filter is per-row.
   const rowsWithInFlightDownstream = mergedUpdates.filter(
-    (u) => u.inFlightDownstreamGroups.length > 0
+    (update) => affectedRowIdSet.has(update.rowId) && update.inFlightDownstreamGroups.length > 0
   )
   if (rowsWithInFlightDownstream.length > 0) {
     void (async () => {
@@ -1640,19 +2525,21 @@ export async function batchUpdateRows(
       }
     })()
   }
-  void runWorkflowColumn({
-    tableId: table.id,
-    workspaceId: table.workspaceId,
-    rowIds: updatedRowsForTrigger.map((r) => r.id),
-    mode: 'new',
-    isManualRun: false,
-    requestId,
-    triggeredByUserId: data.actorUserId,
-  }).catch((err) => logger.error(`[${requestId}] auto-dispatch (batchUpdateRows) failed:`, err))
+  if (updatedRowsForTrigger.length > 0) {
+    void runWorkflowColumn({
+      tableId: table.id,
+      workspaceId: table.workspaceId,
+      rowIds: updatedRowsForTrigger.map((r) => r.id),
+      mode: 'new',
+      isManualRun: false,
+      requestId,
+      triggeredByUserId: data.actorUserId,
+    }).catch((err) => logger.error(`[${requestId}] auto-dispatch (batchUpdateRows) failed:`, err))
+  }
 
   return {
-    affectedCount: mergedUpdates.length,
-    affectedRowIds: mergedUpdates.map((u) => u.rowId),
+    affectedCount: affectedRowIds.length,
+    affectedRowIds,
   }
 }
 
@@ -1669,12 +2556,14 @@ export async function deleteRowsByFilter(
   data: BulkDeleteData,
   requestId: string
 ): Promise<BulkOperationResult> {
+  const proof = assertRowDelete(table)
+
   const tableName = USER_TABLE_ROWS_SQL_NAME
 
   // Build filter clause
   const filterClause = buildFilterClause(data.filter, tableName, table.schema.columns)
   if (!filterClause) {
-    throw new Error('Filter is required for bulk delete')
+    throw new OrchestrationError('validation', 'Filter is required for bulk delete')
   }
 
   // Find matching rows
@@ -1683,35 +2572,65 @@ export async function deleteRowsByFilter(
     eq(userTableRows.workspaceId, table.workspaceId)
   )
 
-  // Tenant-bounded for the same reason as updateRowsByFilter — see withSeqscanOff.
-  const matchingRows = await withSeqscanOff(async (trx) => {
-    let query = trx
-      .select({ id: userTableRows.id, position: userTableRows.position })
-      .from(userTableRows)
-      .where(and(baseConditions, filterClause))
-    if (data.limit) {
-      query = query.limit(data.limit) as typeof query
+  const limit = data.limit
+  const deletedRows: { id: string }[] = []
+  if (limit === undefined) {
+    const cutoff = new Date()
+    let afterId: string | undefined
+    while (true) {
+      const page = await selectRowIdPage({
+        tableId: table.id,
+        workspaceId: table.workspaceId,
+        cutoff,
+        filterClause,
+        afterId,
+        limit: TABLE_LIMITS.DELETE_PAGE_SIZE,
+      })
+      if (page.length === 0) break
+      const nextAfterId = page[page.length - 1]
+      for (let index = 0; index < page.length; index += TABLE_LIMITS.DELETE_BATCH_SIZE) {
+        deletedRows.push(
+          ...(await deleteOrderedRowsByIds({
+            tableId: table.id,
+            workspaceId: table.workspaceId,
+            rowIds: page.slice(index, index + TABLE_LIMITS.DELETE_BATCH_SIZE),
+            proof,
+          }))
+        )
+      }
+      afterId = nextAfterId
+      if (page.length < TABLE_LIMITS.DELETE_PAGE_SIZE) break
     }
-    return query
-  })
-
-  if (matchingRows.length === 0) {
-    return { affectedCount: 0, affectedRowIds: [] }
+  } else {
+    const matchingRows = await withSeqscanOff(async (trx) =>
+      trx
+        .select({ id: userTableRows.id })
+        .from(userTableRows)
+        .where(and(baseConditions, filterClause))
+        .orderBy(buildRowOrderBySql(undefined, tableName, table.schema.columns))
+        .limit(limit)
+    )
+    const rowIds = matchingRows.map((row) => row.id)
+    if (rowIds.length > 0) {
+      deletedRows.push(
+        ...(await deleteOrderedRowsByIds({
+          tableId: table.id,
+          workspaceId: table.workspaceId,
+          rowIds,
+          proof,
+        }))
+      )
+    }
   }
 
-  const rowIds = matchingRows.map((r) => r.id)
+  if (deletedRows.length === 0) return { affectedCount: 0, affectedRowIds: [] }
+  const deletedRowIds = deletedRows.map((row) => row.id)
 
-  await deleteOrderedRowsByIds({
-    tableId: table.id,
-    workspaceId: table.workspaceId,
-    rowIds,
-  })
-
-  logger.info(`[${requestId}] Deleted ${matchingRows.length} rows from table ${table.id}`)
+  logger.info(`[${requestId}] Deleted ${deletedRowIds.length} rows from table ${table.id}`)
 
   return {
-    affectedCount: matchingRows.length,
-    affectedRowIds: rowIds,
+    affectedCount: deletedRowIds.length,
+    affectedRowIds: deletedRowIds,
   }
 }
 
@@ -1723,15 +2642,19 @@ export async function deleteRowsByFilter(
  * @returns Deletion result with deleted/missing row IDs
  */
 export async function deleteRowsByIds(
+  table: TableDefinition,
   data: BulkDeleteByIdsData,
   requestId: string
 ): Promise<BulkDeleteByIdsResult> {
+  const proof = assertRowDelete(table)
+
   const uniqueRequestedRowIds = Array.from(new Set(data.rowIds))
 
   const deletedRows = await deleteOrderedRowsByIds({
     tableId: data.tableId,
     workspaceId: data.workspaceId,
     rowIds: uniqueRequestedRowIds,
+    proof,
   })
 
   const deletedIds = deletedRows.map((r) => r.id)

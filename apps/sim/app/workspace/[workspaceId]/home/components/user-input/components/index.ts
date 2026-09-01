@@ -23,7 +23,7 @@ export {
 } from './constants'
 export { DropOverlay } from './drop-overlay'
 export { MicButton } from './mic-button'
-export type { AvailableResourceGroup } from './plus-menu-dropdown'
+export { MicrophonePermissionHelp } from './microphone-permission-help'
 export { PlusMenuDropdown } from './plus-menu-dropdown'
 export type {
   PromptEditorInstance,

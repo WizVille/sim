@@ -3,7 +3,7 @@
  *
  * @vitest-environment node
  */
-import { createMockRequest, redisConfigMock, redisConfigMockFns } from '@sim/testing'
+import { createMockRequest, redisConfigMockFns } from '@sim/testing'
 import { sleep } from '@sim/utils/helpers'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -15,8 +15,6 @@ const { mockVerifyCronAuth, mockPollProvider } = vi.hoisted(() => ({
 vi.mock('@/lib/auth/internal', () => ({
   verifyCronAuth: mockVerifyCronAuth,
 }))
-
-vi.mock('@/lib/core/config/redis', () => redisConfigMock)
 
 vi.mock('@/lib/webhooks/polling', () => ({
   pollProvider: mockPollProvider,
@@ -68,10 +66,13 @@ describe('webhook polling route (fire-and-forget)', () => {
     expect(response.status).toBe(202)
     const data = await response.json()
     expect(data).toMatchObject({ status: 'started' })
+    // `reclaimOnFailure` is what stops a timed-out acquire from leaving a lock
+    // no one owns, which skipped every poll until the TTL expired.
     expect(redisConfigMockFns.mockAcquireLock).toHaveBeenCalledWith(
       'gmail-polling-lock',
       expect.any(String),
-      expect.any(Number)
+      expect.any(Number),
+      { reclaimOnFailure: true }
     )
 
     await flushMicrotasks()

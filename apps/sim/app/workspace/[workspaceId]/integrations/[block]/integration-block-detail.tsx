@@ -2,29 +2,38 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Chip, ChipDropdown, ChipLink, cn } from '@sim/emcn'
-import { ArrowLeft, ArrowRight, Plus } from 'lucide-react'
-import Link from 'next/link'
+import { ArrowLeft, Plus } from '@sim/emcn/icons'
 import { useRouter } from 'next/navigation'
 import { useQueryState } from 'nuqs'
-import { getClientCredentialAccountDescriptor } from '@/lib/credentials/client-credential-accounts/descriptors'
-import { getTokenServiceAccountDescriptor } from '@/lib/credentials/token-service-accounts/descriptors'
+import { HEADER_ACTION_CLUSTER, PAGE_HEADER_BAR } from '@/components/page-header-bar'
+import { isChatEnabled } from '@/lib/core/config/env-flags'
 import {
   blockTypeToIconMap,
   type Integration,
+  resolveCredentialDisplay,
   resolveOAuthServiceForIntegration,
 } from '@/lib/integrations'
-import { getServiceConfigByProviderId } from '@/lib/oauth'
-import { SLACK_CUSTOM_BOT_PROVIDER_ID } from '@/lib/oauth/types'
+import { credentialProviderMatchesService } from '@/lib/oauth'
 import { ConnectOAuthModal } from '@/app/workspace/[workspaceId]/components/connect-oauth-modal'
+import { RESOURCE_TILE_BASE } from '@/app/workspace/[workspaceId]/components/resource-tile'
 import { IntegrationSkillsSection } from '@/app/workspace/[workspaceId]/integrations/[block]/integration-skills-section'
 import { connectParam } from '@/app/workspace/[workspaceId]/integrations/[block]/search-params'
-import { ConnectServiceAccountModal } from '@/app/workspace/[workspaceId]/integrations/components/connect-service-account-modal'
+import {
+  ConnectServiceAccountModal,
+  useServiceAccountConnectTarget,
+} from '@/app/workspace/[workspaceId]/integrations/components/connect-service-account-modal'
 import { IntegrationSection } from '@/app/workspace/[workspaceId]/integrations/components/integration-section'
 import { IntegrationTile } from '@/app/workspace/[workspaceId]/integrations/components/integrations-showcase'
-import { CONNECT_MODE } from '@/app/workspace/[workspaceId]/integrations/connect-route'
+import {
+  CONNECT_MODE,
+  resolveAvailableConnectMode,
+} from '@/app/workspace/[workspaceId]/integrations/connect-route'
 import { useScrollRestoration } from '@/app/workspace/[workspaceId]/integrations/hooks/use-scroll-restoration'
-import { getBlock } from '@/blocks'
-import { useCustomBlockOverlayVersion } from '@/blocks/custom/client-overlay'
+import {
+  RESOURCE_LIST_STACK,
+  SettingsResourceRow,
+} from '@/app/workspace/[workspaceId]/settings/components/settings-resource-row'
+import { SettingsSection } from '@/app/workspace/[workspaceId]/settings/components/settings-section/settings-section'
 import { getTileIconColorClass } from '@/blocks/icon-color'
 import { storeCuratedPrompt } from '@/blocks/integration-matcher'
 import {
@@ -32,9 +41,9 @@ import {
   getTemplatesForBlock,
   type ScopedBlockTemplate,
 } from '@/blocks/registry'
-import { isHiddenUnder, overlayVisibility } from '@/blocks/visibility/context'
 import { useWorkspaceCredentials } from '@/hooks/queries/credentials'
 import { useOAuthReturnRouter } from '@/hooks/use-oauth-return'
+import { usePermissionConfig } from '@/hooks/use-permission-config'
 
 /** Maximum number of overlapping icon tiles rendered per template row. */
 const TEMPLATE_CLUSTER_MAX = 3 as const
@@ -59,6 +68,9 @@ export function IntegrationBlockDetail({ integration, workspaceId }: Integration
   const matchingTemplates = getTemplatesForBlock(integration.type)
   const suggestedSkills = getSuggestedSkillsForBlock(integration.type)
   const oauthService = resolveOAuthServiceForIntegration(integration)
+  const { integrationAvailability, isLoading: permissionConfigLoading } = usePermissionConfig()
+  const availability = integrationAvailability.get(integration.type.toLowerCase())
+  const oauthAvailable = Boolean(oauthService) && (availability?.oauthAvailable ?? true)
   const [oauthOpen, setOAuthOpen] = useState(false)
 
   const { data: credentials = [], isPending: credentialsLoading } = useWorkspaceCredentials({
@@ -68,71 +80,81 @@ export function IntegrationBlockDetail({ integration, workspaceId }: Integration
 
   useScrollRestoration(scrollContainerRef, { ready: !credentialsLoading })
 
+  /**
+   * Matches on the service's own id *or* its service-account id, so a family
+   * credential lists on every product it powers. Comparing resolved
+   * `providerId`s instead hides it from all of them.
+   */
   const connectedCredentials = useMemo(() => {
     if (!oauthService) return []
     return credentials.filter(
       (c) =>
         (c.type === 'oauth' || c.type === 'service_account') &&
         c.providerId &&
-        getServiceConfigByProviderId(c.providerId)?.providerId === oauthService.providerId
+        credentialProviderMatchesService(c.providerId, oauthService)
     )
   }, [credentials, oauthService])
   const [serviceAccountOpen, setServiceAccountOpen] = useState(false)
-  const isSlackBot = oauthService?.serviceAccountProviderId === SLACK_CUSTOM_BOT_PROVIDER_ID
-  const blockOverlayVersion = useCustomBlockOverlayVersion()
-  // Custom Slack bots ride the slack_v2 preview flag: the setup surface stays
-  // hidden until that block is revealed for this viewer.
-  const slackBotPreviewHidden = useMemo(() => {
-    if (!isSlackBot) return false
-    const v2 = getBlock('slack_v2')
-    return !v2 || isHiddenUnder(overlayVisibility(), v2)
-  }, [isSlackBot, blockOverlayVersion])
+  const serviceAccountTarget = useServiceAccountConnectTarget({
+    serviceAccountProviderId: oauthService?.serviceAccountProviderId,
+    serviceName: oauthService?.serviceName,
+    serviceIcon: oauthService?.serviceIcon,
+  })
+  const serviceAccountDeploymentAvailable =
+    availability?.state === 'ready' || availability?.state === 'limited'
   const hasServiceAccount =
-    Boolean(oauthService?.serviceAccountProviderId) && !slackBotPreviewHidden
-  // Vendor-accurate connect label: token-paste and client-credential
-  // providers use their own noun ("Add API key", "Add server-to-server app");
-  // only true service-account providers (Google, Atlassian) say
-  // "Add service account".
-  const nounDescriptor =
-    getTokenServiceAccountDescriptor(oauthService?.serviceAccountProviderId) ??
-    getClientCredentialAccountDescriptor(oauthService?.serviceAccountProviderId)
-  const serviceAccountConnectLabel = isSlackBot
-    ? 'Set up a custom bot'
-    : nounDescriptor
-      ? `Add ${nounDescriptor.connectNoun}`
-      : 'Add service account'
+    serviceAccountDeploymentAvailable &&
+    Boolean(serviceAccountTarget) &&
+    !serviceAccountTarget?.hidden
+  const serviceAccountConnectLabel = serviceAccountTarget?.label ?? 'Add service account'
   const hasHandledConnectQueryRef = useRef(false)
 
   useEffect(() => {
-    if (hasHandledConnectQueryRef.current) return
-    if (!connectMode) return
+    if (hasHandledConnectQueryRef.current || !connectMode || permissionConfigLoading) return
 
-    let handled = false
-    if (connectMode === CONNECT_MODE.oauth && oauthService) {
+    const availableConnectMode = resolveAvailableConnectMode(connectMode, {
+      oauth: Boolean(oauthService) && oauthAvailable,
+      serviceAccount: hasServiceAccount,
+    })
+    if (!availableConnectMode) return
+
+    if (availableConnectMode === CONNECT_MODE.oauth) {
       setOAuthOpen(true)
-      handled = true
-    } else if (connectMode === CONNECT_MODE.serviceAccount && hasServiceAccount) {
+    } else {
       setServiceAccountOpen(true)
-      handled = true
     }
-    if (!handled) return
 
     hasHandledConnectQueryRef.current = true
     void setConnectMode(null, { history: 'replace', scroll: false })
-  }, [connectMode, oauthService, hasServiceAccount, setConnectMode])
+  }, [
+    connectMode,
+    oauthService,
+    oauthAvailable,
+    hasServiceAccount,
+    permissionConfigLoading,
+    setConnectMode,
+  ])
 
   const connectOptions = oauthService
     ? [
-        {
-          value: CONNECT_MODE.oauth,
-          label: 'Connect with OAuth',
-          icon: oauthService.serviceIcon,
-        },
-        {
-          value: CONNECT_MODE.serviceAccount,
-          label: serviceAccountConnectLabel,
-          icon: oauthService.serviceIcon,
-        },
+        ...(oauthAvailable
+          ? [
+              {
+                value: CONNECT_MODE.oauth,
+                label: 'Connect with OAuth',
+                icon: oauthService.serviceIcon,
+              },
+            ]
+          : []),
+        ...(hasServiceAccount
+          ? [
+              {
+                value: CONNECT_MODE.serviceAccount,
+                label: serviceAccountConnectLabel,
+                icon: serviceAccountTarget?.serviceIcon ?? oauthService.serviceIcon,
+              },
+            ]
+          : []),
       ]
     : []
 
@@ -148,13 +170,13 @@ export function IntegrationBlockDetail({ integration, workspaceId }: Integration
 
   return (
     <div className='flex h-full flex-col bg-[var(--bg)]'>
-      <div className='flex flex-shrink-0 items-center bg-[var(--bg)] px-[16px] pt-[8.5px] pb-[8.5px]'>
+      <div className={PAGE_HEADER_BAR}>
         <ChipLink href={`/workspace/${workspaceId}/integrations`} leftIcon={ArrowLeft}>
           Integrations
         </ChipLink>
-        <div className='ml-auto flex items-center'>
+        <div className={cn('ml-auto', HEADER_ACTION_CLUSTER)}>
           {oauthService ? (
-            hasServiceAccount ? (
+            connectOptions.length > 1 ? (
               <ChipDropdown
                 variant='primary'
                 leftIcon={Plus}
@@ -164,19 +186,25 @@ export function IntegrationBlockDetail({ integration, workspaceId }: Integration
                 onChange={handleSelectConnectOption}
                 matchTriggerWidth={false}
               />
-            ) : (
+            ) : oauthAvailable ? (
               <Chip variant='primary' leftIcon={Plus} onClick={() => setOAuthOpen(true)}>
                 Add to Sim
               </Chip>
+            ) : hasServiceAccount ? (
+              <Chip variant='primary' leftIcon={Plus} onClick={() => setServiceAccountOpen(true)}>
+                {serviceAccountConnectLabel}
+              </Chip>
+            ) : (
+              <Chip disabled>Unavailable</Chip>
             )
-          ) : (
+          ) : isChatEnabled ? (
             <Chip variant='primary' leftIcon={Plus} onClick={handleAddInChat}>
               Add to Sim
             </Chip>
-          )}
+          ) : null}
         </div>
       </div>
-      {oauthService && (
+      {oauthService && oauthAvailable && (
         <ConnectOAuthModal
           mode='connect'
           origin='integrations'
@@ -187,16 +215,17 @@ export function IntegrationBlockDetail({ integration, workspaceId }: Integration
           requiredScopes={oauthService.requiredScopes}
           serviceName={oauthService.serviceName}
           serviceIcon={oauthService.serviceIcon}
+          requireDataverseEnvironment={integration.type === 'microsoft_dynamics_365'}
         />
       )}
-      {hasServiceAccount && oauthService?.serviceAccountProviderId && (
+      {hasServiceAccount && serviceAccountTarget && (
         <ConnectServiceAccountModal
           open={serviceAccountOpen}
           onOpenChange={setServiceAccountOpen}
           workspaceId={workspaceId}
-          serviceAccountProviderId={oauthService.serviceAccountProviderId}
-          serviceName={oauthService.serviceName}
-          serviceIcon={oauthService.serviceIcon}
+          serviceAccountProviderId={serviceAccountTarget.serviceAccountProviderId}
+          serviceName={serviceAccountTarget.serviceName}
+          serviceIcon={serviceAccountTarget.serviceIcon}
         />
       )}
       <div
@@ -209,17 +238,14 @@ export function IntegrationBlockDetail({ integration, workspaceId }: Integration
               <IntegrationTile blockType={integration.type} icon={Icon} />
             ) : (
               <div
-                className={cn(
-                  'flex size-9 flex-shrink-0 items-center justify-center rounded-xl border border-[var(--border-1)]',
-                  getTileIconColorClass(integration.bgColor)
-                )}
+                className={cn(RESOURCE_TILE_BASE, getTileIconColorClass(integration.bgColor))}
                 style={{ background: integration.bgColor }}
               >
                 {integration.name.charAt(0)}
               </div>
             )}
             <div className='flex flex-col gap-1'>
-              <h1 className='font-medium text-[var(--text-body)] text-lg'>{integration.name}</h1>
+              <h1 className='text-[var(--text-body)] text-lg'>{integration.name}</h1>
               <p className='text-[var(--text-muted)] text-md'>{integration.description}</p>
             </div>
           </div>
@@ -227,22 +253,18 @@ export function IntegrationBlockDetail({ integration, workspaceId }: Integration
           {connectedCredentials.length > 0 && (
             <IntegrationSection label='Connected'>
               {connectedCredentials.map((credential) => (
-                <Link
+                <SettingsResourceRow
                   key={credential.id}
+                  iconVariant='custom'
+                  icon={Icon && <IntegrationTile blockType={integration.type} icon={Icon} />}
+                  title={credential.displayName}
+                  description={
+                    credential.description || resolveCredentialDisplay(credential).subtitle
+                  }
                   href={`/workspace/${workspaceId}/integrations/connected/${credential.id}`}
-                  className='flex items-center gap-2.5 rounded-lg p-2 text-left transition-colors hover-hover:bg-[var(--surface-active)]'
-                >
-                  {Icon && <IntegrationTile blockType={integration.type} icon={Icon} />}
-                  <div className='flex min-w-0 flex-1 flex-col'>
-                    <span className='truncate text-[14px] text-[var(--text-body)]'>
-                      {credential.displayName}
-                    </span>
-                    <span className='truncate text-[12px] text-[var(--text-muted)]'>
-                      {credential.description || oauthService?.serviceName}
-                    </span>
-                  </div>
-                  <ArrowRight className='size-4 flex-shrink-0 text-[var(--text-icon)]' />
-                </Link>
+                  clickLabel={`Open ${credential.displayName}`}
+                  navigable
+                />
               ))}
             </IntegrationSection>
           )}
@@ -255,7 +277,9 @@ export function IntegrationBlockDetail({ integration, workspaceId }: Integration
             />
           )}
 
-          {matchingTemplates.length > 0 && (
+          {/* Every template hands its prompt to Chat, so the section has no
+              destination without it. */}
+          {isChatEnabled && matchingTemplates.length > 0 && (
             <TemplatesSection
               integration={integration}
               templates={matchingTemplates}
@@ -283,10 +307,8 @@ function TemplatesSection({ integration, templates, workspaceId }: TemplatesSect
   }
 
   return (
-    <section className='flex flex-col'>
-      <span className='pl-0.5 text-[var(--text-muted)] text-small'>Templates</span>
-      <div className='mt-[9px] mb-3 h-px bg-[var(--border)]' />
-      <div className='-mx-2 flex flex-col gap-y-0.5'>
+    <SettingsSection label='Templates'>
+      <div className={RESOURCE_LIST_STACK}>
         {templates.map((template) => {
           const blockTypes = [integration.type, ...template.otherBlockTypes].slice(
             0,
@@ -303,7 +325,7 @@ function TemplatesSection({ integration, templates, workspaceId }: TemplatesSect
           )
         })}
       </div>
-    </section>
+    </SettingsSection>
   )
 }
 
@@ -315,25 +337,21 @@ interface TemplateRowProps {
 }
 
 /**
- * Template row that mirrors `IntegrationItem` from the integrations index
- * byte-for-byte (icon cluster · title · description · trailing `ArrowRight`).
- * Renders as a `<button>` because click seeds the home page chat with `prompt`
- * and navigates to the workspace home, matching the `ShowcaseWithExplore` flow.
+ * Template row. Click seeds the home page chat with `prompt` and navigates to the
+ * workspace home, matching the `ShowcaseWithExplore` flow — so it activates rather
+ * than links, and its leading visual is an overlapping block cluster.
  */
 function TemplateRow({ blockTypes, title, prompt, onSelect }: TemplateRowProps) {
   return (
-    <button
-      type='button'
+    <SettingsResourceRow
+      iconVariant='custom'
+      icon={<TemplateIcons blockTypes={blockTypes} />}
+      title={title}
+      description={prompt}
       onClick={() => onSelect(prompt)}
-      className='group flex items-center gap-2.5 rounded-lg p-2 text-left transition-colors hover-hover:bg-[var(--surface-active)]'
-    >
-      <TemplateIcons blockTypes={blockTypes} />
-      <div className='flex min-w-0 flex-1 flex-col'>
-        <span className='truncate text-[14px] text-[var(--text-body)]'>{title}</span>
-        <span className='truncate text-[12px] text-[var(--text-muted)]'>{prompt}</span>
-      </div>
-      <ArrowRight className='size-4 flex-shrink-0 text-[var(--text-icon)]' />
-    </button>
+      clickLabel={`Use template ${title}`}
+      navigable
+    />
   )
 }
 

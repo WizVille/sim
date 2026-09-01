@@ -26,11 +26,15 @@
       "!**/public/workbox-*.js",
       "!**/public/worker-*.js",
       "!**/public/fallback-*.js",
+      "!**/apps/sim/tools/generated",
       "!**/apps/docs/.source",
+      "!**/apps/desktop/release",
       "!**/venv",
       "!**/.venv",
       "!**/uploads",
-      "!**/apps/sim/lib/execution/sandbox/bundles/*.cjs"
+      "!**/apps/sim/lib/execution/sandbox/bundles/*.cjs",
+      "!**/test-results",
+      "!**/playwright-report"
     ]
   },
   "formatter": {
@@ -130,12 +134,25 @@
         "noStaticOnlyClass": "off"
       },
       "performance": {
-        "noAccumulatingSpread": "off",
+        "noAccumulatingSpread": "error",
         "noDelete": "error",
         "noImgElement": "off"
       }
     }
   },
+  "overrides": [
+    {
+      "includes": ["packages/**"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noUnusedFunctionParameters": "error",
+            "noUnusedVariables": "error"
+          }
+        }
+      }
+    }
+  ],
   "javascript": {
     "formatter": {
       "jsxQuoteStyle": "single",

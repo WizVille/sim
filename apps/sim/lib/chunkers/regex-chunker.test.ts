@@ -256,6 +256,35 @@ describe('RegexChunker', () => {
   })
 
   describe('strictBoundaries mode', () => {
+    it.concurrent('preserves delimiter-only content as one chunk', async () => {
+      const chunker = new RegexChunker({
+        pattern: '---',
+        chunkSize: 1024,
+        strictBoundaries: true,
+      })
+
+      const chunks = await chunker.chunk('------')
+
+      expect(chunks).toHaveLength(1)
+      expect(chunks[0].text).toBe('------')
+    })
+
+    it.concurrent(
+      'preserves the original text when only one meaningful segment remains',
+      async () => {
+        const chunker = new RegexChunker({
+          pattern: '---',
+          chunkSize: 1024,
+          strictBoundaries: true,
+        })
+
+        const chunks = await chunker.chunk('---alpha---')
+
+        expect(chunks).toHaveLength(1)
+        expect(chunks[0].text).toBe('---alpha---')
+      }
+    )
+
     it.concurrent(
       'should produce one chunk per match without merging small adjacent segments',
       async () => {
@@ -386,6 +415,40 @@ describe('RegexChunker', () => {
           chunks[i - 1].metadata.endIndex
         )
       }
+    })
+    it.concurrent(
+      'chunks with a catastrophic pattern without hanging',
+      async () => {
+        // `a*a*b` defeats every syntactic backtracking screen. The previous
+        // guard probed it against 'a'.repeat(10000) and measured the elapsed
+        // time only after the match returned, so the guard itself hung for
+        // ~213s. RE2 has no backtracking, so this simply completes.
+        const chunker = new RegexChunker({ pattern: 'a*a*b', chunkSize: 100, chunkOverlap: 0 })
+
+        const start = Date.now()
+        await chunker.chunk(`${'a'.repeat(10000)}!`)
+
+        expect(Date.now() - start).toBeLessThan(2000)
+      },
+      10000
+    )
+
+    it.concurrent('still supports lookahead split patterns', async () => {
+      // RE2 has no lookaround; compileLookaroundSplit expresses this as slicing
+      // at each match start, so the idiom keeps working on the linear engine.
+      // (No `m` flag is applied, so anchor the lookahead on the delimiter
+      // itself rather than on `^`.)
+      const chunker = new RegexChunker({
+        pattern: '(?=#\\s)',
+        chunkSize: 1024,
+        chunkOverlap: 0,
+        strictBoundaries: true,
+      })
+      const chunks = await chunker.chunk('# One\nalpha\n# Two\nbeta')
+
+      expect(chunks.length).toBe(2)
+      expect(chunks[0].text).toContain('# One')
+      expect(chunks[1].text).toContain('# Two')
     })
   })
 })

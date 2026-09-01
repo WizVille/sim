@@ -3,35 +3,28 @@ import { toDecimal } from '@/lib/billing/utils/decimal'
 
 interface DeriveEnterpriseCreditLimitsInput {
   metadata: Record<string, string>
-  monthlyPriceUsd: number
+  invoiceAmountUsd: number
   prepaidBalanceDollars: string | number
 }
 
 export function deriveEnterpriseCreditLimits({
   metadata,
-  monthlyPriceUsd,
+  invoiceAmountUsd,
   prepaidBalanceDollars,
 }: DeriveEnterpriseCreditLimitsInput) {
-  const parsedIncludedCredits = Number(metadata.includedMonthlyCredits)
-  const includedMonthlyCredits = Number.isFinite(parsedIncludedCredits)
-    ? Math.max(0, Math.round(parsedIncludedCredits))
-    : dollarsToCredits(monthlyPriceUsd)
   const parsedUsageLimitCredits = Number(metadata.usageLimitCredits)
   const configuredUsageLimitCredits = Number.isFinite(parsedUsageLimitCredits)
     ? Math.max(0, Math.round(parsedUsageLimitCredits))
-    : includedMonthlyCredits
+    : dollarsToCredits(invoiceAmountUsd)
   const prepaidBalance = toDecimal(prepaidBalanceDollars)
   const prepaidCredits = dollarsToCredits(prepaidBalance.toNumber())
-  const effectiveUsageLimitDollars = toDecimal(
-    Math.max(configuredUsageLimitCredits, includedMonthlyCredits)
-  )
+  const effectiveUsageLimitDollars = toDecimal(configuredUsageLimitCredits)
     .div(CREDIT_MULTIPLIER)
     .plus(prepaidBalance)
     .toString()
   const effectiveUsageLimitCredits = dollarsToCredits(Number(effectiveUsageLimitDollars))
 
   return {
-    includedMonthlyCredits,
     configuredUsageLimitCredits,
     prepaidCredits,
     effectiveUsageLimitCredits,

@@ -1,8 +1,11 @@
 import { ClipboardList } from '@sim/emcn/icons'
-import { GreptileIcon, SlackIcon } from '@/components/icons'
+import { GreptileIcon } from '@/components/icons'
 import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
 import type { GreptileResponse } from '@/tools/greptile/types'
+
+/** Shared by the two repository operations, which both take a branch. */
+const ON_BRANCH = { text: 'on branch', field: 'branch' } as const
 
 export const GreptileBlock: BlockConfig<GreptileResponse> = {
   type: 'greptile',
@@ -16,6 +19,22 @@ export const GreptileBlock: BlockConfig<GreptileResponse> = {
   integrationType: IntegrationType.DevOps,
   bgColor: '#181C1E',
   icon: GreptileIcon,
+  canvasPresentation: {
+    defaultTitle: 'Greptile',
+    sentences: {
+      byOperation: {
+        greptile_query: [
+          { text: 'Query', field: 'repositories', after: 'for', core: true },
+          { field: 'query', core: true },
+        ],
+        greptile_index_repo: [{ text: 'Index', field: 'repository', core: true }, ON_BRANCH],
+        greptile_status: [
+          { text: 'Check indexing status of', field: 'repository', core: true },
+          ON_BRANCH,
+        ],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -202,8 +221,8 @@ export const GreptileBlockMeta = {
   url: 'https://www.greptile.com',
   templates: [
     {
-      icon: SlackIcon,
-      title: 'Slack code Q&A bot',
+      icon: GreptileIcon,
+      title: 'Greptile Slack Q&A bot',
       prompt:
         'Build a workflow that monitors a Slack channel for code questions, routes them to Greptile against the relevant repository, and replies in-thread with the answer and the cited files.',
       modules: ['agent', 'workflows'],
@@ -213,7 +232,7 @@ export const GreptileBlockMeta = {
     },
     {
       icon: GreptileIcon,
-      title: 'Onboarding codebase explainer',
+      title: 'Greptile onboarding explainer',
       prompt:
         'Create a workflow where a new engineer asks how a part of the codebase works, Greptile answers against the indexed repository with cited files, and the explanation is saved to a Google Doc.',
       modules: ['agent', 'files', 'workflows'],
@@ -223,7 +242,7 @@ export const GreptileBlockMeta = {
     },
     {
       icon: ClipboardList,
-      title: 'PR review with codebase context',
+      title: 'Greptile PR review context',
       prompt:
         'Build a workflow that takes a pull request, asks Greptile how the changed code interacts with the rest of the repository, and writes a review comment summarizing impact and risks with cited files.',
       modules: ['agent', 'workflows'],

@@ -1,72 +1,37 @@
 /**
  * @vitest-environment node
  */
-import { createMockRequest } from '@sim/testing'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  authMockFns,
+  createMockRequest,
+  resetDbChainMock,
+  resetEnvMock,
+  setEnv,
+} from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
-  mockGetSession,
   mockRecordUsage,
-  mockCheckActorUsageLimits,
   mockVerifyWorkspaceMembership,
-  mockChatRows,
   mockResolveBillingAttribution,
-  mockResolveSystemBillingAttribution,
   mockCheckAttributedUsageLimits,
   mockToBillingContext,
   mockCheckAndBillPayerOverageThreshold,
 } = vi.hoisted(() => ({
-  mockGetSession: vi.fn(),
   mockRecordUsage: vi.fn(),
-  mockCheckActorUsageLimits: vi.fn(),
   mockVerifyWorkspaceMembership: vi.fn(),
-  mockChatRows: { value: [] as Array<Record<string, unknown>> },
   mockResolveBillingAttribution: vi.fn(),
-  mockResolveSystemBillingAttribution: vi.fn(),
   mockCheckAttributedUsageLimits: vi.fn(),
   mockToBillingContext: vi.fn(),
   mockCheckAndBillPayerOverageThreshold: vi.fn(),
 }))
 
-const SYSTEM_BILLING_ATTRIBUTION = {
-  actorUserId: 'owner-after-transfer',
-  workspaceId: 'ws-1',
-  organizationId: 'org-after-transfer',
-  billedAccountUserId: 'owner-after-transfer',
-  billingEntity: { type: 'organization' as const, id: 'org-after-transfer' },
-  billingPeriod: {
-    start: '2026-07-01T00:00:00.000Z',
-    end: '2026-08-01T00:00:00.000Z',
-  },
-  payerSubscription: null,
-}
-
-vi.mock('@sim/db', () => ({
-  db: {
-    select: () => {
-      const chain: Record<string, unknown> = {}
-      chain.from = () => chain
-      chain.leftJoin = () => chain
-      chain.where = () => chain
-      chain.limit = () => Promise.resolve(mockChatRows.value)
-      return chain
-    },
-  },
-}))
-
-vi.mock('@/lib/auth', () => ({ getSession: mockGetSession }))
-
 vi.mock('@/lib/billing/core/usage-log', () => ({ recordUsage: mockRecordUsage }))
 
 vi.mock('@/lib/billing/core/billing-attribution', () => ({
   resolveBillingAttribution: mockResolveBillingAttribution,
-  resolveSystemBillingAttribution: mockResolveSystemBillingAttribution,
   checkAttributedUsageLimits: mockCheckAttributedUsageLimits,
   toBillingContext: mockToBillingContext,
-}))
-
-vi.mock('@/lib/billing/calculations/usage-monitor', () => ({
-  checkActorUsageLimits: mockCheckActorUsageLimits,
 }))
 
 vi.mock('@/lib/billing/threshold-billing', () => ({
@@ -77,38 +42,22 @@ vi.mock('@/app/api/workflows/utils', () => ({
   verifyWorkspaceMembership: mockVerifyWorkspaceMembership,
 }))
 
-vi.mock('@/lib/core/config/env', () => ({ env: { ELEVENLABS_API_KEY: 'test-key' } }))
-
-vi.mock('@/lib/core/config/env-flags', () => ({
-  isBillingEnabled: false,
-  getCostMultiplier: () => 1,
-}))
-
 vi.mock('@/lib/core/rate-limiter', () => ({
   RateLimiter: class {
     checkRateLimitDirect = vi.fn().mockResolvedValue({ allowed: true })
   },
 }))
 
-vi.mock('@/lib/core/security/deployment', () => ({ validateAuthToken: vi.fn(() => false) }))
-
 import { POST } from '@/app/api/speech/token/route'
 
-const publicChatRow = {
-  id: 'chat-1',
-  userId: 'owner-1',
-  isActive: true,
-  authType: 'public',
-  password: null,
-  workspaceId: 'ws-1',
-}
+const mockGetSession = authMockFns.mockGetSession
 
 beforeEach(() => {
   vi.clearAllMocks()
-  mockChatRows.value = []
+  resetDbChainMock()
+  setEnv({ ELEVENLABS_API_KEY: 'test-key' })
   mockGetSession.mockResolvedValue({ user: { id: 'member-1' } })
   mockRecordUsage.mockResolvedValue(undefined)
-  mockCheckActorUsageLimits.mockResolvedValue({ isExceeded: false })
   mockCheckAttributedUsageLimits.mockResolvedValue({ isExceeded: false })
   mockResolveBillingAttribution.mockImplementation(
     ({ actorUserId, workspaceId }: { actorUserId: string; workspaceId: string }) => ({
@@ -117,7 +66,6 @@ beforeEach(() => {
       billingEntity: { type: 'organization', id: 'org-1' },
     })
   )
-  mockResolveSystemBillingAttribution.mockResolvedValue(SYSTEM_BILLING_ATTRIBUTION)
   mockToBillingContext.mockImplementation(
     (attribution: { billingEntity: { type: 'organization' | 'user'; id: string } }) => ({
       billingEntity: attribution.billingEntity,
@@ -135,6 +83,11 @@ beforeEach(() => {
   }) as unknown as typeof fetch
 })
 
+afterAll(() => {
+  resetDbChainMock()
+  resetEnvMock()
+})
+
 describe('POST /api/speech/token — usage attribution', () => {
   it('editor voice: bills the session user and stamps the verified workspace', async () => {
     const res = await POST(createMockRequest('POST', { workspaceId: 'ws-1' }))
@@ -150,7 +103,6 @@ describe('POST /api/speech/token — usage attribution', () => {
       actorUserId: 'member-1',
       workspaceId: 'ws-1',
     })
-    expect(mockResolveSystemBillingAttribution).not.toHaveBeenCalled()
     expect(mockCheckAndBillPayerOverageThreshold).toHaveBeenCalledWith({
       type: 'organization',
       id: 'org-1',
@@ -166,44 +118,8 @@ describe('POST /api/speech/token — usage attribution', () => {
     expect(mockRecordUsage).not.toHaveBeenCalled()
   })
 
-  it('deployed chat: uses one atomic system actor and payer snapshot', async () => {
-    mockChatRows.value = [publicChatRow]
-
-    const res = await POST(createMockRequest('POST', { chatId: 'chat-1' }))
-
-    expect(res.status).toBe(200)
-    expect(mockGetSession).not.toHaveBeenCalled()
-    expect(mockResolveSystemBillingAttribution).toHaveBeenCalledWith('ws-1')
-    expect(mockResolveBillingAttribution).not.toHaveBeenCalled()
-    expect(mockCheckAttributedUsageLimits).toHaveBeenCalledWith(SYSTEM_BILLING_ATTRIBUTION)
-    expect(mockToBillingContext).toHaveBeenCalledWith(SYSTEM_BILLING_ATTRIBUTION)
-    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({
-      userId: 'owner-after-transfer',
-      workspaceId: 'ws-1',
-      billingEntity: { type: 'organization', id: 'org-after-transfer' },
-    })
-    expect(mockCheckAndBillPayerOverageThreshold).toHaveBeenCalledWith({
-      type: 'organization',
-      id: 'org-after-transfer',
-    })
-  })
-
-  it('deployed chat: uses the chat owner only when no workspace exists', async () => {
-    mockChatRows.value = [{ ...publicChatRow, workspaceId: null }]
-
-    const res = await POST(createMockRequest('POST', { chatId: 'chat-1' }))
-
-    expect(res.status).toBe(200)
-    expect(mockResolveSystemBillingAttribution).not.toHaveBeenCalled()
-    expect(mockResolveBillingAttribution).not.toHaveBeenCalled()
-    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({
-      userId: 'owner-1',
-    })
-    expect(mockRecordUsage.mock.calls[0][0].workspaceId).toBeUndefined()
-  })
-
   it('rejects an oversized body before any auth/billing work runs', async () => {
-    const oversizedBody = { chatId: 'x'.repeat(64 * 1024) }
+    const oversizedBody = { workspaceId: 'x'.repeat(64 * 1024) }
     const res = await POST(createMockRequest('POST', oversizedBody))
 
     expect(res.status).toBe(413)

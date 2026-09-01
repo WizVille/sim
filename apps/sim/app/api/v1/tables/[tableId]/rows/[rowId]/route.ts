@@ -1,7 +1,6 @@
 import { db } from '@sim/db'
 import { userTableRows } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
-import { toError } from '@sim/utils/errors'
 import { and, eq } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
 import {
@@ -9,23 +8,30 @@ import {
   v1GetTableRowContract,
   v1UpdateTableRowContract,
 } from '@/lib/api/contracts/v1/tables'
-import { parseRequest, validationErrorResponseFromError } from '@/lib/api/server'
+import { parseRequest } from '@/lib/api/server'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import type { RowData, TableSchema } from '@/lib/table'
+import { updateRow } from '@/lib/table'
+import { namedRowMapper } from '@/lib/table/cell-format'
+import { buildIdByName, rowDataNameToId } from '@/lib/table/column-keys'
+import { signalTableRowsChanged } from '@/lib/table/events'
+import { performDeleteTableRow } from '@/lib/table/orchestration'
+import { createExactEmptyTableRowSecretProvenance } from '@/lib/table/rows/secret-provenance'
 import {
-  buildIdByName,
-  buildNameById,
-  rowDataIdToName,
-  rowDataNameToId,
-  updateRow,
-} from '@/lib/table'
-import { accessError, checkAccess } from '@/app/api/table/utils'
+  accessError,
+  checkAccess,
+  orchestrationErrorResponse,
+  orchestrationOutcomeErrorResponse,
+  tableLockErrorResponse,
+} from '@/app/api/table/utils'
 import {
   checkRateLimit,
   checkWorkspaceScope,
   createRateLimitResponse,
   resolveWorkspaceRequestActor,
+  v1ValidationErrorResponse,
+  v1ValidationErrorResponseFromError,
 } from '@/app/api/v1/middleware'
 
 const logger = createLogger('V1TableRowAPI')
@@ -88,13 +94,13 @@ export const GET = withRouteHandler(async (request: NextRequest, context: RowRou
       return NextResponse.json({ error: 'Row not found' }, { status: 404 })
     }
 
-    const nameById = buildNameById(result.table.schema as TableSchema)
+    const toNamedRow = namedRowMapper((result.table.schema as TableSchema).columns)
     return NextResponse.json({
       success: true,
       data: {
         row: {
           id: row.id,
-          data: rowDataIdToName(row.data as RowData, nameById),
+          data: toNamedRow(row.data as RowData),
           position: row.position,
           createdAt:
             row.createdAt instanceof Date ? row.createdAt.toISOString() : String(row.createdAt),
@@ -120,7 +126,9 @@ export const PATCH = withRouteHandler(async (request: NextRequest, context: RowR
     }
 
     const userId = rateLimit.userId!
-    const parsed = await parseRequest(v1UpdateTableRowContract, request, context)
+    const parsed = await parseRequest(v1UpdateTableRowContract, request, context, {
+      validationErrorResponse: v1ValidationErrorResponse,
+    })
     if (!parsed.success) return parsed.response
     const { tableId, rowId } = parsed.data.params
     const validated = parsed.data.body
@@ -142,18 +150,23 @@ export const PATCH = withRouteHandler(async (request: NextRequest, context: RowR
     }
 
     const idByName = buildIdByName(table.schema as TableSchema)
-    const nameById = buildNameById(table.schema as TableSchema)
+    const toNamedRow = namedRowMapper((table.schema as TableSchema).columns)
+    const patchData = rowDataNameToId(validated.data as RowData, idByName)
     const updatedRow = await updateRow(
       {
         tableId,
         rowId,
-        data: rowDataNameToId(validated.data as RowData, idByName),
+        data: patchData,
         workspaceId: validated.workspaceId,
         actorUserId,
+        secretProvenance: createExactEmptyTableRowSecretProvenance(patchData),
       },
       table,
       requestId
     )
+
+    // Live-collab: tell open viewers the change landed so they refetch.
+    signalTableRowsChanged(tableId)
     // No `cancellationGuard` is passed here, so `updateRow` can't return null
     // from this caller. Defensive narrowing for TypeScript.
     if (!updatedRow) {
@@ -168,7 +181,7 @@ export const PATCH = withRouteHandler(async (request: NextRequest, context: RowR
       data: {
         row: {
           id: updatedRow.id,
-          data: rowDataIdToName(updatedRow.data, nameById),
+          data: toNamedRow(updatedRow.data),
           position: updatedRow.position,
           createdAt:
             updatedRow.createdAt instanceof Date
@@ -183,24 +196,13 @@ export const PATCH = withRouteHandler(async (request: NextRequest, context: RowR
       },
     })
   } catch (error) {
-    const validationResponse = validationErrorResponseFromError(error)
+    const lockError = tableLockErrorResponse(error)
+    if (lockError) return lockError
+    const validationResponse = v1ValidationErrorResponseFromError(error)
     if (validationResponse) return validationResponse
 
-    const errorMessage = toError(error).message
-
-    if (errorMessage === 'Row not found') {
-      return NextResponse.json({ error: errorMessage }, { status: 404 })
-    }
-
-    if (
-      errorMessage.includes('Row size exceeds') ||
-      errorMessage.includes('Schema validation') ||
-      errorMessage.includes('must be unique') ||
-      errorMessage.includes('Unique constraint violation') ||
-      errorMessage.includes('Cannot set unique column')
-    ) {
-      return NextResponse.json({ error: errorMessage }, { status: 400 })
-    }
+    const classified = orchestrationErrorResponse(error)
+    if (classified) return classified
 
     logger.error(`[${requestId}] Error updating row:`, error)
     return NextResponse.json({ error: 'Failed to update row' }, { status: 500 })
@@ -236,20 +238,13 @@ export const DELETE = withRouteHandler(async (request: NextRequest, context: Row
       return NextResponse.json({ error: 'Invalid workspace ID' }, { status: 400 })
     }
 
-    const [deletedRow] = await db
-      .delete(userTableRows)
-      .where(
-        and(
-          eq(userTableRows.id, rowId),
-          eq(userTableRows.tableId, tableId),
-          eq(userTableRows.workspaceId, workspaceId)
-        )
-      )
-      .returning({ id: userTableRows.id })
-
-    if (!deletedRow) {
-      return NextResponse.json({ error: 'Row not found' }, { status: 404 })
+    const outcome = await performDeleteTableRow({ table: result.table, rowId, requestId })
+    if (!outcome.success) {
+      return orchestrationOutcomeErrorResponse(outcome, 'Failed to delete row')
     }
+
+    // Live-collab: tell open viewers the change landed so they refetch.
+    signalTableRowsChanged(tableId)
 
     return NextResponse.json({
       success: true,
@@ -259,6 +254,10 @@ export const DELETE = withRouteHandler(async (request: NextRequest, context: Row
       },
     })
   } catch (error) {
+    const lockError = tableLockErrorResponse(error)
+    if (lockError) return lockError
+    const classified = orchestrationErrorResponse(error)
+    if (classified) return classified
     logger.error(`[${requestId}] Error deleting row:`, error)
     return NextResponse.json({ error: 'Failed to delete row' }, { status: 500 })
   }

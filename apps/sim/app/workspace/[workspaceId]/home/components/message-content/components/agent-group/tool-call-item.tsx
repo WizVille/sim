@@ -1,17 +1,24 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { isPlainRecord } from '@sim/utils/object'
 import { ShimmerText } from '@/components/ui'
 import {
   CallIntegrationTool,
+  PrepareFileEdit,
   Read as ReadTool,
-  WorkspaceFile,
+  Terminal as TerminalTool,
+  Wait as WaitTool,
 } from '@/lib/copilot/generated/tool-catalog-v1'
 import { getReadTargetBlock } from '@/lib/copilot/tools/client/read-block'
+import { RETIRED_BROWSER_REQUEST_TAKEOVER_ID } from '@/lib/copilot/tools/retired-tools'
 import { extractStreamingStringArgument } from '@/lib/copilot/tools/streaming-args'
-import { getToolStatusDisplayTitle } from '@/lib/copilot/tools/tool-display'
-import { getBareIconStyle } from '@/blocks/icon-color'
+import { getToolStatusDisplayTitle, getWaitCountdownTitle } from '@/lib/copilot/tools/tool-display'
+import { BrandIcon } from '@/blocks/brand-icon'
+import { useCustomBlockOverlayVersion } from '@/blocks/custom/client-overlay'
 import { getBlockByToolName } from '@/blocks/registry'
-import type { ToolCallStatus } from '../../../../types'
+import type { ToolCallData, ToolCallStatus } from '../../../../types'
 import { resolveToolDisplayState } from '../../utils'
+import { BrowserTakeoverQuestion, CredentialDisplay } from '../special-tags'
+import { ToolPermissionCard } from './tool-permission-card'
 
 export function CircleStop({ className }: { className?: string }) {
   return (
@@ -34,7 +41,63 @@ interface ToolCallItemProps {
   displayTitle: string
   status: ToolCallStatus
   params?: Record<string, unknown>
+  result?: ToolCallData['result']
   streamingArgs?: string
+  /** Required for a gated row: the permission decision is posted against it. */
+  toolCallId?: string
+  /** When the call started, used to count down a running `wait`. */
+  startedAt?: number
+}
+
+function stringParam(params: Record<string, unknown> | undefined, key: string): string {
+  const value = params?.[key]
+  return typeof value === 'string' ? value : ''
+}
+
+function browserTakeoverAnswer(result: ToolCallData['result']): string {
+  if (!isPlainRecord(result?.output)) return 'Continue'
+  const instruction = result.output.userInstruction
+  return typeof instruction === 'string' && instruction.trim() ? instruction.trim() : 'Continue'
+}
+
+/** Reads a field out of the terminal tool's nested `args` object. */
+function nestedStringParam(params: Record<string, unknown> | undefined, key: string): string {
+  const args = params?.args
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return ''
+  const value = (args as Record<string, unknown>)[key]
+  return typeof value === 'string' ? value : ''
+}
+
+/**
+ * How often the countdown re-reads the clock. Comfortably under a second so
+ * the displayed number turns over close to when it actually should, rather
+ * than drifting by most of a second against an interval that started late.
+ */
+const COUNTDOWN_TICK_MS = 250
+
+/**
+ * Milliseconds elapsed since the call started, while `active`.
+ *
+ * Anchors to `startedAt` so a row that mounts partway through a pause resumes
+ * mid-countdown instead of restarting; falls back to activation time when the
+ * caller has no start to give.
+ */
+function useElapsedMs(active: boolean, startedAt: number | undefined): number {
+  const [elapsedMs, setElapsedMs] = useState(0)
+
+  useEffect(() => {
+    if (!active) {
+      setElapsedMs(0)
+      return
+    }
+    const anchor = startedAt ?? Date.now()
+    const tick = () => setElapsedMs(Date.now() - anchor)
+    tick()
+    const interval = setInterval(tick, COUNTDOWN_TICK_MS)
+    return () => clearInterval(interval)
+  }, [active, startedAt])
+
+  return elapsedMs
 }
 
 /**
@@ -46,19 +109,26 @@ interface ToolCallItemProps {
  * inline next to its display name (e.g. the Gmail logo before "Read Gmail").
  * The status-aware rewrite is repeated at this final rendering boundary so
  * live, replayed, and directly-constructed rows cannot bypass completed verbs.
+ * An executing `browser_request_takeover` is lifted by AgentGroup into its
+ * parent flow; this row remains the canonical completed-history entry after
+ * the browser agent resumes.
  */
 export function ToolCallItem({
   toolName,
   displayTitle,
   status,
   params,
+  result,
   streamingArgs,
+  toolCallId,
+  startedAt,
 }: ToolCallItemProps) {
-  const readBlock = useMemo(() => {
-    if (toolName !== ReadTool.id) return undefined
-    const path = params?.path
-    return typeof path === 'string' ? getReadTargetBlock(path) : undefined
-  }, [toolName, params])
+  useCustomBlockOverlayVersion()
+  const readPath = params?.path
+  const readBlock =
+    toolName === ReadTool.id && typeof readPath === 'string'
+      ? getReadTargetBlock(readPath)
+      : undefined
 
   // Like read's VFS-target resolution above, the gateway uses its exact
   // discovered toolId only as a deterministic registry lookup. This renders
@@ -70,7 +140,7 @@ export function ToolCallItem({
   }, [toolName, params, streamingArgs])
 
   const liveWorkspaceFileTitle = useMemo(() => {
-    if (toolName !== WorkspaceFile.id || !streamingArgs) return null
+    if (toolName !== PrepareFileEdit.id || !streamingArgs) return null
     const titleMatch = streamingArgs.match(/"title"\s*:\s*"([^"]+)"/)
     if (!titleMatch?.[1]) return null
     const opMatch = streamingArgs.match(/"operation"\s*:\s*"(\w+)"/)
@@ -98,29 +168,86 @@ export function ToolCallItem({
     return `${verb} ${unescaped}`
   }, [toolName, streamingArgs])
 
-  const isExecuting = resolveToolDisplayState(status) === 'spinner'
-  const liveTitle = liveWorkspaceFileTitle || displayTitle
-  const title = getToolStatusDisplayTitle(liveTitle, status)
+  const displayState = resolveToolDisplayState(status)
+  const isExecuting = displayState === 'spinner'
+  const isBrowserTakeover = toolName === RETIRED_BROWSER_REQUEST_TAKEOVER_ID
+
+  const isCountingDown = toolName === WaitTool.id && isExecuting
+  const elapsedMs = useElapsedMs(isCountingDown, startedAt)
+
+  const liveTitle = isCountingDown
+    ? getWaitCountdownTitle(params, elapsedMs)
+    : liveWorkspaceFileTitle || displayTitle
+  const title = getToolStatusDisplayTitle(liveTitle, status, toolName)
+
+  // A waiting terminal handoff swaps its row for the hand-back chip, the same
+  // way a browser takeover does: the row would otherwise spin with nothing
+  // saying the shell is blocked on the user.
+  const terminalHandoff =
+    toolName === TerminalTool.id && isExecuting && stringParam(params, 'operation') === 'handoff'
+      ? {
+          terminalId: nestedStringParam(params, 'terminalId'),
+          reason: nestedStringParam(params, 'reason'),
+        }
+      : null
 
   const BlockIcon = (readBlock ?? gatewayBlock ?? getBlockByToolName(toolName))?.icon
 
-  return (
-    <div className='flex items-center gap-[6px] pl-6'>
-      {BlockIcon && (
-        // Size via inline style: a custom block's image icon carries a trailing
-        // `size-full` that defeats size *classes* (it fills tiled surfaces), so a
-        // class-only size renders the uploaded icon at natural size here.
-        <BlockIcon
-          className='size-[14px] flex-shrink-0'
-          style={{ width: 14, height: 14, ...getBareIconStyle(BlockIcon) }}
+  // A gated row is replaced outright by its permission card, the same way an
+  // executing browser takeover swaps itself for the takeover chip.
+  if (displayState === 'awaiting_approval' && toolCallId) {
+    return (
+      <div className='pl-6'>
+        <ToolPermissionCard
+          toolCallId={toolCallId}
+          toolName={toolName}
+          displayTitle={liveTitle}
+          params={params}
         />
-      )}
+      </div>
+    )
+  }
+
+  if (isBrowserTakeover && isExecuting) return null
+
+  if (isBrowserTakeover && status === 'success') {
+    return (
+      <div className='pl-6'>
+        <BrowserTakeoverQuestion
+          reason={stringParam(params, 'reason')}
+          answer={browserTakeoverAnswer(result)}
+        />
+      </div>
+    )
+  }
+
+  if (terminalHandoff) {
+    return (
+      <div className='pl-6'>
+        <CredentialDisplay
+          data={[
+            {
+              type: 'terminal_handoff',
+              value: terminalHandoff.terminalId,
+              name: terminalHandoff.reason,
+            },
+          ]}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className='flex min-w-0 items-center gap-[6px] pl-6'>
+      {BlockIcon && <BrandIcon icon={BlockIcon} className='size-[14px] flex-shrink-0' />}
       {isExecuting ? (
-        <ShimmerText className='text-[13px] [--shimmer-rest:var(--text-secondary)]'>
+        <ShimmerText className='min-w-0 truncate text-[13px] leading-[18px] [--shimmer-rest:var(--text-secondary)]'>
           {title}
         </ShimmerText>
       ) : (
-        <span className='text-[13px] text-[var(--text-secondary)]'>{title}</span>
+        <span className='min-w-0 truncate text-[13px] text-[var(--text-secondary)] leading-[18px]'>
+          {title}
+        </span>
       )}
     </div>
   )

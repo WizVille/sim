@@ -3,6 +3,11 @@
  * Used by both client-side signature computation and server-side comparison.
  */
 
+import { isRecordLike } from '@sim/utils/object'
+import {
+  normalizeWorkflowEdgeSourceHandle,
+  normalizeWorkflowEdgeTargetHandle,
+} from '@sim/workflow-types/workflow'
 import type { Edge } from 'reactflow'
 import { isNonEmptyValue } from '@/lib/workflows/subblocks/visibility'
 import { isSyntheticToolSubBlockId } from '@/lib/workflows/tool-input/synthetic-subblocks'
@@ -194,7 +199,7 @@ export function sanitizeTools(tools: unknown[] | undefined): Record<string, unkn
   if (!Array.isArray(tools)) return []
 
   return tools.map((tool) => {
-    if (tool && typeof tool === 'object' && !Array.isArray(tool)) {
+    if (isRecordLike(tool)) {
       const { isExpanded, ...rest } = tool as ToolWithExpanded
       return rest
     }
@@ -231,6 +236,50 @@ export function normalizeVariables(variables: unknown): Record<string, Variable>
   return variables as Record<string, Variable>
 }
 
+/** Table row shape produced by the table subblock component */
+type TableRowLike = Record<string, unknown> & { id?: unknown; cells?: Record<string, unknown> }
+
+function isBlankTableCellValue(value: unknown): boolean {
+  return value === '' || value === null || value === undefined
+}
+
+/**
+ * Sanitizes table subblock rows for comparison. Only rows in the editor's
+ * canonical `{ id, cells }` shape are normalized:
+ * - The row `id` is dropped — it is a client-generated React key
+ *   (`generateId()`), never read at execution (`transformTable` / response
+ *   `parseHeaders` consume cells only), and non-deterministic: the table
+ *   component materializes an empty starter row with a fresh id on mount.
+ * - Rows whose cells are all empty are dropped — execution ignores rows
+ *   without a truthy Key, and the editor persists one blank starter row for
+ *   an empty table, so a blank row is presentation, not configuration.
+ *
+ * Rows in any other shape (e.g. copilot-written flat rows like
+ * `{ name, value }`) pass through verbatim — their keys carry data, so
+ * nothing about them may be assumed blank or UI-only.
+ *
+ * @param rows - Array of table row values
+ * @returns Sanitized rows array
+ */
+export function sanitizeTableRows(rows: unknown[]): unknown[] {
+  const sanitized: unknown[] = []
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      sanitized.push(row)
+      continue
+    }
+    const { cells } = row as TableRowLike
+    if (!cells || typeof cells !== 'object' || Array.isArray(cells)) {
+      sanitized.push(row)
+      continue
+    }
+    if (Object.values(cells).every(isBlankTableCellValue)) continue
+    const { id: _id, ...rest } = row as TableRowLike
+    sanitized.push(rest)
+  }
+  return sanitized
+}
+
 /** Input format item with optional UI-only fields */
 type InputFormatItem = Record<string, unknown> & { collapsed?: boolean }
 
@@ -242,7 +291,7 @@ type InputFormatItem = Record<string, unknown> & { collapsed?: boolean }
 export function sanitizeInputFormat(inputFormat: unknown[] | undefined): Record<string, unknown>[] {
   if (!Array.isArray(inputFormat)) return []
   return inputFormat.map((item) => {
-    if (item && typeof item === 'object' && !Array.isArray(item)) {
+    if (isRecordLike(item)) {
       const { collapsed, ...rest } = item as InputFormatItem
       return rest
     }
@@ -269,13 +318,26 @@ export function normalizeEdge(edge: Edge): NormalizedEdge {
     source: edge.source,
     target: edge.target,
   }
+  /*
+   * Canonicalized here rather than by each caller, because the two sides of a
+   * redeploy check are loaded by different paths and only some of them
+   * normalize: the server diffs the normalized tables — which now collapse a
+   * falsy handle to nothing — against the version's raw jsonb, which does not.
+   * An edge persisted with `sourceHandle: ''` (two write paths use `?? null`,
+   * which preserves it) would then be present on one side and absent on the
+   * other, counting as removed-and-re-added and asking every such workflow to
+   * redeploy. Both spellings name one port, so the comparison must not be able
+   * to tell them apart however its inputs arrived.
+   */
+  const sourceHandle = normalizeWorkflowEdgeSourceHandle(edge.sourceHandle)
+  const targetHandle = normalizeWorkflowEdgeTargetHandle(edge.targetHandle)
   // Only include handles if they have a non-null value
   // This treats null and undefined as equivalent (both omitted)
-  if (edge.sourceHandle != null) {
-    normalized.sourceHandle = edge.sourceHandle
+  if (sourceHandle != null) {
+    normalized.sourceHandle = sourceHandle
   }
-  if (edge.targetHandle != null) {
-    normalized.targetHandle = edge.targetHandle
+  if (targetHandle != null) {
+    normalized.targetHandle = targetHandle
   }
   return normalized
 }
@@ -465,13 +527,19 @@ export function normalizeTriggerConfigValues(
 
 /**
  * Normalizes a subBlock value with sanitization for specific subBlock types.
- * Sanitizes: tools (removes isExpanded), inputFormat (removes collapsed)
+ * Sanitizes: tools (removes isExpanded), inputFormat (removes collapsed),
+ * table values (removes non-deterministic row ids and all-blank starter rows).
  *
  * @param subBlockId - The subBlock ID
  * @param value - The subBlock value
+ * @param subBlockType - Optional subBlock type for type-based sanitization
  * @returns Normalized value
  */
-export function normalizeSubBlockValue(subBlockId: string, value: unknown): unknown {
+export function normalizeSubBlockValue(
+  subBlockId: string,
+  value: unknown,
+  subBlockType?: unknown
+): unknown {
   let normalizedValue = value ?? null
 
   if (subBlockId === 'tools' && Array.isArray(normalizedValue)) {
@@ -479,6 +547,10 @@ export function normalizeSubBlockValue(subBlockId: string, value: unknown): unkn
   }
   if (subBlockId === 'inputFormat' && Array.isArray(normalizedValue)) {
     normalizedValue = sanitizeInputFormat(normalizedValue)
+  }
+  if (subBlockType === 'table' && Array.isArray(normalizedValue)) {
+    const sanitizedRows = sanitizeTableRows(normalizedValue)
+    normalizedValue = sanitizedRows.length > 0 ? sanitizedRows : null
   }
 
   return normalizedValue
@@ -530,7 +602,7 @@ export function normalizeWorkflowState(state: WorkflowState): NormalizedWorkflow
 
     for (const subBlockId of subBlockIds) {
       const subBlock = blockSubBlocks[subBlockId] as SubBlockWithDiffMarker
-      const value = normalizeSubBlockValue(subBlockId, subBlock.value)
+      const value = normalizeSubBlockValue(subBlockId, subBlock.value, subBlock.type)
       const subBlockRest = extractSubBlockRest(subBlock as Record<string, unknown>)
 
       normalizedSubBlocks[subBlockId] = {

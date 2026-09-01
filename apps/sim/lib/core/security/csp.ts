@@ -1,3 +1,4 @@
+import { CONSENT_BACKEND_URL } from '../../consent/constants'
 import { env, getEnv } from '../config/env'
 import { isDev, isHosted, isReactGrabEnabled } from '../config/env-flags'
 
@@ -6,7 +7,8 @@ import { isDev, isHosted, isReactGrabEnabled } from '../config/env-flags'
  *
  * NOTE: This file is loaded by next.config.ts at build time, before @/ path
  * aliases are resolved. Do NOT import from ../utils/urls (which uses @/ imports).
- * Keep all URL constants local to this file.
+ * Keep URL constants local to this file, or in a leaf module reachable by a
+ * relative import that itself pulls in no `@/` paths (../../consent/constants).
  */
 
 const DEFAULT_SOCKET_URL = 'http://localhost:3002'
@@ -14,6 +16,23 @@ const DEFAULT_OLLAMA_URL = 'http://localhost:11434'
 
 function toWebSocketUrl(httpUrl: string): string {
   return httpUrl.replace('http://', 'ws://').replace('https://', 'wss://')
+}
+
+/**
+ * Kept in sync with LOCALHOST_HOSTNAMES in ../utils/urls by hand: this module is
+ * loaded by next.config.ts before `@/` aliases resolve, so it cannot import from
+ * there (see the note above).
+ */
+const LOCALHOST_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+
+/** Mirrors getSocketUrl's localhost check — those origins fall back to DEFAULT_SOCKET_URL. */
+function isLocalhostUrl(url: string): boolean {
+  if (!url) return false
+  try {
+    return LOCALHOST_HOSTNAMES.has(new URL(url).hostname)
+  } catch {
+    return false
+  }
 }
 
 function getHostnameFromUrl(url: string | undefined): string[] {
@@ -66,6 +85,9 @@ const STATIC_SCRIPT_SRC = [
         'https://*.hs-analytics.net',
         'https://*.hscollectedforms.net',
         'https://*.hs-banner.com',
+        // X (Twitter) conversion pixel (landing pages) — the base code injects
+        // uwt.js as a <script> tag from static.ads-twitter.com
+        'https://static.ads-twitter.com',
       ]
     : []),
 ] as const
@@ -87,6 +109,7 @@ const STATIC_CONNECT_SRC = [
   'https://*.supabase.co',
   'https://api.github.com',
   'https://github.com/*',
+  'https://status.sim.ai',
   'https://challenges.cloudflare.com',
   // Cal.com booking embed (landing /demo) — embed XHR/availability calls
   'https://app.cal.com',
@@ -95,6 +118,9 @@ const STATIC_CONNECT_SRC = [
   ...(isDev ? ['ws://localhost:4722'] : []),
   ...(isHosted
     ? [
+        // Blocked here, the consent runtime silently falls back to an offline
+        // policy and the banner shows to every visitor worldwide.
+        CONSENT_BACKEND_URL,
         'https://www.googletagmanager.com',
         'https://*.google-analytics.com',
         'https://*.analytics.google.com',
@@ -106,6 +132,10 @@ const STATIC_CONNECT_SRC = [
         // The visitor beacon itself is an image pixel (img-src, already
         // permitted below), not a connect-src request.
         'https://*.hscollectedforms.net',
+        // X (Twitter) conversion pixel — uwt.js sends conversion beacons here
+        // via fetch/sendBeacon. The t.co image-pixel fallback is already
+        // covered by the `https:` wildcard in img-src.
+        'https://analytics.twitter.com',
       ]
     : []),
 ] as const
@@ -141,7 +171,6 @@ const STATIC_FRAME_SRC = [
   'https://www.mixcloud.com',
   'https://tenor.com',
   'https://giphy.com',
-  ...(isHosted ? ['https://www.googletagmanager.com'] : []),
 ] as const
 
 // Build-time CSP directives (for next.config.ts)
@@ -201,7 +230,15 @@ export function buildCSPString(directives: CSPDirectives): string {
 export function generateRuntimeCSP(): string {
   const appUrl = getEnv('NEXT_PUBLIC_APP_URL') || ''
 
-  const socketUrl = getEnv('NEXT_PUBLIC_SOCKET_URL') || (isDev ? DEFAULT_SOCKET_URL : '')
+  // Must permit whatever getSocketUrl() actually connects to, or the browser
+  // blocks the handshake and Socket.IO retries forever. That helper falls back
+  // to DEFAULT_SOCKET_URL whenever the page is served from localhost — which
+  // includes a production build (docker compose sets NODE_ENV=production), so
+  // keying this on isDev alone left the bundled stack with a CSP that forbade
+  // its own realtime port. A non-localhost origin still resolves to the page
+  // origin, which appUrl already covers, so nothing is loosened there.
+  const socketUrl =
+    getEnv('NEXT_PUBLIC_SOCKET_URL') || (isDev || isLocalhostUrl(appUrl) ? DEFAULT_SOCKET_URL : '')
   const socketWsUrl = socketUrl ? toWebSocketUrl(socketUrl) : ''
   const ollamaUrl = getEnv('OLLAMA_URL') || (isDev ? DEFAULT_OLLAMA_URL : '')
 

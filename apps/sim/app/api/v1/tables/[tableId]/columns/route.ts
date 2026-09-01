@@ -6,21 +6,26 @@ import {
   v1DeleteTableColumnContract,
   v1UpdateTableColumnContract,
 } from '@/lib/api/contracts/v1/tables'
-import { parseRequest, validationErrorResponseFromError } from '@/lib/api/server'
+import { parseRequest } from '@/lib/api/server'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { addTableColumn, deleteColumn } from '@/lib/table'
+import { signalTableSchemaChanged } from '@/lib/table/events'
+import { performUpdateTableColumn } from '@/lib/table/orchestration'
+import { normalizeColumn } from '@/lib/table/wire'
 import {
-  addTableColumn,
-  deleteColumn,
-  renameColumn,
-  updateColumnConstraints,
-  updateColumnType,
-} from '@/lib/table'
-import { accessError, checkAccess, normalizeColumn } from '@/app/api/table/utils'
+  accessError,
+  checkAccess,
+  orchestrationErrorResponse,
+  orchestrationOutcomeErrorResponse,
+  tableLockErrorResponse,
+} from '@/app/api/table/utils'
 import {
   checkRateLimit,
   checkWorkspaceScope,
   createRateLimitResponse,
+  v1ValidationErrorResponse,
+  v1ValidationErrorResponseFromError,
 } from '@/app/api/v1/middleware'
 
 const logger = createLogger('V1TableColumnsAPI')
@@ -44,7 +49,9 @@ export const POST = withRouteHandler(async (request: NextRequest, context: Colum
 
     const userId = rateLimit.userId!
 
-    const parsed = await parseRequest(v1AddTableColumnContract, request, context)
+    const parsed = await parseRequest(v1AddTableColumnContract, request, context, {
+      validationErrorResponse: v1ValidationErrorResponse,
+    })
     if (!parsed.success) return parsed.response
     const { tableId } = parsed.data.params
     const validated = parsed.data.body
@@ -62,6 +69,7 @@ export const POST = withRouteHandler(async (request: NextRequest, context: Colum
     }
 
     const updatedTable = await addTableColumn(tableId, validated.column, requestId)
+    signalTableSchemaChanged(tableId)
 
     recordAudit({
       workspaceId: validated.workspaceId,
@@ -82,17 +90,13 @@ export const POST = withRouteHandler(async (request: NextRequest, context: Colum
       },
     })
   } catch (error) {
-    const validationResponse = validationErrorResponseFromError(error)
+    const lockError = tableLockErrorResponse(error)
+    if (lockError) return lockError
+    const validationResponse = v1ValidationErrorResponseFromError(error)
     if (validationResponse) return validationResponse
 
-    if (error instanceof Error) {
-      if (error.message.includes('already exists') || error.message.includes('maximum column')) {
-        return NextResponse.json({ error: error.message }, { status: 400 })
-      }
-      if (error.message === 'Table not found') {
-        return NextResponse.json({ error: error.message }, { status: 404 })
-      }
-    }
+    const classified = orchestrationErrorResponse(error)
+    if (classified) return classified
 
     logger.error(`[${requestId}] Error adding column to table:`, error)
     return NextResponse.json({ error: 'Failed to add column' }, { status: 500 })
@@ -111,7 +115,9 @@ export const PATCH = withRouteHandler(async (request: NextRequest, context: Colu
 
     const userId = rateLimit.userId!
 
-    const parsed = await parseRequest(v1UpdateTableColumnContract, request, context)
+    const parsed = await parseRequest(v1UpdateTableColumnContract, request, context, {
+      validationErrorResponse: v1ValidationErrorResponse,
+    })
     if (!parsed.success) return parsed.response
     const { tableId } = parsed.data.params
     const validated = parsed.data.body
@@ -128,78 +134,30 @@ export const PATCH = withRouteHandler(async (request: NextRequest, context: Colu
       return NextResponse.json({ error: 'Invalid workspace ID' }, { status: 400 })
     }
 
-    const { updates } = validated
-    let updatedTable = null
-
-    if (updates.name) {
-      updatedTable = await renameColumn(
-        { tableId, oldName: validated.columnName, newName: updates.name },
-        requestId
-      )
-    }
-
-    if (updates.type) {
-      updatedTable = await updateColumnType(
-        { tableId, columnName: updates.name ?? validated.columnName, newType: updates.type },
-        requestId
-      )
-    }
-
-    if (updates.required !== undefined || updates.unique !== undefined) {
-      updatedTable = await updateColumnConstraints(
-        {
-          tableId,
-          columnName: updates.name ?? validated.columnName,
-          ...(updates.required !== undefined ? { required: updates.required } : {}),
-          ...(updates.unique !== undefined ? { unique: updates.unique } : {}),
-        },
-        requestId
-      )
-    }
-
-    if (!updatedTable) {
-      return NextResponse.json({ error: 'No updates specified' }, { status: 400 })
-    }
-
-    recordAudit({
-      workspaceId: validated.workspaceId,
-      actorId: userId,
-      action: AuditAction.TABLE_UPDATED,
-      resourceType: AuditResourceType.TABLE,
-      resourceId: tableId,
-      resourceName: table.name,
-      description: `Updated column "${validated.columnName}" in table "${table.name}"`,
-      metadata: { columnName: validated.columnName, updates },
+    const outcome = await performUpdateTableColumn({
+      table,
+      columnName: validated.columnName,
+      userId,
+      updates: validated.updates,
+      requestId,
       request,
     })
+    if (!outcome.success || !outcome.table) {
+      return orchestrationOutcomeErrorResponse(outcome, 'Failed to update column')
+    }
+
+    // Live-collab: tell open viewers the change landed so they refetch.
+    signalTableSchemaChanged(tableId)
 
     return NextResponse.json({
       success: true,
       data: {
-        columns: updatedTable.schema.columns.map(normalizeColumn),
+        columns: outcome.table.schema.columns.map(normalizeColumn),
       },
     })
   } catch (error) {
-    const validationResponse = validationErrorResponseFromError(error)
+    const validationResponse = v1ValidationErrorResponseFromError(error)
     if (validationResponse) return validationResponse
-
-    if (error instanceof Error) {
-      const msg = error.message
-      if (msg.includes('not found') || msg.includes('Table not found')) {
-        return NextResponse.json({ error: msg }, { status: 404 })
-      }
-      if (
-        msg.includes('already exists') ||
-        msg.includes('Cannot delete the last column') ||
-        msg.includes('Cannot set column') ||
-        msg.includes('Invalid column') ||
-        msg.includes('exceeds maximum') ||
-        msg.includes('incompatible') ||
-        msg.includes('duplicate')
-      ) {
-        return NextResponse.json({ error: msg }, { status: 400 })
-      }
-    }
 
     logger.error(`[${requestId}] Error updating column in table:`, error)
     return NextResponse.json({ error: 'Failed to update column' }, { status: 500 })
@@ -219,7 +177,9 @@ export const DELETE = withRouteHandler(
 
       const userId = rateLimit.userId!
 
-      const parsed = await parseRequest(v1DeleteTableColumnContract, request, context)
+      const parsed = await parseRequest(v1DeleteTableColumnContract, request, context, {
+        validationErrorResponse: v1ValidationErrorResponse,
+      })
       if (!parsed.success) return parsed.response
       const { tableId } = parsed.data.params
       const validated = parsed.data.body
@@ -240,6 +200,7 @@ export const DELETE = withRouteHandler(
         { tableId, columnName: validated.columnName },
         requestId
       )
+      signalTableSchemaChanged(tableId)
 
       recordAudit({
         workspaceId: validated.workspaceId,
@@ -260,17 +221,13 @@ export const DELETE = withRouteHandler(
         },
       })
     } catch (error) {
-      const validationResponse = validationErrorResponseFromError(error)
+      const lockError = tableLockErrorResponse(error)
+      if (lockError) return lockError
+      const validationResponse = v1ValidationErrorResponseFromError(error)
       if (validationResponse) return validationResponse
 
-      if (error instanceof Error) {
-        if (error.message.includes('not found') || error.message === 'Table not found') {
-          return NextResponse.json({ error: error.message }, { status: 404 })
-        }
-        if (error.message.includes('Cannot delete') || error.message.includes('last column')) {
-          return NextResponse.json({ error: error.message }, { status: 400 })
-        }
-      }
+      const classified = orchestrationErrorResponse(error)
+      if (classified) return classified
 
       logger.error(`[${requestId}] Error deleting column from table:`, error)
       return NextResponse.json({ error: 'Failed to delete column' }, { status: 500 })

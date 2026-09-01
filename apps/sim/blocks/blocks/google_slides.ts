@@ -6,11 +6,20 @@ import { AuthMode, IntegrationType } from '@/blocks/types'
 import { normalizeFileInput, SERVICE_ACCOUNT_SUBBLOCKS } from '@/blocks/utils'
 import type { GoogleSlidesResponse } from '@/tools/google_slides/types'
 
+const PRESENTATION_FIELD = ['presentationId', 'manualPresentationId'] as const
+const SOURCE_PRESENTATION_FIELD = [
+  'sourcePresentationSelector',
+  'manualSourcePresentationId',
+] as const
+const NEW_PRESENTATION_FOLDER_FIELD = ['folderSelector', 'folderId'] as const
+const COPY_FOLDER_FIELD = ['copyFolderSelector', 'manualCopyFolderId'] as const
+
 export const GoogleSlidesBlock: BlockConfig<GoogleSlidesResponse> = {
   type: 'google_slides',
   name: 'Google Slides (Legacy)',
   description: 'Read, write, and create presentations',
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'google_slides_v2' },
   authMode: AuthMode.OAuth,
   longDescription:
     'Build, edit, and export branded Google Slides presentations end-to-end. Copy a template, replace text and image tokens, embed Sheets charts, style text and shapes with brand fonts and colors, manage tables and layouts, group elements, run atomic batch updates, and export to PDF or PPTX.',
@@ -19,6 +28,236 @@ export const GoogleSlidesBlock: BlockConfig<GoogleSlidesResponse> = {
   integrationType: IntegrationType.Documents,
   bgColor: '#FFFFFF',
   icon: GoogleSlidesIcon,
+  canvasPresentation: {
+    defaultTitle: 'Google Slides',
+    sentences: {
+      byOperation: {
+        read: [{ text: 'Read all slides from', field: PRESENTATION_FIELD, core: true }],
+        write: [
+          { text: 'Write', field: 'content', core: true },
+          { text: 'to slide', field: 'slideIndex' },
+          { text: 'in', field: PRESENTATION_FIELD, core: true },
+        ],
+        create: [
+          { text: 'Create presentation', field: 'title', core: true },
+          { text: 'in folder', field: NEW_PRESENTATION_FOLDER_FIELD },
+        ],
+        copy_presentation: [
+          { text: 'Copy', field: SOURCE_PRESENTATION_FIELD, core: true },
+          { text: 'to a new file named', field: 'copyTitle' },
+          { text: 'in folder', field: COPY_FOLDER_FIELD },
+        ],
+        export_presentation: [
+          { text: 'Export', field: PRESENTATION_FIELD, core: true },
+          { text: 'as', field: 'exportFormat' },
+        ],
+        batch_update: [
+          { text: 'Run a raw batch update on', field: PRESENTATION_FIELD, core: true },
+        ],
+        replace_all_text: [
+          { text: 'Replace every', field: 'findText', core: true },
+          { text: 'with', field: 'replaceText' },
+          { text: 'in', field: PRESENTATION_FIELD },
+        ],
+        replace_all_shapes_with_image: [
+          { text: 'Replace shapes matching', field: 'replaceShapesFindText', core: true },
+          { text: 'with the image at', field: 'replaceShapesImageUrl', core: true },
+        ],
+        replace_image: [
+          { text: 'Swap image', field: 'replaceImageObjectId', core: true },
+          { text: 'for the image at', field: 'replaceImageUrl' },
+        ],
+        update_image_properties: [
+          { text: 'Restyle image', field: 'imagePropsObjectId', core: true },
+          { text: ', setting outline to', field: 'imageOutlineColor' },
+        ],
+        add_slide: [
+          { text: 'Add a slide to', field: PRESENTATION_FIELD, core: true },
+          { text: ', using layout', field: 'layout' },
+          { text: ', at position', field: 'insertionIndex' },
+        ],
+        add_image: [
+          { text: 'Add an image to slide', field: 'pageObjectId', core: true },
+          { text: 'in', field: PRESENTATION_FIELD },
+        ],
+        get_thumbnail: [
+          { text: 'Render a thumbnail of slide', field: 'thumbnailPageId', core: true },
+          { text: 'at', field: 'thumbnailSize' },
+        ],
+        get_page: [
+          { text: 'Read slide', field: 'getPageObjectId', core: true },
+          { text: 'in', field: PRESENTATION_FIELD },
+        ],
+        delete_object: [
+          { text: 'Delete object', field: 'deleteObjectId', core: true },
+          { text: 'from', field: PRESENTATION_FIELD },
+        ],
+        duplicate_object: [
+          { text: 'Duplicate object', field: 'duplicateObjectId', core: true },
+          { text: 'in', field: PRESENTATION_FIELD },
+        ],
+        reorder_slides: [
+          { text: 'Move slides', field: 'reorderSlideIds', core: true },
+          { text: 'to position', field: 'reorderInsertionIndex' },
+        ],
+        create_table: [
+          { text: 'Create a table on slide', field: 'tablePageObjectId', core: true },
+          { text: 'with', field: 'tableRows', after: 'rows' },
+          { text: 'and', field: 'tableColumns', after: 'columns' },
+        ],
+        create_shape: [
+          {
+            text: 'Create shape',
+            field: 'shapeType',
+            after: 'on slide',
+            core: true,
+          },
+          { field: 'shapePageObjectId', core: true },
+        ],
+        create_line: [
+          {
+            text: 'Create',
+            field: 'lineCategory',
+            after: 'line on slide',
+            core: true,
+          },
+          { field: 'linePageObjectId', core: true },
+        ],
+        insert_text: [
+          { text: 'Insert', field: 'insertTextContent', core: true },
+          { text: 'into', field: 'insertTextObjectId', core: true },
+        ],
+        delete_text: [
+          { text: 'Delete text from', field: 'textObjectId', core: true },
+          { text: ', covering', field: 'textRangeType' },
+        ],
+        update_text_style: [
+          { text: 'Style text in', field: 'textObjectId', core: true },
+          { text: ', setting font to', field: 'textFontFamily' },
+          { text: ', at size', field: 'textFontSize' },
+        ],
+        update_paragraph_style: [
+          { text: 'Style paragraphs in', field: 'textObjectId', core: true },
+          { text: ', aligned', field: 'paragraphAlignment' },
+        ],
+        create_paragraph_bullets: [
+          { text: 'Add bullets to paragraphs in', field: 'textObjectId', core: true },
+        ],
+        delete_paragraph_bullets: [
+          { text: 'Remove bullets from paragraphs in', field: 'textObjectId', core: true },
+        ],
+        update_shape_properties: [
+          { text: 'Restyle shape', field: 'shapePropsObjectId', core: true },
+          { text: ', setting fill to', field: 'shapeFillColor' },
+        ],
+        update_page_properties: [
+          { text: 'Set the background of slide', field: 'pagePropsObjectId', core: true },
+          { text: 'to', field: 'pageBackgroundColor' },
+        ],
+        update_slide_properties: [
+          { text: 'Update properties of slide', field: 'slidePropsObjectId', core: true },
+        ],
+        update_page_element_alt_text: [
+          { text: 'Set alt text on element', field: 'altTextObjectId', core: true },
+          { text: 'to', field: ['altTextTitle', 'altTextDescription'] },
+        ],
+        update_page_element_transform: [
+          { text: 'Move or resize element', field: 'transformObjectId', core: true },
+        ],
+        update_page_elements_z_order: [
+          { text: 'Set layering of elements', field: 'zOrderObjectIds', core: true },
+          { text: 'to', field: 'zOrderOperation' },
+        ],
+        group_objects: [
+          { text: 'Group elements', field: 'groupChildrenObjectIds', core: true },
+          { text: 'into group', field: 'groupObjectIdInput' },
+        ],
+        ungroup_objects: [{ text: 'Ungroup', field: 'ungroupObjectIds', core: true }],
+        update_line_properties: [
+          { text: 'Restyle line', field: 'linePropsObjectId', core: true },
+          { text: ', setting color to', field: 'lineColor' },
+        ],
+        update_line_category: [
+          { text: 'Set the category of line', field: 'lineCategoryObjectId', core: true },
+          { text: 'to', field: 'newLineCategory' },
+        ],
+        reroute_line: [{ text: 'Reroute line', field: 'rerouteLineObjectId', core: true }],
+        insert_table_rows: [
+          {
+            text: 'Insert',
+            field: 'tableInsertNumber',
+            after: 'rows into table',
+            core: true,
+          },
+          { field: 'tableTargetObjectId', core: true },
+        ],
+        insert_table_columns: [
+          {
+            text: 'Insert',
+            field: 'tableInsertNumber',
+            after: 'columns into table',
+            core: true,
+          },
+          { field: 'tableTargetObjectId', core: true },
+        ],
+        delete_table_row: [
+          { text: 'Delete row', field: 'tableCellRowIndex', core: true },
+          { text: 'from table', field: 'tableTargetObjectId', core: true },
+        ],
+        delete_table_column: [
+          { text: 'Delete column', field: 'tableCellColumnIndex', core: true },
+          { text: 'from table', field: 'tableTargetObjectId', core: true },
+        ],
+        merge_table_cells: [
+          { text: 'Merge cells in table', field: 'tableRangeObjectId', core: true },
+          { text: ', spanning', field: 'tableRangeRowSpan', after: 'rows' },
+        ],
+        unmerge_table_cells: [
+          { text: 'Unmerge cells in table', field: 'tableRangeObjectId', core: true },
+        ],
+        update_table_cell_properties: [
+          { text: 'Restyle cells in table', field: 'tableRangeObjectId', core: true },
+          { text: ', setting background to', field: 'tableCellBackgroundColor' },
+        ],
+        update_table_border_properties: [
+          { text: 'Restyle borders in table', field: 'tableRangeObjectId', core: true },
+          { text: ', on edges', field: 'tableBorderPosition' },
+        ],
+        update_table_column_properties: [
+          { text: 'Resize columns', field: 'tableColumnIndices', core: true },
+          { text: 'in table', field: 'tableColumnPropsObjectId', core: true },
+          { text: 'to', field: 'tableColumnWidth', after: 'points' },
+        ],
+        update_table_row_properties: [
+          { text: 'Resize rows', field: 'tableRowIndices', core: true },
+          { text: 'in table', field: 'tableRowPropsObjectId', core: true },
+          { text: 'to at least', field: 'tableMinRowHeight', after: 'points' },
+        ],
+        create_sheets_chart: [
+          { text: 'Embed Sheets chart', field: 'chartId', core: true },
+          { text: 'on slide', field: 'chartPageObjectId' },
+        ],
+        refresh_sheets_chart: [
+          { text: 'Refresh embedded chart', field: 'refreshChartObjectId', core: true },
+        ],
+        replace_all_shapes_with_sheets_chart: [
+          { text: 'Replace shapes matching', field: 'replaceShapesChartFindText', core: true },
+          { text: 'with Sheets chart', field: 'chartId', core: true },
+        ],
+        create_video: [
+          { text: 'Embed a video from', field: 'videoSource', core: true },
+          { text: 'on slide', field: 'videoPageObjectId', core: true },
+        ],
+        update_video_properties: [
+          {
+            text: 'Update playback options for video',
+            field: 'videoPropsObjectId',
+            core: true,
+          },
+        ],
+      },
+    },
+  },
   subBlocks: [
     // Operation selector
     {
@@ -241,7 +480,6 @@ export const GoogleSlidesBlock: BlockConfig<GoogleSlidesResponse> = {
       },
     },
 
-    // ========== Write Operation Fields ==========
     {
       id: 'slideIndex',
       title: 'Slide Index',
@@ -269,7 +507,6 @@ Return ONLY the slide content - no explanations, no markdown formatting markers,
       },
     },
 
-    // ========== Create Operation Fields ==========
     {
       id: 'title',
       title: 'Presentation Title',
@@ -339,7 +576,6 @@ Return ONLY the slide content - no explanations, no markdown formatting markers,
       },
     },
 
-    // ========== Replace All Text Operation Fields ==========
     {
       id: 'findText',
       title: 'Find Text',
@@ -379,7 +615,6 @@ Return ONLY the replacement text - no explanations, no quotes, no extra text.`,
       mode: 'advanced',
     },
 
-    // ========== Add Slide Operation Fields ==========
     {
       id: 'layout',
       title: 'Slide Layout',
@@ -436,7 +671,6 @@ Return ONLY the JSON array - no explanations, no markdown, no extra text.`,
       },
     },
 
-    // ========== Add Image Operation Fields ==========
     {
       id: 'pageObjectId',
       title: 'Slide ID',
@@ -496,7 +730,6 @@ Return ONLY the JSON array - no explanations, no markdown, no extra text.`,
       condition: { field: 'operation', value: 'add_image' },
     },
 
-    // ========== Get Thumbnail Operation Fields ==========
     {
       id: 'thumbnailPageId',
       title: 'Slide ID',
@@ -526,7 +759,6 @@ Return ONLY the JSON array - no explanations, no markdown, no extra text.`,
       value: () => 'PNG',
     },
 
-    // ========== Get Page Operation Fields ==========
     {
       id: 'getPageObjectId',
       title: 'Page/Slide ID',
@@ -536,7 +768,6 @@ Return ONLY the JSON array - no explanations, no markdown, no extra text.`,
       required: true,
     },
 
-    // ========== Delete Object Operation Fields ==========
     {
       id: 'deleteObjectId',
       title: 'Object ID',
@@ -546,7 +777,6 @@ Return ONLY the JSON array - no explanations, no markdown, no extra text.`,
       required: true,
     },
 
-    // ========== Duplicate Object Operation Fields ==========
     {
       id: 'duplicateObjectId',
       title: 'Object ID',
@@ -564,7 +794,6 @@ Return ONLY the JSON array - no explanations, no markdown, no extra text.`,
       mode: 'advanced',
     },
 
-    // ========== Reorder Slides Operation Fields ==========
     {
       id: 'reorderSlideIds',
       title: 'Slide IDs',
@@ -582,7 +811,6 @@ Return ONLY the JSON array - no explanations, no markdown, no extra text.`,
       required: true,
     },
 
-    // ========== Create Table Operation Fields ==========
     {
       id: 'tablePageObjectId',
       title: 'Slide ID',
@@ -636,7 +864,6 @@ Return ONLY the JSON array - no explanations, no markdown, no extra text.`,
       condition: { field: 'operation', value: 'create_table' },
     },
 
-    // ========== Create Shape Operation Fields ==========
     {
       id: 'shapePageObjectId',
       title: 'Slide ID',
@@ -697,7 +924,6 @@ Return ONLY the JSON array - no explanations, no markdown, no extra text.`,
       condition: { field: 'operation', value: 'create_shape' },
     },
 
-    // ========== Insert Text Operation Fields ==========
     {
       id: 'insertTextObjectId',
       title: 'Object ID',
@@ -733,7 +959,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'insert_text' },
     },
 
-    // ========== Copy Presentation Operation Fields ==========
     {
       id: 'sourcePresentationSelector',
       title: 'Source Presentation',
@@ -792,7 +1017,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'copy_presentation' },
     },
 
-    // ========== Export Presentation Operation Fields ==========
     {
       id: 'exportFormat',
       title: 'Export Format',
@@ -810,7 +1034,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'export_presentation' },
     },
 
-    // ========== Batch Update (Raw) Operation Fields ==========
     {
       id: 'requestsJson',
       title: 'Requests (JSON Array)',
@@ -835,7 +1058,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Replace All Shapes With Image Fields ==========
     {
       id: 'replaceShapesImageUrl',
       title: 'Image URL',
@@ -878,7 +1100,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Replace Image Fields ==========
     {
       id: 'replaceImageObjectId',
       title: 'Image Object ID',
@@ -907,7 +1128,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'replace_image' },
     },
 
-    // ========== Update Image Properties Fields ==========
     {
       id: 'imagePropsObjectId',
       title: 'Image Object ID',
@@ -984,7 +1204,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Text Style Fields ==========
     {
       id: 'textObjectId',
       title: 'Object ID',
@@ -1312,7 +1531,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'create_paragraph_bullets' },
     },
 
-    // ========== Update Shape Properties Fields ==========
     {
       id: 'shapePropsObjectId',
       title: 'Shape Object ID',
@@ -1417,7 +1635,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Update Page Properties Fields ==========
     {
       id: 'pagePropsObjectId',
       title: 'Slide ID',
@@ -1471,7 +1688,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Update Slide Properties Fields ==========
     {
       id: 'slidePropsObjectId',
       title: 'Slide ID',
@@ -1502,7 +1718,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Update Alt Text Fields ==========
     {
       id: 'altTextObjectId',
       title: 'Element Object ID',
@@ -1523,7 +1738,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'update_page_element_alt_text' },
     },
 
-    // ========== Update Element Transform Fields ==========
     {
       id: 'transformObjectId',
       title: 'Element Object ID',
@@ -1583,7 +1797,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'update_page_element_transform' },
     },
 
-    // ========== Z-Order Fields ==========
     {
       id: 'zOrderObjectIds',
       title: 'Object IDs',
@@ -1606,7 +1819,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       required: true,
     },
 
-    // ========== Group / Ungroup Fields ==========
     {
       id: 'groupChildrenObjectIds',
       title: 'Children Object IDs',
@@ -1632,7 +1844,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       required: true,
     },
 
-    // ========== Create Line Fields ==========
     {
       id: 'linePageObjectId',
       title: 'Slide ID',
@@ -1680,7 +1891,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'create_line' },
     },
 
-    // ========== Update Line Properties Fields ==========
     {
       id: 'linePropsObjectId',
       title: 'Line Object ID',
@@ -1748,7 +1958,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Update Line Category Fields ==========
     {
       id: 'lineCategoryObjectId',
       title: 'Line Object ID',
@@ -1769,7 +1978,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       required: true,
     },
 
-    // ========== Reroute Line Fields ==========
     {
       id: 'rerouteLineObjectId',
       title: 'Line Object ID',
@@ -1778,7 +1986,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       required: true,
     },
 
-    // ========== Table Row/Column Insert/Delete Fields ==========
     {
       id: 'tableTargetObjectId',
       title: 'Table Object ID',
@@ -1850,7 +2057,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'insert_table_columns' },
     },
 
-    // ========== Merge / Unmerge / Cell / Border Table Range Fields ==========
     {
       id: 'tableRangeObjectId',
       title: 'Table Object ID',
@@ -1931,7 +2137,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       required: true,
     },
 
-    // ========== Update Table Cell Properties Fields ==========
     {
       id: 'tableCellBackgroundColor',
       title: 'Cell Background Color',
@@ -1974,7 +2179,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Update Table Border Properties Fields ==========
     {
       id: 'tableBorderPosition',
       title: 'Border Position',
@@ -2030,7 +2234,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Update Table Column Properties Fields ==========
     {
       id: 'tableColumnPropsObjectId',
       title: 'Table Object ID',
@@ -2068,7 +2271,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Update Table Row Properties Fields ==========
     {
       id: 'tableRowPropsObjectId',
       title: 'Table Object ID',
@@ -2106,7 +2308,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Sheets Chart Embed Fields ==========
     {
       id: 'chartPageObjectId',
       title: 'Slide ID',
@@ -2177,7 +2378,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'create_sheets_chart' },
     },
 
-    // ========== Refresh Sheets Chart Fields ==========
     {
       id: 'refreshChartObjectId',
       title: 'Chart Object ID',
@@ -2186,7 +2386,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       required: true,
     },
 
-    // ========== Replace All Shapes With Sheets Chart Fields ==========
     {
       id: 'replaceShapesChartFindText',
       title: 'Find Text (Token)',
@@ -2210,7 +2409,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       mode: 'advanced',
     },
 
-    // ========== Create Video Fields ==========
     {
       id: 'videoPageObjectId',
       title: 'Slide ID',
@@ -2266,7 +2464,6 @@ Return ONLY the text content - no explanations, no markdown formatting markers, 
       condition: { field: 'operation', value: 'create_video' },
     },
 
-    // ========== Update Video Properties Fields ==========
     {
       id: 'videoPropsObjectId',
       title: 'Video Object ID',
@@ -3454,6 +3651,7 @@ const googleSlidesV2Inputs = GoogleSlidesBlock.inputs
 
 export const GoogleSlidesV2Block: BlockConfig<GoogleSlidesResponse> = {
   ...GoogleSlidesBlock,
+  sunset: undefined,
   type: 'google_slides_v2',
   name: 'Google Slides',
   description: 'Read, write, and create presentations',

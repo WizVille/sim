@@ -37,6 +37,11 @@ function toolStatusToNode(status: ToolCallStatus): NodeStatus {
   return status
 }
 
+/** Statuses a snapshot replay must NOT close with a synthetic result. */
+function isOpenToolStatus(status: ToolCallStatus): boolean {
+  return status === ToolCallStatus.executing || status === ToolCallStatus.awaiting_approval
+}
+
 /**
  * Resolves a tool row's display title with the same precedence the live handler
  * used: the integration gateway's model-authored activity description first
@@ -146,6 +151,7 @@ export function modelToContentBlocks(model: TurnModel): ContentBlock[] {
                 }
               : {}),
             ...(isSub && ownerAgent ? { calledBy: ownerAgent.agentId } : {}),
+            ...(node.startedAtMs !== undefined ? { startedAtMs: node.startedAtMs } : {}),
           },
           ...spanFields,
           // Wall-clock when available (uniform with text); falls back to seq.
@@ -161,6 +167,7 @@ export function modelToContentBlocks(model: TurnModel): ContentBlock[] {
       block: {
         type: 'subagent',
         content: node.agentId,
+        ...(node.displayName ? { subagentName: node.displayName } : {}),
         spanId: node.spanId,
         parentSpanId: node.parentSpanId,
         ...(node.triggerToolCallId ? { parentToolCallId: node.triggerToolCallId } : {}),
@@ -261,7 +268,10 @@ export function contentBlocksToModel(blocks: ContentBlock[]): TurnModel {
             kind: 'subagent',
             event: 'start',
             agent: block.content,
-            data: block.parentToolCallId ? { tool_call_id: block.parentToolCallId } : {},
+            data: {
+              ...(block.parentToolCallId ? { tool_call_id: block.parentToolCallId } : {}),
+              ...(block.subagentName ? { name: block.subagentName } : {}),
+            },
           },
           scopeFor(block),
           block.timestamp
@@ -298,6 +308,11 @@ export function contentBlocksToModel(blocks: ContentBlock[]): TurnModel {
             toolCallId: tc.id,
             toolName: tc.name,
             arguments: tc.params,
+            // Carries an unanswered permission prompt across a snapshot rebuild
+            // so the reloaded row is still actionable rather than a spinner.
+            ...(tc.status === ToolCallStatus.awaiting_approval
+              ? { status: ToolCallStatus.awaiting_approval }
+              : {}),
             // Preserve a server-provided title that isn't derivable from args.
             ...(tc.displayTitle ? { ui: { title: tc.displayTitle } } : {}),
             // Rebound gateway rows keep their model-authored activity phrase
@@ -310,7 +325,7 @@ export function contentBlocksToModel(blocks: ContentBlock[]): TurnModel {
           block.timestamp
         )
       )
-      if (tc.status !== ToolCallStatus.executing) {
+      if (!isOpenToolStatus(tc.status)) {
         const node = toolStatusToNode(tc.status)
         reduceEvent(
           model,

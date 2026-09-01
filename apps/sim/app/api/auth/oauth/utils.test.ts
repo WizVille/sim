@@ -4,15 +4,13 @@
  * @vitest-environment node
  */
 
-import { redisConfigMock, redisConfigMockFns } from '@sim/testing'
+import { redisConfigMockFns } from '@sim/testing'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@/lib/oauth/oauth', () => ({
   refreshOAuthToken: vi.fn(),
   OAUTH_PROVIDERS: {},
 }))
-
-vi.mock('@/lib/core/config/redis', () => redisConfigMock)
 
 const { mockDecryptSecret } = vi.hoisted(() => ({ mockDecryptSecret: vi.fn() }))
 vi.mock('@/lib/core/security/encryption', () => ({
@@ -28,19 +26,22 @@ vi.mock('@/lib/credentials/client-credential-accounts/server', () => ({
 
 import { db } from '@sim/db'
 import { __resetCoalesceLocallyForTests } from '@/lib/concurrency/singleflight'
-import { ZOOM_SERVICE_ACCOUNT_PROVIDER_ID } from '@/lib/credentials/client-credential-accounts/descriptors'
-import { refreshOAuthToken } from '@/lib/oauth'
 import {
-  ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID,
-  GOOGLE_SERVICE_ACCOUNT_PROVIDER_ID,
-  SLACK_CUSTOM_BOT_PROVIDER_ID,
-} from '@/lib/oauth/types'
+  NETSUITE_SERVICE_ACCOUNT_PROVIDER_ID,
+  ZOOM_SERVICE_ACCOUNT_PROVIDER_ID,
+} from '@/lib/credentials/client-credential-accounts/descriptors'
+import { refreshOAuthToken } from '@/lib/oauth'
 import {
   getCredential,
   refreshAccessTokenIfNeeded,
   refreshTokenIfNeeded,
   resolveServiceAccountToken,
-} from '@/app/api/auth/oauth/utils'
+} from '@/lib/oauth/credential-service'
+import {
+  ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID,
+  GOOGLE_SERVICE_ACCOUNT_PROVIDER_ID,
+  SLACK_CUSTOM_BOT_PROVIDER_ID,
+} from '@/lib/oauth/types'
 
 const mockDb = db as any
 const mockRefreshOAuthToken = refreshOAuthToken as any
@@ -444,6 +445,23 @@ describe('OAuth Utils', () => {
       expect(result.accessToken).toBe('xoxb-tok')
     })
 
+    it('returns the bot token for an action-only Slack bot without a signing secret', async () => {
+      mockSelectChain([
+        {
+          type: 'service_account',
+          providerId: SLACK_CUSTOM_BOT_PROVIDER_ID,
+          encryptedServiceAccountKey: 'enc',
+        },
+      ])
+      mockDecryptSecret.mockResolvedValueOnce({
+        decrypted: JSON.stringify({ botToken: 'xoxb-action' }),
+      })
+
+      const result = await resolveServiceAccountToken('cred-1', SLACK_CUSTOM_BOT_PROVIDER_ID)
+
+      expect(result.accessToken).toBe('xoxb-action')
+    })
+
     it('throws when the Slack bot credential is missing', async () => {
       mockSelectChain([])
       await expect(
@@ -525,6 +543,33 @@ describe('OAuth Utils', () => {
         accessToken: 'tok-1',
         instanceUrl: 'https://org.my.salesforce.com',
       })
+      expect(mockMinter).toHaveBeenCalledTimes(1)
+    })
+
+    it('forwards NetSuite certificate material and caches its SuiteTalk instance URL', async () => {
+      const credId = 'ccsa-netsuite-certificate'
+      const fields = {
+        clientId: 'netsuite-client',
+        certificateId: 'certificate-id',
+        orgId: 'https://1234567.suitetalk.api.netsuite.com',
+        privateKey: 'private-key',
+      }
+      mockDecryptSecret.mockResolvedValueOnce({ decrypted: JSON.stringify(fields) })
+      mockCredentialRow(ENCRYPTED_KEY_A)
+      mockMinter.mockResolvedValueOnce({
+        accessToken: 'netsuite-token',
+        expiresInSeconds: 3600,
+        instanceUrl: fields.orgId,
+      })
+
+      const first = await resolveServiceAccountToken(credId, NETSUITE_SERVICE_ACCOUNT_PROVIDER_ID)
+
+      expect(first).toEqual({ accessToken: 'netsuite-token', instanceUrl: fields.orgId })
+      expect(mockMinter).toHaveBeenCalledWith(fields, { skipIdentity: true })
+
+      mockCredentialRow(ENCRYPTED_KEY_A)
+      const cached = await resolveServiceAccountToken(credId, NETSUITE_SERVICE_ACCOUNT_PROVIDER_ID)
+      expect(cached).toEqual(first)
       expect(mockMinter).toHaveBeenCalledTimes(1)
     })
 

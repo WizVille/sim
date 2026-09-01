@@ -30,67 +30,206 @@ const NUMERIC_ID_PATTERN = /^\d+$/
 const KB_CATEGORY_DISALLOWED = /[\^"'`\u0000-\u001f\u007f]/
 const VALID_WORKFLOW_STATES = new Set(['published', 'draft', 'review', 'retired', 'outdated'])
 
+/**
+ * The single KB workflow state that means "removed from view".
+ *
+ * `retired` is the documented end of a knowledge article's lifecycle: the row is
+ * never deleted from `kb_knowledge`, it just stops appearing in knowledge search
+ * and portal views. It is therefore the only state safe to drop implicitly.
+ *
+ * `outdated` is deliberately NOT in this set. It marks a superseded version when
+ * a new version is published, but ServiceNow also moves an article to `outdated`
+ * once it passes its `valid_to` date — and that record is still the latest
+ * version of the article, not a historical snapshot. Excluding `outdated` would
+ * therefore make deletion reconciliation hard-delete live customer content.
+ */
+const REMOVED_FROM_VIEW_KB_WORKFLOW_STATE = 'retired'
+
+/**
+ * Decides whether a `kb_knowledge` record should be ingested.
+ *
+ * `GET /api/now/table/kb_knowledge` applies no implicit state filter, so retired
+ * articles keep appearing in every full listing, keep getting upserted, and
+ * never fall out via deletion reconciliation (which removes only documents
+ * absent from the listing). This guard drops them.
+ *
+ * The implicit exclusion applies ONLY when the connector config leaves
+ * `workflowState` unset. Any explicit selection — including `all` ("All States")
+ * and `retired` itself — is the user's stated intent and is honoured verbatim,
+ * with no client-side filtering layered on top of the server-side
+ * `sysparm_query` clause built by {@link buildKBQuery}.
+ *
+ * Fail-open by design: only an EXPLICIT `retired` state excludes a record. A
+ * missing, empty, non-string or unrecognised state (`pending retirement`, a
+ * customer-defined state) is kept, because a wrongful exclusion would make
+ * reconciliation hard-delete a still-current article. For the same reason the
+ * exclusion is applied client-side rather than as an encoded-query `!=` clause:
+ * ServiceNow's negative operators have inconsistently reported behaviour for
+ * empty field values, and a server-side filter that silently dropped rows with
+ * no `workflow_state` would purge them.
+ *
+ * Known and accepted consequence: no `latest=true` filter is applied, so when an
+ * instance runs the knowledge versioning plugin, superseded versions are still
+ * ingested as separate documents (each prior version is its own `kb_knowledge`
+ * row with its own sys_id). Filtering on `latest` is not safe generally —
+ * instances without versioning enabled do not populate the field reliably, and a
+ * missing/false value there would purge current articles.
+ */
+export function shouldIngestKBArticle(
+  article: Record<string, unknown>,
+  configuredWorkflowState?: unknown
+): boolean {
+  if (typeof configuredWorkflowState === 'string' && configuredWorkflowState.trim()) {
+    return true
+  }
+
+  const state = rawValue(article.workflow_state)?.trim().toLowerCase()
+  if (!state) return true
+  return state !== REMOVED_FROM_VIEW_KB_WORKFLOW_STATE
+}
+
+/**
+ * The object form a field takes under `sysparm_display_value=all`.
+ *
+ * Under `all` the Table API wraps EVERY column — not just reference and choice
+ * fields, and explicitly including `sys_id` — in `{ display_value, value }`.
+ * Reference fields carry an additional `link`, and `display_value` is `null`
+ * rather than `""` when the field is empty.
+ */
+interface ServiceNowFieldObject {
+  value?: string
+  display_value?: string | null
+  link?: string
+}
+
+/**
+ * A field as it may arrive from the Table API.
+ *
+ * Both shapes must be tolerated: this connector requests
+ * `sysparm_display_value=all` (object form), but plain strings are what the
+ * same endpoint returns under `true`/`false`, and are still what a record
+ * fetched without the parameter looks like. Every read therefore goes through
+ * {@link rawValue} or {@link displayValue}, never through a direct field access.
+ */
+type ServiceNowField = string | ServiceNowFieldObject | null | undefined
+
 interface ServiceNowRecord {
-  sys_id: string
-  sys_updated_on?: string
-  sys_created_on?: string
-  sys_created_by?: string
-  sys_updated_by?: string
+  sys_id: ServiceNowField
+  sys_updated_on?: ServiceNowField
+  sys_created_on?: ServiceNowField
+  sys_created_by?: ServiceNowField
+  sys_updated_by?: ServiceNowField
 }
 
 interface KBArticle extends ServiceNowRecord {
-  short_description?: string
-  text?: string
-  wiki?: string
-  workflow_state?: string
-  kb_category?: string | { display_value?: string }
-  kb_knowledge_base?: string | { display_value?: string }
-  number?: string
-  author?: string | { display_value?: string }
+  short_description?: ServiceNowField
+  text?: ServiceNowField
+  wiki?: ServiceNowField
+  workflow_state?: ServiceNowField
+  kb_category?: ServiceNowField
+  kb_knowledge_base?: ServiceNowField
+  number?: ServiceNowField
+  author?: ServiceNowField
 }
 
 interface Incident extends ServiceNowRecord {
-  number?: string
-  short_description?: string
-  description?: string
-  state?: string
-  priority?: string
-  category?: string
-  assigned_to?: string | { display_value?: string }
-  opened_by?: string | { display_value?: string }
-  close_notes?: string
-  comments_and_work_notes?: string
-  work_notes?: string
-  resolution_notes?: string
+  number?: ServiceNowField
+  short_description?: ServiceNowField
+  description?: ServiceNowField
+  state?: ServiceNowField
+  priority?: ServiceNowField
+  category?: ServiceNowField
+  assigned_to?: ServiceNowField
+  opened_by?: ServiceNowField
+  close_notes?: ServiceNowField
+  resolution_notes?: ServiceNowField
 }
 
 /**
  * Normalizes and validates the ServiceNow instance URL.
  *
- * Prepends https:// if the scheme is missing, strips trailing slashes, then
- * enforces a ServiceNow-owned domain allowlist to prevent SSRF — the instance
- * URL is user-controlled and was previously fetched server-side with no
- * validation.
+ * Prepends https:// if the scheme is missing, then enforces a ServiceNow-owned
+ * domain allowlist to prevent SSRF — the instance URL is user-controlled and was
+ * previously fetched server-side with no validation.
+ *
+ * The result is reduced to the URL's origin. Users routinely paste a full
+ * console URL (`https://acme.service-now.com/nav_to.do?uri=...`, a `/kb_view.do`
+ * link, or a trailing slash); every Table API path is built by appending
+ * `/api/now/table/...`, so any surviving path, query or fragment would produce
+ * a 404. `URL.origin` also lower-cases the host and drops the default port.
  */
 function resolveServiceNowInstanceUrl(rawUrl: string): string {
-  let url = (rawUrl ?? '').trim().replace(/\/+$/, '')
-  if (url && !url.startsWith('https://') && !url.startsWith('http://')) {
+  let url = (rawUrl ?? '').trim()
+  if (url && !/^https?:\/\//i.test(url)) {
     url = `https://${url}`
   }
   const validation = validateServiceNowInstanceUrl(url)
   if (!validation.isValid) {
     throw new Error(validation.error || 'Invalid instance URL')
   }
-  return validation.sanitized ?? url
+  return new URL(validation.sanitized ?? url).origin
 }
 
 /**
- * Builds Basic Auth header from username and API key/password.
+ * Builds the HTTP Basic auth header from the username and the API key/password.
+ *
+ * The username is validated here rather than only in `validateConfig`, because
+ * `listDocuments`/`getDocument` run against a stored `sourceConfig` that may
+ * have been written after validation. A missing username would otherwise be
+ * encoded as the literal `undefined:<key>` and surface as an opaque 401, and a
+ * username containing `:` cannot be represented in Basic auth at all (RFC 7617
+ * splits on the first colon).
  */
 function buildAuthHeader(accessToken: string, sourceConfig: Record<string, unknown>): string {
-  const username = sourceConfig.username as string
-  const encoded = Buffer.from(`${username}:${accessToken}`).toString('base64')
+  const username = sourceConfig.username
+  if (typeof username !== 'string' || !username.trim()) {
+    throw new Error('ServiceNow username is required')
+  }
+  if (username.includes(':')) {
+    throw new Error('ServiceNow username cannot contain a colon')
+  }
+  const encoded = Buffer.from(`${username.trim()}:${accessToken}`).toString('base64')
   return `Basic ${encoded}`
+}
+
+/**
+ * Coerces the user-supplied `maxItems` into a usable positive integer.
+ *
+ * A non-numeric value would otherwise make `maxItems` `NaN`, which poisons every
+ * downstream comparison: `sysparm_limit` becomes `NaN`, `resultCount >= limit`
+ * is `false` so `nextOffset` is never produced, and — worst — the cap check is
+ * gated on `nextOffset`, so `listingCapped` is never set and the sync engine
+ * hard-deletes every document missing from the broken listing.
+ */
+function resolveMaxItems(value: unknown): number {
+  const parsed = Math.floor(Number(value))
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_ITEMS
+  return parsed
+}
+
+/** The `YYYY-MM-DD HH:mm:ss` shape a glide_date_time takes in its raw form. */
+const SERVICENOW_DATETIME_PATTERN = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})$/
+
+/**
+ * Parses a ServiceNow raw datetime (`sys_updated_on`) into a `Date`.
+ *
+ * Raw glide_date_time values come back as `YYYY-MM-DD HH:mm:ss` in **UTC** (only
+ * `display_value` is shifted into the API user's timezone), and every read here
+ * goes through {@link rawValue}, which prefers `value`. `new Date()` treats that
+ * space-separated, zone-less form as *local* time, so passing it straight to
+ * `parseTagDate` skews the tag by the host's UTC offset. Appending the explicit
+ * `Z` fixes it; anything not matching the ServiceNow shape falls back to the
+ * shared parser.
+ */
+function parseServiceNowDate(value: unknown): Date | undefined {
+  if (typeof value === 'string') {
+    const match = SERVICENOW_DATETIME_PATTERN.exec(value.trim())
+    if (match) {
+      const date = new Date(`${match[1]}T${match[2]}Z`)
+      return Number.isNaN(date.getTime()) ? undefined : date
+    }
+  }
+  return parseTagDate(value)
 }
 
 /**
@@ -186,14 +325,22 @@ async function serviceNowApiGetById(
   return data.result ?? null
 }
 
+/**
+ * Accepts a record that carries a usable sys_id in either wire shape.
+ *
+ * Both listing and single-record fetches send `sysparm_display_value=all`, under
+ * which `sys_id` arrives as `{ display_value, value }` rather than as a plain
+ * string, so a `typeof === 'string'` test would reject every record. Normalising
+ * through {@link rawValue} accepts the object form and still accepts the plain
+ * string form returned when the parameter is absent or set to `true`/`false`.
+ * `rawValue` returns `undefined` for an empty string, so a non-empty result is
+ * exactly the original intent: reject records with no usable sys_id.
+ */
 function isServiceNowRecord(record: unknown): record is ServiceNowRecord & Record<string, unknown> {
-  return (
-    typeof record === 'object' &&
-    record !== null &&
-    !Array.isArray(record) &&
-    typeof (record as Record<string, unknown>).sys_id === 'string' &&
-    ((record as Record<string, unknown>).sys_id as string).length > 0
-  )
+  if (typeof record !== 'object' || record === null || Array.isArray(record)) {
+    return false
+  }
+  return Boolean(rawValue((record as Record<string, unknown>).sys_id))
 }
 
 /**
@@ -268,7 +415,8 @@ function priorityLabel(priority: string | undefined): string {
  * Converts a KB article record to an ExternalDocument.
  */
 function kbArticleToDocument(article: KBArticle, instanceUrl: string): ExternalDocument {
-  const title = rawValue(article.short_description) || rawValue(article.number) || article.sys_id
+  const sysId = rawValue(article.sys_id) ?? ''
+  const title = rawValue(article.short_description) || rawValue(article.number) || sysId
   /**
    * Wiki-template KB articles populate `wiki` with the body and leave
    * `text` empty; HTML-template articles do the opposite. Falling back
@@ -276,7 +424,6 @@ function kbArticleToDocument(article: KBArticle, instanceUrl: string): ExternalD
    */
   const articleText = rawValue(article.text) || rawValue(article.wiki) || ''
   const content = htmlToPlainText(articleText)
-  const sysId = rawValue(article.sys_id) || article.sys_id
   const updatedOn = rawValue(article.sys_updated_on) || ''
   const contentHash = `servicenow:${sysId}:${updatedOn}`
   const sourceUrl = `${instanceUrl}/kb_view.do?sys_kb_id=${sysId}`
@@ -305,9 +452,10 @@ function kbArticleToDocument(article: KBArticle, instanceUrl: string): ExternalD
  * Converts an incident record to an ExternalDocument.
  */
 function incidentToDocument(incident: Incident, instanceUrl: string): ExternalDocument {
+  const sysId = rawValue(incident.sys_id) ?? ''
   const number = rawValue(incident.number)
   const shortDesc = rawValue(incident.short_description)
-  const title = number ? `${number}: ${shortDesc || 'Untitled'}` : shortDesc || incident.sys_id
+  const title = number ? `${number}: ${shortDesc || 'Untitled'}` : shortDesc || sysId
 
   const parts: string[] = []
   if (shortDesc) {
@@ -341,7 +489,6 @@ function incidentToDocument(incident: Incident, instanceUrl: string): ExternalDo
   }
 
   const content = parts.join('\n')
-  const sysId = rawValue(incident.sys_id) || incident.sys_id
   const updatedOn = rawValue(incident.sys_updated_on) || ''
   const contentHash = `servicenow:${sysId}:${updatedOn}`
   const sourceUrl = `${instanceUrl}/incident.do?sys_id=${sysId}`
@@ -438,16 +585,23 @@ export const servicenowConnector: ConnectorConfig = {
     accessToken: string,
     sourceConfig: Record<string, unknown>,
     cursor?: string,
-    _syncContext?: Record<string, unknown>
+    syncContext?: Record<string, unknown>
   ): Promise<ExternalDocumentList> => {
     const instanceUrl = resolveServiceNowInstanceUrl(sourceConfig.instanceUrl as string)
     const contentType = (sourceConfig.contentType as string) || 'kb_knowledge'
-    const maxItems = sourceConfig.maxItems ? Number(sourceConfig.maxItems) : DEFAULT_MAX_ITEMS
+    const maxItems = resolveMaxItems(sourceConfig.maxItems)
     const authHeader = buildAuthHeader(accessToken, sourceConfig)
 
     const offset = cursor ? Number(cursor) : 0
     const remaining = maxItems - offset
     if (remaining <= 0) {
+      /**
+       * The `maxItems` cap stopped this listing before the table was exhausted,
+       * so it does not represent the full source set. Flagging it keeps the sync
+       * engine's deletion reconciliation from reading the missing tail as
+       * "deleted at the source" and hard-deleting those documents.
+       */
+      if (syncContext) syncContext.listingCapped = true
       return { documents: [], hasMore: false }
     }
 
@@ -466,6 +620,7 @@ export const servicenowConnector: ConnectorConfig = {
       sysparm_query: query,
       sysparm_fields: fields,
       sysparm_display_value: 'all',
+      sysparm_exclude_reference_link: 'true',
     }
 
     logger.info('Fetching ServiceNow records', {
@@ -475,7 +630,7 @@ export const servicenowConnector: ConnectorConfig = {
       query,
     })
 
-    const { result, nextOffset } = await serviceNowApiGet(
+    const { result, nextOffset, totalCount } = await serviceNowApiGet(
       instanceUrl,
       tableName,
       authHeader,
@@ -486,6 +641,17 @@ export const servicenowConnector: ConnectorConfig = {
     for (const record of result) {
       if (!isServiceNowRecord(record)) {
         logger.warn('Skipping ServiceNow record without sys_id', { table: tableName })
+        continue
+      }
+
+      /**
+       * Retired articles are dropped here, not via the encoded query, so records
+       * with no `workflow_state` are never lost to ServiceNow's
+       * negative-operator semantics. Paging stays derived from the API result
+       * count (see `serviceNowApiGet`), never from the post-filter document
+       * count, so filtering never shifts the offset window.
+       */
+      if (isKB && !shouldIngestKBArticle(record, sourceConfig.workflowState)) {
         continue
       }
 
@@ -501,6 +667,32 @@ export const servicenowConnector: ConnectorConfig = {
     const hasMore = nextOffset !== undefined && nextOffset < maxItems
     const nextCursor = hasMore ? String(nextOffset) : undefined
 
+    /**
+     * Records exist past the `maxItems` cap. See the `remaining <= 0` branch
+     * above — the listing is knowingly incomplete, so reconciliation must not
+     * treat the untraversed tail as removed at the source.
+     *
+     * A full page landing exactly on the cap is ambiguous: `nextOffset` is set
+     * whenever a page comes back full, so it cannot distinguish "more rows
+     * follow" from "the table ended on a page boundary". `X-Total-Count`
+     * resolves it when present. The Table API documents that header only as
+     * "Total count of records returned by the query", without stating that it
+     * ignores `sysparm_limit`/`sysparm_offset`; sibling APIs on the same platform
+     * state the stronger semantic outright — the Case API describes it as "the
+     * total number of records matching the request when the `sysparm_limit` or
+     * `sysparm_offset` query parameters are specified". When the header is absent
+     * the ambiguity resolves conservatively (assume truncated), since
+     * over-flagging only defers a purge whereas under-flagging deletes live
+     * documents. Note the asymmetry: that fallback covers only an *absent*
+     * header. A page-scoped count would equal the page size, never exceed the
+     * cap, and so suppress the flag — the one way this check can under-flag.
+     */
+    if (nextOffset !== undefined && !hasMore && syncContext) {
+      if (totalCount === undefined || totalCount > maxItems) {
+        syncContext.listingCapped = true
+      }
+    }
+
     logger.info('Fetched ServiceNow documents', {
       count: documents.length,
       hasMore,
@@ -514,6 +706,15 @@ export const servicenowConnector: ConnectorConfig = {
     }
   },
 
+  /**
+   * Fetches one record by sys_id.
+   *
+   * No `workflow_state` guard is applied here on purpose. The sync engine calls
+   * this only to hydrate content for documents that `listDocuments` already
+   * admitted (and only for `contentDeferred` entries, which this connector never
+   * emits), so a second filter would be unreachable today and, if it ever became
+   * reachable, could only turn an already-selected document into a skip.
+   */
   getDocument: async (
     accessToken: string,
     sourceConfig: Record<string, unknown>,
@@ -538,29 +739,26 @@ export const servicenowConnector: ConnectorConfig = {
 
     const instanceUrl = resolveServiceNowInstanceUrl(sourceConfig.instanceUrl as string)
 
-    try {
-      const record = await serviceNowApiGetById(instanceUrl, tableName, externalId, authHeader, {
-        sysparm_fields: fields,
-        sysparm_display_value: 'all',
-      })
+    /**
+     * `serviceNowApiGetById` resolves `null` only for a 404 (or an empty result);
+     * every other failure throws, so the sync engine records a visible failed
+     * document instead of dropping the record with no counter and no error log.
+     */
+    const record = await serviceNowApiGetById(instanceUrl, tableName, externalId, authHeader, {
+      sysparm_fields: fields,
+      sysparm_display_value: 'all',
+      sysparm_exclude_reference_link: 'true',
+    })
 
-      if (!record || !isServiceNowRecord(record)) {
-        return null
-      }
-
-      const doc = isKB
-        ? kbArticleToDocument(record, instanceUrl)
-        : incidentToDocument(record, instanceUrl)
-
-      return doc.content.trim() ? doc : null
-    } catch (error) {
-      logger.warn('Failed to get ServiceNow document', {
-        externalId,
-        table: tableName,
-        error: toError(error).message,
-      })
+    if (!record || !isServiceNowRecord(record)) {
       return null
     }
+
+    const doc = isKB
+      ? kbArticleToDocument(record, instanceUrl)
+      : incidentToDocument(record, instanceUrl)
+
+    return doc.content.trim() ? doc : null
   },
 
   validateConfig: async (
@@ -588,17 +786,18 @@ export const servicenowConnector: ConnectorConfig = {
       return { valid: false, error: 'Max items must be a positive number' }
     }
 
-    let normalizedUrl: string
-    try {
-      normalizedUrl = resolveServiceNowInstanceUrl(instanceUrl)
-    } catch (error) {
-      return { valid: false, error: toError(error).message }
-    }
-
-    const authHeader = buildAuthHeader(accessToken, sourceConfig)
     const tableName = contentType === 'kb_knowledge' ? 'kb_knowledge' : 'incident'
 
+    /**
+     * `resolveServiceNowInstanceUrl` and `buildAuthHeader` both reject malformed
+     * config by throwing, so they run inside the same try as the probe — outside
+     * it, a rejected instance URL or a colon-bearing username would escape
+     * `validateConfig` as an exception instead of a readable validation error.
+     */
     try {
+      const normalizedUrl = resolveServiceNowInstanceUrl(instanceUrl)
+      const authHeader = buildAuthHeader(accessToken, sourceConfig)
+
       await serviceNowApiGet(
         normalizedUrl,
         tableName,
@@ -606,6 +805,7 @@ export const servicenowConnector: ConnectorConfig = {
         {
           sysparm_limit: '1',
           sysparm_offset: '0',
+          sysparm_fields: 'sys_id',
         },
         VALIDATE_RETRY_OPTIONS
       )
@@ -640,7 +840,7 @@ export const servicenowConnector: ConnectorConfig = {
       result.author = author
     }
 
-    const lastUpdated = parseTagDate(metadata.lastUpdated)
+    const lastUpdated = parseServiceNowDate(metadata.lastUpdated)
     if (lastUpdated) {
       result.lastUpdated = lastUpdated
     }

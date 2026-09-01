@@ -1,13 +1,4 @@
-import {
-  Bell,
-  ClipboardList,
-  Database,
-  File,
-  Search,
-  Server,
-  TrashOutline,
-  Wrench,
-} from '@sim/emcn/icons'
+import { Bell, ClipboardList, Database, File, Search, Server, Trash, Wrench } from '@sim/emcn/icons'
 import { getErrorMessage } from '@sim/utils/errors'
 import { ClickHouseIcon } from '@/components/icons'
 import type { BlockConfig, BlockMeta } from '@/blocks/types'
@@ -81,6 +72,64 @@ export const ClickHouseBlock: BlockConfig<ClickHouseResponse> = {
   integrationType: IntegrationType.Databases,
   bgColor: '#f9ff69',
   icon: ClickHouseIcon,
+  canvasPresentation: {
+    defaultTitle: 'ClickHouse',
+    sentences: {
+      byOperation: {
+        query: [{ text: 'Query rows with', field: 'query', core: true }],
+        execute: [{ text: 'Execute raw SQL', field: 'query', core: true }],
+        insert: [
+          { text: 'Insert a row into', field: 'table', core: true },
+          { text: ', with', field: 'data' },
+        ],
+        insert_rows: [{ text: 'Bulk insert rows into', field: 'table', core: true }],
+        update: [
+          { text: 'Update rows in', field: 'table', core: true },
+          { text: ', where', field: 'where' },
+          { text: ', setting', field: 'data' },
+        ],
+        delete: [
+          { text: 'Delete rows from', field: 'table', core: true },
+          { text: ', where', field: 'where' },
+        ],
+        list_databases: ['List all databases on the server'],
+        list_tables: [{ text: 'List tables in', field: 'database', core: true }],
+        describe_table: [{ text: 'Describe the columns of', field: 'table', core: true }],
+        show_create_table: [
+          { text: 'Read the CREATE TABLE statement for', field: 'table', core: true },
+        ],
+        count_rows: [
+          { text: 'Count rows in', field: 'table', core: true },
+          { text: ', where', field: 'where' },
+        ],
+        introspect: [{ text: 'Introspect the schema of', field: 'database', core: true }],
+        create_database: [{ text: 'Create database', field: 'name', core: true }],
+        drop_database: [{ text: 'Drop database', field: 'name', core: true }],
+        create_table: [
+          { text: 'Create table', field: 'table', core: true },
+          { text: ', ordered by', field: 'orderBy' },
+          { text: ', partitioned by', field: 'partitionBy' },
+        ],
+        drop_table: [{ text: 'Drop table', field: 'table', core: true }],
+        truncate_table: [{ text: 'Remove all rows from', field: 'table', core: true }],
+        rename_table: [
+          { text: 'Rename table', field: 'table', core: true },
+          { text: 'to', field: 'newTable' },
+        ],
+        optimize_table: [{ text: 'Merge the parts of', field: 'table', core: true }],
+        list_partitions: [{ text: 'List active partitions of', field: 'table', core: true }],
+        drop_partition: [
+          { text: 'Drop partition', field: 'partition', core: true },
+          { text: 'from', field: 'table' },
+        ],
+        list_mutations: ['List mutations', { text: 'on', field: 'table' }],
+        list_running_queries: ['List currently running queries'],
+        kill_query: [{ text: 'Kill query', field: 'queryId', core: true }],
+        table_stats: ['Read row counts and disk size', { text: 'for', field: 'table' }],
+        list_clusters: ['List clusters, shards, and replicas'],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -517,7 +566,7 @@ export const ClickHouseBlockMeta = {
     },
     {
       icon: Wrench,
-      title: 'Scheduled table maintenance',
+      title: 'Scheduled ClickHouse maintenance',
       prompt:
         'Create a scheduled workflow that runs OPTIMIZE TABLE on my high-write ClickHouse tables each night to merge parts, then reports the resulting part counts and storage size.',
       modules: ['scheduled', 'workflows'],
@@ -525,8 +574,8 @@ export const ClickHouseBlockMeta = {
       tags: ['data-warehouse', 'maintenance'],
     },
     {
-      icon: TrashOutline,
-      title: 'Partition retention cleanup',
+      icon: Trash,
+      title: 'ClickHouse partition cleanup',
       prompt:
         'Build a scheduled workflow that enforces a retention policy on my ClickHouse events table: take an explicit cutoff date as input, list the table partitions, select only the partitions on that exact table whose range ends strictly before the cutoff, and drop just those. Never infer the cutoff and never drop a partition that is not clearly past it.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -535,7 +584,7 @@ export const ClickHouseBlockMeta = {
     },
     {
       icon: Bell,
-      title: 'Alert on long-running queries',
+      title: 'Alert on slow ClickHouse queries',
       prompt:
         'Create a scheduled workflow that lists ClickHouse running queries and posts a Slack alert for any whose elapsed time exceeds an explicit threshold I set, including the query_id, user, and elapsed time so a human can investigate and decide whether to intervene.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -554,7 +603,7 @@ export const ClickHouseBlockMeta = {
     },
     {
       icon: Server,
-      title: 'Weekly storage growth report',
+      title: 'ClickHouse storage growth report',
       prompt:
         'Create a scheduled workflow that collects ClickHouse table stats (rows and size on disk) each week, has an agent summarize the largest tables and fastest growth, and posts the report to Slack.',
       modules: ['scheduled', 'agent', 'workflows'],

@@ -2,20 +2,7 @@
  * @vitest-environment node
  */
 
-import { describe, expect, it, vi } from 'vitest'
-
-vi.mock('@sim/db', () => ({ db: {} }))
-vi.mock('@sim/db/schema', () => ({
-  knowledgeBase: {},
-  knowledgeConnector: {},
-  mcpServers: {},
-  userTableDefinitions: {},
-  userTableRows: {},
-  workflow: {},
-  workflowFolder: {},
-  workflowSchedule: {},
-}))
-
+import { describe, expect, it } from 'vitest'
 import { canonicalWorkflowVfsDir } from '@/lib/copilot/vfs/path-utils'
 import { buildVfsSnapshot, buildWorkspaceMd, type WorkspaceMdData } from './workspace-context'
 
@@ -142,6 +129,35 @@ describe('buildWorkspaceMd - connected integrations / credentials', () => {
   })
 })
 
+describe('buildWorkspaceMd - Sim sandbox entitlement projection', () => {
+  it('omits all sandbox knowledge when sandboxes are not projected', () => {
+    const data = baseData()
+
+    expect(buildWorkspaceMd(data)).not.toContain('Sim Sandboxes')
+    expect(buildVfsSnapshot(data)).not.toHaveProperty('sandboxes')
+  })
+
+  it('publishes entitled sandbox inventory and the typed snapshot fields', () => {
+    const data = baseData({
+      sandboxes: [
+        {
+          id: 'sandbox-1',
+          name: 'Data Tools',
+          language: 'python',
+          dependencies: ['pandas'],
+          systemPackages: ['graphviz'],
+          cliTools: ['kubectl@1.36.3-r1'],
+        },
+      ],
+    })
+
+    const markdown = buildWorkspaceMd(data)
+    expect(markdown).toContain('## Sim Sandboxes (1)')
+    expect(markdown).toContain('agent/sandboxes/Data%20Tools.json')
+    expect(buildVfsSnapshot(data).sandboxes).toEqual(data.sandboxes)
+  })
+})
+
 describe('buildWorkspaceMd - determinism (prompt-cache stability)', () => {
   it('is byte-identical regardless of input row order', () => {
     const a = buildWorkspaceMd(
@@ -179,26 +195,6 @@ describe('buildWorkspaceMd - determinism (prompt-cache stability)', () => {
           { id: 'sk-2', name: 'Writer', description: 'writes' },
           { id: 'sk-1', name: 'Editor', description: 'edits' },
         ],
-        jobs: [
-          {
-            id: 'j-2',
-            title: 'Nightly',
-            prompt: 'run nightly',
-            cronExpression: '0 0 * * *',
-            status: 'active',
-            lifecycle: 'persistent',
-            sourceTaskName: null,
-          },
-          {
-            id: 'j-1',
-            title: 'Hourly',
-            prompt: 'run hourly',
-            cronExpression: '0 * * * *',
-            status: 'active',
-            lifecycle: 'persistent',
-            sourceTaskName: null,
-          },
-        ],
       })
     )
     const b = buildWorkspaceMd(
@@ -235,26 +231,6 @@ describe('buildWorkspaceMd - determinism (prompt-cache stability)', () => {
         skills: [
           { id: 'sk-1', name: 'Editor', description: 'edits' },
           { id: 'sk-2', name: 'Writer', description: 'writes' },
-        ],
-        jobs: [
-          {
-            id: 'j-1',
-            title: 'Hourly',
-            prompt: 'run hourly',
-            cronExpression: '0 * * * *',
-            status: 'active',
-            lifecycle: 'persistent',
-            sourceTaskName: null,
-          },
-          {
-            id: 'j-2',
-            title: 'Nightly',
-            prompt: 'run nightly',
-            cronExpression: '0 0 * * *',
-            status: 'active',
-            lifecycle: 'persistent',
-            sourceTaskName: null,
-          },
         ],
       })
     )
@@ -311,10 +287,12 @@ describe('custom blocks', () => {
     expect(buildWorkspaceMd(baseData())).not.toContain('## Custom Blocks')
   })
 
-  it('never leaks custom blocks into the typed snapshot Go diffs (diff-safety)', () => {
+  it('carries custom blocks in the typed snapshot keyed by type (Go diffs the customBlocks kind)', () => {
     const withBlocks = buildVfsSnapshot(baseData({ customBlocks }))
+    expect(withBlocks.customBlocks).toEqual([
+      { type: 'custom_block_abc', name: 'Invoice Parser', description: 'Parses invoices' },
+    ])
     const without = buildVfsSnapshot(baseData())
-    expect('customBlocks' in withBlocks).toBe(false)
-    expect(JSON.stringify(withBlocks)).toBe(JSON.stringify(without))
+    expect(without.customBlocks).toEqual([])
   })
 })

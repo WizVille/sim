@@ -1,6 +1,8 @@
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
 import OpenAI from 'openai'
+import type { ChatCompletionChunk } from 'openai/resources/chat/completions'
 import type { StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
 import { formatMessagesForProvider } from '@/providers/attachments'
@@ -10,9 +12,14 @@ import {
   getProviderDefaultModel,
   getProviderModels,
 } from '@/providers/models'
+import { createOpenAICompatAssistantHistory } from '@/providers/openai-compat/assistant-history'
+import { executeProviderTool } from '@/providers/runtime-context'
+import { createSettledAgentEventStream } from '@/providers/stream-events'
 import { createStreamingExecution } from '@/providers/streaming-execution'
+import { isAbortError, parseToolArguments } from '@/providers/streaming-tool-loop-shared'
 import { adaptOpenAIChatToolSchema } from '@/providers/tool-schema-adapter'
 import { enrichLastModelSegmentFromChatCompletions } from '@/providers/trace-enrichment'
+import { openAICompatTransport } from '@/providers/transport'
 import type {
   ProviderConfig,
   ProviderRequest,
@@ -23,12 +30,12 @@ import { ProviderError } from '@/providers/types'
 import {
   calculateCost,
   enforceStrictSchema,
+  isFunctionToolCall,
   prepareToolExecution,
   prepareToolsWithUsageControl,
   sumToolCosts,
   trackForcedToolUsage,
 } from '@/providers/utils'
-import { executeTool } from '@/tools'
 
 const logger = createLogger('KimiProvider')
 
@@ -94,6 +101,7 @@ export const kimiProvider: ProviderConfig = {
 
     try {
       const kimi = new OpenAI({
+        ...openAICompatTransport(),
         apiKey: request.apiKey,
         baseURL: KIMI_BASE_URL,
       })
@@ -202,26 +210,31 @@ export const kimiProvider: ProviderConfig = {
           initialTokens: { input: 0, output: 0, total: 0 },
           initialCost: { input: 0, output: 0, total: 0 },
           isStreaming: true,
+          streamFormat: 'agent-events-v1',
           createStream: ({ output }) =>
-            createReadableStreamFromKimiStream(streamResponse as any, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: usage.prompt_tokens,
-                output: usage.completion_tokens,
-                total: usage.total_tokens,
-              }
+            createReadableStreamFromKimiStream(
+              // double-cast-allowed: payload is untyped so the SDK cannot resolve the streaming overload; the stream yields OpenAI ChatCompletionChunk objects
+              streamResponse as unknown as AsyncIterable<ChatCompletionChunk>,
+              (content, usage) => {
+                output.content = content
+                output.tokens = {
+                  input: usage.prompt_tokens,
+                  output: usage.completion_tokens,
+                  total: usage.total_tokens,
+                }
 
-              const costResult = calculateCost(
-                request.model,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              output.cost = {
-                input: costResult.input,
-                output: costResult.output,
-                total: costResult.total,
+                const costResult = calculateCost(
+                  request.model,
+                  usage.prompt_tokens,
+                  usage.completion_tokens
+                )
+                output.cost = {
+                  input: costResult.input,
+                  output: costResult.output,
+                  total: costResult.total,
+                }
               }
-            }),
+            ),
         })
 
         return streamingResult
@@ -263,11 +276,9 @@ export const kimiProvider: ProviderConfig = {
         },
       ]
 
-      if (
-        typeof originalToolChoice === 'object' &&
-        currentResponse.choices[0]?.message?.tool_calls
-      ) {
-        const toolCallsResponse = currentResponse.choices[0].message.tool_calls
+      const toolCallsResponse =
+        currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
+      if (typeof originalToolChoice === 'object' && toolCallsResponse?.length) {
         const result = trackForcedToolUsage(
           toolCallsResponse,
           originalToolChoice,
@@ -286,7 +297,8 @@ export const kimiProvider: ProviderConfig = {
             content = currentResponse.choices[0].message.content
           }
 
-          const toolCallsInResponse = currentResponse.choices[0]?.message?.tool_calls
+          const toolCallsInResponse =
+            currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
 
           enrichLastModelSegmentFromChatCompletions(
             timeSegments,
@@ -306,7 +318,7 @@ export const kimiProvider: ProviderConfig = {
             const toolName = toolCall.function.name
 
             try {
-              const toolArgs = JSON.parse(toolCall.function.arguments)
+              const toolArgs = parseToolArguments(toolCall.function.arguments, toolName)
               const tool = request.tools?.find((t) => t.id === toolName)
 
               if (!tool) {
@@ -326,22 +338,35 @@ export const kimiProvider: ProviderConfig = {
                 }
               }
 
-              const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-              const result = await executeTool(toolName, executionParams, {
-                signal: request.abortSignal,
-              })
+              const { toolParams, executionParams } = prepareToolExecution(
+                tool,
+                toolArgs,
+                request,
+                toolCall.id
+              )
+              const { rawResponse, modelResponse } = await executeProviderTool(
+                toolName,
+                executionParams,
+                {
+                  signal: request.abortSignal,
+                }
+              )
               const toolCallEndTime = Date.now()
 
               return {
                 toolCall,
                 toolName,
                 toolParams,
-                result,
+                result: rawResponse,
+                modelResult: modelResponse,
                 startTime: toolCallStartTime,
                 endTime: toolCallEndTime,
                 duration: toolCallEndTime - toolCallStartTime,
               }
             } catch (error) {
+              if (isAbortError(error) || request.abortSignal?.aborted) {
+                throw error
+              }
               const toolCallEndTime = Date.now()
               logger.error('Error processing tool call:', { error, toolName })
 
@@ -361,31 +386,23 @@ export const kimiProvider: ProviderConfig = {
             }
           })
 
-          const executionResults = await Promise.allSettled(toolExecutionPromises)
+          const executionResults = await Promise.all(toolExecutionPromises)
+          const assistantMessage = currentResponse.choices[0]?.message
+          if (assistantMessage) {
+            currentMessages.push(
+              createOpenAICompatAssistantHistory({
+                message: assistantMessage,
+                toolCalls: toolCallsInResponse,
+                reasoningFields: ['reasoning_content'],
+              })
+            )
+          }
 
-          const assistantReasoning = (
-            currentResponse.choices[0]?.message as { reasoning_content?: string } | undefined
-          )?.reasoning_content
-
-          currentMessages.push({
-            role: 'assistant',
-            content: null,
-            ...(assistantReasoning ? { reasoning_content: assistantReasoning } : {}),
-            tool_calls: toolCallsInResponse.map((tc) => ({
-              id: tc.id,
-              type: 'function',
-              function: {
-                name: tc.function.name,
-                arguments: tc.function.arguments,
-              },
-            })),
-          })
-
-          for (const settledResult of executionResults) {
-            if (settledResult.status === 'rejected' || !settledResult.value) continue
-
+          for (const executionResult of executionResults) {
             const { toolCall, toolName, toolParams, result, startTime, endTime, duration } =
-              settledResult.value
+              executionResult
+            const modelResult =
+              'modelResult' in executionResult ? (executionResult.modelResult ?? result) : result
 
             timeSegments.push({
               type: 'tool',
@@ -396,10 +413,12 @@ export const kimiProvider: ProviderConfig = {
               toolCallId: toolCall.id,
             })
 
-            let resultContent: any
-            if (result.success && result.output) {
-              toolResults.push(result.output)
-              resultContent = result.output
+            let resultContent: unknown
+            if (result.success) {
+              if (isRecordLike(result.output)) {
+                toolResults.push(result.output)
+              }
+              resultContent = result.output ?? null
             } else {
               resultContent = {
                 error: true,
@@ -407,6 +426,13 @@ export const kimiProvider: ProviderConfig = {
                 tool: toolName,
               }
             }
+            const modelResultContent = modelResult.success
+              ? (modelResult.output ?? null)
+              : {
+                  error: true,
+                  message: modelResult.error || 'Tool execution failed',
+                  tool: toolName,
+                }
 
             toolCalls.push({
               name: toolName,
@@ -421,7 +447,7 @@ export const kimiProvider: ProviderConfig = {
             currentMessages.push({
               role: 'tool',
               tool_call_id: toolCall.id,
-              content: JSON.stringify(resultContent),
+              content: JSON.stringify(modelResultContent),
             })
           }
 
@@ -458,11 +484,9 @@ export const kimiProvider: ProviderConfig = {
             request.abortSignal ? { signal: request.abortSignal } : undefined
           )
 
-          if (
-            typeof nextPayload.tool_choice === 'object' &&
-            currentResponse.choices[0]?.message?.tool_calls
-          ) {
-            const toolCallsResponse = currentResponse.choices[0].message.tool_calls
+          const toolCallsResponse =
+            currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
+          if (typeof nextPayload.tool_choice === 'object' && toolCallsResponse?.length) {
             const result = trackForcedToolUsage(
               toolCallsResponse,
               nextPayload.tool_choice,
@@ -502,12 +526,57 @@ export const kimiProvider: ProviderConfig = {
         }
 
         if (iterationCount === MAX_TOOL_ITERATIONS) {
+          const cappedToolCalls =
+            currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
           enrichLastModelSegmentFromChatCompletions(
             timeSegments,
             currentResponse,
-            currentResponse.choices[0]?.message?.tool_calls,
+            cappedToolCalls,
             { model: request.model, provider: 'kimi' }
           )
+
+          if (cappedToolCalls?.length) {
+            const finalPayload: any = {
+              ...payload,
+              messages: currentMessages,
+            }
+            finalPayload.tools = undefined
+            finalPayload.tool_choice = undefined
+
+            const finalModelStartTime = Date.now()
+            currentResponse = await kimi.chat.completions.create(
+              finalPayload,
+              request.abortSignal ? { signal: request.abortSignal } : undefined
+            )
+            const finalModelEndTime = Date.now()
+            const finalModelDuration = finalModelEndTime - finalModelStartTime
+
+            timeSegments.push({
+              type: 'model',
+              name: request.model,
+              startTime: finalModelStartTime,
+              endTime: finalModelEndTime,
+              duration: finalModelDuration,
+            })
+            modelTime += finalModelDuration
+
+            if (currentResponse.choices[0]?.message?.content) {
+              content = currentResponse.choices[0].message.content
+            }
+            if (currentResponse.usage) {
+              tokens.input += currentResponse.usage.prompt_tokens || 0
+              tokens.output += currentResponse.usage.completion_tokens || 0
+              tokens.total += currentResponse.usage.total_tokens || 0
+            }
+
+            enrichLastModelSegmentFromChatCompletions(
+              timeSegments,
+              currentResponse,
+              currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
+              { model: request.model, provider: 'kimi' }
+            )
+            iterationCount++
+          }
         }
       } catch (error) {
         logger.error('Error in Kimi request:', { error })
@@ -515,23 +584,8 @@ export const kimiProvider: ProviderConfig = {
       }
 
       if (request.stream) {
-        logger.info('Using streaming for final Kimi response after tool processing')
-
-        const streamingPayload: any = {
-          ...payload,
-          messages: currentMessages,
-          stream: true,
-          stream_options: { include_usage: true },
-        }
-        streamingPayload.tools = undefined
-        streamingPayload.tool_choice = undefined
-
-        const streamResponse = await kimi.chat.completions.create(
-          streamingPayload,
-          request.abortSignal ? { signal: request.abortSignal } : undefined
-        )
-
         const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
+        const toolCost = sumToolCosts(toolResults)
 
         const streamingResult = createStreamingExecution({
           model: request.model,
@@ -553,8 +607,8 @@ export const kimiProvider: ProviderConfig = {
           initialCost: {
             input: accumulatedCost.input,
             output: accumulatedCost.output,
-            toolCost: undefined as number | undefined,
-            total: accumulatedCost.total,
+            toolCost: toolCost || undefined,
+            total: accumulatedCost.total + toolCost,
           },
           toolCalls:
             toolCalls.length > 0
@@ -564,28 +618,12 @@ export const kimiProvider: ProviderConfig = {
                 }
               : undefined,
           isStreaming: true,
-          createStream: ({ output }) =>
-            createReadableStreamFromKimiStream(streamResponse as any, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: tokens.input + usage.prompt_tokens,
-                output: tokens.output + usage.completion_tokens,
-                total: tokens.total + usage.total_tokens,
-              }
-
-              const streamCost = calculateCost(
-                request.model,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              const tc = sumToolCosts(toolResults)
-              output.cost = {
-                input: accumulatedCost.input + streamCost.input,
-                output: accumulatedCost.output + streamCost.output,
-                toolCost: tc || undefined,
-                total: accumulatedCost.total + streamCost.total + tc,
-              }
-            }),
+          streamFormat: 'agent-events-v1',
+          createStream: ({ output, finalizeTiming }) => {
+            output.content = content
+            finalizeTiming()
+            return createSettledAgentEventStream(content)
+          },
         })
 
         return streamingResult
@@ -621,6 +659,10 @@ export const kimiProvider: ProviderConfig = {
         error,
         duration: totalDuration,
       })
+
+      if (isAbortError(error) || request.abortSignal?.aborted) {
+        throw error
+      }
 
       throw new ProviderError(toError(error).message, {
         startTime: providerStartTimeISO,

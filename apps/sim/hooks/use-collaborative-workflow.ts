@@ -12,7 +12,8 @@ import {
   WORKFLOW_OPERATIONS,
 } from '@sim/realtime-protocol/constants'
 import { generateId } from '@sim/utils/id'
-import { getWorkflowBlockNameConflict } from '@sim/workflow-types/workflow'
+import type { BlockRetryConfig } from '@sim/workflow-types/workflow'
+import { filterAcyclicEdges, getWorkflowBlockNameConflict } from '@sim/workflow-types/workflow'
 import { useQueryClient } from '@tanstack/react-query'
 import { isEqual } from 'es-toolkit'
 import type { Edge } from 'reactflow'
@@ -24,10 +25,10 @@ import {
   type WorkflowSearchSubflowFieldId,
   workflowSearchSubflowFieldMatchesExpected,
 } from '@/lib/workflows/search-replace/subflow-fields'
+import { getSubBlocksDependingOnChange } from '@/lib/workflows/subblocks/dependencies'
 import { isSyntheticToolSubBlockId } from '@/lib/workflows/tool-input/synthetic-subblocks'
 import { useSocket } from '@/app/workspace/providers/socket-provider'
 import { getBlock } from '@/blocks'
-import { getSubBlocksDependingOnChange } from '@/blocks/utils'
 import { invalidateDeploymentQueries } from '@/hooks/queries/deployments'
 import { useUndoRedo } from '@/hooks/use-undo-redo'
 import {
@@ -54,17 +55,14 @@ import type {
   Position,
   WorkflowState,
 } from '@/stores/workflows/workflow/types'
-import {
-  filterAcyclicEdges,
-  findAllDescendantNodes,
-  isBlockProtected,
-} from '@/stores/workflows/workflow/utils'
+import { findAllDescendantNodes, isBlockProtected } from '@/stores/workflows/workflow/utils'
 
 const logger = createLogger('CollaborativeWorkflow')
 
 export function useCollaborativeWorkflow() {
   const queryClient = useQueryClient()
   const undoRedo = useUndoRedo()
+  const recordBatchRemoveEdges = undoRedo.recordBatchRemoveEdges
   const isUndoRedoInProgress = useRef(false)
   const lastDiffOperationId = useRef<string | null>(null)
 
@@ -153,6 +151,7 @@ export function useCollaborativeWorkflow() {
     onSubblockUpdate,
     onVariableUpdate,
     onWorkflowDeleted,
+    onAccessRevoked,
     onWorkflowReverted,
     onWorkflowUpdated,
     onWorkflowDeployed,
@@ -230,6 +229,12 @@ export function useCollaborativeWorkflow() {
               break
             case BLOCK_OPERATIONS.UPDATE_ADVANCED_MODE:
               useWorkflowStore.getState().setBlockAdvancedMode(payload.id, payload.advancedMode)
+              break
+            case BLOCK_OPERATIONS.UPDATE_ERROR_ENABLED:
+              useWorkflowStore.getState().setBlockErrorEnabled(payload.id, payload.errorEnabled)
+              break
+            case BLOCK_OPERATIONS.UPDATE_RETRY:
+              useWorkflowStore.getState().setBlockRetry(payload.id, payload.retry)
               break
             case BLOCK_OPERATIONS.UPDATE_CANONICAL_MODE:
               useWorkflowStore
@@ -527,6 +532,19 @@ export function useCollaborativeWorkflow() {
             }
           }
         }
+
+        /**
+         * Per-frame `update-position` broadcasts are not applied by this
+         * handler (positions land via BATCH_UPDATE_POSITIONS commits), so they
+         * must not count as applied remote state changes — a collaborator's
+         * drag would otherwise exhaust sync refetch attempts for nothing.
+         */
+        const isUnappliedPositionFrame =
+          target === OPERATION_TARGETS.BLOCK && operation === BLOCK_OPERATIONS.UPDATE_POSITION
+        const appliedWorkflowId = metadata?.workflowId || activeWorkflowId
+        if (!isUnappliedPositionFrame && appliedWorkflowId) {
+          useOperationQueueStore.getState().markRemoteApplied(appliedWorkflowId)
+        }
       } catch (error) {
         logger.error('Error applying remote operation:', error)
       } finally {
@@ -559,6 +577,11 @@ export function useCollaborativeWorkflow() {
         if (activeWorkflowId && blockType === 'function' && subblockId === 'code') {
           useCodeUndoRedoStore.getState().clear(activeWorkflowId, blockId, subblockId)
         }
+
+        const appliedWorkflowId = workflowId || activeWorkflowId
+        if (appliedWorkflowId) {
+          useOperationQueueStore.getState().markRemoteApplied(appliedWorkflowId)
+        }
       } catch (error) {
         logger.error('Error applying remote subblock update:', error)
       } finally {
@@ -585,12 +608,18 @@ export function useCollaborativeWorkflow() {
       isApplyingRemoteChange.current = true
 
       try {
+        const isKnownField = field === 'name' || field === 'value' || field === 'type'
         if (field === 'name') {
           useVariablesStore.getState().updateVariable(variableId, { name: value })
         } else if (field === 'value') {
           useVariablesStore.getState().updateVariable(variableId, { value })
         } else if (field === 'type') {
           useVariablesStore.getState().updateVariable(variableId, { type: value })
+        }
+
+        const appliedWorkflowId = workflowId || activeWorkflowId
+        if (isKnownField && appliedWorkflowId) {
+          useOperationQueueStore.getState().markRemoteApplied(appliedWorkflowId)
         }
       } catch (error) {
         logger.error('Error applying remote variable update:', error)
@@ -606,6 +635,22 @@ export function useCollaborativeWorkflow() {
       if (activeWorkflowId === workflowId) {
         logger.info(
           `Currently active workflow ${workflowId} was deleted, stopping collaborative operations`
+        )
+
+        const currentUserId = session?.user?.id || 'unknown'
+        useUndoRedoStore.getState().clear(workflowId, currentUserId)
+
+        isApplyingRemoteChange.current = false
+      }
+    }
+
+    const handleAccessRevoked = (data: any) => {
+      const { workflowId } = data
+      logger.warn(`Access to workflow ${workflowId} has been revoked`)
+
+      if (activeWorkflowId === workflowId) {
+        logger.info(
+          `Access to currently active workflow ${workflowId} was revoked, stopping collaborative operations`
         )
 
         const currentUserId = session?.user?.id || 'unknown'
@@ -889,6 +934,7 @@ export function useCollaborativeWorkflow() {
     onSubblockUpdate(handleSubblockUpdate)
     onVariableUpdate(handleVariableUpdate)
     onWorkflowDeleted(handleWorkflowDeleted)
+    onAccessRevoked(handleAccessRevoked)
     onWorkflowReverted(handleWorkflowReverted)
     onWorkflowUpdated(handleWorkflowUpdated)
     onWorkflowDeployed(handleWorkflowDeployed)
@@ -911,6 +957,7 @@ export function useCollaborativeWorkflow() {
     onSubblockUpdate,
     onVariableUpdate,
     onWorkflowDeleted,
+    onAccessRevoked,
     onWorkflowReverted,
     onWorkflowUpdated,
     onWorkflowDeployed,
@@ -1258,6 +1305,30 @@ export function useCollaborativeWorkflow() {
     [executeQueuedOperation]
   )
 
+  const collaborativeSetBlockErrorEnabled = useCallback(
+    (id: string, errorEnabled: boolean) => {
+      executeQueuedOperation(
+        BLOCK_OPERATIONS.UPDATE_ERROR_ENABLED,
+        OPERATION_TARGETS.BLOCK,
+        { id, errorEnabled },
+        () => useWorkflowStore.getState().setBlockErrorEnabled(id, errorEnabled)
+      )
+    },
+    [executeQueuedOperation]
+  )
+
+  const collaborativeSetBlockRetry = useCallback(
+    (id: string, retry: BlockRetryConfig) => {
+      executeQueuedOperation(
+        BLOCK_OPERATIONS.UPDATE_RETRY,
+        OPERATION_TARGETS.BLOCK,
+        { id, retry },
+        () => useWorkflowStore.getState().setBlockRetry(id, retry)
+      )
+    },
+    [executeQueuedOperation]
+  )
+
   const collaborativeSetBlockCanonicalMode = useCallback(
     (id: string, canonicalId: string, canonicalMode: 'basic' | 'advanced') => {
       if (isBaselineDiffView) {
@@ -1506,13 +1577,13 @@ export function useCollaborativeWorkflow() {
       useWorkflowStore.getState().batchRemoveEdges(validEdgeIds)
 
       if (!options?.skipUndoRedo && edgeSnapshots.length > 0) {
-        undoRedo.recordBatchRemoveEdges(edgeSnapshots)
+        recordBatchRemoveEdges(edgeSnapshots)
       }
 
       logger.info('Batch removed edges', { count: validEdgeIds.length })
       return true
     },
-    [isBaselineDiffView, addToQueue, activeWorkflowId, session, undoRedo]
+    [isBaselineDiffView, addToQueue, activeWorkflowId, session, recordBatchRemoveEdges]
   )
 
   const collaborativeSetSubblockValue = useCallback(
@@ -2212,6 +2283,8 @@ export function useCollaborativeWorkflow() {
     collaborativeBatchToggleBlockEnabled,
     collaborativeBatchUpdateParent,
     collaborativeToggleBlockAdvancedMode,
+    collaborativeSetBlockErrorEnabled,
+    collaborativeSetBlockRetry,
     collaborativeSetBlockCanonicalMode,
     collaborativeSetBlockCanonicalModes,
     collaborativeBatchToggleBlockHandles,

@@ -1,8 +1,14 @@
-import { GoogleSheetsIcon, StripeIcon } from '@/components/icons'
+import { StripeIcon } from '@/components/icons'
 import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
 import type { StripeResponse } from '@/tools/stripe/types'
 import { getTrigger } from '@/triggers'
+
+/**
+ * Capture amount, whichever of the two amount inputs the operation exposes —
+ * `capture_payment_intent` shows both, and either one carries the value.
+ */
+const CAPTURE_AMOUNT_FIELD = ['amount_to_capture', 'amount'] as const
 
 export const StripeBlock: BlockConfig<StripeResponse> = {
   type: 'stripe',
@@ -17,6 +23,172 @@ export const StripeBlock: BlockConfig<StripeResponse> = {
   bgColor: '#635BFF',
   iconColor: '#635BFF',
   icon: StripeIcon,
+  canvasPresentation: {
+    defaultTitle: 'Stripe',
+    /* The webhook URL and signing secret are plumbing; the event selection is
+       the whole of what the trigger watches, and leaving it empty really does
+       mean every event — which is what the chip's noun says. */
+    triggerSentences: {
+      default: ['Run on', { field: 'eventTypes', core: true }],
+    },
+    sentences: {
+      byOperation: {
+        create_payment_intent: [
+          { text: 'Create a payment intent for', field: 'amount', core: true },
+          { text: 'in', field: 'currency' },
+          { text: ', charging customer', field: 'customer' },
+        ],
+        retrieve_payment_intent: [{ text: 'Fetch payment intent', field: 'id', core: true }],
+        update_payment_intent: [
+          { text: 'Update payment intent', field: 'id', core: true },
+          { text: ', setting amount to', field: 'amount' },
+          { text: ', describing it as', field: 'description' },
+        ],
+        confirm_payment_intent: [
+          { text: 'Confirm payment intent', field: 'id', core: true },
+          { text: ', with payment method', field: 'payment_method' },
+        ],
+        capture_payment_intent: [
+          { text: 'Capture payment intent', field: 'id', core: true },
+          { text: ', for', field: CAPTURE_AMOUNT_FIELD },
+        ],
+        cancel_payment_intent: [
+          { text: 'Cancel payment intent', field: 'id', core: true },
+          { text: ', citing', field: 'cancellation_reason' },
+        ],
+        list_payment_intents: ['List payment intents', { text: ', up to', field: 'limit' }],
+        search_payment_intents: [
+          {
+            text: 'Search payment intents matching',
+            field: 'query',
+            core: true,
+          },
+          { text: ', up to', field: 'limit' },
+        ],
+        create_customer: [
+          { text: 'Create customer', field: 'name', core: true },
+          { text: ', with email', field: 'email' },
+        ],
+        retrieve_customer: [{ text: 'Fetch customer', field: 'id', core: true }],
+        update_customer: [
+          { text: 'Update customer', field: 'id', core: true },
+          { text: ', renaming to', field: 'name' },
+          { text: ', setting email to', field: 'email' },
+        ],
+        delete_customer: [{ text: 'Delete customer', field: 'id', core: true }],
+        list_customers: ['List customers', { text: ', up to', field: 'limit' }],
+        search_customers: [
+          { text: 'Search customers matching', field: 'query', core: true },
+          { text: ', up to', field: 'limit' },
+        ],
+        create_subscription: [
+          { text: 'Subscribe customer', field: 'customer', core: true },
+          { text: 'to', field: 'items' },
+          { text: ', after a', field: 'trial_period_days', after: 'day trial' },
+        ],
+        retrieve_subscription: [{ text: 'Fetch subscription', field: 'id', core: true }],
+        update_subscription: [
+          { text: 'Update subscription', field: 'id', core: true },
+          { text: ', setting items to', field: 'items' },
+        ],
+        cancel_subscription: [{ text: 'Cancel subscription', field: 'id', core: true }],
+        resume_subscription: [{ text: 'Resume subscription', field: 'id', core: true }],
+        list_subscriptions: [
+          'List subscriptions',
+          { text: ', with status', field: 'status' },
+          { text: ', up to', field: 'limit' },
+        ],
+        search_subscriptions: [
+          {
+            text: 'Search subscriptions matching',
+            field: 'query',
+            core: true,
+          },
+          { text: ', up to', field: 'limit' },
+        ],
+        create_invoice: [
+          { text: 'Create an invoice for customer', field: 'customer', core: true },
+          { text: ', described as', field: 'description' },
+        ],
+        retrieve_invoice: [{ text: 'Fetch invoice', field: 'id', core: true }],
+        update_invoice: [
+          { text: 'Update invoice', field: 'id', core: true },
+          { text: ', describing it as', field: 'description' },
+        ],
+        delete_invoice: [{ text: 'Delete draft invoice', field: 'id', core: true }],
+        finalize_invoice: [{ text: 'Finalize draft invoice', field: 'id', core: true }],
+        pay_invoice: [{ text: 'Pay invoice', field: 'id', core: true }],
+        void_invoice: [{ text: 'Void invoice', field: 'id', core: true }],
+        send_invoice: [
+          { text: 'Email invoice', field: 'id', core: true, after: 'to its customer' },
+        ],
+        list_invoices: [
+          'List invoices',
+          { text: ', with status', field: 'status' },
+          { text: ', up to', field: 'limit' },
+        ],
+        search_invoices: [
+          { text: 'Search invoices matching', field: 'query', core: true },
+          { text: ', up to', field: 'limit' },
+        ],
+        create_charge: [
+          { text: 'Charge', field: 'amount', core: true },
+          { text: 'in', field: 'currency' },
+          { text: 'to customer', field: 'customer' },
+        ],
+        retrieve_charge: [{ text: 'Fetch charge', field: 'id', core: true }],
+        update_charge: [
+          { text: 'Update charge', field: 'id', core: true },
+          { text: ', describing it as', field: 'description' },
+        ],
+        capture_charge: [
+          { text: 'Capture charge', field: 'id', core: true },
+          { text: ', for', field: 'amount' },
+        ],
+        list_charges: [
+          { text: 'List charges for customer', field: 'customer', core: true },
+          { text: ', up to', field: 'limit' },
+        ],
+        search_charges: [
+          { text: 'Search charges matching', field: 'query', core: true },
+          { text: ', up to', field: 'limit' },
+        ],
+        create_product: [
+          { text: 'Create product', field: 'name', core: true },
+          { text: ', described as', field: 'description' },
+        ],
+        retrieve_product: [{ text: 'Fetch product', field: 'id', core: true }],
+        update_product: [
+          { text: 'Update product', field: 'id', core: true },
+          { text: ', renaming to', field: 'name' },
+        ],
+        delete_product: [{ text: 'Delete product', field: 'id', core: true }],
+        list_products: ['List products', { text: ', up to', field: 'limit' }],
+        search_products: [
+          { text: 'Search products matching', field: 'query', core: true },
+          { text: ', up to', field: 'limit' },
+        ],
+        create_price: [
+          { text: 'Create a price of', field: 'unit_amount', core: true },
+          { text: 'in', field: 'currency' },
+          { text: ', for product', field: 'product' },
+        ],
+        retrieve_price: [{ text: 'Fetch price', field: 'id', core: true }],
+        update_price: [{ text: 'Update price', field: 'id', core: true }],
+        list_prices: ['List prices', { text: ', up to', field: 'limit' }],
+        search_prices: [
+          { text: 'Search prices matching', field: 'query', core: true },
+          { text: ', up to', field: 'limit' },
+        ],
+        retrieve_event: [{ text: 'Fetch event', field: 'id', core: true }],
+        list_events: [
+          'List events',
+          { text: ', of type', field: 'type' },
+          { text: ', up to', field: 'limit' },
+        ],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -848,8 +1020,8 @@ export const StripeBlockMeta = {
   url: 'https://stripe.com',
   templates: [
     {
-      icon: GoogleSheetsIcon,
-      title: 'Weekly metrics report',
+      icon: StripeIcon,
+      title: 'Stripe weekly metrics report',
       prompt:
         'Build a scheduled workflow that pulls data from Stripe and my database every Monday, calculates key metrics like MRR, churn, new subscriptions, and failed payments, writes results to Google Sheets, and sends the team a Slack summary with week-over-week trends.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -859,7 +1031,7 @@ export const StripeBlockMeta = {
     },
     {
       icon: StripeIcon,
-      title: 'Revenue operations dashboard',
+      title: 'Stripe revenue dashboard',
       prompt:
         'Create a scheduled daily workflow that pulls payment data from Stripe, calculates MRR, net revenue, failed payments, and new subscriptions, logs everything to a table with historical tracking, and sends a daily Slack summary with trends and anomalies.',
       modules: ['tables', 'scheduled', 'agent', 'workflows'],
@@ -869,7 +1041,7 @@ export const StripeBlockMeta = {
     },
     {
       icon: StripeIcon,
-      title: 'Failed payment recovery',
+      title: 'Stripe failed payment recovery',
       prompt:
         'Build a workflow that listens for Stripe failed-payment events, looks up the customer, classifies the failure reason, drafts a tailored recovery email and a Slack alert to the success team, and logs the attempt in a tracking table so recovery rate can be measured.',
       modules: ['tables', 'agent', 'workflows'],
@@ -879,7 +1051,7 @@ export const StripeBlockMeta = {
     },
     {
       icon: StripeIcon,
-      title: 'Subscription churn flagger',
+      title: 'Stripe churn flagger',
       prompt:
         'Create a scheduled daily workflow that lists Stripe subscriptions canceled or scheduled for cancellation, enriches each customer with usage and support history, scores the churn risk, and logs the cohort to a table with recommended save plays for the success team.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -889,7 +1061,7 @@ export const StripeBlockMeta = {
     },
     {
       icon: StripeIcon,
-      title: 'Invoice chase automation',
+      title: 'Stripe invoice chaser',
       prompt:
         'Build a scheduled workflow that lists Stripe invoices overdue by more than seven days, sends a polite chase email tailored to the customer history, escalates to a Slack alert at thirty days, and writes every action into a collections tracking table.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -899,7 +1071,7 @@ export const StripeBlockMeta = {
     },
     {
       icon: StripeIcon,
-      title: 'New customer welcome flow',
+      title: 'Stripe customer welcome flow',
       prompt:
         'Create a workflow triggered when a new Stripe customer is created. Send a personalized welcome email, create their onboarding checklist in a table, schedule a follow-up meeting via Calendly, and post a Slack notification to the customer success channel.',
       modules: ['tables', 'agent', 'workflows'],
@@ -909,7 +1081,7 @@ export const StripeBlockMeta = {
     },
     {
       icon: StripeIcon,
-      title: 'Refund pattern analyzer',
+      title: 'Stripe refund pattern analyzer',
       prompt:
         'Build a scheduled weekly workflow that lists Stripe charge and dispute events, classifies each refund or dispute by reason and product, identifies recurring patterns or fraud signals, writes a narrative report file, and Slacks finance with the top concerns and recommended actions.',
       modules: ['scheduled', 'agent', 'files', 'workflows'],

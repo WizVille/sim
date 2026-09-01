@@ -24,35 +24,41 @@
  */
 
 import { db } from '@sim/db'
-import { workflow, workflowFolder } from '@sim/db/schema'
+import { folder as folderTable, workflow } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
-import { getErrorMessage } from '@sim/utils/errors'
+import { getErrorMessage, getPostgresErrorCode } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
-import { eq } from 'drizzle-orm'
+import { and, eq, isNull } from 'drizzle-orm'
 import { NextResponse } from 'next/server'
 import {
   adminV1ImportWorkspaceContract,
   adminV1WorkspaceImportBodySchema,
 } from '@/lib/api/contracts/v1/admin'
 import { parseJsonBody, parseRequest } from '@/lib/api/server'
+import { asOrchestrationError } from '@/lib/core/orchestration/types'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import type { DbOrTx } from '@/lib/db/types'
+import { withFolderTreeLock } from '@/lib/folders/locks'
+import { assertFolderCollectionHasRoom } from '@/lib/folders/queries'
 import {
   extractWorkflowName,
   extractWorkflowsFromZip,
   parseWorkflowJson,
 } from '@/lib/workflows/operations/import-export'
+import { prepareWorkflowStateForPersistence } from '@/lib/workflows/persistence/prepare-state'
 import { saveWorkflowToNormalizedTables } from '@/lib/workflows/persistence/utils'
 import { deduplicateWorkflowName } from '@/lib/workflows/utils'
+import { normalizeImportedVariables } from '@/lib/workflows/variables/parse'
 import { getWorkspaceWithOwner } from '@/lib/workspaces/permissions/utils'
 import { withAdminAuthParams } from '@/app/api/v1/admin/middleware'
 import {
   badRequestResponse,
+  conflictResponse,
   internalErrorResponse,
   notFoundResponse,
 } from '@/app/api/v1/admin/responses'
 import type {
   ImportResult,
-  WorkflowVariable,
   WorkspaceImportRequest,
   WorkspaceImportResponse,
 } from '@/app/api/v1/admin/types'
@@ -73,6 +79,91 @@ interface ParsedWorkflow {
   content: string
   name: string
   folderPath: string[]
+}
+
+/** The active workflow folder named `name` under `parentId`, or undefined. */
+async function findImportFolder(
+  executor: DbOrTx,
+  workspaceId: string,
+  name: string,
+  parentId: string | null
+): Promise<string | undefined> {
+  const [existing] = await executor
+    .select({ id: folderTable.id })
+    .from(folderTable)
+    .where(
+      and(
+        eq(folderTable.workspaceId, workspaceId),
+        eq(folderTable.resourceType, 'workflow'),
+        eq(folderTable.name, name),
+        parentId ? eq(folderTable.parentId, parentId) : isNull(folderTable.parentId),
+        isNull(folderTable.deletedAt)
+      )
+    )
+    .limit(1)
+  return existing?.id
+}
+
+/**
+ * Returns the id of the active workflow folder named `name` under `parentId`, creating it if
+ * absent — `mkdir -p` semantics.
+ *
+ * The generic `folder` table enforces active sibling-name uniqueness, which
+ * `workflow_folder` did not, so blindly inserting an import path segment that already exists
+ * now fails the whole import on a unique violation. Reusing the existing folder is also the
+ * behaviour an import of a folder *path* should have: importing into "Reports/2026" twice
+ * should land in one tree, not two.
+ */
+async function ensureImportFolder(
+  workspaceId: string,
+  userId: string,
+  name: string,
+  parentId: string | null
+): Promise<string> {
+  const existing = await findImportFolder(db, workspaceId, name, parentId)
+  if (existing) return existing
+
+  try {
+    /**
+     * The create runs under the workspace's folder mutation lock, so the ceiling count and
+     * the insert are atomic against every other folder writer — the reuse lookup above is
+     * only a lock-free fast path and is repeated inside. Each call adds exactly one folder,
+     * so the default `additionalRows` of 1 is the real row count; the segments of one import
+     * path are separate calls that each take the lock and re-count.
+     */
+    return await withFolderTreeLock(workspaceId, 'workflow', async (tx) => {
+      const concurrent = await findImportFolder(tx, workspaceId, name, parentId)
+      if (concurrent) return concurrent
+
+      await assertFolderCollectionHasRoom(workspaceId, 'workflow', tx)
+
+      const folderId = generateId()
+      await tx.insert(folderTable).values({
+        id: folderId,
+        resourceType: 'workflow',
+        name,
+        userId,
+        workspaceId,
+        parentId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      return folderId
+    })
+  } catch (error) {
+    /**
+     * A writer that does not take the folder mutation lock can still take this name between
+     * the check and the insert. The name is server-chosen, not user-chosen, so the right
+     * resolution is to adopt whichever folder won rather than fail the whole import with a
+     * 500 — the same reuse-on-conflict `ensureWorkspaceFileFolderPath` already does. The
+     * recovery read runs on `db`, not the (now rolled back) transaction.
+     */
+    if (getPostgresErrorCode(error) !== '23505') throw error
+
+    const concurrent = await findImportFolder(db, workspaceId, name, parentId)
+    if (!concurrent) throw error
+    return concurrent
+  }
 }
 
 export const POST = withRouteHandler(
@@ -150,16 +241,12 @@ export const POST = withRouteHandler(
 
       let rootFolderId: string | undefined
       if (rootFolderName && createFolders) {
-        rootFolderId = generateId()
-        await db.insert(workflowFolder).values({
-          id: rootFolderId,
-          name: rootFolderName,
-          userId: workspaceData.ownerId,
+        rootFolderId = await ensureImportFolder(
           workspaceId,
-          parentId: null,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        })
+          workspaceData.ownerId,
+          rootFolderName,
+          null
+        )
       }
 
       const folderMap = new Map<string, string>()
@@ -191,6 +278,18 @@ export const POST = withRouteHandler(
       const response: WorkspaceImportResponse = { imported, failed, results }
       return NextResponse.json(response)
     } catch (error) {
+      /**
+       * The workspace folder ceiling refuses the import as a classified `conflict`. It is a
+       * whole-import failure rather than a per-workflow one: once the tree is full every
+       * remaining folder segment fails the same way, so the caller gets one actionable 409
+       * instead of N identical per-workflow errors behind a 200.
+       */
+      const orchestrationError = asOrchestrationError(error)
+      if (orchestrationError?.code === 'conflict') {
+        logger.warn('Admin API: Import refused by the workspace folder limit', { workspaceId })
+        return conflictResponse(orchestrationError.message)
+      }
+
       logger.error('Admin API: Failed to import into workspace', { error, workspaceId })
       return internalErrorResponse('Failed to import workflows')
     }
@@ -228,16 +327,12 @@ async function importSingleWorkflow(
         const fullPath = rootFolderId ? `root/${pathSegment}` : pathSegment
 
         if (!folderMap.has(fullPath)) {
-          const folderId = generateId()
-          await db.insert(workflowFolder).values({
-            id: folderId,
-            name: wf.folderPath[i],
-            userId: ownerId,
+          const folderId = await ensureImportFolder(
             workspaceId,
-            parentId,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          })
+            ownerId,
+            wf.folderPath[i],
+            parentId
+          )
           folderMap.set(fullPath, folderId)
           parentId = folderId
         } else {
@@ -270,7 +365,22 @@ async function importSingleWorkflow(
       variables: {},
     })
 
-    const saveResult = await saveWorkflowToNormalizedTables(workflowId, workflowData)
+    /**
+     * Same normalization the editor, the v1 import API and the single-workflow
+     * admin import run, via the one shared implementation. Without it this route
+     * wrote raw parsed state, so a dangling edge tripped the `workflow_edges`
+     * foreign key and failed the restore, and blocks missing their backfilled
+     * columns could land unopenable.
+     */
+    const { state: preparedState, warnings } = prepareWorkflowStateForPersistence(workflowData)
+    if (warnings.length > 0) {
+      logger.warn(`Admin API: normalized "${dedupedName}" with warnings`, { warnings })
+    }
+
+    const saveResult = await saveWorkflowToNormalizedTables(workflowId, {
+      ...workflowData,
+      ...preparedState,
+    })
 
     if (!saveResult.success) {
       await db.delete(workflow).where(eq(workflow.id, workflowId))
@@ -282,18 +392,13 @@ async function importSingleWorkflow(
       }
     }
 
-    if (workflowData.variables && Array.isArray(workflowData.variables)) {
-      const variablesRecord: Record<string, WorkflowVariable> = {}
-      workflowData.variables.forEach((v) => {
-        const varId = v.id || generateId()
-        variablesRecord[varId] = {
-          id: varId,
-          name: v.name,
-          type: v.type || 'string',
-          value: v.value,
-        }
-      })
-
+    /**
+     * Previously guarded on `Array.isArray`, which silently dropped every
+     * variable in the current record form — the exact shape this workspace's
+     * own export emits — so an export/import round trip lost all of them.
+     */
+    const variablesRecord = normalizeImportedVariables(workflowData.variables)
+    if (Object.keys(variablesRecord).length > 0) {
       await db
         .update(workflow)
         .set({ variables: variablesRecord, updatedAt: new Date() })
@@ -306,6 +411,10 @@ async function importSingleWorkflow(
       success: true,
     }
   } catch (error) {
+    // A full folder tree is a property of the workspace, not of this workflow: recording it
+    // as one of N per-workflow failures would bury it in a 200. Let it reach the route.
+    if (asOrchestrationError(error)?.code === 'conflict') throw error
+
     return {
       workflowId: '',
       name: wf.name,

@@ -1,5 +1,12 @@
 import { db } from '@sim/db'
-import { publicShare, user, workspace, workspaceFiles } from '@sim/db/schema'
+import {
+  publicShare,
+  user,
+  type WorkspaceFileRow,
+  workspace,
+  workspaceFileColumns,
+  workspaceFiles,
+} from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { generateId, generateShortId } from '@sim/utils/id'
 import { and, eq, inArray, isNull } from 'drizzle-orm'
@@ -76,6 +83,32 @@ export async function getSharesForResources(
       and(eq(publicShare.resourceType, resourceType), inArray(publicShare.resourceId, resourceIds))
     )
 
+  for (const row of rows) {
+    result.set(row.resourceId, mapShareRecord(row))
+  }
+  return result
+}
+
+/**
+ * All shares of a type within a workspace, keyed by `resourceId`.
+ *
+ * Preferred over {@link getSharesForResources} when enriching a workspace-wide
+ * listing: an id-list `IN` clause grows with the file count, while this is a
+ * single indexed lookup on `workspaceId`. Returning a superset of the listed
+ * resources is harmless — callers read it by `get(id)`.
+ */
+export async function getWorkspaceShares(
+  resourceType: ShareResourceType,
+  workspaceId: string
+): Promise<Map<string, ShareRecord>> {
+  const rows = await db
+    .select()
+    .from(publicShare)
+    .where(
+      and(eq(publicShare.resourceType, resourceType), eq(publicShare.workspaceId, workspaceId))
+    )
+
+  const result = new Map<string, ShareRecord>()
   for (const row of rows) {
     result.set(row.resourceId, mapShareRecord(row))
   }
@@ -202,7 +235,7 @@ export async function upsertFileShare({
  */
 export interface ResolvedShare {
   share: PublicShareRow
-  file: typeof workspaceFiles.$inferSelect
+  file: WorkspaceFileRow
   /** Owning workspace name, for provenance on the public page. */
   workspaceName: string | null
   /** Display name of the file's uploader. */
@@ -213,7 +246,7 @@ export async function resolveActiveShareByToken(token: string): Promise<Resolved
   const [row] = await db
     .select({
       share: publicShare,
-      file: workspaceFiles,
+      file: workspaceFileColumns,
       workspaceName: workspace.name,
       ownerName: user.name,
     })

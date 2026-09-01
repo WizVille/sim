@@ -15,6 +15,33 @@ export const STSBlock: BlockConfig<STSBaseResponse> = {
   authMode: AuthMode.ApiKey,
   bgColor: 'linear-gradient(45deg, #BD0816 0%, #FF5252 100%)',
   icon: STSIcon,
+  canvasPresentation: {
+    defaultTitle: 'AWS STS',
+    sentences: {
+      byOperation: {
+        assume_role: [
+          { text: 'Assume role', field: 'roleArn', core: true },
+          { text: 'as session', field: 'roleSessionName' },
+        ],
+        assume_role_with_web_identity: [
+          { text: 'Assume role', field: 'roleArn', after: 'via web identity', core: true },
+          { text: ', as session', field: 'roleSessionName' },
+        ],
+        assume_role_with_saml: [
+          { text: 'Assume role', field: 'roleArn', after: 'via SAML', core: true },
+        ],
+        get_caller_identity: ['Read the IAM identity of the calling credentials'],
+        get_session_token: [
+          'Issue temporary session credentials',
+          { text: 'for', field: 'durationSeconds', after: 'seconds' },
+          { text: ', verified by MFA device', field: 'serialNumber' },
+        ],
+        get_access_key_info: [
+          { text: 'Read the account for access key', field: 'targetAccessKeyId', core: true },
+        ],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -103,6 +130,7 @@ export const STSBlock: BlockConfig<STSBaseResponse> = {
       id: 'webIdentityToken',
       title: 'Web Identity Token',
       type: 'long-input',
+      password: true,
       placeholder: 'OIDC/OAuth 2.0 token from the identity provider',
       condition: { field: 'operation', value: 'assume_role_with_web_identity' },
       required: { field: 'operation', value: 'assume_role_with_web_identity' },
@@ -128,6 +156,7 @@ export const STSBlock: BlockConfig<STSBaseResponse> = {
       id: 'samlAssertion',
       title: 'SAML Assertion',
       type: 'long-input',
+      password: true,
       placeholder: 'Base64-encoded SAML authentication response',
       condition: { field: 'operation', value: 'assume_role_with_saml' },
       required: { field: 'operation', value: 'assume_role_with_saml' },
@@ -213,6 +242,7 @@ export const STSBlock: BlockConfig<STSBaseResponse> = {
       id: 'tokenCode',
       title: 'MFA Token Code',
       type: 'short-input',
+      password: true,
       placeholder: '123456',
       condition: { field: 'operation', value: ['assume_role', 'get_session_token'] },
       required: false,
@@ -527,7 +557,7 @@ export const STSBlockMeta = {
     },
     {
       icon: STSIcon,
-      title: 'CI/CD OIDC credential broker',
+      title: 'STS CI/CD OIDC credential broker',
       prompt:
         'Build a workflow that receives an OIDC token from a CI/CD pipeline (e.g. GitHub Actions), calls AWS STS assume role with web identity to mint short-lived deployment credentials, and writes the issuance to an audit log.',
       modules: ['agent', 'workflows'],
@@ -536,7 +566,7 @@ export const STSBlockMeta = {
     },
     {
       icon: STSIcon,
-      title: 'Enterprise SSO SAML role broker',
+      title: 'STS SAML SSO role broker',
       prompt:
         'Create a workflow that takes a SAML assertion from a corporate identity provider, calls AWS STS assume role with SAML to grant scoped temporary credentials, and logs the session details for compliance review.',
       modules: ['agent', 'workflows'],

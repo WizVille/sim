@@ -1,12 +1,13 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { ChipInput, cn, toast } from '@sim/emcn'
 import { createLogger } from '@sim/logger'
-import { generateShortId } from '@sim/utils/id'
+import { countPasteRows } from '@sim/utils/paste'
 import { useQueryClient } from '@tanstack/react-query'
 import { useParams, useRouter } from 'next/navigation'
 import { canMutateWorkspaceSettingsSection } from '@/components/settings/navigation'
+import { saveDiscardActions } from '@/components/settings/save-discard-actions'
 import {
   clearPendingCredentialCreateRequest,
   PENDING_CREDENTIAL_CREATE_REQUEST_EVENT,
@@ -18,8 +19,8 @@ import { UnsavedChangesModal } from '@/app/workspace/[workspaceId]/components/cr
 import { RowActionsMenu } from '@/app/workspace/[workspaceId]/settings/components/row-actions-menu'
 import { SecretValueField } from '@/app/workspace/[workspaceId]/settings/components/secrets/components/secret-value-field'
 import { SettingsEmptyState } from '@/app/workspace/[workspaceId]/settings/components/settings-empty-state'
-import type { SettingsAction } from '@/app/workspace/[workspaceId]/settings/components/settings-header/settings-header'
 import { SettingsPanel } from '@/app/workspace/[workspaceId]/settings/components/settings-panel'
+import { SettingsSection } from '@/app/workspace/[workspaceId]/settings/components/settings-section/settings-section'
 import { useSettingsSearch } from '@/app/workspace/[workspaceId]/settings/components/use-settings-search'
 import { isValidEnvVarName } from '@/executor/constants'
 import { useWorkspaceCredentials, type WorkspaceCredential } from '@/hooks/queries/credentials'
@@ -38,6 +39,7 @@ const logger = createLogger('SecretsManager')
 
 const GRID_COLS = 'grid grid-cols-[minmax(0,1fr)_8px_minmax(0,1fr)_auto] items-center'
 const COL_SPAN_ALL = 'col-span-4'
+const MAX_ENV_PASTE_ROWS = 10_000
 
 /** Copies a secret's name and confirms with a toast. */
 function copyName(key: string) {
@@ -192,6 +194,7 @@ interface WorkspaceVariableRowProps {
   pendingKeyValue: string
   hasCredential: boolean
   canEdit: boolean
+  canReveal: boolean
   /** Renaming creates a new key + deletes the old, so it also needs create access. */
   canRename: boolean
   onRenameStart: (key: string) => void
@@ -209,6 +212,7 @@ function WorkspaceVariableRow({
   pendingKeyValue,
   hasCredential,
   canEdit,
+  canReveal,
   canRename,
   onRenameStart,
   onPendingKeyChange,
@@ -217,6 +221,15 @@ function WorkspaceVariableRow({
   onDelete,
   onViewDetails,
 }: WorkspaceVariableRowProps) {
+  /**
+   * Salts the generated `name` attributes so password managers can't match them
+   * against a known field. `useId` is stable across SSR and hydration and across
+   * re-renders — a fresh `generateShortId()` per render would patch six DOM
+   * attributes on every keystroke, and a module-scope one would differ between
+   * the server and browser bundles.
+   */
+  const autofillSalt = useId()
+
   return (
     <div className='contents'>
       <ChipInput
@@ -227,7 +240,7 @@ function WorkspaceVariableRow({
           onPendingKeyChange(e.target.value)
         }}
         onBlur={() => onRenameEnd(envKey, value)}
-        name={`workspace_env_key_${envKey}_${generateShortId()}`}
+        name={`workspace_env_key_${envKey}_${autofillSalt}`}
         autoComplete='off'
         autoCapitalize='off'
         spellCheck='false'
@@ -241,7 +254,8 @@ function WorkspaceVariableRow({
         value={value}
         onChange={(next) => onValueChange(envKey, next)}
         canEdit={canEdit}
-        name={`workspace_env_value_${envKey}_${generateShortId()}`}
+        canReveal={canReveal}
+        name={`workspace_env_value_${envKey}_${autofillSalt}`}
       />
       <SecretRowMenu
         onCopyName={() => copyName(envKey)}
@@ -265,6 +279,15 @@ function NewWorkspaceVariableRow({
   onUpdate,
   onPaste,
 }: NewWorkspaceVariableRowProps) {
+  /**
+   * Salts the generated `name` attributes so password managers can't match them
+   * against a known field. `useId` is stable across SSR and hydration and across
+   * re-renders — a fresh `generateShortId()` per render would patch six DOM
+   * attributes on every keystroke, and a module-scope one would differ between
+   * the server and browser bundles.
+   */
+  const autofillSalt = useId()
+
   const keyError = validateEnvVarKey(envVar.key)
   const hasContent = Boolean(envVar.key || envVar.value)
 
@@ -277,7 +300,7 @@ function NewWorkspaceVariableRow({
         onChange={(e) => onUpdate(index, 'key', e.target.value)}
         onPaste={onPaste ? (e) => onPaste(e, index) : undefined}
         placeholder='API_KEY'
-        name={`new_workspace_key_${envVar.id || index}_${generateShortId()}`}
+        name={`new_workspace_key_${envVar.id || index}_${autofillSalt}`}
         autoComplete='off'
         autoCapitalize='off'
         spellCheck='false'
@@ -291,7 +314,7 @@ function NewWorkspaceVariableRow({
         onChange={(next) => onUpdate(index, 'value', next)}
         onPaste={onPaste ? (e) => onPaste(e, index) : undefined}
         placeholder='Enter value'
-        name={`new_workspace_value_${envVar.id || index}_${generateShortId()}`}
+        name={`new_workspace_value_${envVar.id || index}_${autofillSalt}`}
         className='ml-0'
       />
       {hasContent ? (
@@ -320,6 +343,15 @@ function NewWorkspaceVariableRow({
 }
 
 export function SecretsManager() {
+  /**
+   * Salts the generated `name` attributes so password managers can't match them
+   * against a known field. `useId` is stable across SSR and hydration and across
+   * re-renders — a fresh `generateShortId()` per render would patch six DOM
+   * attributes on every keystroke, and a module-scope one would differ between
+   * the server and browser bundles.
+   */
+  const autofillSalt = useId()
+
   const params = useParams()
   const router = useRouter()
   const workspaceId = (params?.workspaceId as string) || ''
@@ -392,12 +424,21 @@ export function SecretsManager() {
     return mapped.filter(({ envVar }) => envVar.key.toLowerCase().includes(term))
   }, [envVars, searchTerm])
 
+  /**
+   * The row has no description column, so a description-only match is legible
+   * only on the secret's detail page. Personal secrets carry no shared
+   * description and stay key-only.
+   */
   const filteredWorkspaceEntries = useMemo(() => {
     const entries = Object.entries(workspaceVars)
     if (!searchTerm.trim()) return entries
     const term = searchTerm.toLowerCase()
-    return entries.filter(([key]) => key.toLowerCase().includes(term))
-  }, [workspaceVars, searchTerm])
+    return entries.filter(
+      ([key]) =>
+        key.toLowerCase().includes(term) ||
+        Boolean(workspaceEnvKeyToCredential.get(key)?.description?.toLowerCase().includes(term))
+    )
+  }, [workspaceVars, searchTerm, workspaceEnvKeyToCredential])
 
   const filteredNewWorkspaceRows = useMemo(() => {
     const mapped = newWorkspaceRows.map((row, index) => ({ row, originalIndex: index }))
@@ -677,6 +718,14 @@ export function SecretsManager() {
     const text = e.clipboardData.getData('text').trim()
     if (!text) return
 
+    if (countPasteRows(text, MAX_ENV_PASTE_ROWS) > MAX_ENV_PASTE_ROWS) {
+      e.preventDefault()
+      toast.warning('Paste has too many secrets', {
+        description: `Add up to ${MAX_ENV_PASTE_ROWS.toLocaleString()} rows at once.`,
+      })
+      return
+    }
+
     const lines = text.split(/\r?\n/).filter((line) => line.trim())
     if (lines.length === 0) return
 
@@ -712,6 +761,14 @@ export function SecretsManager() {
   const handleWorkspacePaste = (e: React.ClipboardEvent<HTMLInputElement>, _index: number) => {
     const text = e.clipboardData.getData('text').trim()
     if (!text) return
+
+    if (countPasteRows(text, MAX_ENV_PASTE_ROWS) > MAX_ENV_PASTE_ROWS) {
+      e.preventDefault()
+      toast.warning('Paste has too many secrets', {
+        description: `Add up to ${MAX_ENV_PASTE_ROWS.toLocaleString()} rows at once.`,
+      })
+      return
+    }
 
     const lines = text.split(/\r?\n/).filter((line) => line.trim())
     if (lines.length === 0) return
@@ -759,9 +816,9 @@ export function SecretsManager() {
       }
     }
 
-    const validVariables = envVars
-      .filter((v) => v.key && v.value)
-      .reduce<Record<string, string>>((acc, { key, value }) => ({ ...acc, [key]: value }), {})
+    const validVariables = Object.fromEntries(
+      envVars.filter((v) => v.key && v.value).map(({ key, value }) => [key, value])
+    )
 
     const before = initialWorkspaceVarsRef.current
     const after = mergedWorkspaceVars
@@ -865,7 +922,7 @@ export function SecretsManager() {
           onChange={(e) => updateEnvVar(originalIndex, 'key', e.target.value)}
           onPaste={(e) => handlePaste(e, originalIndex)}
           placeholder='API_KEY'
-          name={`env_variable_name_${envVar.id || originalIndex}_${generateShortId()}`}
+          name={`env_variable_name_${envVar.id || originalIndex}_${autofillSalt}`}
           autoComplete='off'
           autoCapitalize='off'
           spellCheck='false'
@@ -881,7 +938,7 @@ export function SecretsManager() {
           unmasked={isConflicted}
           readOnly={isConflicted}
           placeholder={isConflicted ? 'Workspace override active' : 'Enter value'}
-          name={`env_variable_value_${envVar.id || originalIndex}_${generateShortId()}`}
+          name={`env_variable_value_${envVar.id || originalIndex}_${autofillSalt}`}
           className={cn(isConflicted && 'cursor-not-allowed opacity-50')}
         />
         {hasContent ? (
@@ -955,36 +1012,25 @@ export function SecretsManager() {
           onChange: setSearchTerm,
           placeholder: 'Search secrets...',
         }}
-        actions={[
-          ...(hasChanges
-            ? [
-                {
-                  text: 'Discard',
-                  onSelect: handleCancel,
-                  disabled: isListSaving,
-                } satisfies SettingsAction,
-              ]
-            : []),
-          {
-            text: isListSaving ? 'Saving...' : 'Save',
-            onSelect: handleSave,
-            disabled: hasConflicts || hasInvalidKeys || isLoading || !hasChanges || isListSaving,
-            tooltip: hasConflicts
-              ? 'Resolve all conflicts before saving'
-              : hasInvalidKeys
-                ? 'Fix invalid variable names before saving'
-                : undefined,
-          },
-        ]}
+        actions={saveDiscardActions({
+          dirty: hasChanges,
+          saving: isListSaving,
+          onSave: handleSave,
+          onDiscard: handleCancel,
+          saveDisabled: hasConflicts || hasInvalidKeys || isLoading,
+          saveTooltip: hasConflicts
+            ? 'Resolve all conflicts before saving'
+            : hasInvalidKeys
+              ? 'Fix invalid variable names before saving'
+              : undefined,
+        })}
       >
         {!isLoading && (
           <div className='flex flex-col gap-7'>
             {(!searchTerm.trim() ||
               filteredWorkspaceEntries.length > 0 ||
               filteredNewWorkspaceRows.length > 0) && (
-              <section className='flex flex-col'>
-                <span className='pl-0.5 text-[var(--text-muted)] text-small'>Workspace</span>
-                <div className='mt-[9px] mb-3 h-px bg-[var(--border)]' />
+              <SettingsSection label='Workspace'>
                 <div className={`${GRID_COLS} gap-y-2`}>
                   {(searchTerm.trim()
                     ? filteredWorkspaceEntries
@@ -992,6 +1038,8 @@ export function SecretsManager() {
                   ).map(([key, value]) => {
                     const cred = workspaceEnvKeyToCredential.get(key)
                     const canEditRow = canCreateWorkspaceSecret && cred?.role === 'admin'
+                    const canRevealRow =
+                      isWorkspaceAdmin || cred?.role === 'admin' || Boolean(cred?.unredacted)
                     return (
                       <WorkspaceVariableRow
                         key={key}
@@ -1001,15 +1049,14 @@ export function SecretsManager() {
                         pendingKeyValue={pendingKeyValue}
                         hasCredential={Boolean(cred)}
                         canEdit={canEditRow}
+                        canReveal={canRevealRow}
                         canRename={canCreateWorkspaceSecret && canEditRow}
                         onRenameStart={setRenamingKey}
                         onPendingKeyChange={setPendingKeyValue}
                         onRenameEnd={handleWorkspaceKeyRename}
                         onValueChange={handleWorkspaceValueChange}
                         onDelete={handleDeleteWorkspaceVar}
-                        onViewDetails={
-                          canCreateWorkspaceSecret && cred ? handleViewDetails : undefined
-                        }
+                        onViewDetails={cred ? handleViewDetails : undefined}
                       />
                     )
                   })}
@@ -1027,13 +1074,11 @@ export function SecretsManager() {
                       />
                     ))}
                 </div>
-              </section>
+              </SettingsSection>
             )}
 
             {(!searchTerm.trim() || filteredEnvVars.length > 0) && (
-              <section className='flex flex-col'>
-                <span className='pl-0.5 text-[var(--text-muted)] text-small'>Personal</span>
-                <div className='mt-[9px] mb-3 h-px bg-[var(--border)]' />
+              <SettingsSection label='Personal'>
                 <div className={`${GRID_COLS} gap-y-2`}>
                   {filteredEnvVars.map(({ envVar, originalIndex }) => (
                     <div key={envVar.id || originalIndex} className='contents'>
@@ -1041,7 +1086,7 @@ export function SecretsManager() {
                     </div>
                   ))}
                 </div>
-              </section>
+              </SettingsSection>
             )}
             {searchTerm.trim() &&
               filteredEnvVars.length === 0 &&

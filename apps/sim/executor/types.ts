@@ -1,15 +1,22 @@
+import type { WorkflowExecutionAuthority, WorkflowExecutionPrincipal } from '@sim/auth/principal'
 import type { BillingAttributionSnapshot } from '@/lib/billing/core/billing-attribution'
 import type { TraceSpan } from '@/lib/logs/types'
 import type { PermissionGroupConfig } from '@/lib/permission-groups/types'
 import type { BlockOutput } from '@/blocks/types'
 import type {
   ChildWorkflowContext,
+  ExecutionCallbacks,
   IterationContext,
   ParentIteration,
   PiiBlockOutputRedaction,
   SerializableExecutionState,
 } from '@/executor/execution/types'
+import type {
+  ResolvedSecretTraceProvenanceV1,
+  ResolvedSecretTraceRegistry,
+} from '@/executor/utils/resolved-secret-trace-registry'
 import type { RunFromBlockContext } from '@/executor/utils/run-from-block'
+import type { AgentStreamSink, UnsubscribeAgentStreamSink } from '@/providers/stream-events'
 import type { SerializedBlock, SerializedWorkflow } from '@/serializer/types'
 import type { SubflowType } from '@/stores/workflows/workflow/types'
 
@@ -184,7 +191,7 @@ export interface BlockToolCall {
   error?: string
   arguments?: Record<string, unknown>
   input?: Record<string, unknown>
-  result?: Record<string, unknown>
+  result?: unknown
   output?: Record<string, unknown>
 }
 
@@ -266,6 +273,8 @@ export interface BlockLog {
   error?: string
   /** Whether this error was handled by an error handler path (error port) */
   errorHandled?: boolean
+  /** Total handler tries, present only when the block retried at least once. */
+  tries?: number
   loopId?: string
   parallelId?: string
   iterationIndex?: number
@@ -282,6 +291,23 @@ export interface BlockLog {
    * while preserving data for trace-spans processing.
    */
   childTraceSpans?: TraceSpan[]
+  /**
+   * A custom block's child run, which executes under its own execution id against
+   * the SOURCE workspace. Only the opaque id crosses the invocation boundary — the
+   * child's spans stay on its own log row and are joined at READ time. Written only
+   * for a block whose publisher opted its runs into consumer traces — the presence of
+   * this id IS that permission. Kept off `output` for the same reason
+   * {@link childTraceSpans} is.
+   */
+  childExecution?: { executionId: string }
+  /**
+   * A custom block ran a child whose publisher has not opened it to consumers, so no
+   * `childExecution` handle exists to join. Recorded because a boundary span with
+   * no children is otherwise indistinguishable from a leaf block.
+   */
+  childTraceDisabled?: boolean
+  /** Internal encrypted sidecar used only for causal display projection. */
+  displayResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
 }
 
 interface ExecutionMetadata {
@@ -307,6 +333,7 @@ interface ExecutionMetadata {
     depth: number
   }
   userId?: string
+  principal?: WorkflowExecutionPrincipal
   executionId?: string
   triggerType?: string
   triggerBlockId?: string
@@ -314,12 +341,34 @@ interface ExecutionMetadata {
   resumeFromSnapshot?: boolean
   resumeTerminalNoop?: boolean
   executionMode?: 'sync' | 'stream' | 'async'
+  /**
+   * Run-level agent-events opt-in (see the snapshot ExecutionMetadata).
+   * Gates streaming tool loops and provider thinking-summary requests.
+   */
+  agentEvents?: boolean
 }
 
 export interface BlockState {
   output: NormalizedBlockOutput
   executed: boolean
   executionTime: number
+  /** Encrypted candidates active in this block call. Consumers filter them to the selected value. */
+  resolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
+}
+
+/**
+ * Canonical signed execution identity used for executor-delegated internal operations.
+ *
+ * A nested workflow changes {@link ExecutionContext.workflowId} for execution semantics, but it
+ * still belongs to the parent log row identified here. Custom blocks replace this origin with the
+ * publisher-owned child execution after opening their own source-workspace log row.
+ */
+export interface ExecutorDelegationOrigin {
+  subjectUserId?: string
+  workflowId: string
+  executionId?: string
+  principal?: WorkflowExecutionPrincipal
+  currentWorkflow?: WorkflowExecutionAuthority
 }
 
 export interface ExecutionContext {
@@ -331,6 +380,10 @@ export interface ExecutionContext {
   fileKeys?: string[]
   allowLargeValueWorkflowScope?: boolean
   userId?: string
+  /** Original authenticated caller for resource-policy decisions. */
+  principal?: WorkflowExecutionPrincipal
+  /** Trusted origin for signed executor delegation, distinct from the currently executing child. */
+  executorDelegationOrigin?: ExecutorDelegationOrigin
   isDeployedContext?: boolean
   enforceCredentialAccess?: boolean
   copilotToolExecution?: boolean
@@ -340,6 +393,16 @@ export interface ExecutionContext {
   permissionConfig?: PermissionGroupConfig | null
   permissionConfigLoaded?: boolean
 
+  /**
+   * Resolved display names for the resources an agent tool is bound to, keyed `${kind}:${id}`,
+   * with `null` recording a miss so it is not retried. Shared across the whole run: an agent block
+   * inside a loop re-formats its tools every iteration, and its bound resources do not change.
+   *
+   * A Map rather than plain fields on purpose — `blockCtx` is a shallow clone of this context per
+   * block execution, so only a shared reference survives; a scalar written here would be lost.
+   */
+  toolBindingLabelCache?: Map<string, string | null>
+
   blockStates: ReadonlyMap<string, BlockState>
   executedBlocks: ReadonlySet<string>
 
@@ -348,7 +411,13 @@ export interface ExecutionContext {
   /** Trusted run metadata for the Start block's "Add run metadata" toggle. */
   startRunMetadata?: StartBlockRunMetadata
   environmentVariables: Record<string, string>
+  resolvedSecretTraceRegistry?: ResolvedSecretTraceRegistry
+  /** Exact candidates that may be carried by this block's terminal error, never its normal output. */
+  errorResolvedSecretTraceRegistry?: ResolvedSecretTraceRegistry
   workflowVariables?: Record<string, any>
+  workflowVariableResolvedSecretTraceProvenance?: Record<string, ResolvedSecretTraceProvenanceV1>
+  workflowInputResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
+  finalOutputResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
 
   decisions: {
     router: Map<string, string>
@@ -381,6 +450,8 @@ export interface ExecutionContext {
       skipFirstConditionCheck?: boolean
       skippedAtStart?: boolean
       loopType?: 'for' | 'forEach' | 'while' | 'doWhile'
+      inputResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
+      resolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
     }
   >
 
@@ -398,6 +469,8 @@ export interface ExecutionContext {
       items?: any[]
       validationError?: string
       isEmpty?: boolean
+      inputResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
+      resolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
     }
   >
 
@@ -488,6 +561,34 @@ export interface ExecutionContext {
   callChain?: string[]
 
   /**
+   * The Sim user watching this run's live block stream, when there is exactly one
+   * and they are a known, authenticated workspace member — i.e. an editor/manual
+   * run. Deliberately UNSET on chat deployments, public API, webhook, and schedule
+   * runs, whose stream consumer may be an anonymous external visitor.
+   *
+   * Whether a custom block may stream the SOURCE workflow's block events is the
+   * publisher's decision, not this viewer's — but that decision covers the ORG, so it
+   * still requires a stream with an identified consumer. This field is the proof of
+   * one; absent, the boundary holds and every anonymous-consumer surface is
+   * fail-closed by default.
+   */
+  liveTraceViewerUserId?: string
+
+  /**
+   * Block callbacks that ONLY emit to the live stream — they never write the invoking
+   * run's progress markers. `onBlockStart`/`onBlockComplete` above are persist-then-emit
+   * composites: on the invoking run they write block names and I/O into that run's
+   * `LoggingSession` before reaching the stream.
+   *
+   * A custom block's child must reach the emit half and never the persist half. The
+   * stream is gated on the publisher's trace policy AND an identified consumer, but a
+   * persisted marker is keyed by the PARENT execution and is readable by anyone with
+   * parent-workspace access on any surface — so persisting the source workflow's block
+   * names there would leak them past the gate entirely.
+   */
+  liveStreamCallbacks?: Pick<ExecutionCallbacks, 'onBlockStart' | 'onBlockComplete'>
+
+  /**
    * Counter for generating monotonically increasing execution order values.
    * Starts at 0 and increments for each block. Use getNextExecutionOrder() to access.
    */
@@ -522,7 +623,36 @@ export interface ExecutionResult {
 }
 
 export interface StreamingExecution {
+  /**
+   * Provider stream payload. Format is declared by {@link streamFormat}:
+   * - `'text'` (default): UTF-8 answer bytes (`ReadableStream<Uint8Array>`)
+   * - `'agent-events-v1'`: in-process `ReadableStream` of `AgentStreamEvent` objects
+   *
+   * Never sniff the payload; always read {@link streamFormat}.
+   * After the executor pump, {@link stream} is always projected UTF-8 answer text.
+   */
   stream: ReadableStream
+  /**
+   * Discriminator for {@link stream}. Defaults to `'text'` when omitted so
+   * existing providers remain byte-stream consumers without changes.
+   */
+  streamFormat?: 'text' | 'agent-events-v1'
+  /**
+   * Optional sink subscription installed synchronously during `onStream` before
+   * the executor pump starts draining. Late subscribers receive future events only.
+   */
+  subscribe?: (sink: AgentStreamSink) => UnsubscribeAgentStreamSink
+  /**
+   * True when {@link stream} is a response-format projection (selected JSON
+   * fields extracted from structured output) rather than raw answer text. Sink
+   * `text_delta` events then do NOT match the byte stream, so consumers must
+   * keep sourcing answer text from {@link stream} instead of the sink.
+   */
+  clientStreamTransformed?: boolean
+  /** Internal provenance for the exact block input that initiated this live stream. */
+  displayResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
+  /** Internal source registry retained only for sanitizing failures while the stream drains. */
+  diagnosticResolvedSecretTraceRegistry?: ResolvedSecretTraceRegistry
   execution: ExecutionResult & { isStreaming?: boolean }
   /**
    * Invoked with the assembled response text after the stream drains. Lets agent
@@ -542,29 +672,45 @@ interface BlockExecutor {
   ): Promise<BlockOutput>
 }
 
+/**
+ * Per-invocation identity for one run of one block.
+ *
+ * `executionOrder` is the field a `keyed` delivery derives its idempotency token
+ * from. It is assigned once, before the block executor's retry wrapper, and is
+ * distinct per loop iteration and per parallel branch — so it is both stable
+ * across every retry layer and distinguishing between logically separate
+ * invocations. Both halves are required; see `KeyedDeliveryContext`.
+ */
+export interface BlockNodeMetadata {
+  nodeId: string
+  loopId?: string
+  parallelId?: string
+  branchIndex?: number
+  branchTotal?: number
+  originalBlockId?: string
+  isLoopNode?: boolean
+  executionOrder?: number
+}
+
 export interface BlockHandler {
   canHandle(block: SerializedBlock): boolean
 
+  /**
+   * `nodeMetadata` is optional so the many handlers that do not need an
+   * invocation identity keep their three-parameter signature.
+   */
   execute(
     ctx: ExecutionContext,
     block: SerializedBlock,
-    inputs: Record<string, any>
+    inputs: Record<string, any>,
+    nodeMetadata?: BlockNodeMetadata
   ): Promise<BlockOutput | StreamingExecution>
 
   executeWithNode?: (
     ctx: ExecutionContext,
     block: SerializedBlock,
     inputs: Record<string, any>,
-    nodeMetadata: {
-      nodeId: string
-      loopId?: string
-      parallelId?: string
-      branchIndex?: number
-      branchTotal?: number
-      originalBlockId?: string
-      isLoopNode?: boolean
-      executionOrder?: number
-    }
+    nodeMetadata: BlockNodeMetadata
   ) => Promise<BlockOutput | StreamingExecution>
 }
 

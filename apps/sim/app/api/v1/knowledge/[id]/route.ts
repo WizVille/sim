@@ -1,4 +1,3 @@
-import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { type NextRequest, NextResponse } from 'next/server'
 import {
   v1DeleteKnowledgeBaseContract,
@@ -6,14 +5,21 @@ import {
   v1UpdateKnowledgeBaseContract,
 } from '@/lib/api/contracts/v1/knowledge'
 import { parseRequest } from '@/lib/api/server'
+import {
+  messageForOrchestrationError,
+  statusForOrchestrationError,
+} from '@/lib/core/orchestration/types'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
-import { deleteKnowledgeBase, updateKnowledgeBase } from '@/lib/knowledge/service'
+import {
+  performDeleteKnowledgeBase,
+  performUpdateKnowledgeBase,
+} from '@/lib/knowledge/orchestration'
 import {
   formatKnowledgeBase,
   handleError,
   resolveKnowledgeBase,
 } from '@/app/api/v1/knowledge/utils'
-import { authenticateRequest } from '@/app/api/v1/middleware'
+import { authenticateRequest, v1ValidationErrorResponse } from '@/app/api/v1/middleware'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -29,7 +35,9 @@ export const GET = withRouteHandler(async (request: NextRequest, context: Knowle
   const { requestId, userId, rateLimit } = auth
 
   try {
-    const parsed = await parseRequest(v1GetKnowledgeBaseContract, request, context)
+    const parsed = await parseRequest(v1GetKnowledgeBaseContract, request, context, {
+      validationErrorResponse: v1ValidationErrorResponse,
+    })
     if (!parsed.success) return parsed.response
 
     const { id } = parsed.data.params
@@ -54,7 +62,9 @@ export const PUT = withRouteHandler(async (request: NextRequest, context: Knowle
   const { requestId, userId, rateLimit } = auth
 
   try {
-    const parsed = await parseRequest(v1UpdateKnowledgeBaseContract, request, context)
+    const parsed = await parseRequest(v1UpdateKnowledgeBaseContract, request, context, {
+      validationErrorResponse: v1ValidationErrorResponse,
+    })
     if (!parsed.success) return parsed.response
 
     const { id } = parsed.data.params
@@ -63,33 +73,26 @@ export const PUT = withRouteHandler(async (request: NextRequest, context: Knowle
     const result = await resolveKnowledgeBase(id, workspaceId, userId, rateLimit, 'write')
     if (result instanceof NextResponse) return result
 
-    const updates: {
-      name?: string
-      description?: string
-      chunkingConfig?: { maxSize: number; minSize: number; overlap: number }
-    } = {}
-    if (name !== undefined) updates.name = name
-    if (description !== undefined) updates.description = description
-    if (chunkingConfig !== undefined) updates.chunkingConfig = chunkingConfig
-
-    const updatedKb = await updateKnowledgeBase(id, updates, requestId)
-
-    recordAudit({
+    const outcome = await performUpdateKnowledgeBase({
+      knowledgeBaseId: id,
       workspaceId,
-      actorId: userId,
-      action: AuditAction.KNOWLEDGE_BASE_UPDATED,
-      resourceType: AuditResourceType.KNOWLEDGE_BASE,
-      resourceId: id,
-      resourceName: updatedKb.name,
-      description: `Updated knowledge base "${updatedKb.name}" via API`,
-      metadata: { updatedFields: Object.keys(updates) },
+      userId,
+      source: 'api',
+      updates: { name, description, chunkingConfig },
+      requestId,
       request,
     })
+    if (!outcome.success) {
+      return NextResponse.json(
+        { error: messageForOrchestrationError(outcome, 'Failed to update knowledge base') },
+        { status: statusForOrchestrationError(outcome.errorCode) }
+      )
+    }
 
     return NextResponse.json({
       success: true,
       data: {
-        knowledgeBase: formatKnowledgeBase(updatedKb),
+        knowledgeBase: formatKnowledgeBase(outcome.knowledgeBase),
         message: 'Knowledge base updated successfully',
       },
     })
@@ -106,7 +109,9 @@ export const DELETE = withRouteHandler(
     const { requestId, userId, rateLimit } = auth
 
     try {
-      const parsed = await parseRequest(v1DeleteKnowledgeBaseContract, request, context)
+      const parsed = await parseRequest(v1DeleteKnowledgeBaseContract, request, context, {
+        validationErrorResponse: v1ValidationErrorResponse,
+      })
       if (!parsed.success) return parsed.response
 
       const { id } = parsed.data.params
@@ -119,18 +124,23 @@ export const DELETE = withRouteHandler(
       )
       if (result instanceof NextResponse) return result
 
-      await deleteKnowledgeBase(id, requestId)
-
-      recordAudit({
-        workspaceId: parsed.data.query.workspaceId,
-        actorId: userId,
-        action: AuditAction.KNOWLEDGE_BASE_DELETED,
-        resourceType: AuditResourceType.KNOWLEDGE_BASE,
-        resourceId: id,
-        resourceName: result.kb.name,
-        description: `Deleted knowledge base "${result.kb.name}" via API`,
+      const outcome = await performDeleteKnowledgeBase({
+        knowledgeBase: {
+          id,
+          name: result.kb.name,
+          workspaceId: parsed.data.query.workspaceId,
+        },
+        userId,
+        source: 'api',
+        requestId,
         request,
       })
+      if (!outcome.success) {
+        return NextResponse.json(
+          { error: messageForOrchestrationError(outcome, 'Failed to delete knowledge base') },
+          { status: statusForOrchestrationError(outcome.errorCode) }
+        )
+      }
 
       return NextResponse.json({
         success: true,

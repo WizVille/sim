@@ -6,12 +6,10 @@ import { normalizeFileInput } from '@/blocks/utils'
 import type { TikTokResponse } from '@/tools/tiktok/types'
 import { getTrigger } from '@/triggers'
 
-const VIDEO_UPLOAD_OPERATIONS = ['tiktok_upload_video_draft']
 const TIKTOK_TOOL_IDS = new Set([
   'tiktok_get_user',
   'tiktok_list_videos',
   'tiktok_query_videos',
-  'tiktok_query_creator_info',
   'tiktok_upload_video_draft',
   'tiktok_get_post_status',
 ])
@@ -22,17 +20,10 @@ const TIKTOK_OPERATION_INPUT_KEYS = [
   'videoIds',
   'file',
   'publishId',
-  'title',
-  'privacyLevel',
-  'disableDuet',
-  'disableStitch',
-  'disableComment',
-  'videoCoverTimestampMs',
-  'isAigc',
-  'brandContentToggle',
-  'brandOrganicToggle',
-  'musicUsageConsent',
 ] as const
+
+/** Video to upload, whichever mode the card is in. */
+const VIDEO_FILE_FIELD = ['videoFile', 'videoFileRef'] as const
 
 export const TikTokBlock: BlockConfig<TikTokResponse> = {
   type: 'tiktok',
@@ -47,7 +38,31 @@ export const TikTokBlock: BlockConfig<TikTokResponse> = {
   bgColor: '#000000',
   icon: TikTokIcon,
   triggerAllowed: true,
-  hideFromToolbar: true,
+  hideFromToolbar: false,
+  canvasPresentation: {
+    defaultTitle: 'TikTok',
+    sentences: {
+      byOperation: {
+        tiktok_get_user: ['Read the account profile', { text: ', returning', field: 'fields' }],
+        tiktok_list_videos: [
+          'List videos on the account',
+          { text: ', up to', field: 'maxCount', after: 'results' },
+        ],
+        tiktok_query_videos: [{ text: 'Fetch metadata for videos', field: 'videoIds', core: true }],
+        tiktok_upload_video_draft: [
+          {
+            text: 'Send',
+            field: VIDEO_FILE_FIELD,
+            after: 'to the inbox as a draft',
+            core: true,
+          },
+        ],
+        tiktok_get_post_status: [
+          { text: 'Check upload status of', field: 'publishId', core: true },
+        ],
+      },
+    },
+  },
 
   subBlocks: [
     {
@@ -58,7 +73,6 @@ export const TikTokBlock: BlockConfig<TikTokResponse> = {
         { label: 'Get User Info', id: 'tiktok_get_user' },
         { label: 'List Videos', id: 'tiktok_list_videos' },
         { label: 'Query Videos', id: 'tiktok_query_videos' },
-        { label: 'Query Creator Info', id: 'tiktok_query_creator_info' },
         { label: 'Upload Video Draft', id: 'tiktok_upload_video_draft' },
         { label: 'Get Post Status', id: 'tiktok_get_post_status' },
       ],
@@ -140,8 +154,8 @@ export const TikTokBlock: BlockConfig<TikTokResponse> = {
       multiple: false,
       maxSize: 250,
       description: 'MP4, MOV, or WebM video up to 250 MB.',
-      condition: { field: 'operation', value: VIDEO_UPLOAD_OPERATIONS },
-      required: { field: 'operation', value: VIDEO_UPLOAD_OPERATIONS },
+      condition: { field: 'operation', value: 'tiktok_upload_video_draft' },
+      required: { field: 'operation', value: 'tiktok_upload_video_draft' },
     },
     {
       id: 'videoFileRef',
@@ -150,8 +164,8 @@ export const TikTokBlock: BlockConfig<TikTokResponse> = {
       canonicalParamId: 'file',
       mode: 'advanced',
       placeholder: 'Reference a video from a previous block',
-      condition: { field: 'operation', value: VIDEO_UPLOAD_OPERATIONS },
-      required: { field: 'operation', value: VIDEO_UPLOAD_OPERATIONS },
+      condition: { field: 'operation', value: 'tiktok_upload_video_draft' },
+      required: { field: 'operation', value: 'tiktok_upload_video_draft' },
     },
 
     {
@@ -168,8 +182,6 @@ export const TikTokBlock: BlockConfig<TikTokResponse> = {
     ...getTrigger('tiktok_post_inbox_delivered').subBlocks,
     ...getTrigger('tiktok_post_publicly_available').subBlocks,
     ...getTrigger('tiktok_post_no_longer_public').subBlocks,
-    ...getTrigger('tiktok_video_publish_completed').subBlocks,
-    ...getTrigger('tiktok_video_upload_failed').subBlocks,
     ...getTrigger('tiktok_authorization_removed').subBlocks,
   ],
 
@@ -181,8 +193,6 @@ export const TikTokBlock: BlockConfig<TikTokResponse> = {
       'tiktok_post_inbox_delivered',
       'tiktok_post_publicly_available',
       'tiktok_post_no_longer_public',
-      'tiktok_video_publish_completed',
-      'tiktok_video_upload_failed',
       'tiktok_authorization_removed',
     ],
   },
@@ -192,7 +202,6 @@ export const TikTokBlock: BlockConfig<TikTokResponse> = {
       'tiktok_get_user',
       'tiktok_list_videos',
       'tiktok_query_videos',
-      'tiktok_query_creator_info',
       'tiktok_upload_video_draft',
       'tiktok_get_post_status',
     ],
@@ -226,8 +235,6 @@ export const TikTokBlock: BlockConfig<TikTokResponse> = {
               .split(/[,\n]+/)
               .map((id: string) => id.trim())
               .filter(Boolean)
-            break
-          case 'tiktok_query_creator_info':
             break
           case 'tiktok_upload_video_draft': {
             result.file = normalizeFileInput(params.file, { single: true })
@@ -340,59 +347,12 @@ export const TikTokBlock: BlockConfig<TikTokResponse> = {
       condition: { field: 'operation', value: 'tiktok_list_videos' },
     },
 
-    creatorAvatarUrl: {
-      type: 'string',
-      description: 'Provider URL of the creator avatar; expires after two hours',
-      condition: { field: 'operation', value: 'tiktok_query_creator_info' },
-    },
-    creatorAvatarFile: {
-      type: 'file',
-      description:
-        'Canonical workflow file containing the creator avatar, suitable for downstream attachments',
-      condition: { field: 'operation', value: 'tiktok_query_creator_info' },
-    },
-    creatorUsername: {
-      type: 'string',
-      description: 'TikTok username of the creator',
-      condition: { field: 'operation', value: 'tiktok_query_creator_info' },
-    },
-    creatorNickname: {
-      type: 'string',
-      description: 'Display name/nickname of the creator',
-      condition: { field: 'operation', value: 'tiktok_query_creator_info' },
-    },
-    privacyLevelOptions: {
-      type: 'array',
-      description: 'Available privacy levels for posting (array of strings)',
-      condition: { field: 'operation', value: 'tiktok_query_creator_info' },
-    },
-    commentDisabled: {
-      type: 'boolean',
-      description: 'Whether the creator disabled comments by default',
-      condition: { field: 'operation', value: 'tiktok_query_creator_info' },
-    },
-    duetDisabled: {
-      type: 'boolean',
-      description: 'Whether the creator disabled duets by default',
-      condition: { field: 'operation', value: 'tiktok_query_creator_info' },
-    },
-    stitchDisabled: {
-      type: 'boolean',
-      description: 'Whether the creator disabled stitches by default',
-      condition: { field: 'operation', value: 'tiktok_query_creator_info' },
-    },
-    maxVideoPostDurationSec: {
-      type: 'number',
-      description: 'Maximum allowed video duration in seconds',
-      condition: { field: 'operation', value: 'tiktok_query_creator_info' },
-    },
-
     publishId: {
       type: 'string',
-      description: 'Publish ID for tracking post status',
+      description: 'Draft upload ID for tracking post status',
       condition: {
         field: 'operation',
-        value: VIDEO_UPLOAD_OPERATIONS,
+        value: 'tiktok_upload_video_draft',
       },
     },
 

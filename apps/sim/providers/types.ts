@@ -67,7 +67,7 @@ export interface FunctionCallResponse {
   startTime?: string
   endTime?: string
   duration?: number
-  result?: Record<string, any>
+  result?: unknown
   output?: Record<string, any>
   input?: Record<string, any>
   success?: boolean
@@ -84,9 +84,14 @@ export interface ProviderResponse {
   content: string
   model: string
   tokens?: {
+    /** Tokens billed at the base input rate, excluding cache reads and writes. */
     input?: number
     output?: number
     total?: number
+    /** Input tokens served from the provider's prompt cache. */
+    cacheRead?: number
+    /** Input tokens written to the provider's prompt cache. */
+    cacheWrite?: number
   }
   toolCalls?: FunctionCallResponse[]
   toolResults?: Record<string, unknown>[]
@@ -114,8 +119,9 @@ export interface ProviderResponse {
 export type ToolUsageControl = 'auto' | 'force' | 'none'
 
 export interface ProviderToolConfig {
+  /** Canonical registry id when {@link id} is a request-scoped provider wire alias. */
+  canonicalId?: string
   id: string
-  name: string
   description: string
   params: Record<string, any>
   parameters: {
@@ -124,6 +130,13 @@ export interface ProviderToolConfig {
     required: string[]
   }
   usageControl?: ToolUsageControl
+  /**
+   * Params the model may never supply, because the tool declares them
+   * `user-only` or `hidden`. Stripped from the model's arguments before they
+   * merge with the user's — omitting them from {@link ProviderToolConfig.parameters}
+   * alone does not stop a model from emitting one anyway.
+   */
+  modelBlockedParams?: string[]
   /** Block-level params transformer — converts SubBlock values to tool-ready params */
   paramsTransform?: (params: Record<string, any>) => Record<string, any>
 }
@@ -172,7 +185,13 @@ export interface ProviderRequest {
   /** ID of the workflow execution this request belongs to */
   executionId?: string
   stream?: boolean
-  streamToolCalls?: boolean
+  /**
+   * Run-level agent-events opt-in. Lets providers request streamable thinking
+   * (e.g. OpenAI reasoning summaries, Gemini thought summaries) and lets opted-in
+   * consumers observe the event timeline. It does not select the internal tool
+   * loop and never changes answer content.
+   */
+  agentEvents?: boolean
   environmentVariables?: Record<string, string>
   workflowVariables?: Record<string, any>
   blockData?: Record<string, any>
@@ -189,8 +208,23 @@ export interface ProviderRequest {
   reasoningEffort?: string
   verbosity?: string
   thinkingLevel?: string
+  /**
+   * Opt in to caller-placed prompt-cache breakpoints on the static prefix.
+   * Only meaningful for models declaring `capabilities.promptCaching`;
+   * `sanitizeRequest` clears it otherwise.
+   */
+  promptCaching?: boolean
+  /** Stable identity of the block issuing the request, used for cache routing. */
+  blockId?: string
   isDeployedContext?: boolean
   callChain?: string[]
+  /**
+   * The invoking run's execution id. Propagated into the `_context` of every
+   * tool the LLM invokes so a tool that starts its own child execution (a
+   * custom block) can correlate that child back to a REAL invoking run rather
+   * than a freshly-minted id, and can honour its cancellation.
+   */
+  executionId?: string
   /**
    * Immutable actor/payer decision captured before execution. Propagated into
    * the `_context` of every tool the LLM invokes so internal routes that
@@ -212,8 +246,17 @@ export class ProviderError extends Error {
     duration: number
   }
 
-  constructor(message: string, timing: { startTime: string; endTime: string; duration: number }) {
-    super(message)
+  /**
+   * `options.cause` should carry the error being wrapped. `name` is deliberately
+   * overwritten with `'ProviderError'`, so without a cause every classification the
+   * original carried — notably a transport `TimeoutError` — is lost to callers.
+   */
+  constructor(
+    message: string,
+    timing: { startTime: string; endTime: string; duration: number },
+    options?: ErrorOptions
+  ) {
+    super(message, options)
     this.name = 'ProviderError'
     this.timing = timing
   }

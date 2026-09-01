@@ -4,6 +4,9 @@ import { AuthMode, IntegrationType } from '@/blocks/types'
 import { normalizeFileInput } from '@/blocks/utils'
 import type { UptimeRobotMonitorResponse } from '@/tools/uptimerobot/types'
 
+/** Incidents narrow by monitor id or by monitor name — whichever the user filled. */
+const INCIDENT_MONITOR_FIELD = ['monitorId', 'monitorName'] as const
+
 const MONITOR_EDIT_OPS = ['create_monitor', 'update_monitor']
 const MAINTENANCE_EDIT_OPS = ['create_maintenance_window', 'update_maintenance_window']
 const PSP_EDIT_OPS = ['create_psp', 'update_psp']
@@ -20,6 +23,80 @@ export const UptimeRobotBlock: BlockConfig<UptimeRobotMonitorResponse> = {
   bgColor: '#111921',
   icon: UptimeRobotIcon,
   authMode: AuthMode.ApiKey,
+  canvasPresentation: {
+    defaultTitle: 'UptimeRobot',
+    sentences: {
+      byOperation: {
+        list_monitors: [
+          'List monitors',
+          { text: 'named', field: 'name' },
+          { text: ', with status', field: 'monitorStatusFilter' },
+          { text: ', tagged', field: 'tags' },
+        ],
+        get_monitor: [{ text: 'Fetch monitor', field: 'monitorId', core: true }],
+        create_monitor: [
+          { text: 'Create', field: 'type', after: 'monitor', core: true },
+          { text: 'named', field: 'friendlyName', core: true },
+          { text: 'for', field: 'url' },
+        ],
+        update_monitor: [
+          { text: 'Update monitor', field: 'monitorId', core: true },
+          { text: ', renaming it to', field: 'friendlyName' },
+          { text: ', pointing it at', field: 'url' },
+        ],
+        delete_monitor: [{ text: 'Delete monitor', field: 'monitorId', core: true }],
+        pause_monitor: [{ text: 'Pause checks on monitor', field: 'monitorId', core: true }],
+        start_monitor: [{ text: 'Resume checks on monitor', field: 'monitorId', core: true }],
+        list_incidents: [
+          'List incidents',
+          { text: 'for monitor', field: INCIDENT_MONITOR_FIELD },
+          { text: ', since', field: 'startedAfter' },
+          { text: ', until', field: 'startedBefore' },
+        ],
+        get_incident: [{ text: 'Fetch incident', field: 'incidentId', core: true }],
+        list_maintenance_windows: ['List all maintenance windows'],
+        get_maintenance_window: [
+          { text: 'Fetch maintenance window', field: 'maintenanceWindowId', core: true },
+        ],
+        create_maintenance_window: [
+          { text: 'Schedule maintenance window', field: 'name', core: true },
+          { text: ', starting', field: 'date' },
+          { text: ', for', field: 'duration', after: 'minutes' },
+        ],
+        update_maintenance_window: [
+          { text: 'Update maintenance window', field: 'maintenanceWindowId', core: true },
+          { text: ', renaming it to', field: 'name' },
+          { text: ', with status', field: 'maintenanceStatus' },
+        ],
+        delete_maintenance_window: [
+          { text: 'Delete maintenance window', field: 'maintenanceWindowId', core: true },
+        ],
+        list_alert_contacts: ['List all alert contacts'],
+        get_alert_contact: [{ text: 'Fetch alert contact', field: 'alertContactId', core: true }],
+        create_alert_contact: [
+          { text: 'Create an email alert contact for', field: 'value', core: true },
+          { text: ', named', field: 'friendlyName' },
+        ],
+        delete_alert_contact: [
+          { text: 'Delete alert contact', field: 'alertContactId', core: true },
+        ],
+        list_psps: ['List all status pages'],
+        get_psp: [{ text: 'Fetch status page', field: 'pspId', core: true }],
+        create_psp: [
+          { text: 'Create status page', field: 'friendlyName', core: true },
+          { text: ', covering monitors', field: 'monitorIds' },
+          { text: ', at', field: 'customDomain' },
+        ],
+        update_psp: [
+          { text: 'Update status page', field: 'pspId', core: true },
+          { text: ', renaming it to', field: 'friendlyName' },
+          { text: ', with status', field: 'pspStatus' },
+        ],
+        delete_psp: [{ text: 'Delete status page', field: 'pspId', core: true }],
+        get_account: ['Read the account plan and limits'],
+      },
+    },
+  },
 
   subBlocks: [
     {
@@ -828,7 +905,7 @@ export const UptimeRobotBlockMeta = {
   templates: [
     {
       icon: UptimeRobotIcon,
-      title: 'Downtime alert to Slack',
+      title: 'UptimeRobot downtime alert to Slack',
       prompt:
         'Build a scheduled workflow that lists UptimeRobot incidents from the last hour, filters to ones that are still active, and posts a formatted Slack alert with the affected monitor name, cause, and how long it has been down.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -838,7 +915,7 @@ export const UptimeRobotBlockMeta = {
     },
     {
       icon: UptimeRobotIcon,
-      title: 'Auto-create monitors from a table',
+      title: 'UptimeRobot monitors from a table',
       prompt:
         'Create a workflow that reads a list of service URLs from a table and creates an HTTP UptimeRobot monitor for each one with a 5-minute interval, then writes the new monitor IDs back to the table.',
       modules: ['tables', 'agent', 'workflows'],
@@ -847,7 +924,7 @@ export const UptimeRobotBlockMeta = {
     },
     {
       icon: UptimeRobotIcon,
-      title: 'Incident to Linear ticket',
+      title: 'UptimeRobot incident to Linear',
       prompt:
         'Build a scheduled workflow that polls UptimeRobot for active incidents, and for any new incident creates a Linear ticket with the monitor name, cause, and root-cause URL, then posts the ticket link to Slack.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -857,7 +934,7 @@ export const UptimeRobotBlockMeta = {
     },
     {
       icon: UptimeRobotIcon,
-      title: 'Maintenance window scheduler',
+      title: 'UptimeRobot maintenance window',
       prompt:
         'Create a workflow that, before a planned deploy, creates a one-time UptimeRobot maintenance window covering the affected monitors for the next 30 minutes so alerts are suppressed during the rollout.',
       modules: ['agent', 'workflows'],
@@ -866,7 +943,7 @@ export const UptimeRobotBlockMeta = {
     },
     {
       icon: UptimeRobotIcon,
-      title: 'Daily uptime digest',
+      title: 'Daily UptimeRobot digest',
       prompt:
         'Build a scheduled daily workflow that lists all UptimeRobot monitors, summarizes how many are up versus down, lists any currently in a down state, and emails a morning availability digest to the on-call team.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -875,7 +952,7 @@ export const UptimeRobotBlockMeta = {
     },
     {
       icon: UptimeRobotIcon,
-      title: 'Status page publisher',
+      title: 'UptimeRobot status page',
       prompt:
         'Create a workflow that builds a public status page in UptimeRobot for a chosen set of monitors, uploads the company logo, and returns the public URL key so it can be shared.',
       modules: ['agent', 'files', 'workflows'],
@@ -884,7 +961,7 @@ export const UptimeRobotBlockMeta = {
     },
     {
       icon: UptimeRobotIcon,
-      title: 'Pause monitors during maintenance',
+      title: 'Pause UptimeRobot monitors',
       prompt:
         'Build a workflow that, when triggered, pauses a specific UptimeRobot monitor, waits for an upstream maintenance task to finish, then starts the monitor again and confirms it is back to a running state.',
       modules: ['agent', 'workflows'],
@@ -893,7 +970,7 @@ export const UptimeRobotBlockMeta = {
     },
     {
       icon: UptimeRobotIcon,
-      title: 'Onboard alert contacts',
+      title: 'Onboard UptimeRobot contacts',
       prompt:
         'Create a workflow that reads a list of team email addresses and adds each one as an UptimeRobot alert contact, then assigns them to the critical production monitors.',
       modules: ['agent', 'workflows'],

@@ -3,16 +3,19 @@ import type { HttpMethod, TableRow, ToolResponse } from '@/tools/types'
 export interface RequestParams {
   url: string
   method?: HttpMethod
-  headers?: TableRow[] | string
+  headers?: TableRow[] | Record<string, unknown> | string
   body?: unknown
   params?: TableRow[] | string
   pathParams?: Record<string, string>
   formData?: Record<string, string | Blob>
+  proxyUrl?: string
   timeout?: number
   retries?: number
   retryDelayMs?: number
   retryMaxDelayMs?: number
   retryNonIdempotent?: boolean
+  redirectPolicyVersion?: string
+  sendCredentialsOnCrossOriginRedirect?: boolean
 }
 
 export interface RequestResponse extends ToolResponse {

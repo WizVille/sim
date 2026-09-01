@@ -10,21 +10,30 @@ import {
   useRef,
   useState,
 } from 'react'
-import { cn } from '@sim/emcn'
+import { type ClipboardContent, cn } from '@sim/emcn'
+import { useQueryClient } from '@tanstack/react-query'
 import { defaultRangeExtractor, type Range, useVirtualizer } from '@tanstack/react-virtual'
+import { SMOOTH_CHASE_RATE } from '@/lib/core/utils/smooth-bottom-chase'
+import type { WorkspaceFileRecord } from '@/lib/uploads/contexts/workspace'
 import { MessageActions } from '@/app/workspace/[workspaceId]/components'
 import { ChatMessageAttachments } from '@/app/workspace/[workspaceId]/home/components/chat-message-attachments'
 import { ChatSurfaceProvider } from '@/app/workspace/[workspaceId]/home/components/chat-surface-context'
 import {
   assistantMessageHasRenderableContent,
+  getOrchestratorMessageText,
   MessageContent,
   type MessagePhase,
 } from '@/app/workspace/[workspaceId]/home/components/message-content'
 import { parseQuestionAnswerMessage } from '@/app/workspace/[workspaceId]/home/components/message-content/components/question'
 import {
-  PendingTagIndicator,
+  type CredentialSubmissionPayload,
+  credentialTagHasVisibleCard,
+  parseCredentialSubmissionProgress,
+  parseLastCredentialTag,
   parseLastQuestionTag,
 } from '@/app/workspace/[workspaceId]/home/components/message-content/components/special-tags'
+import { prepareCopyableMarkdown } from '@/app/workspace/[workspaceId]/home/components/mothership-chat/copyable-markdown'
+import { nextSizerFloor } from '@/app/workspace/[workspaceId]/home/components/mothership-chat/sizer-floor'
 import { QueuedMessages } from '@/app/workspace/[workspaceId]/home/components/queued-messages'
 import {
   UserInput,
@@ -37,15 +46,18 @@ import type {
   ChatMessageContext,
   ContentBlock,
   FileAttachmentForApi,
-  MothershipResource,
   QueuedMessage,
+  WorkspaceResourceRef,
 } from '@/app/workspace/[workspaceId]/home/types'
+import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
+import { getWorkspaceFilesQueryOptions, workspaceFilesKeys } from '@/hooks/queries/workspace-files'
 import { useAutoScroll } from '@/hooks/use-auto-scroll'
 import type { ChatContext } from '@/stores/panel'
 import { MothershipChatSkeleton } from './components/mothership-chat-skeleton'
 import { shouldShowAssistantMessageActions } from './message-actions-visibility'
 
 interface MothershipChatProps {
+  workspaceId: string
   messages: ChatMessage[]
   isSending: boolean
   isReconnecting?: boolean
@@ -66,8 +78,13 @@ interface MothershipChatProps {
   userId?: string
   chatId?: string
   onContextAdd?: (context: ChatContext) => void
-  onContextRemove?: (context: ChatContext) => void
-  onWorkspaceResourceSelect?: (resource: MothershipResource) => void
+  /**
+   * Receives the input's context list AFTER the removal, so the owner can tell
+   * whether another chip still references the removed chip's resource. Matches
+   * `ChatSurfaceContextValue`, which this forwards to.
+   */
+  onContextRemove?: (context: ChatContext, remaining: ChatContext[]) => void
+  onWorkspaceResourceSelect?: (resource: WorkspaceResourceRef) => void
   draftScopeKey?: string
   layout?: 'mothership-view' | 'copilot-view'
   initialScrollBlocked?: boolean
@@ -101,7 +118,6 @@ const OVERSCAN = 6
  * scrolled up.
  */
 const PIN_THRESHOLD = 2
-
 /**
  * Initial-scroll sentinel. Distinct from every real `chatId` value — including
  * `undefined` (a not-yet-persisted chat) — so the first scroll-to-bottom fires
@@ -113,18 +129,19 @@ const UNSCROLLED = Symbol('unscrolled')
 const LAYOUT_STYLES = {
   'mothership-view': {
     scrollContainer:
-      'min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-6 pt-4 pb-8 [scrollbar-gutter:stable_both-edges]',
-    sizer: 'relative mx-auto w-full max-w-[48rem]',
+      'mt-[var(--workspace-content-title-bar-inset)] min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-6 pt-4 pb-2 [overflow-anchor:none] [scrollbar-gutter:stable_both-edges]',
+    sizer: 'relative mx-auto w-full max-w-chat',
     rowGap: 'pb-6',
     userRow: 'flex flex-col items-end gap-[6px] pt-3',
     attachmentWidth: 'max-w-[70%]',
     userBubble: 'max-w-[70%] overflow-hidden rounded-[16px] bg-[var(--surface-5)] px-3.5 py-2',
     assistantRow: 'group/msg',
     footer: 'flex-shrink-0 px-[24px] pb-[16px]',
-    footerInner: 'mx-auto max-w-[48rem]',
+    footerInner: 'mx-auto max-w-chat',
   },
   'copilot-view': {
-    scrollContainer: 'min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 pt-2 pb-4',
+    scrollContainer:
+      'min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 pt-2 pb-4 [overflow-anchor:none]',
     sizer: 'relative w-full',
     rowGap: 'pb-4',
     userRow: 'flex flex-col items-end gap-[6px] pt-2',
@@ -137,6 +154,7 @@ const LAYOUT_STYLES = {
 } as const
 
 const EMPTY_BLOCKS: ContentBlock[] = []
+const EMPTY_WORKSPACE_FILES: readonly WorkspaceFileRecord[] = []
 
 interface UserMessageRowProps {
   content: string
@@ -174,10 +192,16 @@ const UserMessageRow = memo(function UserMessageRow({
 
 interface AssistantMessageRowProps {
   message: ChatMessage
+  prepareContentForCopy: (content: string) => ClipboardContent
   isStreaming: boolean
+  isLast: boolean
   precedingUserContent?: string
   /** Transcript-derived answers for this message's question card (renders the recap). */
   questionAnswers?: string[]
+  /** Transcript-derived status payload for this message's credential card. */
+  credentialSubmission?: CredentialSubmissionPayload
+  /** The user moved on without submitting this message's credential card. */
+  credentialAbandoned?: boolean
   rowClassName: string
   onOptionSelect?: (id: string) => void
   onAnimatingChange?: (animating: boolean) => void
@@ -185,13 +209,18 @@ interface AssistantMessageRowProps {
 
 const AssistantMessageRow = memo(function AssistantMessageRow({
   message,
+  prepareContentForCopy,
   isStreaming,
+  isLast,
   precedingUserContent,
   questionAnswers,
+  credentialSubmission,
+  credentialAbandoned,
   rowClassName,
   onOptionSelect,
   onAnimatingChange,
 }: AssistantMessageRowProps) {
+  const { canEdit } = useUserPermissionsContext()
   const blocks = message.contentBlocks ?? EMPTY_BLOCKS
   const hasAnyBlocks = blocks.length > 0
   const trimmedContent = message.content?.trim() ?? ''
@@ -205,19 +234,24 @@ const AssistantMessageRow = memo(function AssistantMessageRow({
     onAnimatingChangeRef.current?.(phase !== 'settled')
   }, [phase])
 
-  if (!hasAnyBlocks && !trimmedContent && isStreaming) {
-    return <PendingTagIndicator />
-  }
-
+  const getCopyContent = useCallback(
+    () => getOrchestratorMessageText(blocks, message.content),
+    [blocks, message.content]
+  )
   const hasRenderableAssistant = assistantMessageHasRenderableContent(blocks, message.content ?? '')
   if (!hasRenderableAssistant && !trimmedContent && !isStreaming) {
     return null
   }
 
-  // A trailing question card replaces the copy/thumbs row while active or
-  // answered. Its raw tag is the dismissal identity so a later question added
-  // to the same turn cannot inherit an earlier card's dismissed state.
+  // A trailing question or credential card replaces the copy/thumbs row while
+  // active or answered. A question's raw tag is its dismissal identity so a
+  // later question added to the same turn cannot inherit an earlier dismissal.
   const endsWithQuestion = trimmedContent.endsWith('</question>')
+  const endsWithCredential = trimmedContent.endsWith('</credential>')
+  const trailingCredentials = endsWithCredential ? parseLastCredentialTag(trimmedContent) : null
+  const showsCredentialCard = trailingCredentials
+    ? credentialTagHasVisibleCard(trailingCredentials, canEdit)
+    : false
   const questionTag = endsWithQuestion
     ? trimmedContent.slice(trimmedContent.lastIndexOf('<question>'))
     : null
@@ -225,39 +259,57 @@ const AssistantMessageRow = memo(function AssistantMessageRow({
   const handleQuestionDismiss = () => {
     if (questionTag) setDismissedQuestionTag(questionTag)
   }
-  const showActions = shouldShowAssistantMessageActions({
-    phase,
+  // Settle timing lives in MessageContent (the actions take the thinking
+  // slot's place in the same render), so eligibility here is phase-free:
+  // `phase: 'settled'` asks the helper "would a settled turn show them?".
+  const actionsEligible = shouldShowAssistantMessageActions({
+    phase: 'settled',
     hasContent: Boolean(message.content) || hasAnyBlocks,
-    endsWithQuestion,
+    endsWithInteraction: endsWithQuestion || showsCredentialCard,
     questionDismissed,
   })
 
+  // A visible interaction card (active or answered recap) sits 12px below the
+  // preceding prose (chat-content's `space-y-3`). The row's default `pb-6`
+  // would leave 24px underneath — asymmetric. Shrink the trailing gap to match
+  // so the card breathes equally top and bottom. Dismissed cards fall back to
+  // the normal message rhythm (they render the standard actions row instead).
+  const showsInteractionCard = (endsWithQuestion && !questionDismissed) || showsCredentialCard
+
   return (
-    <div className={rowClassName}>
+    <div className={cn(rowClassName, showsInteractionCard && 'pb-3')}>
       <MessageContent
+        messageId={message.id}
         blocks={blocks}
         fallbackContent={message.content}
         isStreaming={isStreaming}
+        isLast={isLast}
         questionAnswers={questionAnswers}
+        credentialSubmission={credentialSubmission}
+        credentialAbandoned={credentialAbandoned}
         onOptionSelect={onOptionSelect}
         onQuestionDismiss={handleQuestionDismiss}
         onPhaseChange={setPhase}
+        actions={
+          actionsEligible ? (
+            <MessageActions
+              content={message.content}
+              getCopyContent={getCopyContent}
+              hasCopyContent={Boolean(getOrchestratorMessageText(blocks, message.content).trim())}
+              prepareContentForCopy={prepareContentForCopy}
+              userQuery={precedingUserContent}
+              requestId={message.requestId}
+              messageId={message.id}
+            />
+          ) : undefined
+        }
       />
-      {showActions && (
-        <div className='mt-2.5'>
-          <MessageActions
-            content={message.content}
-            userQuery={precedingUserContent}
-            requestId={message.requestId}
-            messageId={message.id}
-          />
-        </div>
-      )}
     </div>
   )
 })
 
 export function MothershipChat({
+  workspaceId,
   messages: messagesProp,
   isSending,
   isReconnecting = false,
@@ -283,6 +335,7 @@ export function MothershipChat({
   onInputAnimationEnd,
   className,
 }: MothershipChatProps) {
+  const queryClient = useQueryClient()
   const styles = LAYOUT_STYLES[layout]
   const isStreamActive = isSending || isReconnecting
   /**
@@ -295,6 +348,141 @@ export function MothershipChat({
   const [lastRowAnimating, setLastRowAnimating] = useState(false)
   const scrollElementRef = useRef<HTMLDivElement | null>(null)
   const { ref: autoScrollRef } = useAutoScroll(isStreamActive || lastRowAnimating)
+  const sizerRef = useRef<HTMLDivElement | null>(null)
+  const scrollerPaddingRef = useRef<{ top: number; bottom: number } | null>(null)
+  const sizerFloorAppliedRef = useRef(0)
+  const heldHighWaterRef = useRef(0)
+  const floorChatRef = useRef<string | undefined>(undefined)
+  const floorDrainRafRef = useRef(0)
+  const prepareContentForCopy = useCallback(
+    (content: string) =>
+      prepareCopyableMarkdown(
+        content,
+        queryClient.getQueryData<readonly WorkspaceFileRecord[]>(
+          workspaceFilesKeys.list(workspaceId)
+        ) ?? EMPTY_WORKSPACE_FILES,
+        () =>
+          queryClient.fetchQuery({
+            ...getWorkspaceFilesQueryOptions(workspaceId),
+            staleTime: 0,
+          })
+      ),
+    [queryClient, workspaceId]
+  )
+  useEffect(() => () => cancelAnimationFrame(floorDrainRafRef.current), [])
+
+  /**
+   * Sizer floor while streaming: `scrollHeight` must never dip below the
+   * current viewport bottom. Streaming markdown re-parse emits transient
+   * row-height shrinks; when they pull scrollHeight under
+   * `scrollTop + clientHeight`, the browser clamps `scrollTop` and the pinned
+   * transcript visibly drops, then the chase glides it back. Flooring the
+   * sizer prevents that clamp while never ADDING space, so an estimate
+   * correction (a fresh row measuring smaller than ROW_HEIGHT_ESTIMATE)
+   * releases immediately instead of holding phantom space the chase would
+   * scroll into and bounce back out of. {@link nextSizerFloor} owns the value
+   * and the invariant that keeps it honest.
+   *
+   * Active on the same signal as auto-scroll: the reveal keeps re-parsing
+   * markdown (and shrinking) after the network stream closes, so the floor
+   * must hold through `lastRowAnimating` too.
+   *
+   * Release is DRAINED, not cliffed: while active the floor forbids
+   * scrollHeight from dropping, so permanent shrinks over the turn accrue as
+   * phantom space (debt). Clearing min-height in one commit released that
+   * whole debt as a single clamp — the end-of-turn downward jump. Instead the
+   * floor glides down to the natural size at the chase's rate; the browser's
+   * clamp follows a few px per frame, which reads as the same eased settle as
+   * the rest of the stream. Instant-clears when the debt is sub-pixel or the
+   * user isn't pinned (shrinking below-viewport space is invisible then).
+   */
+  const floorActive = isStreamActive || lastRowAnimating
+  useLayoutEffect(() => {
+    const sizer = sizerRef.current
+    const el = scrollElementRef.current
+    if (!sizer || !el) return
+    // A chat switch replaces the entire transcript, so a floor held for the
+    // previous one is meaningless — and its high-water mark would otherwise
+    // hand a short chat the tall chat's space for as long as the outgoing
+    // turn's `lastRowAnimating` keeps the floor engaged. Released outright
+    // rather than drained: the switch re-lands the viewport anyway, so there
+    // is no eased settle to preserve. A pending chat adopting its id is the
+    // SAME conversation, so it must not release mid-turn.
+    if (floorChatRef.current !== chatId) {
+      const isPendingPersist = floorChatRef.current === undefined && chatId !== undefined
+      floorChatRef.current = chatId
+      if (!isPendingPersist) {
+        cancelAnimationFrame(floorDrainRafRef.current)
+        floorDrainRafRef.current = 0
+        sizerFloorAppliedRef.current = 0
+        heldHighWaterRef.current = 0
+        sizer.style.minHeight = ''
+      }
+    }
+    if (!floorActive) {
+      heldHighWaterRef.current = 0
+      if (sizerFloorAppliedRef.current === 0) return
+      // A drain already in flight keeps its own rAF cadence — settle-burst
+      // commits re-enter this branch and must not add extra steps in layout,
+      // which would accelerate the release past the eased rate.
+      if (floorDrainRafRef.current !== 0) return
+      scrollerPaddingRef.current = null
+      const drain = () => {
+        const target = virtualizer.getTotalSize()
+        const current = sizerFloorAppliedRef.current
+        if (current === 0) {
+          floorDrainRafRef.current = 0
+          return
+        }
+        // Instant-clear only when the whole remaining debt sits BELOW the
+        // viewport (debt ≤ distance-from-bottom) — then the shrink is
+        // invisible. A merely-unpinned viewport with debt larger than its
+        // slack would still clamp, so it keeps the eased drain instead.
+        const distance = el.scrollHeight - el.scrollTop - el.clientHeight
+        const debt = current - target
+        if (debt <= 1 || debt <= distance) {
+          sizerFloorAppliedRef.current = 0
+          floorDrainRafRef.current = 0
+          sizer.style.minHeight = ''
+          return
+        }
+        const next = Math.floor(current - Math.max(1, debt * SMOOTH_CHASE_RATE))
+        sizerFloorAppliedRef.current = next
+        sizer.style.minHeight = `${next}px`
+        floorDrainRafRef.current = requestAnimationFrame(drain)
+      }
+      floorDrainRafRef.current = requestAnimationFrame(drain)
+      return
+    }
+    cancelAnimationFrame(floorDrainRafRef.current)
+    floorDrainRafRef.current = 0
+    if (!scrollerPaddingRef.current) {
+      const style = getComputedStyle(el)
+      scrollerPaddingRef.current = {
+        top: Number.parseFloat(style.paddingTop),
+        bottom: Number.parseFloat(style.paddingBottom),
+      }
+    }
+    const padding = scrollerPaddingRef.current
+    const { floor, highWater } = nextSizerFloor({
+      previousHighWater: heldHighWaterRef.current,
+      appliedFloor: sizerFloorAppliedRef.current,
+      contentHeight: virtualizer.getTotalSize(),
+      scrollTop: el.scrollTop,
+      clientHeight: el.clientHeight,
+      paddingTop: padding.top,
+      paddingBottom: padding.bottom,
+    })
+    heldHighWaterRef.current = highWater
+    // Dead-band: the floor feeds back into its own inputs (a floored value can
+    // land a fraction BELOW the extent, the browser clamps scrollTop, and the
+    // next commit re-derives from the clamped position — a visible ~1px×N
+    // downward cascade on fractional-scrollTop displays). Sub-pixel deltas are
+    // rounding noise from that loop, never real growth; only apply real moves.
+    if (Math.abs(floor - sizerFloorAppliedRef.current) <= 1) return
+    sizerFloorAppliedRef.current = floor
+    sizer.style.minHeight = `${floor}px`
+  })
   const setScrollElement = useCallback(
     (el: HTMLDivElement | null) => {
       scrollElementRef.current = el
@@ -365,31 +553,61 @@ export function MothershipChat({
   }, [messages])
 
   /**
-   * Pairs each assistant question card with the user message that answered it
-   * (strict `Prompt — Answer` match). The paired user message is hidden — the
-   * answered card IS the user turn — and the assistant row renders the card
-   * as a recap with these answers, both live and after reload.
+   * Pairs each assistant question/credential card with the user message that
+   * completed it. The paired user message is hidden — the answered card IS the
+   * user turn — and the assistant row renders a recap both live and on reload.
+   *
+   * A credential card the user talked past instead of submitting is marked
+   * abandoned: the turn is over, so it collapses to the same recap (every row
+   * it has no progress for reads "Skipped") rather than sitting in the
+   * transcript as a live form nobody can complete anymore.
    */
-  const questionPairing = useMemo(() => {
+  const interactionPairing = useMemo(() => {
     const answersByIndex: Array<string[] | undefined> = []
+    const credentialSubmissionByIndex: Array<CredentialSubmissionPayload | undefined> = []
+    const credentialAbandonedByIndex: Array<boolean | undefined> = []
     const hiddenUserByIndex: Array<boolean | undefined> = []
+    let lastUserIndex = -1
+    for (const [index, message] of messages.entries()) {
+      if (message.role === 'user') lastUserIndex = index
+    }
     for (const [index, message] of messages.entries()) {
       if (message.role !== 'assistant') continue
-      // Check the answering user message BEFORE scanning content: a pairing
-      // needs one anyway, and this skips the O(content) `includes` scan over
-      // the still-growing streaming message (always the last row) on every
-      // snapshot flush.
+      // Check the surrounding user turns BEFORE scanning content: a pairing
+      // needs an answering message and abandonment needs a later one, and this
+      // skips the O(content) `includes` scan over the still-growing streaming
+      // message (always the last row) on every snapshot flush.
       const next = messages[index + 1]
-      if (!next || next.role !== 'user' || !next.content) continue
-      if (!message.content?.includes('</question>')) continue
-      const questions = parseLastQuestionTag(message.content)
-      if (!questions) continue
-      const answers = parseQuestionAnswerMessage(questions, next.content)
-      if (!answers) continue
-      answersByIndex[index] = answers
-      hiddenUserByIndex[index + 1] = true
+      const answer = next?.role === 'user' && next.content ? next.content : null
+      const superseded = index < lastUserIndex
+      if (!answer && !superseded) continue
+      if (answer && message.content?.includes('</question>')) {
+        const questions = parseLastQuestionTag(message.content)
+        const answers = questions ? parseQuestionAnswerMessage(questions, answer) : null
+        if (answers) {
+          answersByIndex[index] = answers
+          hiddenUserByIndex[index + 1] = true
+          continue
+        }
+      }
+      if (message.content?.includes('</credential>')) {
+        const credentials = parseLastCredentialTag(message.content)
+        const submission =
+          answer && credentials ? parseCredentialSubmissionProgress(credentials, answer) : null
+        if (submission) {
+          credentialSubmissionByIndex[index] = submission
+          hiddenUserByIndex[index + 1] = true
+        } else if (superseded) {
+          credentialAbandonedByIndex[index] = true
+        }
+      }
     }
-    return { answersByIndex, hiddenUserByIndex }
+    return {
+      answersByIndex,
+      credentialSubmissionByIndex,
+      credentialAbandonedByIndex,
+      hiddenUserByIndex,
+    }
   }, [messages])
 
   /**
@@ -426,6 +644,12 @@ export function MothershipChat({
     overscan: OVERSCAN,
     getItemKey: (index) => rowKeyByIndex[index] ?? index,
     rangeExtractor,
+    // Measure in a rAF instead of synchronously inside ResizeObserver delivery.
+    // A window resize re-wraps every row once the chat column falls under the
+    // 48rem cap — which is exactly what happens while the resource panel is
+    // open — and each synchronous re-measure writes scrollTop and copies the
+    // size cache mid-callback, so the frame re-lays-out once per visible row.
+    useAnimationFrameWithResizeObserver: true,
   })
 
   /**
@@ -474,6 +698,28 @@ export function MothershipChat({
   }, [handleEditQueued])
 
   /**
+   * A drag-selection that overshoots a message's last line crosses the row
+   * wrappers' block boundaries, which the clipboard serializer renders as
+   * trailing newlines — every copied response pasted with blank lines
+   * appended. Rewrite the plain-text flavor trimmed; the rich flavor is
+   * re-serialized from the selection so formatted pastes keep working.
+   */
+  const handleCopy = useCallback((event: React.ClipboardEvent) => {
+    const selection = window.getSelection()
+    if (!selection || selection.isCollapsed || !event.clipboardData) return
+    const text = selection.toString()
+    const trimmed = text.replace(/\s+$/, '')
+    if (trimmed === text) return
+    event.preventDefault()
+    event.clipboardData.setData('text/plain', trimmed)
+    const html = document.createElement('div')
+    for (let i = 0; i < selection.rangeCount; i++) {
+      html.appendChild(selection.getRangeAt(i).cloneContents())
+    }
+    event.clipboardData.setData('text/html', html.innerHTML)
+  }, [])
+
+  /**
    * Land at the most recent message once per chat — on open and when switching
    * chats. The ref tracks which `chatId` we last scrolled for (seeded with
    * {@link UNSCROLLED} so a pending, id-less chat still scrolls on first mount),
@@ -505,11 +751,15 @@ export function MothershipChat({
       onWorkspaceResourceSelect={onWorkspaceResourceSelect}
     >
       <div className={cn('flex h-full min-h-0 flex-col', className)}>
-        <div ref={setScrollElement} className={styles.scrollContainer}>
+        <div ref={setScrollElement} className={styles.scrollContainer} onCopy={handleCopy}>
           {isLoading && !hasMessages ? (
             <MothershipChatSkeleton layout={layout} />
           ) : (
-            <div className={styles.sizer} style={{ height: virtualizer.getTotalSize() }}>
+            <div
+              ref={sizerRef}
+              className={styles.sizer}
+              style={{ height: virtualizer.getTotalSize() }}
+            >
               {virtualItems.map((virtualItem) => {
                 const index = virtualItem.index
                 const msg = messages[index]
@@ -519,11 +769,18 @@ export function MothershipChat({
                     key={virtualItem.key}
                     data-index={index}
                     ref={virtualizer.measureElement}
-                    className='absolute top-0 left-0 w-full'
-                    style={{ transform: `translateY(${virtualItem.start}px)` }}
+                    /* Positioned with a real `top`, NOT `top-0` + translateY:
+                       text selection maps a drag's start point to a text
+                       position via the rows' LAYOUT boxes, and with every row
+                       laid out at y=0 a drag starting in the gutter anchors in
+                       the wrong row — selections ran upward from a downward
+                       drag. Transforms move paint and hit-testing but not the
+                       layout box that mapping falls back to. */
+                    className='absolute left-0 w-full'
+                    style={{ top: virtualItem.start }}
                   >
                     {msg.role === 'user' ? (
-                      questionPairing.hiddenUserByIndex[index] ? null : (
+                      interactionPairing.hiddenUserByIndex[index] ? null : (
                         <UserMessageRow
                           content={msg.content}
                           contexts={msg.contexts}
@@ -536,9 +793,13 @@ export function MothershipChat({
                     ) : (
                       <AssistantMessageRow
                         message={msg}
+                        prepareContentForCopy={prepareContentForCopy}
                         isStreaming={isStreamActive && isLast}
+                        isLast={isLast}
                         precedingUserContent={precedingUserContentByIndex[index]}
-                        questionAnswers={questionPairing.answersByIndex[index]}
+                        questionAnswers={interactionPairing.answersByIndex[index]}
+                        credentialSubmission={interactionPairing.credentialSubmissionByIndex[index]}
+                        credentialAbandoned={interactionPairing.credentialAbandonedByIndex[index]}
                         rowClassName={cn(styles.assistantRow, styles.rowGap)}
                         onOptionSelect={isLast ? stableOnOptionSelect : undefined}
                         onAnimatingChange={isLast ? setLastRowAnimating : undefined}
@@ -566,6 +827,7 @@ export function MothershipChat({
               onCancelEdit={onCancelQueueEdit}
             />
             <UserInput
+              key={draftScopeKey}
               ref={userInputRef}
               onSubmit={onSubmit}
               isSending={isStreamActive}

@@ -46,6 +46,8 @@ const SYSTEM_BILLING_ATTRIBUTION = {
 
 vi.mock('@/app/api/v1/middleware', () => ({
   authenticateRequest: mockAuthenticateRequest,
+  v1ValidationErrorResponse: (e: { issues: unknown[] }) =>
+    NextResponse.json({ error: 'Validation error', details: e.issues }, { status: 400 }),
 }))
 
 vi.mock('@/app/api/v1/knowledge/utils', () => ({
@@ -73,6 +75,9 @@ vi.mock('@/lib/uploads/contexts/workspace', () => ({
 
 vi.mock('@/lib/uploads/utils/validation', () => ({
   validateFileType: mockValidateFileType,
+  // Read at module scope by `lib/uploads/utils/file-utils`, which the route now
+  // reaches transitively through the knowledge orchestration module.
+  SUPPORTED_ARCHIVE_EXTENSIONS: [],
 }))
 
 vi.mock('@/lib/knowledge/documents/service', () => ({
@@ -223,10 +228,17 @@ describe('v1 knowledge document upload route', () => {
     expect(mockResolveBillingAttribution).not.toHaveBeenCalled()
     expect(mockCheckAttributedUsageLimits).toHaveBeenCalledWith(SYSTEM_BILLING_ATTRIBUTION)
     expect(mockCreateSingleDocument).toHaveBeenCalledWith(
-      expect.any(Object),
+      {
+        filename: 'file.txt',
+        fileUrl: 'https://example.com/file.txt',
+        fileSize: 11,
+        mimeType: 'text/plain',
+      },
       'kb-1',
       'req-1',
-      'owner-after-transfer'
+      'owner-after-transfer',
+      undefined,
+      undefined
     )
     expect(mockProcessDocumentsWithQueue).toHaveBeenCalledWith(
       expect.any(Array),

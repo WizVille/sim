@@ -26,8 +26,8 @@
 
 import { execSync } from 'child_process'
 import { SUBBLOCK_ID_MIGRATIONS } from '@/lib/workflows/migrations/subblock-migrations'
-import { getAllBlocks, getBlockMeta } from '@/blocks/registry'
-import { tools as toolRegistry } from '@/tools/registry'
+import { getAllBlocks, getBlock, getBlockMeta } from '@/blocks/registry'
+import { getToolParams } from '@/tools/metadata'
 
 const baseRef = process.argv[2] || 'HEAD~1'
 
@@ -171,11 +171,11 @@ function checkSubblockIdStability(): CheckResult {
     const currIds = current[blockType]
     if (!currIds) continue
 
-    const migrations = SUBBLOCK_ID_MIGRATIONS[blockType] ?? {}
+    const migrations = SUBBLOCK_ID_MIGRATIONS[blockType] ?? []
 
     for (const oldId of prevIds) {
       if (currIds.has(oldId)) continue
-      if (oldId in migrations) continue
+      if (migrations.some((migration) => migration.from === oldId)) continue
 
       errors.push(
         `Block "${blockType}": subblock ID "${oldId}" was removed.\n` +
@@ -213,10 +213,10 @@ function checkCanonicalIdContract(): CheckResult {
     }
 
     for (const toolId of access) {
-      const tool = toolRegistry[toolId]
-      if (!tool) continue
+      const toolParams = getToolParams(toolId)
+      if (!toolParams) continue
 
-      for (const [paramId, paramConfig] of Object.entries(tool.params ?? {})) {
+      for (const [paramId, paramConfig] of Object.entries(toolParams)) {
         if (!paramConfig || typeof paramConfig !== 'object') continue
         const required = (paramConfig as { required?: boolean }).required === true
         const userOnly = (paramConfig as { visibility?: string }).visibility === 'user-only'
@@ -280,6 +280,49 @@ function checkIntegrationMetaCoverage(): CheckResult {
   return { kind: 'fail', errors }
 }
 
+function checkSunsetReplacedBy(): CheckResult {
+  const errors: string[] = []
+
+  for (const block of getAllBlocks()) {
+    const sunset = block.sunset
+    if (!sunset) continue
+
+    if (!sunset.replacedBy) {
+      // `legacy` needs a successor to render its badge + upgrade action; `deprecated`
+      // (red) legitimately badges without one.
+      if (sunset.status === 'legacy') {
+        errors.push(
+          `Block "${block.type}" is sunset (legacy) but has no replacedBy — legacy blocks must name a successor or they render no badge.`
+        )
+      }
+      continue
+    }
+
+    const target = getBlock(sunset.replacedBy)
+    if (!target) {
+      errors.push(
+        `Block "${block.type}" is sunset with replacedBy: '${sunset.replacedBy}', but no such block exists.`
+      )
+      continue
+    }
+    if (target.sunset) {
+      errors.push(
+        `Block "${block.type}" points replacedBy: '${sunset.replacedBy}', but that block is itself sunset.`
+      )
+    }
+    if (target.preview) {
+      errors.push(
+        `Block "${block.type}" points replacedBy: '${sunset.replacedBy}', but that block is preview (not GA).`
+      )
+    }
+  }
+
+  if (errors.length === 0) {
+    return { kind: 'pass', message: 'Sunset replacedBy check passed' }
+  }
+  return { kind: 'fail', errors }
+}
+
 function reportResult(label: string, failureHeader: string, result: CheckResult): boolean {
   if (result.kind === 'pass') {
     console.log(`✓ ${result.message}`)
@@ -300,6 +343,7 @@ function reportResult(label: string, failureHeader: string, result: CheckResult)
 const stabilityResult = checkSubblockIdStability()
 const canonicalResult = checkCanonicalIdContract()
 const metaCoverageResult = checkIntegrationMetaCoverage()
+const sunsetResult = checkSunsetReplacedBy()
 
 const stabilityOk = reportResult(
   'Subblock ID stability check',
@@ -319,4 +363,10 @@ const metaCoverageOk = reportResult(
   metaCoverageResult
 )
 
-process.exit(stabilityOk && canonicalOk && metaCoverageOk ? 0 : 1)
+const sunsetOk = reportResult(
+  'Sunset replacedBy check',
+  'A sunset block must point replacedBy at a real, GA, non-sunset successor.',
+  sunsetResult
+)
+
+process.exit(stabilityOk && canonicalOk && metaCoverageOk && sunsetOk ? 0 : 1)

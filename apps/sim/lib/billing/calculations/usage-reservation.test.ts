@@ -1,25 +1,10 @@
 /**
  * @vitest-environment node
  */
-import { redisConfigMock, redisConfigMockFns } from '@sim/testing'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-
-const { mockFlags } = vi.hoisted(() => ({
-  mockFlags: { isBillingEnabled: true, isHosted: true },
-}))
-
-vi.mock('@/lib/core/config/env-flags', () => ({
-  get isBillingEnabled() {
-    return mockFlags.isBillingEnabled
-  },
-  get isHosted() {
-    return mockFlags.isHosted
-  },
-}))
-
-vi.mock('@/lib/core/config/redis', () => redisConfigMock)
-
+import { redisConfigMockFns, resetEnvFlagsMock, setEnvFlags } from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  refreshExecutionSlotExpiry,
   releaseExecutionSlot,
   reserveExecutionSlot,
   resolveBillingEntityKey,
@@ -54,11 +39,13 @@ function hashTag(key: string): string | undefined {
   return key.match(/\{([^}]+)\}/)?.[1]
 }
 
+afterAll(resetEnvFlagsMock)
+
 describe('usage-reservation', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockFlags.isBillingEnabled = true
-    mockFlags.isHosted = true
+    setEnvFlags({ isBillingEnabled: true })
+    setEnvFlags({ isHosted: true })
     redisConfigMockFns.mockGetRedisClient.mockReturnValue(fakeRedis)
   })
 
@@ -78,6 +65,16 @@ describe('usage-reservation', () => {
       const result = await reserveExecutionSlot(baseParams)
       expect(result).toEqual({ reserved: true, created: true })
       expect(evalMock).toHaveBeenCalledTimes(2)
+    })
+
+    it('uses the active attempt expiry for the reservation and pointer', async () => {
+      evalMock.mockResolvedValueOnce(1).mockResolvedValueOnce(1)
+      const expiresAt = Date.now() + 60_000
+
+      await reserveExecutionSlot({ ...baseParams, expiresAt })
+
+      expect(evalMock.mock.calls[0][5]).toBe(expiresAt.toString())
+      expect(evalMock.mock.calls[1][4]).toBe(expiresAt.toString())
     })
 
     it('returns payer exhaustion without registering a pointer', async () => {
@@ -253,14 +250,14 @@ describe('usage-reservation', () => {
     })
 
     it('is a no-op when billing enforcement is disabled', async () => {
-      mockFlags.isBillingEnabled = false
+      setEnvFlags({ isBillingEnabled: false })
       const result = await reserveExecutionSlot(baseParams)
       expect(result.reserved).toBe(true)
       expect(evalMock).not.toHaveBeenCalled()
     })
 
     it('is a no-op on self-hosted deployments', async () => {
-      mockFlags.isHosted = false
+      setEnvFlags({ isHosted: false })
       const result = await reserveExecutionSlot(baseParams)
       expect(result).toEqual({ reserved: true, created: false })
       expect(evalMock).not.toHaveBeenCalled()
@@ -338,6 +335,50 @@ describe('usage-reservation', () => {
       })
 
       expect(evalMock).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  describe('refreshExecutionSlotExpiry', () => {
+    it('rethrows the original error object rather than the diagnostic wrapper', async () => {
+      const original = Object.assign(new Error('Command timed out'), { code: 'ETIMEDOUT' })
+      getMock.mockRejectedValueOnce(original)
+
+      await expect(refreshExecutionSlotExpiry('exec-1', Date.now() + 60_000)).rejects.toBe(original)
+    })
+
+    it('refreshes only the locally owned slot and matching pointer', async () => {
+      evalMock.mockResolvedValueOnce(1).mockResolvedValueOnce(1)
+      await reserveExecutionSlot(memberParams)
+      const descriptor = String(evalMock.mock.calls[1][3])
+      vi.clearAllMocks()
+      getMock.mockResolvedValueOnce(descriptor)
+      evalMock.mockResolvedValueOnce(1).mockResolvedValueOnce(1)
+      const expiresAt = Date.now() + 60_000
+
+      await expect(refreshExecutionSlotExpiry('exec-1', expiresAt)).resolves.toBe(true)
+
+      const localRefresh = evalMock.mock.calls[0]
+      expect(localRefresh[1]).toBe(3)
+      expect(new Set((localRefresh.slice(2, 5) as string[]).map(hashTag))).toEqual(
+        new Set(['org:org-1'])
+      )
+      expect(localRefresh.at(-1)).toBe(expiresAt.toString())
+      expect(evalMock.mock.calls[1]).toEqual([
+        expect.any(String),
+        1,
+        'usage:reservation:exec-1',
+        descriptor,
+        expiresAt.toString(),
+      ])
+    })
+
+    it('returns false when the queued reservation already expired', async () => {
+      getMock.mockResolvedValueOnce(null)
+
+      await expect(
+        refreshExecutionSlotExpiry('legacy-execution', Date.now() + 60_000)
+      ).resolves.toBe(false)
+      expect(evalMock).not.toHaveBeenCalled()
     })
   })
 
@@ -427,7 +468,7 @@ describe('usage-reservation', () => {
     })
 
     it('is a no-op when billing enforcement is disabled', async () => {
-      mockFlags.isBillingEnabled = false
+      setEnvFlags({ isBillingEnabled: false })
       await releaseExecutionSlot('exec-1')
       expect(getMock).not.toHaveBeenCalled()
     })

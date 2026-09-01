@@ -1,9 +1,5 @@
-import type { SVGProps } from 'react'
-import { createElement } from 'react'
-import { MessageCircle } from 'lucide-react'
+import { Task } from '@sim/emcn/icons'
 import type { BlockConfig } from '@/blocks/types'
-
-const ChatTriggerIcon = (props: SVGProps<SVGSVGElement>) => createElement(MessageCircle, props)
 
 export const ChatTriggerBlock: BlockConfig = {
   type: 'chat_trigger',
@@ -16,8 +12,9 @@ export const ChatTriggerBlock: BlockConfig = {
   `,
   category: 'triggers',
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'start_trigger' },
   bgColor: '#6F3DFA',
-  icon: ChatTriggerIcon,
+  icon: Task,
   subBlocks: [],
   tools: {
     access: [],

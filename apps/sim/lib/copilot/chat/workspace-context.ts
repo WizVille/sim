@@ -1,36 +1,37 @@
 import { db } from '@sim/db'
 import {
+  folder as folderTable,
   knowledgeBase,
   knowledgeConnector,
   mcpServers,
   userTableDefinitions,
   workflow,
-  workflowFolder,
-  workflowSchedule,
 } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
-import { truncate } from '@sim/utils/string'
 import { and, eq, inArray, isNull } from 'drizzle-orm'
-import type {
-  VfsSnapshotV1,
-  VfsSnapshotV1Job,
-  VfsSnapshotV1Workflow,
-} from '@/lib/copilot/generated/vfs-snapshot-v1'
+import { hasWorkspaceSandboxAccess } from '@/lib/billing/core/subscription'
+import { createCopilotWorkspaceContextFilePrincipal } from '@/lib/copilot/auth/file-delegation'
+import type { VfsSnapshotV1, VfsSnapshotV1Workflow } from '@/lib/copilot/generated/vfs-snapshot-v1'
+import {
+  filterSecretNamesByMountPolicy,
+  type SecretMountPolicy,
+} from '@/lib/copilot/secret-mount-policy'
 import { normalizeVfsSegment } from '@/lib/copilot/vfs/normalize-segment'
 import { canonicalWorkflowVfsDir, canonicalWorkspaceFilePath } from '@/lib/copilot/vfs/path-utils'
 import {
   getAccessibleEnvCredentials,
   getAccessibleOAuthCredentials,
 } from '@/lib/credentials/environment'
-import { listWorkspaceFiles } from '@/lib/uploads/contexts/workspace'
+import { listWorkspaceSandboxes } from '@/lib/execution/remote-sandbox/workspace-sandboxes'
 import { listCustomBlockSummariesForWorkspace } from '@/lib/workflows/custom-blocks/operations'
 import { listCustomTools } from '@/lib/workflows/custom-tools/operations'
-import { listSkills } from '@/lib/workflows/skills/operations'
+import { listSkillsForUser } from '@/lib/workflows/skills/operations'
+import { listAllWorkspaceFiles } from '@/lib/workspace-files/application/list-workspace-files'
 import {
   assertActiveWorkspaceAccess,
   getUsersWithPermissions,
-  getWorkspaceWithOwner,
+  type WorkspaceAccess,
 } from '@/lib/workspaces/permissions/utils'
 
 const logger = createLogger('WorkspaceContext')
@@ -78,19 +79,17 @@ export interface WorkspaceMdData {
     role?: string | null
   }>
   envVariables: string[]
-  tasks?: Array<{ id: string; title: string; updatedAt: Date }>
   customTools?: Array<{ id: string; name: string }>
   customBlocks?: Array<{ type: string; name: string; description?: string }>
   mcpServers?: Array<{ id: string; name: string; url?: string | null; enabled: boolean }>
   skills?: Array<{ id: string; name: string; description: string }>
-  jobs?: Array<{
+  sandboxes?: Array<{
     id: string
-    title: string | null
-    prompt: string
-    cronExpression: string | null
-    status: string
-    lifecycle: string
-    sourceTaskName: string | null
+    name: string
+    language: string
+    dependencies: string[]
+    cliTools: string[]
+    systemPackages: string[]
   }>
 }
 
@@ -298,20 +297,16 @@ export function buildWorkspaceMd(data: WorkspaceMdData): string {
     )
   }
 
-  if (data.jobs && data.jobs.length > 0) {
-    const lines = [...data.jobs]
-      .sort((a, b) => stableCompare(a.title || a.id, b.title || b.id) || stableCompare(a.id, b.id))
-      .map((j) => {
-        const displayName = j.title || j.id
-        let line = `- **${displayName}** (${j.id}) — ${j.status}`
-        if (j.lifecycle !== 'persistent') line += ` [${j.lifecycle}]`
-        if (j.cronExpression) line += `, cron: ${j.cronExpression}`
-        if (j.sourceTaskName) line += `, task: ${j.sourceTaskName}`
-        const promptPreview = j.prompt.length > 80 ? truncate(j.prompt, 77) : j.prompt
-        line += `\n  ${promptPreview}`
-        return line
+  if (data.sandboxes) {
+    if (data.sandboxes.length > 0) {
+      const lines = [...data.sandboxes].sort(byNameThenId).map((sandbox) => {
+        const path = `agent/sandboxes/${normalizeVfsSegment(sandbox.name)}.json`
+        return `- **${sandbox.name}** (${sandbox.id}) — ${sandbox.language}; ${sandbox.dependencies.length} dependencies, ${sandbox.systemPackages.length} system packages, ${sandbox.cliTools.length} managed CLIs — \`${path}\``
       })
-    sections.push(`## Jobs (${data.jobs.length})\n${lines.join('\n')}`)
+      sections.push(`## Sim Sandboxes (${data.sandboxes.length})\n${lines.join('\n')}`)
+    } else {
+      sections.push('## Sim Sandboxes (0)\n(none)')
+    }
   }
 
   return sections.join('\n\n')
@@ -334,11 +329,17 @@ export function buildWorkspaceContextMd(data: WorkspaceMdData): string {
 // workspace is unavailable or a fetch fails.
 async function buildWorkspaceMdData(
   workspaceId: string,
-  userId: string
+  userId: string,
+  options?: { workspaceAccess?: WorkspaceAccess; chatId?: string; executionId?: string }
 ): Promise<WorkspaceMdData | null> {
   try {
-    await assertActiveWorkspaceAccess(workspaceId, userId)
-    const wsRow = await getWorkspaceWithOwner(workspaceId)
+    // Reuse the caller's already-asserted access when provided (hot chat path);
+    // the id match keeps a mismatched cache from authorizing this workspace.
+    const workspaceAccess =
+      options?.workspaceAccess && options.workspaceAccess.workspace?.id === workspaceId
+        ? options.workspaceAccess
+        : await assertActiveWorkspaceAccess(workspaceId, userId)
+    const wsRow = workspaceAccess.hasAccess ? workspaceAccess.workspace : null
     if (!wsRow) {
       return null
     }
@@ -355,8 +356,8 @@ async function buildWorkspaceMdData(
       customTools,
       mcpServerRows,
       skillRows,
-      jobRows,
       customBlockSummaries,
+      sandboxResult,
     ] = await Promise.all([
       getUsersWithPermissions(workspaceId),
 
@@ -373,12 +374,18 @@ async function buildWorkspaceMdData(
 
       db
         .select({
-          id: workflowFolder.id,
-          name: workflowFolder.name,
-          parentId: workflowFolder.parentId,
+          id: folderTable.id,
+          name: folderTable.name,
+          parentId: folderTable.parentId,
         })
-        .from(workflowFolder)
-        .where(and(eq(workflowFolder.workspaceId, workspaceId), isNull(workflowFolder.archivedAt))),
+        .from(folderTable)
+        .where(
+          and(
+            eq(folderTable.workspaceId, workspaceId),
+            eq(folderTable.resourceType, 'workflow'),
+            isNull(folderTable.deletedAt)
+          )
+        ),
 
       db
         .select({
@@ -403,7 +410,17 @@ async function buildWorkspaceMdData(
           )
         ),
 
-      listWorkspaceFiles(workspaceId),
+      listAllWorkspaceFiles
+        .execute({
+          principal: createCopilotWorkspaceContextFilePrincipal({
+            userId,
+            workspaceId,
+            chatId: options?.chatId,
+            executionId: options?.executionId,
+          }),
+          input: { workspaceId, scope: 'active' },
+        })
+        .then(({ files }) => files),
 
       getAccessibleOAuthCredentials(workspaceId, userId),
 
@@ -421,28 +438,14 @@ async function buildWorkspaceMdData(
         .from(mcpServers)
         .where(and(eq(mcpServers.workspaceId, workspaceId), isNull(mcpServers.deletedAt))),
 
-      listSkills({ workspaceId, includeBuiltins: false }),
-
-      db
-        .select({
-          id: workflowSchedule.id,
-          jobTitle: workflowSchedule.jobTitle,
-          prompt: workflowSchedule.prompt,
-          cronExpression: workflowSchedule.cronExpression,
-          status: workflowSchedule.status,
-          lifecycle: workflowSchedule.lifecycle,
-          sourceTaskName: workflowSchedule.sourceTaskName,
-        })
-        .from(workflowSchedule)
-        .where(
-          and(
-            eq(workflowSchedule.sourceWorkspaceId, workspaceId),
-            eq(workflowSchedule.sourceType, 'job'),
-            isNull(workflowSchedule.archivedAt)
-          )
-        ),
+      listSkillsForUser({ workspaceId, userId, includeBuiltins: false, workspaceAccess }),
 
       listCustomBlockSummariesForWorkspace(workspaceId),
+
+      hasWorkspaceSandboxAccess(workspaceId).then(async (entitled) => ({
+        entitled,
+        rows: entitled ? await listWorkspaceSandboxes(workspaceId) : [],
+      })),
     ])
 
     const kbIds = kbs.map((kb) => kb.id)
@@ -525,17 +528,18 @@ async function buildWorkspaceMdData(
       customBlocks: customBlockSummaries,
       mcpServers: mcpServerRows,
       skills: skillRows.map((s) => ({ id: s.id, name: s.name, description: s.description })),
-      jobs: jobRows
-        .filter((j) => j.status !== 'completed')
-        .map((j) => ({
-          id: j.id,
-          title: j.jobTitle,
-          prompt: j.prompt || '',
-          cronExpression: j.cronExpression,
-          status: j.status,
-          lifecycle: j.lifecycle,
-          sourceTaskName: j.sourceTaskName,
-        })),
+      ...(sandboxResult.entitled
+        ? {
+            sandboxes: sandboxResult.rows.map((sandbox) => ({
+              id: sandbox.id,
+              name: sandbox.name,
+              language: sandbox.language,
+              dependencies: sandbox.dependencies,
+              cliTools: sandbox.cliTools,
+              systemPackages: sandbox.systemPackages,
+            })),
+          }
+        : {}),
     }
   } catch (err) {
     logger.error('Failed to build workspace data', {
@@ -555,10 +559,21 @@ const WORKSPACE_CONTEXT_UNAVAILABLE_MD =
  */
 export async function generateWorkspaceContext(
   workspaceId: string,
-  userId: string
+  userId: string,
+  options?: {
+    workspaceAccess?: WorkspaceAccess
+    secretMountPolicy?: SecretMountPolicy
+    chatId?: string
+    executionId?: string
+  }
 ): Promise<string> {
-  const data = await buildWorkspaceMdData(workspaceId, userId)
-  return data ? buildWorkspaceMd(data) : WORKSPACE_CONTEXT_UNAVAILABLE_MD
+  const data = await buildWorkspaceMdData(workspaceId, userId, options)
+  if (!data) return WORKSPACE_CONTEXT_UNAVAILABLE_MD
+
+  return buildWorkspaceMd({
+    ...data,
+    envVariables: filterSecretNamesByMountPolicy(data.envVariables, options?.secretMountPolicy),
+  })
 }
 
 /**
@@ -589,17 +604,6 @@ export function buildVfsSnapshot(data: WorkspaceMdData): VfsSnapshotV1 {
     ...(wf.isDeployed ? { isDeployed: true } : {}),
     ...(wf.folderPath ? { folderPath: wf.folderPath } : {}),
   }))
-  const jobs: VfsSnapshotV1Job[] = (data.jobs ?? [])
-    .filter((j) => j.status !== 'completed')
-    .map((j) => ({
-      id: j.id,
-      ...(j.title ? { title: j.title } : {}),
-      ...(j.prompt ? { prompt: j.prompt } : {}),
-      ...(j.cronExpression ? { cronExpression: j.cronExpression } : {}),
-      ...(j.status ? { status: j.status } : {}),
-      ...(j.lifecycle ? { lifecycle: j.lifecycle } : {}),
-      ...(j.sourceTaskName ? { sourceTaskName: j.sourceTaskName } : {}),
-    }))
   return {
     ...(data.workspace
       ? {
@@ -645,6 +649,11 @@ export function buildVfsSnapshot(data: WorkspaceMdData): VfsSnapshotV1 {
     })),
     envVars: data.envVariables,
     customTools: (data.customTools ?? []).map((t) => ({ id: t.id, name: t.name })),
+    customBlocks: (data.customBlocks ?? []).map((b) => ({
+      type: b.type,
+      name: b.name,
+      ...(b.description ? { description: b.description } : {}),
+    })),
     mcpServers: (data.mcpServers ?? []).map((s) => ({
       id: s.id,
       name: s.name,
@@ -656,7 +665,18 @@ export function buildVfsSnapshot(data: WorkspaceMdData): VfsSnapshotV1 {
       name: s.name,
       ...(s.description ? { description: s.description } : {}),
     })),
-    jobs,
+    ...(data.sandboxes
+      ? {
+          sandboxes: data.sandboxes.map((sandbox) => ({
+            id: sandbox.id,
+            name: sandbox.name,
+            language: sandbox.language,
+            dependencies: sandbox.dependencies,
+            systemPackages: sandbox.systemPackages,
+            cliTools: sandbox.cliTools,
+          })),
+        }
+      : {}),
   }
 }
 

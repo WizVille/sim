@@ -1,9 +1,15 @@
-import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { createLogger } from '@sim/logger'
-import { getErrorMessage, toError } from '@sim/utils/errors'
+import { toError } from '@sim/utils/errors'
+import { executeCopilotSkillUseCase } from '@/lib/copilot/application/execute-skill-use-case'
 import type { ExecutionContext, ToolCallResult } from '@/lib/copilot/request/types'
+import { asOrchestrationError } from '@/lib/core/orchestration/types'
 import { captureServerEvent } from '@/lib/posthog/server'
-import { deleteSkill, listSkills, upsertSkills } from '@/lib/workflows/skills/operations'
+import {
+  createSkillUseCase,
+  deleteSkillUseCase,
+  listAvailableSkillsUseCase,
+  updateSkillUseCase,
+} from '@/lib/skills/application/use-cases'
 
 const logger = createLogger('CopilotToolExecutor')
 
@@ -33,22 +39,11 @@ export async function executeManageSkill(
     return { success: false, error: 'workspaceId is required' }
   }
 
-  const writeOps: string[] = ['add', 'edit', 'delete']
-  if (
-    writeOps.includes(operation) &&
-    context.userPermission &&
-    context.userPermission !== 'write' &&
-    context.userPermission !== 'admin'
-  ) {
-    return {
-      success: false,
-      error: `Permission denied: '${operation}' on manage_skill requires write access. You have '${context.userPermission}' permission.`,
-    }
-  }
-
   try {
     if (operation === 'list') {
-      const skills = await listSkills({ workspaceId })
+      const { skills } = await executeCopilotSkillUseCase(context, listAvailableSkillsUseCase, {
+        workspaceId,
+      })
 
       return {
         success: true,
@@ -74,45 +69,33 @@ export async function executeManageSkill(
         }
       }
 
-      const { skills: resultSkills } = await upsertSkills({
-        skills: [{ name: params.name, description: params.description, content: params.content }],
+      const { skill } = await executeCopilotSkillUseCase(context, createSkillUseCase, {
         workspaceId,
-        userId: context.userId,
+        name: params.name,
+        description: params.description,
+        content: params.content,
+        source: 'tool_input',
       })
-      const created = resultSkills.find((s) => s.name === params.name)
-
-      recordAudit({
-        workspaceId,
-        actorId: context.userId,
-        action: AuditAction.SKILL_CREATED,
-        resourceType: AuditResourceType.SKILL,
-        resourceId: created?.id,
-        resourceName: params.name,
-        description: `Created skill "${params.name}"`,
-        metadata: { source: 'tool_input' },
-      })
-      if (created?.id) {
-        captureServerEvent(
-          context.userId,
-          'skill_created',
-          {
-            skill_id: created.id,
-            skill_name: params.name,
-            workspace_id: workspaceId,
-            source: 'tool_input',
-          },
-          { groups: { workspace: workspaceId } }
-        )
-      }
+      captureServerEvent(
+        context.userId,
+        'skill_created',
+        {
+          skill_id: skill.id,
+          skill_name: skill.name,
+          workspace_id: workspaceId,
+          source: 'tool_input',
+        },
+        { groups: { workspace: workspaceId } }
+      )
 
       return {
         success: true,
         output: {
           success: true,
           operation,
-          skillId: created?.id,
-          name: params.name,
-          message: `Created skill "${params.name}"`,
+          skillId: skill.id,
+          name: skill.name,
+          message: `Created skill "${skill.name}"`,
         },
       }
     }
@@ -128,42 +111,20 @@ export async function executeManageSkill(
         }
       }
 
-      const existing = await listSkills({ workspaceId })
-      const found = existing.find((s) => s.id === params.skillId)
-      if (!found) {
-        return { success: false, error: `Skill not found: ${params.skillId}` }
-      }
-
-      await upsertSkills({
-        skills: [
-          {
-            id: params.skillId,
-            name: params.name || found.name,
-            description: params.description || found.description,
-            content: params.content || found.content,
-          },
-        ],
+      const { skill } = await executeCopilotSkillUseCase(context, updateSkillUseCase, {
         workspaceId,
-        userId: context.userId,
-      })
-
-      const updatedName = params.name || found.name
-      recordAudit({
-        workspaceId,
-        actorId: context.userId,
-        action: AuditAction.SKILL_UPDATED,
-        resourceType: AuditResourceType.SKILL,
-        resourceId: params.skillId,
-        resourceName: updatedName,
-        description: `Updated skill "${updatedName}"`,
-        metadata: { source: 'tool_input' },
+        skillId: params.skillId,
+        ...(params.name ? { name: params.name } : {}),
+        ...(params.description ? { description: params.description } : {}),
+        ...(params.content ? { content: params.content } : {}),
+        source: 'tool_input',
       })
       captureServerEvent(
         context.userId,
         'skill_updated',
         {
-          skill_id: params.skillId,
-          skill_name: updatedName,
+          skill_id: skill.id,
+          skill_name: skill.name,
           workspace_id: workspaceId,
           source: 'tool_input',
         },
@@ -175,9 +136,9 @@ export async function executeManageSkill(
         output: {
           success: true,
           operation,
-          skillId: params.skillId,
-          name: params.name || found.name,
-          message: `Updated skill "${params.name || found.name}"`,
+          skillId: skill.id,
+          name: skill.name,
+          message: `Updated skill "${skill.name}"`,
         },
       }
     }
@@ -187,24 +148,15 @@ export async function executeManageSkill(
         return { success: false, error: "'skillId' is required for 'delete'" }
       }
 
-      const deleted = await deleteSkill({ skillId: params.skillId, workspaceId })
-      if (!deleted) {
-        return { success: false, error: `Skill not found: ${params.skillId}` }
-      }
-
-      recordAudit({
+      const { skill } = await executeCopilotSkillUseCase(context, deleteSkillUseCase, {
         workspaceId,
-        actorId: context.userId,
-        action: AuditAction.SKILL_DELETED,
-        resourceType: AuditResourceType.SKILL,
-        resourceId: params.skillId,
-        description: 'Deleted skill',
-        metadata: { source: 'tool_input' },
+        skillId: params.skillId,
+        source: 'tool_input',
       })
       captureServerEvent(
         context.userId,
         'skill_deleted',
-        { skill_id: params.skillId, workspace_id: workspaceId, source: 'tool_input' },
+        { skill_id: skill.id, workspace_id: workspaceId, source: 'tool_input' },
         { groups: { workspace: workspaceId } }
       )
 
@@ -213,7 +165,7 @@ export async function executeManageSkill(
         output: {
           success: true,
           operation,
-          skillId: params.skillId,
+          skillId: skill.id,
           message: 'Deleted skill',
         },
       }
@@ -231,9 +183,13 @@ export async function executeManageSkill(
         error: toError(error).message,
       }
     )
+    const classified = asOrchestrationError(error)
     return {
       success: false,
-      error: getErrorMessage(error, 'Failed to manage skill'),
+      error:
+        classified && classified.code !== 'internal'
+          ? classified.message
+          : 'Failed to manage skill',
     }
   }
 }

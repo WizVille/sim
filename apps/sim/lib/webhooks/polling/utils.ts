@@ -2,14 +2,14 @@ import { db } from '@sim/db'
 import { account, webhook, workflow, workflowDeploymentVersion } from '@sim/db/schema'
 import type { Logger } from '@sim/logger'
 import { and, eq, isNull, ne, or, sql } from 'drizzle-orm'
-import { deliverableWebhookPredicate } from '@/lib/webhooks/delivery-predicate'
-import type { WebhookRecord, WorkflowRecord } from '@/lib/webhooks/polling/types'
 import {
   getOAuthToken,
   refreshAccessTokenIfNeeded,
   resolveOAuthAccountId,
   resolveServiceAccountToken,
-} from '@/app/api/auth/oauth/utils'
+} from '@/lib/oauth/credential-service'
+import { deliverableWebhookPredicate } from '@/lib/webhooks/delivery-predicate'
+import type { WebhookRecord, WorkflowRecord } from '@/lib/webhooks/polling/types'
 import { MAX_CONSECUTIVE_FAILURES } from '@/triggers/constants'
 
 /** Concurrency limit for parallel webhook processing. Standardized across all providers. */
@@ -164,7 +164,13 @@ export async function updateWebhookProviderConfig(
     }
 
     const merged = sql`COALESCE(${webhook.providerConfig}::jsonb, '{}'::jsonb) || ${JSON.stringify(defined)}::jsonb`
-    const nextConfig = removedKeys.length > 0 ? sql`(${merged}) - ${removedKeys}::text[]` : merged
+    const nextConfig =
+      removedKeys.length > 0
+        ? sql`(${merged}) - ARRAY[${sql.join(
+            removedKeys.map((key) => sql`${key}`),
+            sql`, `
+          )}]::text[]`
+        : merged
 
     await db
       .update(webhook)

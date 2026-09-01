@@ -2,208 +2,114 @@
  * @vitest-environment node
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { OrchestrationError } from '@/lib/core/orchestration/types'
 
-const { mockEnsureWorkspaceAccess, mockGetCredentialActorContext } = vi.hoisted(() => ({
-  mockEnsureWorkspaceAccess: vi.fn(),
-  mockGetCredentialActorContext: vi.fn(),
+const mocks = vi.hoisted(() => ({
+  execute: vi.fn(),
+  getBaseUrl: vi.fn(),
 }))
 
-vi.mock('@/lib/copilot/tools/handlers/access', () => ({
-  ensureWorkspaceAccess: mockEnsureWorkspaceAccess,
+const useCases = vi.hoisted(() => ({
+  prepare: { operation: { id: 'credentials.connections.prepare' } },
 }))
 
-vi.mock('@/lib/credentials/access', () => ({
-  getCredentialActorContext: mockGetCredentialActorContext,
+vi.mock('@/lib/copilot/application/execute-credential-use-case', () => ({
+  executeCopilotCredentialUseCase: mocks.execute,
 }))
-
-vi.mock('@/lib/oauth/utils', () => ({
-  getAllOAuthServices: vi.fn(() => [
-    { providerId: 'google-email', name: 'Gmail' },
-    { providerId: 'slack', name: 'Slack' },
-    { providerId: 'trello', name: 'Trello' },
-    { providerId: 'shopify', name: 'Shopify' },
-  ]),
+vi.mock('@/lib/core/utils/urls', () => ({ getBaseUrl: mocks.getBaseUrl }))
+vi.mock('@/lib/credentials/application/prepare-credential-connection', () => ({
+  prepareCredentialConnection: useCases.prepare,
 }))
 
 import type { ExecutionContext } from '@/lib/copilot/request/types'
 import { executeOAuthGetAuthLink } from '@/lib/copilot/tools/handlers/oauth'
 
-const BASE_URL = 'https://sim.test'
-const WORKSPACE_ID = 'ws-1'
-const USER_ID = 'user-1'
-const CREDENTIAL_ID = 'cred-1'
-
-const context = {
-  workspaceId: WORKSPACE_ID,
-  userId: USER_ID,
+const context: ExecutionContext = {
+  userId: 'user-1',
+  workspaceId: 'workspace-1',
+  workflowId: 'workflow-1',
   chatId: 'chat-1',
-} as unknown as ExecutionContext
-
-const WORKSPACE_ACCESS = {
-  exists: true,
-  hasAccess: true,
-  canWrite: true,
-  canAdmin: false,
-  workspace: { id: WORKSPACE_ID },
-}
-
-function oauthCredentialActor(overrides: Record<string, unknown> = {}) {
-  return {
-    credential: {
-      id: CREDENTIAL_ID,
-      workspaceId: WORKSPACE_ID,
-      type: 'oauth',
-      providerId: 'google-email',
-      ...((overrides.credential as Record<string, unknown>) ?? {}),
-    },
-    member: null,
-    hasWorkspaceAccess: true,
-    canWriteWorkspace: true,
-    isAdmin: true,
-    ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== 'credential')),
-  }
+  toolCallId: 'call-1',
+  copilotToolExecution: true,
+  userPermission: 'write',
 }
 
 describe('executeOAuthGetAuthLink', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    process.env.NEXT_PUBLIC_APP_URL = BASE_URL
-    mockEnsureWorkspaceAccess.mockResolvedValue(WORKSPACE_ACCESS)
-  })
-
-  describe('connect (no credentialId)', () => {
-    it('returns an authorize URL without a credentialId param', async () => {
-      const result = await executeOAuthGetAuthLink({ providerName: 'google-email' }, context)
-
-      expect(result.success).toBe(true)
-      const url = new URL((result.output as { oauth_url: string }).oauth_url)
-      expect(url.pathname).toBe('/api/auth/oauth2/authorize')
-      expect(url.searchParams.get('providerId')).toBe('google-email')
-      expect(url.searchParams.get('credentialId')).toBeNull()
-      expect(mockGetCredentialActorContext).not.toHaveBeenCalled()
+    mocks.getBaseUrl.mockReturnValue('https://sim.test')
+    mocks.execute.mockResolvedValue({
+      serviceName: 'Gmail',
+      providerId: 'google-email',
+      workspaceId: 'workspace-1',
     })
   })
 
-  describe('reconnect (credentialId passed)', () => {
-    it('returns an authorize URL carrying the credentialId and a reconnect message', async () => {
-      mockGetCredentialActorContext.mockResolvedValue(oauthCredentialActor())
+  it('uses the credential application adapter for a new connection', async () => {
+    const result = await executeOAuthGetAuthLink({ providerName: 'gmail' }, context)
 
-      const result = await executeOAuthGetAuthLink(
-        { providerName: 'google-email', credentialId: CREDENTIAL_ID },
-        context
-      )
+    expect(result.success).toBe(true)
+    expect(mocks.execute).toHaveBeenCalledWith(context, useCases.prepare, {
+      workspaceId: 'workspace-1',
+      providerName: 'gmail',
+      credentialId: undefined,
+    })
+    const url = new URL((result.output as { oauth_url: string }).oauth_url)
+    expect(url.pathname).toBe('/api/auth/oauth2/authorize')
+    expect(url.searchParams.get('providerId')).toBe('google-email')
+    expect(url.searchParams.get('workspaceId')).toBe('workspace-1')
+    expect(url.searchParams.has('credentialId')).toBe(false)
+  })
 
-      expect(result.success).toBe(true)
-      const output = result.output as { oauth_url: string; message: string }
-      const url = new URL(output.oauth_url)
-      expect(url.searchParams.get('credentialId')).toBe(CREDENTIAL_ID)
-      expect(output.message).toContain('Reconnect')
-      expect(output.message).toContain(CREDENTIAL_ID)
+  it('preserves the canonical credential ID for reconnect', async () => {
+    mocks.execute.mockResolvedValue({
+      serviceName: 'Gmail',
+      providerId: 'google-email',
+      workspaceId: 'workspace-1',
+      credentialId: 'credential-1',
     })
 
-    it('reuses the already-resolved workspace access for the credential lookup', async () => {
-      mockGetCredentialActorContext.mockResolvedValue(oauthCredentialActor())
+    const result = await executeOAuthGetAuthLink(
+      { providerName: 'gmail', credentialId: 'credential-1' },
+      context
+    )
 
-      await executeOAuthGetAuthLink(
-        { providerName: 'google-email', credentialId: CREDENTIAL_ID },
-        context
-      )
+    const output = result.output as { oauth_url: string; message: string }
+    expect(new URL(output.oauth_url).searchParams.get('credentialId')).toBe('credential-1')
+    expect(output.message).toContain('re-authorizes credential credential-1 in place')
+  })
 
-      expect(mockGetCredentialActorContext).toHaveBeenCalledWith(CREDENTIAL_ID, USER_ID, {
-        workspaceAccess: WORKSPACE_ACCESS,
-      })
-    })
+  it('returns application validation errors without exposing infrastructure failures', async () => {
+    mocks.execute.mockRejectedValue(new OrchestrationError('not_found', 'Provider not found'))
 
-    it('fails with an agent-visible error for a nonexistent credential', async () => {
-      mockGetCredentialActorContext.mockResolvedValue({
-        credential: null,
-        member: null,
-        hasWorkspaceAccess: false,
-        canWriteWorkspace: false,
-        isAdmin: false,
-      })
+    const result = await executeOAuthGetAuthLink({ providerName: 'missing' }, context)
 
-      const result = await executeOAuthGetAuthLink(
-        { providerName: 'google-email', credentialId: 'cred-hallucinated' },
-        context
-      )
+    expect(result.success).toBe(false)
+    expect(result.error).toBe('Provider not found')
+  })
 
-      expect(result.success).toBe(false)
-      expect(result.error).toContain('not found in this workspace')
-    })
+  it('fails fast without trusted workspace context', async () => {
+    const result = await executeOAuthGetAuthLink(
+      { providerName: 'gmail' },
+      { ...context, workspaceId: undefined }
+    )
 
-    it('fails when the credential belongs to another workspace', async () => {
-      mockGetCredentialActorContext.mockResolvedValue(
-        oauthCredentialActor({ credential: { workspaceId: 'ws-other' } })
-      )
+    expect(result).toEqual({ success: false, error: 'workspaceId is required' })
+    expect(mocks.execute).not.toHaveBeenCalled()
+  })
 
-      const result = await executeOAuthGetAuthLink(
-        { providerName: 'google-email', credentialId: CREDENTIAL_ID },
-        context
-      )
+  it('rejects service-account providers before OAuth resolution', async () => {
+    const result = await executeOAuthGetAuthLink({ providerName: 'slack custom bot' }, context)
 
-      expect(result.success).toBe(false)
-      expect(result.error).toContain('not found in this workspace')
-    })
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('service account, not an OAuth provider')
+    expect(mocks.execute).not.toHaveBeenCalled()
+  })
 
-    it('fails when the credential is not an OAuth credential', async () => {
-      mockGetCredentialActorContext.mockResolvedValue(
-        oauthCredentialActor({ credential: { type: 'env_workspace' } })
-      )
+  it('does not confuse integrations that also offer service accounts', async () => {
+    const result = await executeOAuthGetAuthLink({ providerName: 'slack' }, context)
 
-      const result = await executeOAuthGetAuthLink(
-        { providerName: 'google-email', credentialId: CREDENTIAL_ID },
-        context
-      )
-
-      expect(result.success).toBe(false)
-      expect(result.error).toContain('not an OAuth credential')
-    })
-
-    it('fails naming the actual provider when providerName does not match the credential', async () => {
-      mockGetCredentialActorContext.mockResolvedValue(oauthCredentialActor())
-
-      const result = await executeOAuthGetAuthLink(
-        { providerName: 'slack', credentialId: CREDENTIAL_ID },
-        context
-      )
-
-      expect(result.success).toBe(false)
-      expect(result.error).toContain('google-email')
-    })
-
-    it('fails when the caller is not a credential admin', async () => {
-      mockGetCredentialActorContext.mockResolvedValue(oauthCredentialActor({ isAdmin: false }))
-
-      const result = await executeOAuthGetAuthLink(
-        { providerName: 'google-email', credentialId: CREDENTIAL_ID },
-        context
-      )
-
-      expect(result.success).toBe(false)
-      expect(result.error).toContain('Admin access')
-    })
-
-    it('rejects reconnect for Trello and directs the user to the integrations page', async () => {
-      const result = await executeOAuthGetAuthLink(
-        { providerName: 'trello', credentialId: CREDENTIAL_ID },
-        context
-      )
-
-      expect(result.success).toBe(false)
-      expect(result.error).toContain('integrations page')
-      expect(mockGetCredentialActorContext).not.toHaveBeenCalled()
-    })
-
-    it('rejects reconnect for Shopify and directs the user to the integrations page', async () => {
-      const result = await executeOAuthGetAuthLink(
-        { providerName: 'shopify', credentialId: CREDENTIAL_ID },
-        context
-      )
-
-      expect(result.success).toBe(false)
-      expect(result.error).toContain('integrations page')
-      expect(mockGetCredentialActorContext).not.toHaveBeenCalled()
-    })
+    expect(result.success).toBe(true)
+    expect(mocks.execute).toHaveBeenCalledOnce()
   })
 })

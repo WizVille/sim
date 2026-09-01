@@ -32,8 +32,9 @@ vi.mock('@/lib/execution/payloads/store', () => ({
   materializeLargeValueRef: materializeLargeValueRefMock,
 }))
 
+import { sleep } from '@sim/utils/helpers'
 import type { TraceSpan } from '@/lib/logs/types'
-import { grepSpans, type LogViewContext, toFull, toOverview } from './log-views'
+import { grepSpans, type LogViewContext, toFull, toOverview, toTrace } from './log-views'
 
 const ctx: LogViewContext = {
   workspaceId: 'ws-1',
@@ -169,15 +170,190 @@ describe('grepSpans', () => {
     expect(result.matches.some((m) => m.field === 'output')).toBe(true)
   })
 
-  it('falls back to literal substring on invalid regex', async () => {
-    const spans = [span({ output: { v: 'value a(b found' } })]
-    const result = await grepSpans(spans, '(', ctx)
+  it.each([
+    ['character class', 'status=\\d+'],
+    ['anchor', '^Agent'],
+    ['alternation', '(openai|anthropic)'],
+    ['word boundary', '\\bstatus\\b'],
+    ['bounded quantifier', '\\d{4}-\\d{2}-\\d{2}'],
+    ['wildcard', 'called.*status'],
+  ])('interprets %s regex syntax', async (_label, pattern) => {
+    // None of these patterns occur literally in the span, so a match proves the
+    // regex was interpreted. `^Agent` anchors against the name field, the rest
+    // against output — hence the field-agnostic assertion.
+    const spans = [span({ output: { v: 'called api.openai.com -> status=503 on 2026-01-01' } })]
+    const result = await grepSpans(spans, pattern, ctx)
+    expect(result.matches.length).toBeGreaterThan(0)
+    expect(result.patternNotice).toBeUndefined()
+  })
+
+  it('falls back to a literal, with a notice, for syntax RE2 does not implement', async () => {
+    const spans = [span({ output: { v: 'id: abc and (?=x) literally here' } })]
+
+    const lookahead = await grepSpans(spans, '(?=x)', ctx)
+    expect(lookahead.matches.some((m) => m.field === 'output')).toBe(true)
+    expect(lookahead.patternNotice).toContain('RE2')
+
+    // Unbalanced paren is invalid in both engines; still degrades to a literal.
+    const invalid = await grepSpans([span({ output: { v: 'value a(b' } })], '(', ctx)
+    expect(invalid.matches.some((m) => m.field === 'output')).toBe(true)
+    expect(invalid.patternNotice).toContain('RE2')
+  })
+
+  it('takes the built-in engine for a metacharacter-free pattern', async () => {
+    const spans = [span({ output: { v: 'saw ECONNREFUSED here' } })]
+    const result = await grepSpans(spans, 'ECONNREFUSED', ctx)
     expect(result.matches.some((m) => m.field === 'output')).toBe(true)
+    expect(result.patternNotice).toBeUndefined()
+  })
+
+  it.each([
+    ['nested quantifier', '(a+)+$'],
+    ['duplicate alternation, passes safe-regex2', '(a|a)*b'],
+    ['adjacent quantifiers, passes every structural screen', 'a*a*b'],
+  ])('runs a catastrophic pattern in linear time (%s)', async (_label, pattern) => {
+    // Each blocks the event loop for minutes on a backtracking engine:
+    // `a*a*b` measured 213s on JSC / 132s on V8 over a 10k-character run.
+    // RE2 has no backtracking, so these are matched normally and stay fast.
+    const spans = [span({ output: { v: `${'a'.repeat(10000)}!` } })]
+
+    const start = Date.now()
+    const result = await grepSpans(spans, pattern, ctx)
+    const elapsedMs = Date.now() - start
+
+    expect(elapsedMs).toBeLessThan(1000)
+    expect(result.truncated).toBe(false)
+  })
+
+  it('matches a long pattern literally without a length cap', async () => {
+    const pattern = `${'x'.repeat(600)}needle`
+    const spans = [span({ output: { v: pattern } })]
+    const result = await grepSpans(spans, pattern, ctx)
+    expect(result.matches.some((m) => m.field === 'output')).toBe(true)
+  })
+
+  it('stops scanning and marks truncated once the character budget is exhausted', async () => {
+    const spans = [
+      span({ id: 'a', output: { v: 'x'.repeat(400) } }),
+      span({ id: 'b', output: { v: 'needle' } }),
+    ]
+    const result = await grepSpans(spans, 'needle', ctx, { maxScannedChars: 100 })
+    expect(result.matches).toEqual([])
+    expect(result.truncated).toBe(true)
+  })
+
+  it('stops scanning and marks truncated once the match-time budget is exhausted', async () => {
+    const spans = [span({ output: { v: 'needle' } })]
+    const result = await grepSpans(spans, 'needle', ctx, { matchTimeBudgetMs: 0 })
+    expect(result.matches).toEqual([])
+    expect(result.truncated).toBe(true)
+  })
+
+  it('accumulates match time and truncates once the budget is spent', async () => {
+    // Guards the accumulation in `findTimed`: with that line removed,
+    // matchTimeMs stays 0, the budget never trips, and every span is scanned.
+    const big = 'x'.repeat(400_000)
+    const spans = [
+      span({ id: 'a', output: { v: big } }),
+      span({ id: 'b', output: { v: big } }),
+      span({ id: 'c', output: { v: `${big} needle` } }),
+    ]
+
+    const result = await grepSpans(spans, 'needle|nomatch', ctx, { matchTimeBudgetMs: 1 })
+
+    expect(result.truncated).toBe(true)
+    expect(result.matches).toEqual([])
+  })
+
+  it('does not charge blob-store I/O to the match-time budget', async () => {
+    // Each slice read sleeps well past the budget: only time spent matching
+    // counts, so a slow-but-legitimate grep must still return complete results.
+    readLargeArrayManifestSliceMock.mockImplementation(async (_m: unknown, start: number) => {
+      await sleep(30)
+      return start === 400 ? [{ v: 'found the needle here' }] : [{ v: 'nothing' }]
+    })
+    const spans = [span({ output: manifest(500) as any })]
+
+    const result = await grepSpans(spans, 'needle', ctx, { matchTimeBudgetMs: 50 })
+
+    expect(result.matches.some((m) => m.field === 'output')).toBe(true)
+    expect(result.truncated).toBe(false)
   })
 
   it('returns empty for empty traceSpans', async () => {
     const result = await grepSpans([], 'anything', ctx)
     expect(result.matches).toEqual([])
     expect(result.truncated).toBe(false)
+  })
+})
+
+describe('toTrace', () => {
+  it('collapses loop iterations into one per-block digest line with status counts', () => {
+    const spans: TraceSpan[] = [
+      span({
+        id: 'loop',
+        blockId: 'blk-loop',
+        name: 'Loop',
+        type: 'loop',
+        children: [
+          span({ id: 'i1', blockId: 'blk-agent', name: 'Agent', status: 'success', duration: 10 }),
+          span({ id: 'i2', blockId: 'blk-agent', name: 'Agent', status: 'success', duration: 20 }),
+          span({ id: 'i3', blockId: 'blk-agent', name: 'Agent', status: 'error', duration: 5 }),
+        ],
+      }),
+    ]
+
+    const digest = toTrace(spans)
+
+    expect(digest).toHaveLength(2)
+    expect(digest[1]).toMatchObject({
+      blockId: 'blk-agent',
+      name: 'Agent',
+      executions: 3,
+      statuses: { success: 2, error: 1 },
+      totalDurationMs: 35,
+    })
+  })
+
+  it('never materializes refs', () => {
+    toTrace([span({ output: ref('big') as unknown as Record<string, unknown> })])
+    expect(materializeLargeValueRefMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('toFull field projection', () => {
+  it('narrows spans to whole payload keys', async () => {
+    const out = await toFull(
+      [span({ input: { a: 1 }, output: { b: 2 }, errorMessage: 'boom' })],
+      ctx,
+      undefined,
+      ['output', 'error']
+    )
+    expect(out[0]).toMatchObject({ output: { b: 2 }, error: 'boom' })
+    expect(out[0]).not.toHaveProperty('input')
+  })
+
+  it('extracts dotted paths under selected', async () => {
+    const out = await toFull(
+      [span({ output: { result: { rows: [1, 2, 3], meta: 'big' } } })],
+      ctx,
+      undefined,
+      ['output.result.rows']
+    )
+    expect(out[0]).not.toHaveProperty('output')
+    expect((out[0] as { selected?: Record<string, unknown> }).selected).toEqual({
+      'output.result.rows': [1, 2, 3],
+    })
+  })
+
+  it('supports blockIds multi-select with field projection', async () => {
+    const spans: TraceSpan[] = [
+      span({ id: 's1', blockId: 'blk-a', name: 'A', output: { keep: 1 } }),
+      span({ id: 's2', blockId: 'blk-b', name: 'B', output: { keep: 2 } }),
+      span({ id: 's3', blockId: 'blk-c', name: 'C', output: { drop: true } }),
+    ]
+    const out = await toFull(spans, ctx, { blockIds: ['blk-a', 'blk-b'] }, ['output'])
+    expect(out.map((s) => s.blockId)).toEqual(['blk-a', 'blk-b'])
+    expect(out[0].output).toEqual({ keep: 1 })
   })
 })

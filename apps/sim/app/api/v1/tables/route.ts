@@ -2,14 +2,23 @@ import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
 import { v1CreateTableContract, v1ListTablesContract } from '@/lib/api/contracts/v1/tables'
-import { parseRequest, validationErrorResponseFromError } from '@/lib/api/server'
+import { parseRequest } from '@/lib/api/server'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
-import { createTable, getWorkspaceTableLimits, listTables, type TableSchema } from '@/lib/table'
-import { normalizeColumn } from '@/app/api/table/utils'
+import {
+  createTable,
+  getWorkspaceTableLimits,
+  listTables,
+  TableConflictError,
+  type TableSchema,
+} from '@/lib/table'
+import { normalizeColumn } from '@/lib/table/wire'
+import { orchestrationErrorResponse } from '@/app/api/table/utils'
 import {
   checkRateLimit,
   createRateLimitResponse,
+  v1ValidationErrorResponse,
+  v1ValidationErrorResponseFromError,
   validateWorkspaceAccess,
 } from '@/app/api/v1/middleware'
 
@@ -29,7 +38,14 @@ export const GET = withRouteHandler(async (request: NextRequest) => {
     }
 
     const userId = rateLimit.userId!
-    const parsed = await parseRequest(v1ListTablesContract, request, {})
+    const parsed = await parseRequest(
+      v1ListTablesContract,
+      request,
+      {},
+      {
+        validationErrorResponse: v1ValidationErrorResponse,
+      }
+    )
     if (!parsed.success) return parsed.response
 
     const { workspaceId } = parsed.data.query
@@ -53,6 +69,7 @@ export const GET = withRouteHandler(async (request: NextRequest) => {
             },
             rowCount: t.rowCount,
             maxRows: t.maxRows,
+            locks: t.locks,
             createdAt:
               t.createdAt instanceof Date ? t.createdAt.toISOString() : String(t.createdAt),
             updatedAt:
@@ -63,7 +80,7 @@ export const GET = withRouteHandler(async (request: NextRequest) => {
       },
     })
   } catch (error) {
-    const validationResponse = validationErrorResponseFromError(error)
+    const validationResponse = v1ValidationErrorResponseFromError(error)
     if (validationResponse) return validationResponse
 
     logger.error(`[${requestId}] Error listing tables:`, error)
@@ -83,7 +100,14 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
 
     const userId = rateLimit.userId!
 
-    const parsed = await parseRequest(v1CreateTableContract, request, {})
+    const parsed = await parseRequest(
+      v1CreateTableContract,
+      request,
+      {},
+      {
+        validationErrorResponse: v1ValidationErrorResponse,
+      }
+    )
     if (!parsed.success) return parsed.response
     const params = parsed.data.body
 
@@ -137,6 +161,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
           },
           rowCount: table.rowCount,
           maxRows: table.maxRows,
+          locks: table.locks,
           createdAt:
             table.createdAt instanceof Date
               ? table.createdAt.toISOString()
@@ -150,21 +175,15 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
       },
     })
   } catch (error) {
-    const validationResponse = validationErrorResponseFromError(error)
+    const validationResponse = v1ValidationErrorResponseFromError(error)
     if (validationResponse) return validationResponse
 
-    if (error instanceof Error) {
-      if (error.message.includes('maximum table limit')) {
-        return NextResponse.json({ error: error.message }, { status: 403 })
-      }
-      if (
-        error.message.includes('Invalid table name') ||
-        error.message.includes('Invalid schema') ||
-        error.message.includes('already exists')
-      ) {
-        return NextResponse.json({ error: error.message }, { status: 400 })
-      }
+    if (error instanceof TableConflictError) {
+      return NextResponse.json({ error: error.message }, { status: 400 })
     }
+
+    const classified = orchestrationErrorResponse(error)
+    if (classified) return classified
 
     logger.error(`[${requestId}] Error creating table:`, error)
     return NextResponse.json({ error: 'Failed to create table' }, { status: 500 })

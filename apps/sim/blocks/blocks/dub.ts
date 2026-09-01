@@ -3,6 +3,11 @@ import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
 import type { DubResponse } from '@/tools/dub/types'
 
+const GET_LINK_FIELD = ['linkId', 'getLinkExternalId', 'getLinkKey'] as const
+const BULK_UPDATE_TARGET_FIELD = ['bulkUpdateLinkIds', 'bulkUpdateExternalIds'] as const
+const ANALYTICS_LINK_FIELD = ['analyticsLinkId', 'analyticsExternalId'] as const
+const EVENTS_LINK_FIELD = ['eventsLinkId', 'eventsExternalId'] as const
+
 export const DubBlock: BlockConfig<DubResponse> = {
   type: 'dub',
   name: 'Dub',
@@ -15,6 +20,89 @@ export const DubBlock: BlockConfig<DubResponse> = {
   integrationType: IntegrationType.DevOps,
   bgColor: '#181C1E',
   icon: DubIcon,
+  canvasPresentation: {
+    defaultTitle: 'Dub',
+    sentences: {
+      byOperation: {
+        create_link: [
+          { text: 'Create a short link to', field: 'url', core: true },
+          { text: ', at slug', field: 'key' },
+          { text: ', on', field: 'domain' },
+        ],
+        upsert_link: [
+          { text: 'Create or update the short link to', field: 'url', core: true },
+          { text: ', at slug', field: 'key' },
+          { text: ', on', field: 'domain' },
+        ],
+        get_link: [{ text: 'Read link', field: GET_LINK_FIELD, core: true }],
+        update_link: [
+          { text: 'Update link', field: 'linkId', core: true },
+          { text: ', pointing it to', field: 'updateUrl' },
+          { text: ', at slug', field: 'key' },
+        ],
+        delete_link: [{ text: 'Delete link', field: 'linkId', core: true }],
+        list_links: [
+          'List links',
+          { text: ', matching', field: 'search' },
+          { text: ', on', field: 'listDomain' },
+          { text: ', up to', field: 'pageSize' },
+        ],
+        get_links_count: [
+          'Count links',
+          { text: ', matching', field: 'countSearch' },
+          { text: ', on', field: 'countDomain' },
+          { text: ', grouped by', field: 'countGroupBy' },
+        ],
+        bulk_create_links: ['Create up to 100 short links in one request'],
+        bulk_update_links: [
+          {
+            text: 'Apply one set of changes to links',
+            field: BULK_UPDATE_TARGET_FIELD,
+            core: true,
+          },
+          { text: ', setting', field: 'bulkUpdateData' },
+        ],
+        bulk_delete_links: [{ text: 'Delete links', field: 'bulkDeleteLinkIds', core: true }],
+        get_analytics: [
+          {
+            text: 'Read',
+            field: 'analyticsEvent',
+            after: 'analytics',
+            core: true,
+          },
+          { text: 'for link', field: ANALYTICS_LINK_FIELD },
+          { text: ', over', field: 'analyticsInterval' },
+        ],
+        get_events: [
+          {
+            text: 'List individual',
+            field: 'eventsEvent',
+            after: 'events',
+            core: true,
+          },
+          { text: 'for link', field: EVENTS_LINK_FIELD },
+          { text: ', over', field: 'eventsInterval' },
+        ],
+        get_qr_code: [
+          { text: 'Generate a QR code for', field: 'qrUrl', core: true },
+          { text: ', at', field: 'qrSize', after: 'pixels' },
+        ],
+        list_domains: [
+          'List the workspace domains',
+          { text: ', matching', field: 'domainsSearch' },
+        ],
+        list_tags: ['List the workspace tags', { text: ', matching', field: 'tagsSearch' }],
+        create_tag: [
+          { text: 'Create tag', field: 'tagName', core: true },
+          { text: ', colored', field: 'tagColor' },
+        ],
+        list_folders: [
+          'List the workspace folders',
+          { text: ', matching', field: 'foldersSearch' },
+        ],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -1206,7 +1294,7 @@ export const DubBlockMeta = {
     },
     {
       icon: DubIcon,
-      title: 'Campaign link batcher',
+      title: 'Dub campaign link batcher',
       prompt:
         'Create a workflow that reads a table of campaign destinations, upserts a Dub short link for each row with consistent UTM tags, writes the resulting short URL back into the table, and posts a Slack confirmation summarizing how many links were created or refreshed.',
       modules: ['tables', 'agent', 'workflows'],
@@ -1226,7 +1314,7 @@ export const DubBlockMeta = {
     },
     {
       icon: DubIcon,
-      title: 'Short link hygiene auditor',
+      title: 'Dub link hygiene auditor',
       prompt:
         'Create a scheduled monthly workflow that lists all Dub links, checks each destination for 4xx and 5xx responses, flags broken links in a table, and emails the marketing team a remediation list so dead campaign links never go live.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -1235,7 +1323,7 @@ export const DubBlockMeta = {
     },
     {
       icon: DubIcon,
-      title: 'Outbound link personalizer',
+      title: 'Dub outbound link personalizer',
       prompt:
         'Build a workflow that reads a leads table, generates a per-lead Dub short link with the lead identifier in UTM and metadata, attaches the personalized link to the outreach email body, and tracks delivery in the table.',
       modules: ['tables', 'agent', 'workflows'],
@@ -1245,7 +1333,7 @@ export const DubBlockMeta = {
     },
     {
       icon: DubIcon,
-      title: 'Release announcement linker',
+      title: 'Dub release announcement linker',
       prompt:
         'Create a workflow triggered by a GitHub release that creates a Dub short link for the release notes URL, posts the short link to the marketing Slack channel, and stores the mapping of release tag to short link in a tracking table.',
       modules: ['tables', 'agent', 'workflows'],
@@ -1255,7 +1343,7 @@ export const DubBlockMeta = {
     },
     {
       icon: DubIcon,
-      title: 'Top-converting links report',
+      title: 'Dub top-converting links report',
       prompt:
         'Build a scheduled monthly workflow that pulls Dub analytics grouped by link, ranks top performers by leads and sales, identifies underperformers, writes a narrative report file with recommendations, and shares it with marketing leadership.',
       modules: ['scheduled', 'agent', 'files', 'workflows'],

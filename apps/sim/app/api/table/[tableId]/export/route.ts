@@ -1,22 +1,14 @@
 import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
-import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
 import { tableExportFormatSchema, tableIdParamsSchema } from '@/lib/api/contracts/tables'
 import { getValidationErrorMessage } from '@/lib/api/server'
 import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
-import { neutralizeCsvFormula } from '@/lib/core/utils/csv'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { captureServerEvent } from '@/lib/posthog/server'
-import { buildNameById, getColumnId, rowDataIdToName } from '@/lib/table/column-keys'
-import { queryRows } from '@/lib/table/rows/service'
+import { sanitizeExportFilename } from '@/lib/table/export-format'
+import { createTableExportStream, exportContentType } from '@/lib/table/export-stream'
 import { accessError, checkAccess } from '@/app/api/table/utils'
-
-const logger = createLogger('TableExport')
-
-const EXPORT_BATCH_SIZE = 1000
-
-type ExportFormat = 'csv' | 'json'
 
 interface RouteParams {
   params: Promise<{ tableId: string }>
@@ -43,18 +35,11 @@ export const GET = withRouteHandler(async (request: NextRequest, { params }: Rou
       { status: 400 }
     )
   }
-  const format: ExportFormat = formatValidation.data
+  const format = formatValidation.data
 
   const access = await checkAccess(tableId, auth.userId, 'read')
   if (!access.ok) return accessError(access, requestId, tableId)
   const { table } = access
-
-  const columns = table.schema.columns
-  // Stored row data is id-keyed; CSV headers and JSON keys are display names, so
-  // translate id → name on the way out (export is a name-friendly boundary).
-  const nameById = buildNameById(table.schema)
-  const safeName = sanitizeFilename(table.name)
-  const filename = `${safeName}.${format}`
 
   // Audit before streaming: rows leave incrementally, so a mid-stream failure still exfiltrates partial data.
   recordAudit({
@@ -77,92 +62,12 @@ export const GET = withRouteHandler(async (request: NextRequest, { params }: Rou
     )
   }
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const encoder = new TextEncoder()
-      try {
-        if (format === 'csv') {
-          controller.enqueue(
-            encoder.encode(`${toCsvRow(columns.map((c) => neutralizeCsvFormula(c.name)))}\n`)
-          )
-        } else {
-          controller.enqueue(encoder.encode('['))
-        }
-
-        let offset = 0
-        let firstJsonRow = true
-        while (true) {
-          const result = await queryRows(
-            table,
-            { limit: EXPORT_BATCH_SIZE, offset, includeTotal: false },
-            requestId
-          )
-
-          for (const row of result.rows) {
-            if (format === 'csv') {
-              const values = columns.map((c) => formatCsvValue(row.data[getColumnId(c)]))
-              controller.enqueue(encoder.encode(`${toCsvRow(values)}\n`))
-            } else {
-              const prefix = firstJsonRow ? '' : ','
-              firstJsonRow = false
-              controller.enqueue(
-                encoder.encode(prefix + JSON.stringify(rowDataIdToName(row.data, nameById)))
-              )
-            }
-          }
-
-          if (result.rows.length < EXPORT_BATCH_SIZE) break
-          offset += result.rows.length
-        }
-
-        if (format === 'json') controller.enqueue(encoder.encode(']'))
-        controller.close()
-
-        logger.info(`[${requestId}] Exported table ${tableId}`, {
-          format,
-          rowCount: table.rowCount,
-        })
-      } catch (err) {
-        logger.error(`[${requestId}] Export failed for table ${tableId}`, err)
-        controller.error(err)
-      }
-    },
-  })
-
-  return new NextResponse(stream, {
+  return new NextResponse(createTableExportStream(table, format, requestId), {
     status: 200,
     headers: {
-      'Content-Type': format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Type': exportContentType(format),
+      'Content-Disposition': `attachment; filename="${sanitizeExportFilename(table.name)}.${format}"`,
       'Cache-Control': 'no-store',
     },
   })
 })
-
-function sanitizeFilename(name: string): string {
-  const cleaned = name.replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '')
-  return cleaned || 'table'
-}
-
-/**
- * Serializes a cell for CSV. Only string cells are formula-neutralized; numbers,
- * booleans, dates, and JSON objects can never form a trigger and pass through verbatim.
- */
-function formatCsvValue(value: unknown): string {
-  if (value === null || value === undefined) return ''
-  if (value instanceof Date) return value.toISOString()
-  if (typeof value === 'object') return JSON.stringify(value)
-  if (typeof value === 'string') return neutralizeCsvFormula(value)
-  return String(value)
-}
-
-function toCsvRow(values: string[]): string {
-  return values.map(escapeCsvField).join(',')
-}
-
-function escapeCsvField(field: string): string {
-  if (/[",\n\r]/.test(field)) {
-    return `"${field.replace(/"/g, '""')}"`
-  }
-  return field
-}

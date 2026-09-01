@@ -4,7 +4,7 @@ import type { RequestResponse } from '@/tools/http/types'
 
 export const WebhookRequestBlock: BlockConfig<RequestResponse> = {
   type: 'webhook_request',
-  name: 'Outgoing Webhook',
+  name: 'Webhook',
   description: 'Send a webhook request',
   longDescription:
     'Send an HTTP POST request to a webhook URL with automatic webhook headers. Optionally sign the payload with HMAC-SHA256 for secure webhook delivery.',
@@ -12,6 +12,15 @@ export const WebhookRequestBlock: BlockConfig<RequestResponse> = {
   category: 'blocks',
   bgColor: '#10B981',
   icon: WebhookIcon,
+  canvasPresentation: {
+    defaultTitle: 'Webhook',
+    sentences: {
+      default: [
+        { text: 'Post', field: 'body', core: true },
+        { text: 'to', field: 'url', core: true },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'url',

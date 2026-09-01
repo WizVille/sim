@@ -27,9 +27,7 @@ const {
   },
   mockPush: vi.fn(),
   mockRequestJson: vi.fn(),
-  mockSearchParams: {
-    get: (key: string) => (key === 'token' ? 'token-1' : null),
-  },
+  mockSearchParams: { current: new URLSearchParams('token=token-1') },
   mockSetActive: vi.fn(),
   mockSetQueryData: vi.fn(),
   mockSignOut: vi.fn(),
@@ -43,16 +41,51 @@ vi.mock('@sim/logger', () => ({
 vi.mock('next/navigation', () => ({
   useParams: () => ({ id: 'invitation-1' }),
   useRouter: () => ({ push: mockPush }),
-  useSearchParams: () => mockSearchParams,
+  useSearchParams: () => mockSearchParams.current,
 }))
 
-vi.mock('@tanstack/react-query', () => ({
-  useQueryClient: () => ({
-    cancelQueries: mockCancelQueries,
-    invalidateQueries: mockInvalidateQueries,
-    setQueryData: mockSetQueryData,
-  }),
-}))
+vi.mock('@tanstack/react-query', async () => {
+  const React = await import('react')
+  return {
+    useQueryClient: () => ({
+      cancelQueries: mockCancelQueries,
+      invalidateQueries: mockInvalidateQueries,
+      setQueryData: mockSetQueryData,
+    }),
+    /**
+     * Minimal useQuery stand-in: runs the queryFn once when enabled and
+     * exposes { data, error, isPending } — enough for the invitation fetch.
+     */
+    useQuery: (options: {
+      queryFn: (context: { signal?: AbortSignal }) => Promise<unknown>
+      enabled?: boolean
+    }) => {
+      const [state, setState] = React.useState<{
+        data: unknown
+        error: unknown
+        isPending: boolean
+      }>({ data: undefined, error: null, isPending: true })
+      const enabled = options.enabled !== false
+      React.useEffect(() => {
+        if (!enabled) return
+        let cancelled = false
+        options.queryFn({}).then(
+          (data) => {
+            if (!cancelled) setState({ data, error: null, isPending: false })
+          },
+          (error) => {
+            if (!cancelled) setState({ data: undefined, error, isPending: false })
+          }
+        )
+        return () => {
+          cancelled = true
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [enabled])
+      return state
+    },
+  }
+})
 
 vi.mock('@/lib/api/client/request', () => ({
   requestJson: mockRequestJson,
@@ -71,15 +104,18 @@ vi.mock('@/app/invite/components', () => ({
   InviteLayout: ({ children }: { children: ReactNode }) => children,
   InviteStatusCard: ({
     actions = [],
+    description,
     title,
     type,
   }: {
     actions?: Array<{ label: string; onClick: () => void }>
+    description?: ReactNode
     title: string
     type: string
   }) => (
     <>
       <div data-invite-status={type}>{title}</div>
+      <div>{description}</div>
       {actions.map((action) => (
         <button key={action.label} type='button' onClick={action.onClick}>
           {action.label}
@@ -114,22 +150,38 @@ async function flush(): Promise<void> {
   })
 }
 
-async function acceptCurrentInvitation(): Promise<void> {
+async function renderInvite(registrationDisabled = false): Promise<void> {
   act(() => {
-    root.render(<Invite />)
+    root.render(<Invite registrationDisabled={registrationDisabled} />)
   })
   await flush()
+}
 
-  const acceptButton = Array.from(container.querySelectorAll('button')).find(
-    (button) => button.textContent === 'Accept Invitation'
+async function renderSignedOut(registrationDisabled: boolean): Promise<void> {
+  mockUseSession.mockReturnValue({ data: null, isPending: false })
+  await renderInvite(registrationDisabled)
+}
+
+function actionLabels(): string[] {
+  return Array.from(container.querySelectorAll('button'), (button) => button.textContent ?? '')
+}
+
+async function clickAction(label: string): Promise<void> {
+  const action = Array.from(container.querySelectorAll('button')).find(
+    (button) => button.textContent === label
   )
-  expect(acceptButton).toBeDefined()
+  expect(action).toBeDefined()
 
   await act(async () => {
-    acceptButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    action?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await Promise.resolve()
     await Promise.resolve()
   })
+}
+
+async function acceptCurrentInvitation(): Promise<void> {
+  await renderInvite()
+  await clickAction('Accept Invitation')
 }
 
 beforeEach(() => {
@@ -139,6 +191,7 @@ beforeEach(() => {
   document.body.appendChild(container)
   root = createRoot(container)
 
+  mockSearchParams.current = new URLSearchParams('token=token-1')
   mockUseSession.mockReturnValue({
     data: { user: { id: 'user-1', email: 'invitee@example.com' } },
     isPending: false,
@@ -246,6 +299,43 @@ describe('Invite', () => {
       cache: 'session',
       error: 'Session refresh denied',
     })
-    expect(mockLogger.warn).toHaveBeenCalledTimes(3)
+    expect(mockLogger.warn).toHaveBeenCalledTimes(4)
+  })
+
+  /**
+   * Every case marks the visitor as new (`new=true`), the state that leads with
+   * "Create an account" when registration is enabled — so each assertion below
+   * fails if the flag stops being honored.
+   */
+  describe('signed out with registration disabled', () => {
+    beforeEach(() => {
+      mockSearchParams.current = new URLSearchParams('token=token-1&new=true')
+    })
+
+    it('offers only sign-in, since /signup would reject the visitor', async () => {
+      await renderSignedOut(true)
+
+      expect(actionLabels()).toEqual(['Sign in', 'Return to Home'])
+      expect(container.textContent).toContain('Account creation is disabled on this instance')
+    })
+
+    it('sends the visitor to login with the invitation as the callback', async () => {
+      await renderSignedOut(true)
+      await clickAction('Sign in')
+
+      expect(mockPush).toHaveBeenCalledWith(
+        `/login?invite_flow=true&callbackUrl=${encodeURIComponent('/invite/invitation-1?token=token-1')}`
+      )
+    })
+
+    it('still offers account creation when registration is enabled', async () => {
+      await renderSignedOut(false)
+
+      expect(actionLabels()).toEqual([
+        'Create an account',
+        'I already have an account',
+        'Return to Home',
+      ])
+    })
   })
 })

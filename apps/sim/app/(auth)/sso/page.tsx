@@ -1,7 +1,8 @@
 import { Suspense } from 'react'
 import type { Metadata } from 'next'
 import { redirect } from 'next/navigation'
-import { getEnv, isTruthy } from '@/lib/core/config/env'
+import { isRegistrationDisabled, isSsoEnabled } from '@/lib/core/config/env-flags'
+import SSOLoading from '@/app/(auth)/sso/loading'
 import SSOForm from '@/ee/sso/components/sso-form'
 
 export const metadata: Metadata = {
@@ -11,13 +12,13 @@ export const metadata: Metadata = {
 export const dynamic = 'force-dynamic'
 
 export default async function SSOPage() {
-  if (!isTruthy(getEnv('NEXT_PUBLIC_SSO_ENABLED'))) {
+  if (!isSsoEnabled) {
     redirect('/login')
   }
 
   return (
-    <Suspense fallback={null}>
-      <SSOForm />
+    <Suspense fallback={<SSOLoading />}>
+      <SSOForm registrationDisabled={isRegistrationDisabled} />
     </Suspense>
   )
 }

@@ -1,7 +1,7 @@
 'use client'
 
 import { useMemo, useState } from 'react'
-import { ChipDropdown, ChipInput, Search, toast } from '@sim/emcn'
+import { ChipDropdown, toast } from '@sim/emcn'
 import { createLogger } from '@sim/logger'
 import { isOrgAdminRole } from '@sim/platform-authz/predicates'
 import { getErrorMessage } from '@sim/utils/errors'
@@ -20,6 +20,10 @@ import type {
 } from '@/lib/api/contracts/organization'
 import type { Member } from '@/lib/workspaces/organization'
 import {
+  ManageCreditsModal,
+  type ManageCreditsTarget,
+} from '@/app/workspace/[workspaceId]/settings/components/manage-credits-modal'
+import {
   MemberRow,
   MemberSection,
 } from '@/app/workspace/[workspaceId]/settings/components/member-list'
@@ -27,10 +31,6 @@ import {
   type RowAction,
   RowActionsMenu,
 } from '@/app/workspace/[workspaceId]/settings/components/row-actions-menu'
-import {
-  ManageCreditsModal,
-  type ManageCreditsTarget,
-} from '@/app/workspace/[workspaceId]/settings/components/team-management/components/manage-credits-modal'
 import {
   useRemoveWorkspaceMember,
   useUpdateWorkspacePermissions,
@@ -73,6 +73,12 @@ interface OrganizationMemberListsProps {
   roster: OrganizationRoster | null | undefined
   isLoadingRoster: boolean
   currentUserId: string
+  /**
+   * The roster filter, owned by the page so it can live in the URL — this
+   * component renders the shared `SettingsPanel` search box's results, it does
+   * not own the box.
+   */
+  query: string
   onRemoveMember: (member: Member) => void
   onTransferOwnership?: () => void
 }
@@ -89,10 +95,10 @@ export function OrganizationMemberLists({
   roster,
   isLoadingRoster,
   currentUserId,
+  query,
   onRemoveMember,
   onTransferOwnership,
 }: OrganizationMemberListsProps) {
-  const [query, setQuery] = useState('')
   const [creditsTarget, setCreditsTarget] = useState<ManageCreditsTarget | null>(null)
 
   const updateMemberRole = useUpdateOrganizationMemberRole()
@@ -284,13 +290,20 @@ export function OrganizationMemberLists({
     workspaceId: string,
     access: RosterWorkspaceAccess
   ) => {
-    const rowUserIsOrgAdmin = isOrgAdminRole(member.role)
     const isSelf = member.userId === currentUserId
     const wouldDemoteSelf = isSelf && access.permission === 'admin'
+    /**
+     * Every reason here has a matching server guard, so a locked control is one
+     * the route would have refused. Derived from the roster payload rather than
+     * from the org role alone, which missed the workspace owner and the billing
+     * account.
+     */
+    const lockReason = workspaceRoleLockReason(access.roleSource, {
+      isBilledAccount: access.isBilledAccount,
+    })
     const disabled =
-      !canManage || rowUserIsOrgAdmin || wouldDemoteSelf || updatePermissions.isPending
-    const lockReason = rowUserIsOrgAdmin ? workspaceRoleLockReason('org-admin') : null
-    const canRemoveFromWorkspace = canManage && !rowUserIsOrgAdmin && !isSelf
+      !canManage || lockReason !== null || wouldDemoteSelf || updatePermissions.isPending
+    const canRemoveFromWorkspace = canManage && !isOrgAdminRole(member.role) && !isSelf
 
     return (
       <MemberRow
@@ -380,48 +393,51 @@ export function OrganizationMemberLists({
 
   /**
    * Group each workspace's members and pending invites once per roster change.
-   * This is O(workspaces × members) and independent of the search query, so
-   * hoisting it out of render keeps keystroke filtering cheap on large orgs.
+   * Indexed by a single pass over the roster rather than a `.find` per
+   * workspace × member — that inner scan made this O(workspaces × members ×
+   * access-entries). Members are appended in roster order, so each group keeps
+   * the same ordering the per-workspace scan produced.
    */
-  const workspaceGroups = useMemo(
-    () =>
-      workspaces.map((workspace) => {
-        const workspaceMembers = members
-          .map((member) => ({
-            member,
-            access: member.workspaces.find((w) => w.workspaceId === workspace.id),
-          }))
-          .filter((entry): entry is { member: RosterMember; access: RosterWorkspaceAccess } =>
-            Boolean(entry.access)
-          )
-        const workspaceInvites = pendingInvitations
-          .map((invitation) => ({
-            invitation,
-            access: invitation.workspaces.find((w) => w.workspaceId === workspace.id),
-          }))
-          .filter(
-            (
-              entry
-            ): entry is { invitation: RosterPendingInvitation; access: RosterWorkspaceAccess } =>
-              Boolean(entry.access)
-          )
-        return { workspace, workspaceMembers, workspaceInvites }
-      }),
-    [workspaces, members, pendingInvitations]
-  )
+  const workspaceGroups = useMemo(() => {
+    const membersByWorkspace = new Map<
+      string,
+      { member: RosterMember; access: RosterWorkspaceAccess }[]
+    >()
+    for (const member of members) {
+      const seen = new Set<string>()
+      for (const access of member.workspaces) {
+        if (seen.has(access.workspaceId)) continue
+        seen.add(access.workspaceId)
+        const entries = membersByWorkspace.get(access.workspaceId)
+        if (entries) entries.push({ member, access })
+        else membersByWorkspace.set(access.workspaceId, [{ member, access }])
+      }
+    }
+
+    const invitesByWorkspace = new Map<
+      string,
+      { invitation: RosterPendingInvitation; access: RosterWorkspaceAccess }[]
+    >()
+    for (const invitation of pendingInvitations) {
+      const seen = new Set<string>()
+      for (const access of invitation.workspaces) {
+        if (seen.has(access.workspaceId)) continue
+        seen.add(access.workspaceId)
+        const entries = invitesByWorkspace.get(access.workspaceId)
+        if (entries) entries.push({ invitation, access })
+        else invitesByWorkspace.set(access.workspaceId, [{ invitation, access }])
+      }
+    }
+
+    return workspaces.map((workspace) => ({
+      workspace,
+      workspaceMembers: membersByWorkspace.get(workspace.id) ?? [],
+      workspaceInvites: invitesByWorkspace.get(workspace.id) ?? [],
+    }))
+  }, [workspaces, members, pendingInvitations])
 
   return (
     <>
-      <div className='flex items-center gap-2'>
-        <ChipInput
-          icon={Search}
-          placeholder='Search members...'
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          className='flex-1'
-        />
-      </div>
-
       {showMembersSection && (
         <MemberSection
           label={`Members (${orgRowCount})`}

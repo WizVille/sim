@@ -1,3 +1,4 @@
+import type { FunctionExecuteBody } from '@/lib/api/contracts'
 import {
   normalizeRecord,
   normalizeRecordMap,
@@ -6,14 +7,61 @@ import {
 } from '@/lib/core/utils/records'
 import { DEFAULT_EXECUTION_TIMEOUT_MS } from '@/lib/execution/constants'
 import { DEFAULT_CODE_LANGUAGE } from '@/lib/execution/languages'
+import { PRIVATE_SECRET_PROVENANCE_FIELD } from '@/lib/execution/private-tool-metadata'
 import type { CodeExecutionInput, CodeExecutionOutput } from '@/tools/function/types'
-import type { ToolConfig } from '@/tools/types'
+import type { InternalToolConfig } from '@/tools/types'
 
-export const functionExecuteTool: ToolConfig<CodeExecutionInput, CodeExecutionOutput> = {
+/** Builds the canonical Function protocol body for both HTTP compatibility and in-process calls. */
+export function buildFunctionExecuteBody(params: CodeExecutionInput): FunctionExecuteBody {
+  const codeContent = Array.isArray(params.code)
+    ? params.code.map((entry: { content: string }) => entry.content).join('\n')
+    : params.code
+
+  return {
+    code: codeContent,
+    sourceCode: params.sourceCode,
+    language: params.language || DEFAULT_CODE_LANGUAGE,
+    timeout: params.timeout || DEFAULT_EXECUTION_TIMEOUT_MS,
+    title: params.title,
+    outputPath: params.outputPath,
+    outputFormat: params.outputFormat,
+    outputTable: params.outputTable,
+    outputSandboxPath: params.outputSandboxPath,
+    outputMimeType: params.outputMimeType,
+    sandboxId: params.sandboxId,
+    secretScope: params.secretScope,
+    mountedSecrets: params.mountedSecrets,
+    unredactedSecretNames: params.unredactedSecretNames,
+    overwriteFileId: params.overwriteFileId,
+    inputs: params.inputs,
+    outputs: params.outputs,
+    envVars: normalizeStringRecord(params.envVars),
+    workflowVariables: normalizeWorkflowVariables(params.workflowVariables),
+    blockData: normalizeRecord(params.blockData),
+    blockNameMapping: normalizeStringRecord(params.blockNameMapping),
+    blockOutputSchemas: normalizeRecordMap(params.blockOutputSchemas),
+    contextVariables: normalizeRecord(params.contextVariables),
+    workflowId: params._context?.workflowId,
+    executionId: params._context?.executionId,
+    largeValueExecutionIds: params._context?.largeValueExecutionIds,
+    largeValueKeys: params._context?.largeValueKeys,
+    fileKeys: params._context?.fileKeys,
+    allowLargeValueWorkflowScope: params._context?.allowLargeValueWorkflowScope,
+    userId: params._context?.userId,
+    workspaceId: params._context?.workspaceId,
+    isCustomTool: params.isCustomTool || false,
+    ...(params[PRIVATE_SECRET_PROVENANCE_FIELD]
+      ? { [PRIVATE_SECRET_PROVENANCE_FIELD]: params[PRIVATE_SECRET_PROVENANCE_FIELD] }
+      : {}),
+    ...(params._sandboxFiles ? { _sandboxFiles: params._sandboxFiles } : {}),
+  }
+}
+
+export const functionExecuteTool: InternalToolConfig<CodeExecutionInput, CodeExecutionOutput> = {
   id: 'function_execute',
   name: 'Function Execute',
   description:
-    'Execute JavaScript, Python, or shell scripts in a secure sandbox. For JS: fetch() is available, code runs in async IIFE wrapper. For shell: workspace env vars available as $VAR_NAME, pre-installed CLI tools (jq, curl, awscli, psql, gh, etc.). Use outputPath/outputTable to persist returned data, or outputSandboxPath + outputPath to export a file created inside the sandbox into the workspace.',
+    'Execute JavaScript, Python, or shell scripts in a secure sandbox. For JS: fetch() is available, code runs in an async IIFE wrapper. Shell includes general utilities such as jq, curl, git, and rg. Use outputPath/outputTable to persist returned data, or outputSandboxPath + outputPath to export a file created inside the sandbox into the workspace.',
   version: '1.0.0',
 
   params: {
@@ -22,7 +70,7 @@ export const functionExecuteTool: ToolConfig<CodeExecutionInput, CodeExecutionOu
       required: true,
       visibility: 'user-or-llm',
       description:
-        'Raw JavaScript statements (NOT a function). Code is auto-wrapped in async context. MUST use fetch() for HTTP (NOT xhr/axios/request libs). Write like: await fetch(url) then return result. NO import/require statements.',
+        'Source code in the selected language. JavaScript runs as an async function body and returns a result with return. Python runs as a module and returns an optional result through __sim_result__; legacy snippets with a top-level return remain supported. Shell runs as Bash and can emit a typed result with __SIM_RESULT__=<json>.',
     },
     language: {
       type: 'string',
@@ -85,6 +133,24 @@ export const functionExecuteTool: ToolConfig<CodeExecutionInput, CodeExecutionOu
       description:
         'Overwrite this existing workspace file ID instead of creating a duplicate output file.',
     },
+    sandboxId: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description: 'Workspace sandbox providing importable packages and CLI tools',
+    },
+    secretScope: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description: 'Whether this code can read all workspace secrets or only selected ones',
+    },
+    mountedSecrets: {
+      type: 'json',
+      required: false,
+      visibility: 'user-only',
+      description: 'Secret names this code can read when secretScope is "selected"',
+    },
     envVars: {
       type: 'object',
       required: false,
@@ -122,54 +188,8 @@ export const functionExecuteTool: ToolConfig<CodeExecutionInput, CodeExecutionOu
     },
   },
 
-  request: {
-    url: '/api/function/execute',
-    method: 'POST',
-    headers: () => ({
-      'Content-Type': 'application/json',
-    }),
-    body: (params: CodeExecutionInput) => {
-      const codeContent = Array.isArray(params.code)
-        ? params.code.map((c: { content: string }) => c.content).join('\n')
-        : params.code
-
-      const body: Record<string, unknown> = {
-        code: codeContent,
-        sourceCode: params.sourceCode,
-        language: params.language || DEFAULT_CODE_LANGUAGE,
-        timeout: params.timeout || DEFAULT_EXECUTION_TIMEOUT_MS,
-        title: params.title,
-        outputPath: params.outputPath,
-        outputFormat: params.outputFormat,
-        outputTable: params.outputTable,
-        outputSandboxPath: params.outputSandboxPath,
-        outputMimeType: params.outputMimeType,
-        overwriteFileId: params.overwriteFileId,
-        inputs: params.inputs,
-        outputs: params.outputs,
-        envVars: normalizeStringRecord(params.envVars),
-        workflowVariables: normalizeWorkflowVariables(params.workflowVariables),
-        blockData: normalizeRecord(params.blockData),
-        blockNameMapping: normalizeStringRecord(params.blockNameMapping),
-        blockOutputSchemas: normalizeRecordMap(params.blockOutputSchemas),
-        contextVariables: normalizeRecord(params.contextVariables),
-        workflowId: params._context?.workflowId,
-        executionId: params._context?.executionId,
-        largeValueExecutionIds: params._context?.largeValueExecutionIds,
-        largeValueKeys: params._context?.largeValueKeys,
-        fileKeys: params._context?.fileKeys,
-        allowLargeValueWorkflowScope: params._context?.allowLargeValueWorkflowScope,
-        userId: params._context?.userId,
-        workspaceId: params._context?.workspaceId,
-        isCustomTool: params.isCustomTool || false,
-      }
-
-      if (params._sandboxFiles) {
-        body._sandboxFiles = params._sandboxFiles
-      }
-
-      return body
-    },
+  operation: {
+    input: buildFunctionExecuteBody,
   },
 
   transformResponse: async (response: Response): Promise<CodeExecutionOutput> => {
@@ -183,6 +203,7 @@ export const functionExecuteTool: ToolConfig<CodeExecutionInput, CodeExecutionOu
           stdout: result.output?.stdout || '',
         },
         error: result.error,
+        retryable: result.retryable,
         resources: result.resources,
         largeValueKeys: result.largeValueKeys,
         fileKeys: result.fileKeys,
@@ -198,11 +219,12 @@ export const functionExecuteTool: ToolConfig<CodeExecutionInput, CodeExecutionOu
       resources: result.resources,
       largeValueKeys: result.largeValueKeys,
       fileKeys: result.fileKeys,
+      retryable: result.retryable,
     }
   },
 
   outputs: {
-    result: { type: 'string', description: 'The result of the code execution' },
+    result: { type: 'json', description: 'The structured result emitted by the executed code' },
     stdout: { type: 'string', description: 'The standard output of the code execution' },
   },
 }

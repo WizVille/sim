@@ -2,8 +2,8 @@
  * @vitest-environment node
  */
 
-import { loggingSessionMock } from '@sim/testing'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { loggingSessionMock, workflowAuthzMockFns } from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ADMISSION_ERROR_CODE } from '@/lib/core/admission/transient-failure'
 
 const {
@@ -22,8 +22,6 @@ const {
   mockResolveSystemBillingAttribution: vi.fn(),
 }))
 
-vi.mock('@sim/db', () => ({ db: {} }))
-vi.mock('drizzle-orm', () => ({ eq: vi.fn() }))
 vi.mock('@/lib/auth/ban', () => ({
   getActivelyBannedUserIds: mockGetActivelyBannedUserIds,
 }))
@@ -36,6 +34,8 @@ vi.mock('@/lib/billing/calculations/usage-reservation', () => ({
     readonly code = 'SERVICE_OVERLOADED'
     readonly statusCode = 503
     readonly retryable = true
+    /** Mirrors ADMISSION_ERROR_DESCRIPTOR.RESERVATION_INFRASTRUCTURE. */
+    readonly retryAfterSeconds = 5
   },
 }))
 vi.mock('@/lib/billing/core/billing-attribution', () => ({
@@ -49,6 +49,11 @@ vi.mock('@/lib/billing/core/subscription', () => ({
 }))
 vi.mock('@/lib/core/execution-limits', () => ({
   getExecutionTimeout: vi.fn(() => 0),
+  resolveAsyncExecutionTimeout: vi.fn((policyTimeoutMs, requestedTimeoutSeconds) => {
+    if (requestedTimeoutSeconds === undefined) return policyTimeoutMs
+    const requestedTimeoutMs = requestedTimeoutSeconds * 1000
+    return policyTimeoutMs > 0 ? Math.min(policyTimeoutMs, requestedTimeoutMs) : requestedTimeoutMs
+  }),
 }))
 vi.mock('@/lib/core/rate-limiter/rate-limiter', () => ({
   RateLimiter: vi.fn(function (this: unknown) {
@@ -57,17 +62,8 @@ vi.mock('@/lib/core/rate-limiter/rate-limiter', () => ({
 }))
 vi.mock('@/lib/logs/execution/logging-session', () => loggingSessionMock)
 
-vi.mock('@sim/platform-authz/workflow', () => ({
-  getActiveWorkflowRecord: vi.fn().mockResolvedValue({
-    id: 'workflow-1',
-    userId: 'creator-1',
-    workspaceId: 'workspace-1',
-    isDeployed: true,
-  }),
-}))
-
 import { getHighestPrioritySubscription } from '@/lib/billing/core/subscription'
-import { preprocessExecution } from './preprocessing'
+import { preprocessExecution, WORKFLOW_NOT_DEPLOYED_CODE } from './preprocessing'
 
 const ORGANIZATION_ATTRIBUTION = {
   actorUserId: 'actor-1',
@@ -90,7 +86,17 @@ const ORGANIZATION_ATTRIBUTION = {
   workspaceId: 'workspace-1',
 }
 
+afterAll(() => {
+  workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockReset()
+})
+
 beforeEach(() => {
+  workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockResolvedValue({
+    id: 'workflow-1',
+    userId: 'creator-1',
+    workspaceId: 'workspace-1',
+    isDeployed: true,
+  })
   mockResolveBillingAttribution.mockImplementation(
     ({ actorUserId, workspaceId }: { actorUserId: string; workspaceId: string }) => ({
       ...ORGANIZATION_ATTRIBUTION,
@@ -109,6 +115,34 @@ beforeEach(() => {
     payerUsage: { currentUsage: 1, limit: 10 },
   })
   mockReserveExecutionSlot.mockResolvedValue({ reserved: true })
+})
+
+describe('preprocessExecution deployment checks', () => {
+  it('returns a structured code when a required deployment is missing', async () => {
+    workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockResolvedValueOnce({
+      id: 'workflow-1',
+      userId: 'user-1',
+      workspaceId: 'workspace-1',
+      isDeployed: false,
+    })
+    const result = await preprocessExecution({
+      workflowId: 'workflow-1',
+      userId: 'user-1',
+      triggerType: 'copilot',
+      executionId: 'execution-1',
+      requestId: 'request-1',
+      checkDeployment: true,
+    })
+
+    expect(result).toEqual({
+      success: false,
+      error: {
+        message: 'Workflow is not deployed',
+        statusCode: 403,
+        code: WORKFLOW_NOT_DEPLOYED_CODE,
+      },
+    })
+  })
 })
 
 describe('preprocessExecution correlation logging', () => {
@@ -210,6 +244,86 @@ describe('preprocessExecution logPreprocessingErrors option', () => {
 
     expect(result).toMatchObject({ success: false, error: { statusCode: 402 } })
     expect(loggingSession.safeStart).not.toHaveBeenCalled()
+  })
+})
+
+describe('preprocessExecution suppressRetryableFailureLogs option', () => {
+  const baseOptions = {
+    workflowId: 'workflow-1',
+    userId: 'owner-1',
+    triggerType: 'webhook' as const,
+    executionId: 'execution-1',
+    requestId: 'request-1',
+    checkDeployment: false,
+    checkRateLimit: false,
+    workspaceId: 'workspace-1',
+  }
+
+  function makeLoggingSession() {
+    return {
+      safeStart: vi.fn().mockResolvedValue(true),
+      safeCompleteWithError: vi.fn().mockResolvedValue(undefined),
+    }
+  }
+
+  it('skips the failure row for a retryable infrastructure failure', async () => {
+    workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockRejectedValueOnce(
+      Object.assign(new Error('write CONNECT_TIMEOUT'), { code: 'CONNECT_TIMEOUT' })
+    )
+    const loggingSession = makeLoggingSession()
+
+    const result = await preprocessExecution({
+      ...baseOptions,
+      suppressRetryableFailureLogs: true,
+      loggingSession: loggingSession as any,
+    })
+
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        message: 'Internal error while fetching workflow',
+        statusCode: 500,
+        retryable: true,
+      },
+    })
+    expect(loggingSession.safeStart).not.toHaveBeenCalled()
+  })
+
+  it('still records non-retryable failures while suppression is on', async () => {
+    workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockRejectedValueOnce(
+      new Error('column "unknown" does not exist')
+    )
+    const loggingSession = makeLoggingSession()
+
+    const result = await preprocessExecution({
+      ...baseOptions,
+      suppressRetryableFailureLogs: true,
+      loggingSession: loggingSession as any,
+    })
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { statusCode: 500, retryable: false },
+    })
+    expect(loggingSession.safeStart).toHaveBeenCalled()
+  })
+
+  it('records retryable failures when the option is absent', async () => {
+    workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockRejectedValueOnce(
+      Object.assign(new Error('write CONNECT_TIMEOUT'), { code: 'CONNECT_TIMEOUT' })
+    )
+    const loggingSession = makeLoggingSession()
+
+    const result = await preprocessExecution({
+      ...baseOptions,
+      loggingSession: loggingSession as any,
+    })
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { statusCode: 500, retryable: true },
+    })
+    expect(loggingSession.safeStart).toHaveBeenCalled()
   })
 })
 
@@ -639,6 +753,8 @@ describe('preprocessExecution billing attribution', () => {
       statusCode: 429,
       code: ADMISSION_ERROR_CODE.RESERVATION_CONCURRENCY,
       retryable: true,
+      /** A retryable denial must carry the descriptor's declared wait to the transport. */
+      retryAfterMs: 5000,
       message: 'Too many concurrent executions',
     },
     {
@@ -646,6 +762,8 @@ describe('preprocessExecution billing attribution', () => {
       statusCode: 402,
       code: ADMISSION_ERROR_CODE.RESERVATION_PAYER_HEADROOM,
       retryable: false,
+      /** Waiting does not fix a billing limit, so no retry pacing is offered. */
+      retryAfterMs: undefined,
       message: 'billing account has no guaranteed base-charge headroom',
     },
     {
@@ -653,11 +771,12 @@ describe('preprocessExecution billing attribution', () => {
       statusCode: 402,
       code: ADMISSION_ERROR_CODE.RESERVATION_MEMBER_HEADROOM,
       retryable: false,
+      retryAfterMs: undefined,
       message: 'organization member usage limit has no guaranteed base-charge headroom',
     },
   ])(
     'maps $reason to stable admission metadata while retaining local wording',
-    async ({ reason, statusCode, code, retryable, message }) => {
+    async ({ reason, statusCode, code, retryable, retryAfterMs, message }) => {
       mockCheckAttributedUsageLimits.mockResolvedValueOnce({
         isExceeded: false,
         payerUsage: { currentUsage: 1, limit: 10 },
@@ -685,6 +804,7 @@ describe('preprocessExecution billing attribution', () => {
       })
       if (result.success) throw new Error('Expected preprocessing to reject the reservation')
       expect(result.error.message).toContain(message)
+      expect(result.error.retryAfterMs).toBe(retryAfterMs)
     }
   )
 
@@ -702,6 +822,7 @@ describe('preprocessExecution billing attribution', () => {
       error: {
         statusCode: 503,
         retryable: true,
+        retryAfterMs: 5000,
         code: ADMISSION_ERROR_CODE.RESERVATION_INFRASTRUCTURE,
         cause: { code: 'SERVICE_OVERLOADED' },
       },

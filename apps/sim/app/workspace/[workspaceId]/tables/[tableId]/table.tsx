@@ -1,42 +1,68 @@
 'use client'
 
-import { useCallback, useMemo, useReducer, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { Chip, ChipConfirmModal, toast } from '@sim/emcn'
-import { Download, Pencil, Table as TableIcon, Trash, Upload } from '@sim/emcn/icons'
+import { Download, Lock, Pencil, Trash, Upload } from '@sim/emcn/icons'
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
+import { isEqual } from 'es-toolkit'
 import { useParams, useRouter } from 'next/navigation'
 import { useQueryStates } from 'nuqs'
 import { usePostHog } from 'posthog-js/react'
-import type { RunLimit, RunMode } from '@/lib/api/contracts/tables'
+import type { RunLimit, RunMode, TableViewWire } from '@/lib/api/contracts/tables'
 import { captureEvent } from '@/lib/posthog/client'
 import type {
   ColumnDefinition,
-  Filter,
-  Sort,
+  Predicate,
+  SortDirection,
+  SortSpec,
+  TableMetadata,
+  TablePredicate,
   TableRow as TableRowType,
+  TableViewConfig,
   WorkflowGroup,
 } from '@/lib/table'
 import { getColumnId } from '@/lib/table/column-keys'
-import { TABLE_LIMITS } from '@/lib/table/constants'
+import { withCellValueFilter } from '@/lib/table/query-builder/cell-filter'
 import {
   type BreadcrumbItem,
   type ColumnOption,
   Resource,
   type SortConfig,
 } from '@/app/workspace/[workspaceId]/components'
+import {
+  FOLDERED_RESOURCE_HEADERS,
+  folderBreadcrumbItems,
+  folderedResourceListHref,
+  useFolderAncestors,
+} from '@/app/workspace/[workspaceId]/components/folders'
+import { PresenceAvatars } from '@/app/workspace/[workspaceId]/components/presence/presence-avatars'
 import { LogDetails } from '@/app/workspace/[workspaceId]/logs/components'
+import { useRegisterGlobalCommands } from '@/app/workspace/[workspaceId]/providers/global-commands-provider'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
+import {
+  getTableViewRevision,
+  resolveTableViewConfig,
+  resolveTableViewSelection,
+  shouldApplyTableViewRevision,
+  type TableViewRevision,
+} from '@/app/workspace/[workspaceId]/tables/[tableId]/view-state'
 import { ImportCsvDialog } from '@/app/workspace/[workspaceId]/tables/components/import-csv-dialog'
 import { ImportProgressMenu } from '@/app/workspace/[workspaceId]/tables/components/import-progress-menu'
 import { useLogByExecutionId } from '@/hooks/queries/logs'
 import {
-  downloadTableExport,
+  downloadExportResult,
   useCancelTableRuns,
+  useCreateTableView,
   useDeleteTable,
   useDeleteTableRowsAsync,
-  useExportTableAsync,
+  useDeleteTableView,
+  useExportTable,
   useRenameTable,
   useRunColumn,
+  useTableViews,
+  useUpdateTableMetadata,
+  useUpdateTableView,
 } from '@/hooks/queries/tables'
 import { useInlineRename } from '@/hooks/use-inline-rename'
 import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
@@ -45,22 +71,28 @@ import type { DeletedRowSnapshot } from '@/stores/table/types'
 import {
   type ColumnConfig,
   ColumnConfigSidebar,
+  ColumnDropdown,
+  ColumnsMenu,
   EnrichmentDetails,
   EnrichmentsSidebar,
-  NewColumnDropdown,
+  LockSettingsModal,
   RowModal,
   RunStatusControl,
+  SaveViewModal,
   type SelectionSnapshot,
   TableActionBar,
   TableFilter,
   TableGrid,
+  ViewsMenu,
   type WorkflowConfig,
   WorkflowSidebar,
 } from './components'
 import { COLUMN_SIDEBAR_WIDTH } from './components/table-grid/constants'
-import { COLUMN_TYPE_ICONS } from './components/table-grid/headers'
-import { useTable, useTableEventStream } from './hooks'
+import { columnTypeIcon } from './components/table-grid/headers'
+import { useTable, useTableEventStream, useTableRoom } from './hooks'
+import { type BlockedTableAction, describeBlockedAction, lockedNouns } from './lock-copy'
 import {
+  ALL_VIEW_PARAM,
   DEFAULT_TABLE_DETAIL_SORT_DIRECTION,
   tableDetailParsers,
   tableDetailUrlKeys,
@@ -70,6 +102,9 @@ import { generateColumnName } from './utils'
 
 const logger = createLogger('Table')
 
+/** Blocked-action toasts carry a button, so they linger past the 5s default. */
+const BLOCKED_TOAST_MS = 8000
+
 interface TableProps {
   /** When set, the table renders without its page header / breadcrumbs / page-level
    *  options bar. Used by the mothership chat panel to embed a table inline. */
@@ -77,6 +112,13 @@ interface TableProps {
   /** Identifiers — only set in embedded mode. Page mode reads from `useParams()`. */
   workspaceId?: string
   tableId?: string
+  /**
+   * Saved view to adopt on first seed instead of the table's default —
+   * embedded mode only, set when the agent opened this table pinned to a
+   * view. Participates only in the one-time adoption branch, so it never
+   * fights a later user switch.
+   */
+  initialViewId?: string
 }
 
 /**
@@ -118,6 +160,18 @@ function slideoutReducer(_state: SlideoutState, action: SlideoutAction): Slideou
   }
 }
 
+/** Stable identity so a loading/disabled views query doesn't remint `[]` each render. */
+const NO_VIEWS: TableViewWire[] = []
+
+/** New views are named before configuration; rename targets an existing view. */
+type ViewModalState = { mode: 'new' } | { mode: 'rename'; viewId: string } | null
+
+interface ViewConfigKeep {
+  sort?: boolean
+  filter?: boolean
+  hiddenColumns?: boolean
+}
+
 /**
  * Page-level wrapper for the table detail view. Mirrors the shape of
  * `logs/logs.tsx`: a thin orchestrator that composes the data grid (`<TableGrid>`)
@@ -131,6 +185,7 @@ function slideoutReducer(_state: SlideoutState, action: SlideoutAction): Slideou
  */
 export function Table({
   embedded,
+  initialViewId,
   workspaceId: propWorkspaceId,
   tableId: propTableId,
 }: TableProps = {}) {
@@ -153,8 +208,18 @@ export function Table({
   }
   useTableEventStream({ tableId, workspaceId, onUsageLimitReached })
 
+  // Live table presence (cell-selection carets + avatars). Runs in both modes so the
+  // mothership chat panel shows collaborators' live selections too. The avatar stack lives
+  // only in the `!embedded` Resource.Header, so the embedded panel gets carets without avatars
+  // for free — matching the panel's own-chrome layout.
+  const { otherUsers: presenceUsers, remoteSelections, emitCellSelection } = useTableRoom(tableId)
+
   const [slideout, dispatch] = useReducer(slideoutReducer, { kind: 'none' })
   const [showDeleteTableConfirm, setShowDeleteTableConfirm] = useState(false)
+  const [showLockSettings, setShowLockSettings] = useState(false)
+  // Id of the last blocked-action toast, so a user who keeps typing into a
+  // locked cell replaces one notice rather than stacking a column of them.
+  const blockedToastIdRef = useRef<string | null>(null)
   const [isImportCsvOpen, setIsImportCsvOpen] = useState(false)
   const [editingRow, setEditingRow] = useState<TableRowType | null>(null)
   const [deletingRows, setDeletingRows] = useState<DeletedRowSnapshot[]>([])
@@ -174,17 +239,28 @@ export function Table({
     selectionStats: { hasIncompleteOrFailed: false, hasCompleted: false, hasInFlight: false },
     singleWorkflowCell: null,
   })
-  const [filter, setFilter] = useState<Filter | null>(null)
+  const [filter, setFilter] = useState<TablePredicate | null>(null)
   const [filterOpen, setFilterOpen] = useState(false)
+  /** Bumped whenever the filter is replaced from outside the panel, to re-seed
+   *  its rule rows. See {@link replaceFilter}. */
+  const [filterSeed, setFilterSeed] = useState(0)
+  /** Hidden **column ids**. Lives here (not in the grid) because the filter
+   *  panel's Columns section edits it and the active view persists it. */
+  const [hiddenColumns, setHiddenColumns] = useState<string[]>([])
 
-  const [{ sort: sortColumn, dir: sortDirection }, setSortParams] = useQueryStates(
-    tableDetailParsers,
-    tableDetailUrlKeys
-  )
+  const [{ sort: sortColumn, dir: sortDirection, view: activeViewId }, setTableParams] =
+    useQueryStates(tableDetailParsers, tableDetailUrlKeys)
 
-  /** Resolved single-column sort, or `null` when no column is active. */
-  const sortQuery = useMemo<Sort | null>(
-    () => (sortColumn ? { [sortColumn]: sortDirection } : null),
+  // Read-only mirrors for the resolve effect and replaceFilter's echo check:
+  // both must read the current values without re-running when they change.
+  const filterRef = useRef(filter)
+  filterRef.current = filter
+  const hiddenColumnsRef = useRef(hiddenColumns)
+  hiddenColumnsRef.current = hiddenColumns
+
+  /** Resolved single-column sort as an ordered spec, or `null` when none is active. */
+  const sortQuery = useMemo<SortSpec | null>(
+    () => (sortColumn ? [{ field: sortColumn, direction: sortDirection }] : null),
     [sortColumn, sortDirection]
   )
 
@@ -270,13 +346,551 @@ export function Table({
     ((previousName: string, newName: string) => void) | null
   >(null)
 
+  const { data: viewsData, isError: viewsErrored } = useTableViews({
+    workspaceId,
+    tableId,
+  })
+  const views = viewsData ?? NO_VIEWS
+  /** A views list exists — fresh or cached. A failed background refetch flips
+   *  `isError` while the cached list stays perfectly usable (and every view
+   *  mutation invalidates this query), so success/error is the wrong axis:
+   *  what matters is whether there is a list to resolve against. */
+  const viewsAvailable = viewsData !== undefined
+
   // Single source of truth for `useTable` — drives both the grid render and
   // the wrapper's slideouts/modals. The grid receives the bundle as props.
-  const { tableData, columns, tableWorkflowGroups, workflows } = useTable({
+  const {
+    tableData,
+    columns,
+    tableWorkflowGroups,
+    workflows,
+    // Server-bound scopes use this: a filter condition the current schema
+    // invalidated is pruned from the rows query, so the delete must target the
+    // same predicate the grid is displaying.
+    filter: effectiveFilter,
+  } = useTable({
     workspaceId,
     tableId,
     queryOptions,
   })
+  const tableAvailable = tableData !== undefined
+  const createViewMutation = useCreateTableView({ workspaceId, tableId })
+  const updateViewMutation = useUpdateTableView({ workspaceId, tableId })
+  const updateMetadataMutation = useUpdateTableMetadata({ workspaceId, tableId })
+  const deleteViewMutation = useDeleteTableView({ workspaceId, tableId })
+
+  /** Resolve the default synchronously so the grid, autosave owner, and menu all
+   *  agree before the URL effect records the adopted view id. */
+  const { selectedView, defaultView, activeView } = resolveTableViewSelection(views, activeViewId)
+  const activeViewConfig = useMemo(
+    () => resolveTableViewConfig(tableData?.metadata, activeView?.config ?? null),
+    [tableData?.metadata, activeView?.config]
+  )
+
+  const [viewModal, setViewModal] = useState<ViewModalState>(null)
+  /** Which persisted view revision last seeded the local filter/sort/hidden state.
+   *  `undefined` means "nothing seeded yet" so the first resolve still runs. */
+  const appliedViewRevisionRef = useRef<TableViewRevision | undefined>(undefined)
+
+  /**
+   * A view this client just created, held only until the list refetch carries it.
+   * Distinct from `appliedViewRevisionRef`, which is stamped on EVERY selection —
+   * reusing that for the create race also matched a view that had been selected
+   * normally and then deleted, so the delete never cleaned up.
+   */
+  const pendingCreatedViewIdRef = useRef<string | null>(null)
+
+  /** View config gestures made before the views query identifies their owner. */
+  const pendingViewConfigRef = useRef<TableViewConfig | null>(null)
+
+  /**
+   * State deliberately kept over the first view seed. Deep-linked sort remains
+   * authoritative until the user changes it; early filter/column gestures stay
+   * protected until their queued patch succeeds.
+   */
+  const preservedViewStateRef = useRef<{ viewId: string; keep: ViewConfigKeep } | null>(null)
+
+  /**
+   * Replaces the filter from OUTSIDE the filter panel — a view switch, or
+   * "Filter by cell value". Bumps {@link filterSeed} so the panel re-seeds: it
+   * builds its draft rule rows from the predicate once at mount, so without
+   * this an open panel keeps showing the rules of the filter it replaced.
+   *
+   * The remount discards an unapplied draft, which is the point — the rules on
+   * screen must be the rules in effect. An incoming filter identical to the
+   * current one is skipped entirely: the resolve effect re-applies the config
+   * after this client's own autosave settles, and letting that echo remount an
+   * open panel would wipe keystrokes typed since the flush and steal focus.
+   */
+  const replaceFilter = useCallback((next: TablePredicate | null) => {
+    if (isEqual(next, filterRef.current)) return
+    setFilter(next)
+    setFilterSeed((seed) => seed + 1)
+  }, [])
+
+  /**
+   * Applies a view's config to the live state. `keep` marks slices the user has
+   * already set by hand. A deep-linked `?sort=` is more specific than the view's
+   * default, and a filter typed while the views query was still in flight should
+   * not be thrown away when it lands. Switching views later passes no `keep`, so
+   * the incoming view fully replaces the outgoing one.
+   */
+  const applyViewConfig = useCallback(
+    (config: TableViewConfig | null, keep?: ViewConfigKeep) => {
+      if (!keep?.filter) replaceFilter(config?.filter ?? null)
+      if (!keep?.hiddenColumns) setHiddenColumns(config?.hiddenColumns ?? [])
+      if (keep?.sort) return
+      const sortEntry = config?.sort?.[0]
+      setTableParams({
+        sort: sortEntry ? sortEntry.field : null,
+        dir: sortEntry ? (sortEntry.direction as SortDirection) : null,
+      })
+    },
+    [replaceFilter, setTableParams]
+  )
+
+  /** Reader for the grid's CURRENT column layout, populated by the grid itself.
+   *  The grid owns widths/order/pinning, so the wrapper asks at the moment it
+   *  needs them instead of mirroring every patch — a mirror only stays right
+   *  while every write flows through it, and layout writes bypass it whenever
+   *  All is active. */
+  const layoutSnapshotRef = useRef<(() => TableMetadata) | null>(null)
+  const readLayout = useCallback((): TableMetadata => layoutSnapshotRef.current?.() ?? {}, [])
+
+  /** Layout patch the user committed before the views query identified its owner. */
+  const pendingLayoutPatchRef = useRef<TableMetadata | null>(null)
+
+  /** Whether the resolve effect has decided the initial owner — including the
+   *  terminal-error fallback to All. Until then a write that reads "All" might
+   *  actually belong to a default view about to be adopted, so it buffers. */
+  const ownerResolvedRef = useRef(false)
+
+  /**
+   * Resolves that pending layout once the resolve effect has picked an owner.
+   *
+   * Called from the resolve effect rather than keyed on the URL selection:
+   * default adoption is resolved synchronously before that URL catches up.
+   */
+  const resolvePendingLayout = useCallback(
+    (viewId: string | null) => {
+      const patch = pendingLayoutPatchRef.current
+      pendingLayoutPatchRef.current = null
+      if (!patch || !userPermissions.canEdit) return
+      if (viewId) {
+        updateViewMutation.mutate(
+          { viewId, configPatch: patch },
+          { onError: (error) => toast.error(getErrorMessage(error, 'Failed to save layout')) }
+        )
+        return
+      }
+      updateMetadataMutation.mutate(patch)
+    },
+    [userPermissions.canEdit]
+  )
+
+  /** What the user has already set by hand when the first view resolves. */
+  const localWork = () => {
+    const pending = pendingViewConfigRef.current
+    return {
+      sort: sortColumn !== null || Boolean(pending && 'sort' in pending),
+      filter: filterRef.current !== null || Boolean(pending && 'filter' in pending),
+      hiddenColumns:
+        hiddenColumnsRef.current.length > 0 || Boolean(pending && 'hiddenColumns' in pending),
+    }
+  }
+
+  const preserveViewState = useCallback((viewId: string, keep: ViewConfigKeep | undefined) => {
+    if (!keep || (!keep.sort && !keep.filter && !keep.hiddenColumns)) {
+      preservedViewStateRef.current = null
+      return
+    }
+    preservedViewStateRef.current = { viewId, keep }
+  }, [])
+
+  const releasePersistedViewState = useCallback((viewId: string, patch: TableViewConfig) => {
+    const preserved = preservedViewStateRef.current
+    if (!preserved || preserved.viewId !== viewId) return
+    const keep = { ...preserved.keep }
+    if ('sort' in patch) keep.sort = undefined
+    if ('filter' in patch) keep.filter = undefined
+    if ('hiddenColumns' in patch) keep.hiddenColumns = undefined
+    preservedViewStateRef.current =
+      keep.sort || keep.filter || keep.hiddenColumns ? { viewId, keep } : null
+  }, [])
+
+  const flushPendingViewConfig = useCallback(
+    (viewId: string) => {
+      const configPatch = pendingViewConfigRef.current
+      if (!configPatch || !userPermissions.canEdit) return
+      pendingViewConfigRef.current = null
+      updateViewMutation.mutate(
+        { viewId, configPatch },
+        {
+          onSuccess: () => releasePersistedViewState(viewId, configPatch),
+          onError: (error) => toast.error(getErrorMessage(error, 'Failed to save view')),
+        }
+      )
+    },
+    [userPermissions.canEdit, releasePersistedViewState]
+  )
+
+  /**
+   * Resolves the active view and seeds the local filter/sort/hidden-column state
+   * from it. A different view always applies; a newer revision of the same view
+   * applies once this client's autosave queue settles. That lets navigation
+   * rehydrate a freshly saved filter without an intermediate response rewinding
+   * a newer local gesture.
+   *
+   * On first load with no `?view=` the table's default view (if any) is selected
+   * and written into the URL explicitly — a link then keeps resolving to the same
+   * view even after someone changes which view is default.
+   */
+  useEffect(() => {
+    // Terminal only when the fetch failed WITHOUT ever producing a list — then
+    // the table settles to All: mark the owner resolved so layout writes flow
+    // to shared metadata, and flush what was touched during the load. It does
+    // NOT stamp `appliedViewRevisionRef` — that would consume the first resolve, and a
+    // later successful refetch must still run adoption (with `localWork` keep,
+    // so filters set while errored survive). An error with a cached list falls
+    // through — the list is still resolvable.
+    if (viewsErrored && !viewsAvailable) {
+      ownerResolvedRef.current = true
+      resolvePendingLayout(null)
+      return
+    }
+    if (!viewsAvailable || !tableAvailable) return
+    ownerResolvedRef.current = true
+    if (appliedViewRevisionRef.current === undefined) {
+      // Embedded tables bind these parsers to the HOST page's URL, which the
+      // mothership panel keeps across resource switches. A view id this table
+      // can't resolve was left by the previously-open resource — ignore it so
+      // this table picks its own default. A param it CAN resolve is honoured.
+      const inheritedParams =
+        embedded &&
+        activeViewId !== null &&
+        activeViewId !== ALL_VIEW_PARAM &&
+        selectedView === null
+      // Until the backfill ships, All remains the compatibility state for a
+      // table with no persisted default. Once a default exists, an old All URL
+      // upgrades to that view instead of preserving the synthetic state.
+      const legacyAllWithDefault = activeViewId === ALL_VIEW_PARAM && defaultView !== null
+
+      if (activeViewId === null || inheritedParams || legacyAllWithDefault) {
+        // Embedded mode may pin the view the agent opened this table on
+        // (`initialViewId`); the pin outranks the persisted default for this
+        // first adoption.
+        const pinnedView =
+          embedded && initialViewId ? views.find((view) => view.id === initialViewId) : undefined
+        const viewToApply = pinnedView ?? defaultView
+        // `sort` rides the same host URL, so when the view id is inherited the
+        // sort beside it is too — not local work, and it must not suppress the
+        // default view's own sort.
+        const keep = inheritedParams ? { ...localWork(), sort: false } : localWork()
+        if (viewToApply) {
+          appliedViewRevisionRef.current = getTableViewRevision(viewToApply)
+          setTableParams({ view: viewToApply.id })
+          preserveViewState(viewToApply.id, keep)
+          applyViewConfig(resolveTableViewConfig(tableData?.metadata, viewToApply.config), keep)
+          resolvePendingLayout(viewToApply.id)
+          flushPendingViewConfig(viewToApply.id)
+          return
+        }
+        // No view to adopt. Deliberately does NOT apply an empty config — that
+        // would clear a deep-linked `?sort=` on mount. Inherited params are the
+        // exception: nothing about them refers to this table, so they're cleared.
+        appliedViewRevisionRef.current = getTableViewRevision(null)
+        if (inheritedParams) setTableParams({ view: ALL_VIEW_PARAM, sort: null, dir: null })
+        resolvePendingLayout(null)
+        return
+      }
+      if (activeViewId === ALL_VIEW_PARAM) {
+        appliedViewRevisionRef.current = getTableViewRevision(null)
+        resolvePendingLayout(null)
+        return
+      }
+      // A `?view=` that resolves to nothing adopts the persisted default when
+      // one exists; tables awaiting backfill retain the legacy All fallback.
+      const viewToAdopt = selectedView ?? defaultView
+      const keep = localWork()
+      appliedViewRevisionRef.current = getTableViewRevision(viewToAdopt)
+      resolvePendingLayout(viewToAdopt?.id ?? null)
+      if (selectedView) {
+        preserveViewState(selectedView.id, keep)
+        applyViewConfig(resolveTableViewConfig(tableData?.metadata, selectedView.config), keep)
+        flushPendingViewConfig(selectedView.id)
+      } else if (defaultView) {
+        setTableParams({ view: defaultView.id })
+        preserveViewState(defaultView.id, keep)
+        applyViewConfig(resolveTableViewConfig(tableData?.metadata, defaultView.config), keep)
+        flushPendingViewConfig(defaultView.id)
+      } else {
+        // Nothing to apply, but the URL still names a view that no longer exists.
+        // Rewrite it so a stale bookmark can't be copied on, and so the param
+        // matches the All the UI is already showing.
+        setTableParams({ view: ALL_VIEW_PARAM })
+      }
+      return
+    }
+
+    /** Creating a view updates the query cache before nuqs commits its URL id.
+     *  Keep the blank view already applied in the success handler during that
+     *  gap instead of briefly reapplying the previously selected view. */
+    if (pendingCreatedViewIdRef.current && activeViewId !== pendingCreatedViewIdRef.current) {
+      return
+    }
+
+    // The id resolved, so any create race for it is over.
+    if (selectedView && pendingCreatedViewIdRef.current === selectedView.id) {
+      pendingCreatedViewIdRef.current = null
+    }
+
+    // A selected id that doesn't resolve is one of two things. Ours — creation
+    // writes the URL before the list refetches, and clearing there would wipe the
+    // config just saved. Or genuinely dead (deleted by someone else, stale
+    // bookmark), where leaving it applied keeps the grid narrowed under the
+    // wrong label because the menu resolves the same missing view to null.
+    if (activeViewId !== null && activeViewId !== ALL_VIEW_PARAM && !selectedView) {
+      if (pendingCreatedViewIdRef.current === activeViewId) return
+      preservedViewStateRef.current = null
+      appliedViewRevisionRef.current = getTableViewRevision(defaultView)
+      setTableParams({ view: defaultView?.id ?? ALL_VIEW_PARAM })
+      applyViewConfig(resolveTableViewConfig(tableData?.metadata, defaultView?.config ?? null))
+      return
+    }
+
+    const nextViewRevision = getTableViewRevision(activeView)
+    if (
+      !shouldApplyTableViewRevision(
+        appliedViewRevisionRef.current,
+        nextViewRevision,
+        updateViewMutation.isPending
+      )
+    ) {
+      return
+    }
+    appliedViewRevisionRef.current = nextViewRevision
+    const nextViewId = nextViewRevision.id
+    const preserved = preservedViewStateRef.current
+    if (preserved && preserved.viewId !== nextViewId) {
+      preservedViewStateRef.current = null
+    }
+    if (activeView && (activeViewId === null || activeViewId === ALL_VIEW_PARAM)) {
+      setTableParams({ view: activeView.id })
+    }
+    const keep = preserved?.viewId === nextViewId ? preserved.keep : undefined
+    applyViewConfig(activeViewConfig, keep)
+    if (activeView) flushPendingViewConfig(activeView.id)
+  }, [
+    viewsAvailable,
+    viewsErrored,
+    tableAvailable,
+    views,
+    selectedView,
+    defaultView,
+    activeView,
+    activeViewConfig,
+    activeViewId,
+    embedded,
+    sortColumn,
+    updateViewMutation.isPending,
+    applyViewConfig,
+    setTableParams,
+    resolvePendingLayout,
+    preserveViewState,
+    flushPendingViewConfig,
+    tableData?.metadata,
+  ])
+
+  /**
+   * Live state pruned the same way `pruneViewConfig` prunes the stored config on
+   * read. Without this, deleting a hidden or sorted column leaves the local ids
+   * behind while the server drops them. Guarded on the schema being loaded so
+   * an empty first render doesn't prune everything.
+   */
+  const liveColumnIds = useMemo(() => new Set(columns.map(getColumnId)), [columns])
+  const effectiveHiddenColumns = useMemo(
+    () =>
+      columns.length === 0 ? hiddenColumns : hiddenColumns.filter((id) => liveColumnIds.has(id)),
+    [columns.length, hiddenColumns, liveColumnIds]
+  )
+
+  /** Rename targets a live view rather than a snapshot, so a concurrent rename or
+   *  delete can't leave the modal editing stale data. */
+  const renamingView =
+    viewModal?.mode === 'rename' ? (views.find((v) => v.id === viewModal.viewId) ?? null) : null
+
+  const handleSelectView = useCallback(
+    (viewId: string | null) => {
+      preservedViewStateRef.current = null
+      setTableParams({ view: viewId ?? ALL_VIEW_PARAM })
+    },
+    [setTableParams]
+  )
+
+  const handleRenameView = useCallback((viewId: string) => {
+    setViewModal({ mode: 'rename', viewId })
+  }, [])
+
+  const handleSetDefaultView = useCallback((viewId: string) => {
+    updateViewMutation.mutate(
+      { viewId, isDefault: true },
+      {
+        onError: (error) => toast.error(getErrorMessage(error, 'Failed to set default view')),
+      }
+    )
+  }, [])
+
+  const handleNewView = useCallback(() => {
+    setViewModal({ mode: 'new' })
+  }, [])
+
+  /**
+   * Persists one user-committed view change. Filter application, sorting, and
+   * column visibility are discrete gestures, so they can save immediately
+   * without the document-style debounce needed for text editing. The mutation
+   * hook serializes patches for this table, preserving click order when several
+   * visibility changes happen before the first request settles.
+   */
+  const persistActiveViewConfig = useCallback(
+    (configPatch: TableViewConfig) => {
+      if (!userPermissions.canEdit) return
+      const viewId = activeView?.id ?? pendingCreatedViewIdRef.current
+      if (!viewId) {
+        if (!ownerResolvedRef.current) {
+          pendingViewConfigRef.current = {
+            ...pendingViewConfigRef.current,
+            ...configPatch,
+          }
+        }
+        return
+      }
+
+      updateViewMutation.mutate(
+        { viewId, configPatch },
+        {
+          onSuccess: () => releasePersistedViewState(viewId, configPatch),
+          onError: (error) => toast.error(getErrorMessage(error, 'Failed to save view')),
+        }
+      )
+    },
+    [activeView?.id, userPermissions.canEdit, releasePersistedViewState]
+  )
+
+  /**
+   * Drops a sort whose column was deleted from the URL and, only when the saved
+   * view names that same field, from persistence. A stale deep-link can name a
+   * missing field while the view still owns a different valid sort, which must
+   * not be erased.
+   */
+  useEffect(() => {
+    if (!sortColumn || columns.length === 0) return
+    if (liveColumnIds.has(sortColumn)) return
+    setTableParams({ sort: null, dir: null })
+    if (activeViewConfig?.sort?.[0]?.field === sortColumn) {
+      persistActiveViewConfig({ sort: null })
+    }
+  }, [
+    sortColumn,
+    columns.length,
+    liveColumnIds,
+    activeViewConfig?.sort,
+    setTableParams,
+    persistActiveViewConfig,
+  ])
+
+  /** Column order/width/pinning auto-saves into the active view as the user drags.
+   *  Sent as a `configPatch` so the server merges it — two overlapping layout writes must
+   *  not each replace the whole blob from their own snapshot. With All selected
+   *  the sink is unbound and the grid writes the table's shared metadata instead;
+   *  while the views query is still loading the sink IS bound and the write is
+   *  suppressed, because the owner isn't known yet. */
+  const handlePersistLayout = useCallback(
+    (patch: TableMetadata, owner: string | null) => {
+      // The resize grip and drag handles stay live for read-only members, so
+      // without this a resize fires a write-gated PATCH and an error toast. Local
+      // layout still updates — only the persist is suppressed.
+      if (!userPermissions.canEdit) return
+      // `owner` is stamped by the GRID — the layout source it was displaying
+      // when the write happened — so routing no longer depends on when the
+      // resolve effect ran relative to the grid's own effects. A write stamped
+      // with a view id is fully addressed: route it even before the first
+      // resolve (a deep-linked view's seed reconcile must persist, not buffer)
+      // or before the list refetch resolves a just-created view.
+      const target = owner ?? pendingCreatedViewIdRef.current
+      if (target) {
+        updateViewMutation.mutate(
+          { viewId: target, configPatch: patch },
+          { onError: (error) => toast.error(getErrorMessage(error, 'Failed to save layout')) }
+        )
+        return
+      }
+      // Owner reads "All", but the resolve effect hasn't confirmed that yet —
+      // retain the exact gesture so adoption can save it to the selected owner.
+      if (!ownerResolvedRef.current) {
+        pendingLayoutPatchRef.current = { ...pendingLayoutPatchRef.current, ...patch }
+        return
+      }
+      updateMetadataMutation.mutate(patch)
+    },
+    [userPermissions.canEdit]
+  )
+
+  const handleSubmitViewName = (name: string) => {
+    if (viewModal?.mode === 'rename') {
+      updateViewMutation.mutate(
+        { viewId: viewModal.viewId, name },
+        {
+          onSuccess: () => setViewModal(null),
+          onError: (error) => toast.error(getErrorMessage(error, 'Failed to rename view')),
+        }
+      )
+      return
+    }
+    // New views start unfiltered and are configured after naming. They inherit
+    // the live layout so creation never visually resets the grid.
+    const config: TableViewConfig = {
+      ...(activeView?.config ?? tableData?.metadata),
+      ...readLayout(),
+      filter: null,
+      sort: null,
+      hiddenColumns: [],
+    }
+    createViewMutation.mutate(
+      { name, config },
+      {
+        onSuccess: (view) => {
+          setViewModal(null)
+          // Stamp before selecting so the resolve effect treats this as already
+          // seeded — it can't tell a just-created view from a dead id otherwise.
+          appliedViewRevisionRef.current = getTableViewRevision(view)
+          pendingCreatedViewIdRef.current = view.id
+          setTableParams({ view: view.id })
+          // Apply the clean config immediately; nuqs batches its sort write with
+          // the `view` write above into one URL update.
+          applyViewConfig(view.config)
+        },
+        onError: (error) => toast.error(getErrorMessage(error, 'Failed to create view')),
+      }
+    )
+  }
+
+  const handleDeleteView = useCallback(
+    (viewId: string) => {
+      if (views.some((view) => view.id === viewId && view.isDefault)) {
+        toast.error('Set another view as default before deleting this view')
+        return
+      }
+      deleteViewMutation.mutate(viewId, {
+        onSuccess: () => {
+          if (viewId !== activeViewId) return
+          const defaultView = views.find((view) => view.isDefault && view.id !== viewId)
+          setTableParams({ view: defaultView?.id ?? ALL_VIEW_PARAM })
+        },
+        onError: (error) => toast.error(getErrorMessage(error, 'Failed to delete view')),
+      })
+    },
+    [activeViewId, views, setTableParams]
+  )
 
   const runColumnMutation = useRunColumn({ workspaceId, tableId })
   const cancelRunsMutation = useCancelTableRuns({ workspaceId, tableId })
@@ -290,7 +904,7 @@ export function Table({
     (args: {
       groupIds: string[]
       rowIds?: string[]
-      filter?: Filter
+      filter?: TablePredicate
       excludeRowIds?: string[]
       runMode: RunMode
       limit?: RunLimit
@@ -329,7 +943,7 @@ export function Table({
       runMode: RunMode,
       rowIds?: string[],
       limit?: RunLimit,
-      filter?: Filter,
+      filter?: TablePredicate,
       excludeRowIds?: string[]
     ) => {
       runScope({
@@ -346,7 +960,12 @@ export function Table({
   )
 
   const onRunRows = useCallback(
-    (rowIds: string[] | undefined, runMode: RunMode, filter?: Filter, excludeRowIds?: string[]) => {
+    (
+      rowIds: string[] | undefined,
+      runMode: RunMode,
+      filter?: TablePredicate,
+      excludeRowIds?: string[]
+    ) => {
       runScope({
         groupIds: tableWorkflowGroups.map((g) => g.id),
         rowIds,
@@ -414,7 +1033,7 @@ export function Table({
 
   /** Select-all Stop — filter-scoped when a filter is active; deselected rows keep running. */
   const onStopAllRows = useCallback(
-    (filter?: Filter, excludeRowIds?: string[]) => {
+    (filter?: TablePredicate, excludeRowIds?: string[]) => {
       // `sort` scopes the optimistic flip to the active view's cache (filtered stops
       // only cancel matching rows server-side).
       cancelRunsMutate({ scope: 'all', filter, sort: queryOptions.sort, excludeRowIds })
@@ -443,9 +1062,24 @@ export function Table({
     },
   })
 
-  const handleNavigateBack = useCallback(() => {
-    router.push(`/workspace/${workspaceId}/tables`)
-  }, [router, workspaceId])
+  /**
+   * The table's own folder trail, so the header reads `Tables / Reports / Q3` exactly as the
+   * list does one level up — and as a file's header does. Skipped in embedded mode, which
+   * renders no header at all.
+   */
+  const { ancestors: folderChain } = useFolderAncestors({
+    resourceType: 'table',
+    workspaceId,
+    folderId: tableData?.folderId,
+    enabled: !embedded,
+  })
+
+  const handleNavigateToFolder = useCallback(
+    (folderId: string | null) => {
+      router.push(folderedResourceListHref('table', workspaceId, folderId))
+    },
+    [router, workspaceId]
+  )
 
   const handleStartTableRename = useCallback(() => {
     const data = tableDataRef.current
@@ -467,16 +1101,11 @@ export function Table({
   const handleExportCsv = useCallback(async () => {
     if (!tableData) return
     try {
-      // Big tables export as a background job (the file downloads when the job completes via the
-      // SSE stream); small ones keep the instant synchronous stream. While a delete job runs,
-      // rowCount is a doomed-estimate-adjusted number — not ground truth — so always take the
-      // async path (safe at any size; exports bypass the one-job-per-table gate).
-      const deleteRunning = tableData.jobType === 'delete' && tableData.jobStatus === 'running'
-      if (deleteRunning || tableData.rowCount > TABLE_LIMITS.EXPORT_ASYNC_THRESHOLD_ROWS) {
-        await exportTableAsync.mutateAsync({ format: 'csv' })
-        toast.success('Export started — the download will begin when it finishes')
+      const exported = await exportTableAsync.mutateAsync({ format: 'csv' })
+      if (exported.status === 'completed') {
+        await downloadExportResult(workspaceId, exported.id)
       } else {
-        await downloadTableExport(tableData.id, tableData.name)
+        toast.success('Export started — the download will begin when it finishes')
       }
       captureEvent(posthogRef.current, 'table_exported', {
         table_id: tableData.id,
@@ -488,6 +1117,34 @@ export function Table({
     }
   }, [tableData, workspaceId])
 
+  useRegisterGlobalCommands(() => [
+    {
+      id: 'table-new-column',
+      handler: () => {
+        if (!userPermissions.canEdit) return
+        if (tableDataRef.current?.locks.schemaLocked) {
+          showBlockedToast('add-column')
+          return
+        }
+        handleAddColumnOfType('string')
+      },
+    },
+    {
+      id: 'table-export-csv',
+      handler: () => {
+        if (!tableDataRef.current?.rowCount) return
+        void handleExportCsv()
+      },
+    },
+    {
+      id: 'table-import-csv',
+      handler: () => {
+        if (!userPermissions.canEdit || tableDataRef.current?.locks.insertLocked) return
+        onRequestImportCsv()
+      },
+    },
+  ])
+
   const columnOptions = useMemo<ColumnOption[]>(
     () =>
       columns.map((col) => ({
@@ -495,63 +1152,123 @@ export function Table({
         id: getColumnId(col),
         label: col.name,
         type: col.type,
-        icon: COLUMN_TYPE_ICONS[col.type],
+        icon: columnTypeIcon(col.type),
       })),
     [columns]
   )
+
+  const handleSortColumn = useCallback(
+    (column: string, direction: SortDirection) => {
+      setTableParams({ sort: column, dir: direction })
+      persistActiveViewConfig({ sort: [{ field: column, direction }] })
+    },
+    [setTableParams, persistActiveViewConfig]
+  )
+
+  /**
+   * Clearing writes the default direction (stripped by clearOnDefault) and
+   * drops the column, leaving a clean URL with no active sort.
+   */
+  const handleClearSort = useCallback(() => {
+    setTableParams({ sort: null, dir: DEFAULT_TABLE_DETAIL_SORT_DIRECTION })
+    persistActiveViewConfig({ sort: null })
+  }, [setTableParams, persistActiveViewConfig])
 
   const sortConfig = useMemo<SortConfig>(
     () => ({
       options: columnOptions,
       active: sortColumn ? { column: sortColumn, direction: sortDirection } : null,
-      onSort: (column, direction) => setSortParams({ sort: column, dir: direction }),
-      /**
-       * Clearing writes the default direction (stripped by clearOnDefault) and
-       * drops the column, leaving a clean URL with no active sort.
-       */
-      onClear: () => setSortParams({ sort: null, dir: DEFAULT_TABLE_DETAIL_SORT_DIRECTION }),
+      onSort: handleSortColumn,
+      onClear: handleClearSort,
+      keepOpenOnSelect: true,
     }),
-    [columnOptions, sortColumn, sortDirection, setSortParams]
+    [columnOptions, sortColumn, sortDirection, handleSortColumn, handleClearSort]
   )
 
-  const handleFilterApply = (next: Filter | null) => {
-    setFilter(next)
+  const handleFilterChange = useCallback(
+    (next: TablePredicate | null) => {
+      setFilter(next)
+      persistActiveViewConfig({ filter: next })
+    },
+    [persistActiveViewConfig]
+  )
+
+  const handleHiddenColumnsChange = useCallback(
+    (next: string[]) => {
+      setHiddenColumns(next)
+      persistActiveViewConfig({ hiddenColumns: next })
+    },
+    [persistActiveViewConfig]
+  )
+
+  /**
+   * "Filter by cell value" from the grid's cell context menu. Narrows the
+   * PRUNED filter, so a condition the current schema already invalidated is not
+   * resurrected, and opens the panel — a silently narrowed table would leave the
+   * user no way to see what was applied. Persists explicitly: the reseeded
+   * panel starts signature-matched to this filter, so its gesture handlers will
+   * not emit it again.
+   */
+  const handleFilterByCellValue = (conditions: readonly Predicate[]) => {
+    const next = withCellValueFilter(effectiveFilter, conditions)
+    replaceFilter(next)
+    persistActiveViewConfig({ filter: next })
+    setFilterOpen(true)
   }
 
   const breadcrumbs = useMemo(
-    (): BreadcrumbItem[] => [
-      { label: 'Tables', onClick: handleNavigateBack },
-      // While the table loads, mirror this route's loading.tsx (terminal "…" crumb)
-      // so no empty-label / orphaned-chevron frame renders in between.
-      tableData
-        ? {
-            label: tableData.name,
-            editing: tableHeaderRename.editingId
-              ? {
-                  isEditing: true,
-                  value: tableHeaderRename.editValue,
-                  onChange: tableHeaderRename.setEditValue,
-                  onSubmit: tableHeaderRename.submitRename,
-                  onCancel: tableHeaderRename.cancelRename,
-                }
-              : undefined,
-            dropdownItems: [
-              {
-                label: 'Rename',
-                icon: Pencil,
-                onClick: handleStartTableRename,
-              },
-              {
-                label: 'Delete',
-                icon: Trash,
-                onClick: onRequestDeleteTable,
-              },
-            ],
-          }
-        : { label: '…', terminal: true },
-    ],
+    (): BreadcrumbItem[] =>
+      folderBreadcrumbItems({
+        rootLabel: FOLDERED_RESOURCE_HEADERS.table.rootLabel,
+        rootIcon: FOLDERED_RESOURCE_HEADERS.table.rootIcon,
+        breadcrumbs: folderChain,
+        onNavigate: handleNavigateToFolder,
+        trailing: [
+          // While the table loads, mirror this route's loading.tsx (terminal "…" crumb)
+          // so no empty-label / orphaned-chevron frame renders in between.
+          tableData
+            ? {
+                label: tableData.name,
+                editing: tableHeaderRename.editingId
+                  ? {
+                      isEditing: true,
+                      value: tableHeaderRename.editValue,
+                      onChange: tableHeaderRename.setEditValue,
+                      onSubmit: tableHeaderRename.submitRename,
+                      onCancel: tableHeaderRename.cancelRename,
+                    }
+                  : undefined,
+                dropdownItems: [
+                  {
+                    label: 'Rename',
+                    icon: Pencil,
+                    onClick: handleStartTableRename,
+                  },
+                  ...(userPermissions.canAdmin
+                    ? [
+                        {
+                          label: 'Lock settings',
+                          icon: Lock,
+                          onClick: () => setShowLockSettings(true),
+                        },
+                      ]
+                    : []),
+                  {
+                    label: 'Delete',
+                    icon: Trash,
+                    onClick: onRequestDeleteTable,
+                    disabled: userPermissions.canEdit !== true || tableData.locks.deleteLocked,
+                  },
+                ],
+              }
+            : { label: '…', terminal: true },
+        ],
+      }),
     [
-      handleNavigateBack,
+      folderChain,
+      handleNavigateToFolder,
+      userPermissions.canAdmin,
+      userPermissions.canEdit,
       tableData,
       tableHeaderRename.editingId,
       tableHeaderRename.editValue,
@@ -563,31 +1280,103 @@ export function Table({
     ]
   )
 
-  const headerActions = useMemo(
-    () =>
-      tableData
-        ? [
-            {
-              label: 'Import CSV',
-              icon: Upload,
-              onClick: onRequestImportCsv,
-              disabled: userPermissions.canEdit !== true,
-            },
-            {
-              label: 'Export CSV',
-              icon: Download,
-              onClick: () => void handleExportCsv(),
-              disabled: tableData.rowCount === 0,
-            },
-          ]
-        : undefined,
-    [tableData, userPermissions.canEdit, handleExportCsv, onRequestImportCsv]
+  const canOpenLockSettings = userPermissions.canAdmin === true
+
+  /**
+   * Explains why a table mutation is unavailable. A toast rather than a modal:
+   * being told you can't edit shouldn't cost a dismiss click, and admins still
+   * get a direct route to the settings via the action button.
+   */
+  const showBlockedToast = useCallback(
+    (action: BlockedTableAction) => {
+      if (!tableData) return
+      if (blockedToastIdRef.current) toast.dismiss(blockedToastIdRef.current)
+      const { title, text } = describeBlockedAction(action, tableData.locks)
+      // 'status' is the on-open announcement — nothing was refused, so it reads
+      // as information rather than a warning.
+      const notify = action === 'status' ? toast.info : toast.warning
+      blockedToastIdRef.current = notify(title, {
+        description: text,
+        ...(canOpenLockSettings
+          ? {
+              action: { label: 'Lock settings', onClick: () => setShowLockSettings(true) },
+              // An action would otherwise pin the toast open until dismissed.
+              duration: BLOCKED_TOAST_MS,
+            }
+          : {}),
+      })
+    },
+    [tableData, canOpenLockSettings]
   )
 
+  // Announce the lock state once per table on open. Unlike the re-rendering
+  // permission gates, this fires once and can't self-correct, so it waits for
+  // `canAdmin` to settle instead of treating loading as permitted.
+  const announcedLockTableIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!tableData || userPermissions.isLoading) return
+    if (announcedLockTableIdRef.current === tableData.id) return
+    announcedLockTableIdRef.current = tableData.id
+    if (lockedNouns(tableData.locks).length === 0) return
+    showBlockedToast('status')
+  }, [tableData, userPermissions.isLoading, showBlockedToast])
+
+  // A notice must not outlive the table it describes — its action targets
+  // whichever table is current. Keyed on `tableId` so an embedded swap that
+  // changes the prop without a route change is covered too. Leaving ends the
+  // visit, so the latch resets and coming back announces again.
+  useEffect(
+    () => () => {
+      announcedLockTableIdRef.current = null
+      if (!blockedToastIdRef.current) return
+      toast.dismiss(blockedToastIdRef.current)
+      blockedToastIdRef.current = null
+    },
+    [tableId]
+  )
+
+  // A toast's action is captured when it is created, so a viewer who loses
+  // admin access mid-toast would keep a Lock settings button that opens
+  // nothing. Dismiss on that transition only — a viewer who never had access
+  // has a legitimate action-less notice that must survive.
+  const couldOpenLockSettingsRef = useRef(canOpenLockSettings)
+  useEffect(() => {
+    const lostAccess = couldOpenLockSettingsRef.current && !canOpenLockSettings
+    couldOpenLockSettingsRef.current = canOpenLockSettings
+    if (!lostAccess || !blockedToastIdRef.current) return
+    toast.dismiss(blockedToastIdRef.current)
+    blockedToastIdRef.current = null
+  }, [canOpenLockSettings])
+
+  const headerActions = useMemo(() => {
+    if (!tableData) return undefined
+    return [
+      {
+        label: 'Import CSV',
+        icon: Upload,
+        onClick: onRequestImportCsv,
+        // An import always inserts, so the insert lock disables it outright
+        // rather than letting the dialog run to a server-side 423.
+        disabled: userPermissions.canEdit !== true || tableData.locks.insertLocked,
+      },
+      {
+        label: 'Export CSV',
+        icon: Download,
+        onClick: () => void handleExportCsv(),
+        disabled: tableData.rowCount === 0,
+      },
+    ]
+  }, [tableData, userPermissions.canEdit, handleExportCsv, onRequestImportCsv])
+
+  // Adding a column is a schema change. The trigger stays visible when the
+  // table is schema-locked and explains itself instead of disappearing.
+  const canMutateSchema = userPermissions.canEdit && !tableData?.locks.schemaLocked
   const createTrigger = userPermissions.canEdit ? (
-    <NewColumnDropdown
+    <ColumnDropdown
       trigger='header'
       disabled={false}
+      blocked={!canMutateSchema}
+      onBlocked={() => showBlockedToast('add-column')}
       onPickType={handleAddColumnOfType}
       onPickWorkflow={handleAddWorkflowColumn}
       onPickEnrichment={onOpenEnrichments}
@@ -604,7 +1393,7 @@ export function Table({
 
   const deleteTableMutation = useDeleteTable(workspaceId)
   const deleteRowsAsyncMutation = useDeleteTableRowsAsync({ workspaceId, tableId })
-  const exportTableAsync = useExportTableAsync({ workspaceId, tableId })
+  const exportTableAsync = useExportTable({ workspaceId, tableId })
   const handleDeleteTable = async () => {
     try {
       await deleteTableMutation.mutateAsync(tableId)
@@ -640,20 +1429,40 @@ export function Table({
   const filterConfig = useMemo(
     () => ({
       mode: 'toggle' as const,
-      active: filterOpen || !!queryOptions.filter,
+      // The pruned filter, not the raw one: a condition the current schema
+      // invalidated is not applied to the grid, so showing the chip as active
+      // (and reopening that rule) would claim a filter the rows do not reflect.
+      active: filterOpen || !!effectiveFilter,
       onToggle: handleToggleFilter,
     }),
-    [filterOpen, queryOptions.filter, handleToggleFilter]
+    [filterOpen, effectiveFilter, handleToggleFilter]
   )
+
+  const runStatus =
+    embedded && (selection.totalRunning > 0 || selection.hasActiveDispatch) ? (
+      <RunStatusControl
+        running={selection.totalRunning}
+        queueing={!selection.hasRunningCell}
+        onStopAll={onStopAll}
+        isStopping={cancelRunsMutation.isPending}
+      />
+    ) : null
+
+  /** Right-aligned slot. Left `undefined` when absent so the options bar
+   *  doesn't render an empty flex row. */
+  const optionsTrailing = runStatus || undefined
 
   return (
     <Resource>
       {!embedded && (
         <Resource.Header
-          icon={TableIcon}
+          icon={FOLDERED_RESOURCE_HEADERS.table.rootIcon}
           breadcrumbs={breadcrumbs}
           aside={
             <div className='flex items-center gap-1.5'>
+              {presenceUsers.length > 0 && (
+                <PresenceAvatars users={presenceUsers} className='mr-1' />
+              )}
               <ImportProgressMenu workspaceId={workspaceId} tableId={tableId} />
               {selection.totalRunning > 0 || selection.hasActiveDispatch ? (
                 <RunStatusControl
@@ -679,35 +1488,62 @@ export function Table({
         />
       )}
       {/* Sort + filter render in both modes. In embedded (mothership) mode there's no
-          Resource.Header, so the run/stop control rides in the options bar's `aside`
-          slot, just left of filter/sort. */}
+            Resource.Header, so the run/stop control rides in the options bar — pinned
+            right, opposite the menu cluster. */}
       <Resource.Options
         sort={sortConfig}
         filter={filterConfig}
         aside={
-          embedded && (selection.totalRunning > 0 || selection.hasActiveDispatch) ? (
-            <RunStatusControl
-              running={selection.totalRunning}
-              queueing={!selection.hasRunningCell}
-              onStopAll={onStopAll}
-              isStopping={cancelRunsMutation.isPending}
+          viewsAvailable ? (
+            <ViewsMenu
+              views={views}
+              activeViewId={activeView?.id ?? null}
+              onSelect={handleSelectView}
+              onRename={handleRenameView}
+              onSetDefault={handleSetDefaultView}
+              onDelete={handleDeleteView}
+              onNewView={handleNewView}
+              canEdit={userPermissions.canEdit}
             />
           ) : undefined
         }
+        asideEnd={
+          <ColumnsMenu
+            columns={columns}
+            workflowGroups={tableWorkflowGroups}
+            hiddenColumns={effectiveHiddenColumns}
+            onChange={handleHiddenColumnsChange}
+          />
+        }
+        trailing={optionsTrailing}
       />
       {filterOpen && (
         <TableFilter
+          key={filterSeed}
           columns={columns}
-          filter={queryOptions.filter}
-          onApply={handleFilterApply}
+          filter={effectiveFilter}
+          autoApply
+          onChange={handleFilterChange}
           onClose={() => setFilterOpen(false)}
         />
       )}
+      <SaveViewModal
+        open={viewModal?.mode === 'new' || renamingView !== null}
+        onOpenChange={(open) => !open && setViewModal(null)}
+        mode={viewModal?.mode === 'rename' ? 'rename' : 'new'}
+        initialName={renamingView?.name ?? ''}
+        onSubmit={handleSubmitViewName}
+        isSubmitting={createViewMutation.isPending || updateViewMutation.isPending}
+      />
       <TableGrid
         workspaceId={workspaceId}
         tableId={tableId}
         embedded={embedded}
+        locks={tableData?.locks}
+        onBlockedAction={showBlockedToast}
         sidebarReservedPx={sidebarReservedPx}
+        remoteSelections={remoteSelections}
+        emitCellSelection={emitCellSelection}
         onOpenColumnConfig={onOpenColumnConfig}
         onOpenWorkflowConfig={onOpenWorkflowConfig}
         onOpenEnrichments={onOpenEnrichments}
@@ -718,6 +1554,9 @@ export function Table({
         onRequestDeleteRows={onRequestDeleteRows}
         onRequestDeleteAllByFilter={onRequestDeleteAllByFilter}
         onRequestDeleteColumns={onRequestDeleteColumns}
+        onFilterByCellValue={handleFilterByCellValue}
+        onSortColumn={handleSortColumn}
+        onClearSort={handleClearSort}
         onRunColumn={onRunColumn}
         onRunRow={onRunRow}
         onRunRows={onRunRows}
@@ -726,7 +1565,15 @@ export function Table({
         onStopRow={onStopRow}
         onSelectionChange={onSelectionChange}
         queryOptions={queryOptions}
+        hiddenColumns={effectiveHiddenColumns}
+        viewLayout={activeViewConfig}
+        viewLayoutKey={activeView?.id ?? null}
+        // The router reads the owner at call time (buffer / view / All-metadata),
+        // so no binding gap can send a write to the wrong place between settle
+        // and adoption.
+        onPersistLayout={handlePersistLayout}
         columnRenameSinkRef={columnRenameSinkRef}
+        layoutSnapshotSinkRef={layoutSnapshotRef}
         afterDeleteRowsSinkRef={afterDeleteRowsSinkRef}
         afterDeleteAllSinkRef={afterDeleteAllSinkRef}
         confirmDeleteColumnsSinkRef={confirmDeleteColumnsSinkRef}
@@ -878,7 +1725,7 @@ export function Table({
         title='Delete rows'
         text={`Delete ${deletingAll ? deletingAll.estimatedCount.toLocaleString() : 0} ${
           deletingAll?.estimatedCount === 1 ? 'row' : 'rows'
-        }${queryOptions.filter ? ' matching the current filter' : ''}? This can't be undone.`}
+        }${effectiveFilter ? ' matching the current filter' : ''}? This can't be undone.`}
         confirm={{
           label: 'Delete',
           pending: deleteRowsAsyncMutation.isPending,
@@ -887,7 +1734,7 @@ export function Table({
             if (!deletingAll) return
             const { excludeRowIds, estimatedCount } = deletingAll
             deleteRowsAsyncMutation.mutate({
-              filter: queryOptions.filter ?? undefined,
+              filter: effectiveFilter ?? undefined,
               sort: queryOptions.sort,
               excludeRowIds: excludeRowIds.length > 0 ? excludeRowIds : undefined,
               estimatedCount,
@@ -916,6 +1763,7 @@ export function Table({
             ? `Delete ${deletingColumns.length} Columns`
             : 'Delete Column'
         }
+        defaultAction='dismiss'
         text={[
           'Are you sure you want to delete ',
           deletingColumns && deletingColumns.length > 1
@@ -946,6 +1794,7 @@ export function Table({
           onOpenChange={setShowDeleteTableConfirm}
           srTitle='Delete Table'
           title='Delete Table'
+          defaultAction='dismiss'
           text={[
             'Are you sure you want to delete ',
             { text: tableData?.name ?? 'this table', bold: true },
@@ -959,6 +1808,15 @@ export function Table({
             pending: deleteTableMutation.isPending,
             pendingLabel: 'Deleting...',
           }}
+        />
+      )}
+      {tableData && userPermissions.canAdmin && (
+        <LockSettingsModal
+          isOpen={showLockSettings}
+          onClose={() => setShowLockSettings(false)}
+          workspaceId={workspaceId}
+          tableId={tableData.id}
+          locks={tableData.locks}
         />
       )}
     </Resource>

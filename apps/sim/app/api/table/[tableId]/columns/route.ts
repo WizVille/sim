@@ -10,14 +10,17 @@ import { isZodError, validationErrorResponse } from '@/lib/api/server/validation
 import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { addTableColumn, deleteColumn } from '@/lib/table'
+import { signalTableSchemaChanged } from '@/lib/table/events'
+import { performUpdateTableColumn } from '@/lib/table/orchestration'
+import { normalizeColumn } from '@/lib/table/wire'
 import {
-  addTableColumn,
-  deleteColumn,
-  renameColumn,
-  updateColumnConstraints,
-  updateColumnType,
-} from '@/lib/table'
-import { accessError, checkAccess, normalizeColumn, rootErrorMessage } from '@/app/api/table/utils'
+  accessError,
+  checkAccess,
+  orchestrationOutcomeErrorResponse,
+  rootErrorMessage,
+  tableLockErrorResponse,
+} from '@/app/api/table/utils'
 
 const logger = createLogger('TableColumnsAPI')
 
@@ -51,6 +54,7 @@ export const POST = withRouteHandler(async (request: NextRequest, context: Colum
     }
 
     const updatedTable = await addTableColumn(tableId, validated.column, requestId)
+    signalTableSchemaChanged(tableId)
 
     return NextResponse.json({
       success: true,
@@ -59,6 +63,8 @@ export const POST = withRouteHandler(async (request: NextRequest, context: Colum
       },
     })
   } catch (error) {
+    const lockError = tableLockErrorResponse(error)
+    if (lockError) return lockError
     if (isZodError(error)) {
       return validationErrorResponse(error, 'Invalid request data')
     }
@@ -68,7 +74,8 @@ export const POST = withRouteHandler(async (request: NextRequest, context: Colum
       msg.includes('already exists') ||
       msg.includes('maximum column') ||
       msg.includes('Invalid column') ||
-      msg.includes('exceeds maximum')
+      msg.includes('exceeds maximum') ||
+      msg.includes('option')
     ) {
       return NextResponse.json({ error: msg }, { status: 400 })
     }
@@ -106,65 +113,30 @@ export const PATCH = withRouteHandler(async (request: NextRequest, context: Colu
       return NextResponse.json({ error: 'Invalid workspace ID' }, { status: 400 })
     }
 
-    const { updates } = validated
-    let updatedTable = null
-
-    if (updates.name) {
-      updatedTable = await renameColumn(
-        { tableId, oldName: validated.columnName, newName: updates.name },
-        requestId
-      )
+    const outcome = await performUpdateTableColumn({
+      table,
+      columnName: validated.columnName,
+      userId: authResult.userId,
+      updates: validated.updates,
+      requestId,
+      request,
+    })
+    if (!outcome.success || !outcome.table) {
+      return orchestrationOutcomeErrorResponse(outcome, 'Failed to update column')
     }
 
-    if (updates.type) {
-      updatedTable = await updateColumnType(
-        { tableId, columnName: updates.name ?? validated.columnName, newType: updates.type },
-        requestId
-      )
-    }
-
-    if (updates.required !== undefined || updates.unique !== undefined) {
-      updatedTable = await updateColumnConstraints(
-        {
-          tableId,
-          columnName: updates.name ?? validated.columnName,
-          ...(updates.required !== undefined ? { required: updates.required } : {}),
-          ...(updates.unique !== undefined ? { unique: updates.unique } : {}),
-        },
-        requestId
-      )
-    }
-
-    if (!updatedTable) {
-      return NextResponse.json({ error: 'No updates specified' }, { status: 400 })
-    }
+    // Live-collab: tell open viewers the change landed so they refetch.
+    signalTableSchemaChanged(tableId)
 
     return NextResponse.json({
       success: true,
       data: {
-        columns: updatedTable.schema.columns.map(normalizeColumn),
+        columns: outcome.table.schema.columns.map(normalizeColumn),
       },
     })
   } catch (error) {
     if (isZodError(error)) {
       return validationErrorResponse(error, 'Invalid request data')
-    }
-
-    const msg = rootErrorMessage(error)
-    if (msg.includes('not found') || msg.includes('Table not found')) {
-      return NextResponse.json({ error: msg }, { status: 404 })
-    }
-    if (
-      msg.includes('already exists') ||
-      msg.includes('Cannot delete the last column') ||
-      msg.includes('Cannot set column') ||
-      msg.includes('Cannot set unique column') ||
-      msg.includes('Invalid column') ||
-      msg.includes('exceeds maximum') ||
-      msg.includes('incompatible') ||
-      msg.includes('duplicate')
-    ) {
-      return NextResponse.json({ error: msg }, { status: 400 })
     }
 
     logger.error(`[${requestId}] Error updating column in table ${tableId}:`, error)
@@ -202,6 +174,7 @@ export const DELETE = withRouteHandler(
         { tableId, columnName: validated.columnName },
         requestId
       )
+      signalTableSchemaChanged(tableId)
 
       return NextResponse.json({
         success: true,
@@ -210,6 +183,8 @@ export const DELETE = withRouteHandler(
         },
       })
     } catch (error) {
+      const lockError = tableLockErrorResponse(error)
+      if (lockError) return lockError
       if (isZodError(error)) {
         return validationErrorResponse(error, 'Invalid request data')
       }

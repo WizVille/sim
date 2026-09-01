@@ -2,6 +2,9 @@
  * All auditable actions in the platform, grouped by resource type.
  */
 export const AuditAction = {
+  // Accounts
+  ACCOUNT_DELETED: 'account.deleted',
+
   // API Keys
   API_KEY_CREATED: 'api_key.created',
   API_KEY_UPDATED: 'api_key.updated',
@@ -18,6 +21,7 @@ export const AuditAction = {
   CHAT_DEPLOYED: 'chat.deployed',
   CHAT_UPDATED: 'chat.updated',
   CHAT_DELETED: 'chat.deleted',
+  CHAT_PASSWORD_VIEWED: 'chat.password_viewed',
 
   // Custom Blocks (deploy-as-block)
   CUSTOM_BLOCK_PUBLISHED: 'custom_block.published',
@@ -48,6 +52,7 @@ export const AuditAction = {
   // Subscriptions
   SUBSCRIPTION_CREATED: 'subscription.created',
   SUBSCRIPTION_CANCELLED: 'subscription.cancelled',
+  SUBSCRIPTION_REFUNDED: 'subscription.refunded',
   SUBSCRIPTION_TRANSFERRED: 'subscription.transferred',
   ENTERPRISE_SUBSCRIPTION_PROVISIONED: 'subscription.enterprise_provisioned',
 
@@ -64,10 +69,25 @@ export const AuditAction = {
   ENVIRONMENT_UPDATED: 'environment.updated',
   ENVIRONMENT_DELETED: 'environment.deleted',
 
+  /**
+   * Secret provenance
+   *
+   * Recorded when a run proceeded on data whose secret provenance nobody wrote down. The value
+   * crossing into a model could not be checked against the workspace's secrets, so a secret it
+   * carries would not have been redacted. Deliberately an audit entry rather than a refusal:
+   * blocking the run would strand the workspace on data it can no longer read, so the risk is
+   * surfaced to the people who own the secrets instead.
+   */
+  SECRET_PROVENANCE_UNRECORDED: 'secret_provenance.unrecorded',
+
   // Files
   FILE_UPLOADED: 'file.uploaded',
   FILE_UPDATED: 'file.updated',
   FILE_DELETED: 'file.deleted',
+  /**
+   * Irreversible destruction of a file's row and stored bytes. Deliberately not
+   * a reuse of {@link FILE_DELETED}, which records the recoverable archive step.
+   */
   FILE_RESTORED: 'file.restored',
   FILE_MOVED: 'file.moved',
   FILE_SHARED: 'file.shared',
@@ -123,6 +143,7 @@ export const AuditAction = {
   CREDENTIAL_MEMBER_ADDED: 'credential_member.added',
   CREDENTIAL_MEMBER_REMOVED: 'credential_member.removed',
   CREDENTIAL_MEMBER_ROLE_CHANGED: 'credential_member.role_changed',
+  CREDENTIAL_GROUP_UPDATED: 'credential_group.updated',
 
   // Password
   PASSWORD_RESET_REQUESTED: 'password.reset_requested',
@@ -131,6 +152,12 @@ export const AuditAction = {
   // Organizations
   ORGANIZATION_CREATED: 'organization.created',
   ORGANIZATION_UPDATED: 'organization.updated',
+  ORGANIZATION_DELETED: 'organization.deleted',
+  ORGANIZATION_SESSION_POLICY_UPDATED: 'organization.session_policy.updated',
+  ORGANIZATION_SESSIONS_REVOKED: 'organization.sessions.revoked',
+  ORGANIZATION_DOMAIN_ADDED: 'organization.domain.added',
+  ORGANIZATION_DOMAIN_VERIFIED: 'organization.domain.verified',
+  ORGANIZATION_DOMAIN_REMOVED: 'organization.domain.removed',
   ORG_MEMBER_ADDED: 'org_member.added',
   ORG_MEMBER_REMOVED: 'org_member.removed',
   ORG_MEMBER_ROLE_CHANGED: 'org_member.role_changed',
@@ -157,6 +184,8 @@ export const AuditAction = {
   SKILL_CREATED: 'skill.created',
   SKILL_UPDATED: 'skill.updated',
   SKILL_DELETED: 'skill.deleted',
+  SKILL_MEMBER_ADDED: 'skill_member.added',
+  SKILL_MEMBER_REMOVED: 'skill_member.removed',
 
   // Schedules
   SCHEDULE_CREATED: 'schedule.created',
@@ -176,6 +205,7 @@ export const AuditAction = {
 
   // Workflows
   WORKFLOW_CREATED: 'workflow.created',
+  WORKFLOW_UPDATED: 'workflow.updated',
   WORKFLOW_DELETED: 'workflow.deleted',
   WORKFLOW_RESTORED: 'workflow.restored',
   WORKFLOW_DEPLOYED: 'workflow.deployed',
@@ -209,12 +239,14 @@ export type AuditActionType = (typeof AuditAction)[keyof typeof AuditAction]
  * All resource types that can appear in audit log entries.
  */
 export const AuditResourceType = {
+  ACCOUNT: 'account',
   API_KEY: 'api_key',
   BILLING: 'billing',
   BYOK_KEY: 'byok_key',
   CHAT: 'chat',
   CONNECTOR: 'connector',
   CREDENTIAL: 'credential',
+  CREDENTIAL_GROUP: 'credential_group',
   CUSTOM_BLOCK: 'custom_block',
   CUSTOM_TOOL: 'custom_tool',
   DATA_DRAIN: 'data_drain',
@@ -229,6 +261,8 @@ export const AuditResourceType = {
   PASSWORD: 'password',
   PERMISSION_GROUP: 'permission_group',
   SCHEDULE: 'schedule',
+  /** Not a stored resource: the workspace's secrets, as the thing put at risk. */
+  SECRET_PROVENANCE: 'secret_provenance',
   SKILL: 'skill',
   SUBSCRIPTION: 'subscription',
   TABLE: 'table',

@@ -5,6 +5,9 @@ import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
 import type { ApolloResponse } from '@/tools/apollo/types'
 
+/** Identifies a person by email when available, otherwise by given name. */
+const PERSON_IDENTITY_FIELD = ['email', 'first_name'] as const
+
 export const ApolloBlock: BlockConfig<ApolloResponse> = {
   type: 'apollo',
   name: 'Apollo',
@@ -17,6 +20,107 @@ export const ApolloBlock: BlockConfig<ApolloResponse> = {
   integrationType: IntegrationType.Sales,
   bgColor: '#EBF212',
   icon: ApolloIcon,
+  canvasPresentation: {
+    defaultTitle: 'Apollo',
+    sentences: {
+      byOperation: {
+        people_search: [
+          'Search for people',
+          { text: ', with title', field: 'person_titles' },
+          { text: ', in', field: 'person_locations' },
+          { text: ', at', field: 'organization_names' },
+        ],
+        people_enrich: [
+          { text: 'Enrich person', field: PERSON_IDENTITY_FIELD, core: true },
+          { text: 'at', field: ['organization_name', 'domain'] },
+        ],
+        people_bulk_enrich: [{ text: 'Enrich the people in', field: 'people', core: true }],
+        organization_search: [
+          'Search for companies',
+          { text: ', named', field: 'q_organization_name' },
+          { text: ', in', field: 'organization_locations' },
+          { text: ', with headcount', field: 'organization_num_employees_ranges' },
+        ],
+        organization_enrich: [{ text: 'Enrich company', field: 'domain', core: true }],
+        organization_bulk_enrich: [
+          { text: 'Enrich the companies in', field: 'domains', core: true },
+        ],
+        contact_create: [
+          { text: 'Create contact', field: PERSON_IDENTITY_FIELD, core: true },
+          { text: ', titled', field: 'title' },
+          { text: ', at', field: 'organization_name' },
+        ],
+        contact_update: [
+          { text: 'Update contact', field: 'contact_id', core: true },
+          { text: ', with new title', field: 'title' },
+          { text: ', at company', field: 'organization_name' },
+        ],
+        contact_search: [
+          'Search saved contacts',
+          { text: ', matching', field: 'q_keywords' },
+          { text: ', in stage', field: 'contact_stage_ids' },
+          { text: ', labeled', field: 'contact_label_ids' },
+        ],
+        contact_bulk_create: [
+          { text: 'Create the contacts in', field: 'contacts', core: true },
+          { text: ', labeled', field: 'append_label_names' },
+        ],
+        contact_bulk_update: [
+          { text: 'Update the contacts in', field: 'contacts', core: true },
+          { text: ', setting', field: 'contact_attributes' },
+        ],
+        account_create: [
+          { text: 'Create account', field: 'account_name', core: true },
+          { text: ', at', field: 'domain' },
+          { text: ', located in', field: 'raw_address' },
+        ],
+        account_update: [
+          { text: 'Update account', field: 'account_id', core: true },
+          { text: ', with new name', field: 'account_name' },
+          { text: ', at domain', field: 'domain' },
+        ],
+        account_search: [
+          'Search saved accounts',
+          { text: ', named', field: 'q_organization_name' },
+          { text: ', in stage', field: 'account_stage_ids' },
+          { text: ', labeled', field: 'account_label_ids' },
+        ],
+        account_bulk_create: [
+          { text: 'Create the accounts in', field: 'accounts', core: true },
+          { text: ', labeled', field: 'append_label_names' },
+        ],
+        account_bulk_update: [
+          { text: 'Update the accounts in', field: 'accounts', core: true },
+          { text: ', renaming each to', field: 'account_bulk_update_name' },
+          { text: ', setting', field: 'account_attributes' },
+        ],
+        opportunity_create: [
+          { text: 'Create deal', field: 'opportunity_name', core: true },
+          { text: ', worth', field: 'amount' },
+          { text: ', closing', field: 'closed_date' },
+        ],
+        opportunity_search: ['List all deals', { text: ', sorted by', field: 'sort_by_field' }],
+        opportunity_get: [{ text: 'Fetch deal', field: 'opportunity_id', core: true }],
+        opportunity_update: [
+          { text: 'Update deal', field: 'opportunity_id', core: true },
+          { text: ', renaming to', field: 'opportunity_name' },
+          { text: ', setting amount to', field: 'amount' },
+        ],
+        sequence_search: ['Search sequences', { text: ', named', field: 'q_name' }],
+        sequence_add: [
+          { text: 'Add', field: 'contact_ids', core: true },
+          { text: 'to sequence', field: 'sequence_id', core: true },
+          { text: ', sending from', field: 'send_email_from_email_address' },
+        ],
+        task_create: [
+          { text: 'Create a task for contacts', field: 'contact_ids', core: true },
+          { text: ', due', field: 'due_at' },
+        ],
+        task_search: ['Search tasks', { text: ', sorted by', field: 'sort_by_field' }],
+        email_accounts: ['List linked email accounts'],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -218,6 +322,7 @@ export const ApolloBlock: BlockConfig<ApolloResponse> = {
     {
       id: 'people',
       title: 'People (JSON Array)',
+      canvasNoun: 'a JSON array',
       type: 'code',
       placeholder: '[{"first_name": "John", "last_name": "Doe", "email": "john@example.com"}]',
       condition: { field: 'operation', value: 'people_bulk_enrich' },
@@ -1379,7 +1484,7 @@ export const ApolloBlockMeta = {
   templates: [
     {
       icon: Users,
-      title: 'Lead enrichment pipeline',
+      title: 'Apollo lead enrichment',
       prompt:
         'Build a workflow that watches my leads table for new entries, enriches each lead with company size, funding, tech stack, and decision-maker contacts using Apollo and web search, then updates the table with the enriched information.',
       modules: ['tables', 'agent', 'workflows'],
@@ -1388,7 +1493,7 @@ export const ApolloBlockMeta = {
     },
     {
       icon: ApolloIcon,
-      title: 'Prospect researcher',
+      title: 'Apollo prospect researcher',
       prompt:
         'Create an agent that takes a company name, deep-researches them across the web and Apollo, finds key decision-makers, recent news, funding rounds, and pain points, then compiles a prospect brief I can review before outreach.',
       modules: ['agent', 'files', 'workflows'],
@@ -1397,7 +1502,7 @@ export const ApolloBlockMeta = {
     },
     {
       icon: ApolloIcon,
-      title: 'ICP account builder',
+      title: 'Apollo ICP account builder',
       prompt:
         'Build a workflow that runs an Apollo organization search for accounts matching my ideal customer profile — industry, headcount, and tech stack — creates each as an Apollo account, and writes the new target list to a table for the SDR team.',
       modules: ['tables', 'agent', 'workflows'],
@@ -1406,7 +1511,7 @@ export const ApolloBlockMeta = {
     },
     {
       icon: Users,
-      title: 'Buying committee mapper',
+      title: 'Apollo buying committee mapper',
       prompt:
         'Create a workflow that takes a target account, runs an Apollo people search across the relevant titles, enriches each contact with verified email and role, and writes a mapped buying committee to a table so reps know exactly who to engage.',
       modules: ['tables', 'agent', 'workflows'],
@@ -1415,7 +1520,7 @@ export const ApolloBlockMeta = {
     },
     {
       icon: ApolloIcon,
-      title: 'Inbound lead enricher to HubSpot',
+      title: 'Apollo enrichment to HubSpot',
       prompt:
         'Build a workflow that on a new inbound signup enriches the person and their company with Apollo, scores fit against my ICP, and creates or updates the matching contact and company in HubSpot with the enriched fields.',
       modules: ['agent', 'workflows'],
@@ -1425,7 +1530,7 @@ export const ApolloBlockMeta = {
     },
     {
       icon: ApolloIcon,
-      title: 'Pipeline opportunity tracker',
+      title: 'Apollo pipeline tracker',
       prompt:
         'Create a scheduled workflow that searches Apollo opportunities by stage, summarizes new and at-risk deals with an agent, logs the snapshot to a pipeline table, and posts a daily deal-movement digest to the sales Slack channel.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -1435,7 +1540,7 @@ export const ApolloBlockMeta = {
     },
     {
       icon: Users,
-      title: 'CRM contact freshness sweep',
+      title: 'Apollo contact freshness sweep',
       prompt:
         'Build a scheduled workflow that pulls contacts from my CRM, bulk-enriches them through Apollo to refresh titles, emails, and company data, and bulk-updates the records so the database stays accurate for outbound.',
       modules: ['scheduled', 'agent', 'workflows'],

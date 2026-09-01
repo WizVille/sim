@@ -5,18 +5,28 @@
  * Structured workspace inventory snapshot Sim sends to Go; Go diffs successive snapshots into baseline+delta messages.
  */
 export interface VfsSnapshotV1 {
+  customBlocks?: VfsSnapshotV1CustomBlock[]
   customTools?: VfsSnapshotV1NamedResource[]
   envVars?: string[]
   files?: VfsSnapshotV1File[]
   integrations?: VfsSnapshotV1Integration[]
-  jobs?: VfsSnapshotV1Job[]
   knowledgeBases?: VfsSnapshotV1KnowledgeBase[]
   mcpServers?: VfsSnapshotV1McpServer[]
   members?: VfsSnapshotV1Member[]
+  sandboxes?: VfsSnapshotV1Sandbox[]
   skills?: VfsSnapshotV1Skill[]
   tables?: VfsSnapshotV1Table[]
   workflows?: VfsSnapshotV1Workflow[]
   workspace?: VfsSnapshotV1Workspace
+}
+/**
+ * This interface was referenced by `VfsSnapshotV1`'s JSON-Schema
+ * via the `definition` "VfsSnapshotV1CustomBlock".
+ */
+export interface VfsSnapshotV1CustomBlock {
+  description?: string
+  name: string
+  type: string
 }
 /**
  * This interface was referenced by `VfsSnapshotV1`'s JSON-Schema
@@ -50,19 +60,6 @@ export interface VfsSnapshotV1Integration {
 }
 /**
  * This interface was referenced by `VfsSnapshotV1`'s JSON-Schema
- * via the `definition` "VfsSnapshotV1Job".
- */
-export interface VfsSnapshotV1Job {
-  cronExpression?: string
-  id: string
-  lifecycle?: string
-  prompt?: string
-  sourceTaskName?: string
-  status?: string
-  title?: string
-}
-/**
- * This interface was referenced by `VfsSnapshotV1`'s JSON-Schema
  * via the `definition` "VfsSnapshotV1KnowledgeBase".
  */
 export interface VfsSnapshotV1KnowledgeBase {
@@ -89,6 +86,18 @@ export interface VfsSnapshotV1Member {
   email: string
   name?: string
   permissionType?: string
+}
+/**
+ * This interface was referenced by `VfsSnapshotV1`'s JSON-Schema
+ * via the `definition` "VfsSnapshotV1Sandbox".
+ */
+export interface VfsSnapshotV1Sandbox {
+  cliTools?: string[]
+  dependencies?: string[]
+  id: string
+  language: string
+  name: string
+  systemPackages?: string[]
 }
 /**
  * This interface was referenced by `VfsSnapshotV1`'s JSON-Schema

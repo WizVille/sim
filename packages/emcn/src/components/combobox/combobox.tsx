@@ -15,14 +15,15 @@ import {
   useState,
 } from 'react'
 import { cva, type VariantProps } from 'class-variance-authority'
-import { Check, ChevronDown, Search } from 'lucide-react'
-import { Loader } from '../../icons'
+import { Check, ChevronDown, Loader, Search } from '../../icons'
 import { cn } from '../../lib/cn'
+import { chipActiveSurfaceClass, chipHoverSurfaceClass } from '../chip/chip-chrome'
 import { Input } from '../input/input'
+import { OverflowText } from '../overflow-text/overflow-text'
 import { Popover, PopoverAnchor, PopoverContent, PopoverScrollArea } from '../popover/popover'
 
 const comboboxVariants = cva(
-  'flex w-full rounded-sm border border-[var(--border-1)] bg-[var(--surface-5)] px-2 font-sans font-medium text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none disabled:cursor-not-allowed disabled:opacity-50',
+  'flex w-full rounded-sm border border-[var(--border-1)] bg-[var(--surface-5)] px-2 font-sans text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none disabled:cursor-not-allowed disabled:opacity-50',
   {
     variants: {
       variant: {
@@ -93,8 +94,10 @@ export interface ComboboxProps
   disabled?: boolean
   /** Enable free-text input mode (default: false) */
   editable?: boolean
-  /** Custom overlay content for editable mode */
+  /** Visual content rendered over the selected value. */
   overlayContent?: ReactNode
+  /** Plain-text value represented by a visual overlay in non-editable mode. */
+  overlayLabel?: string
   /** Additional input props for editable mode */
   inputProps?: Omit<
     React.InputHTMLAttributes<HTMLInputElement>,
@@ -118,6 +121,19 @@ export interface ComboboxProps
   onArrowLeft?: () => void
   /** Enable search input in dropdown (useful for multiselect) */
   searchable?: boolean
+  /**
+   * Notified when the dropdown's search box changes value, including the `''` a
+   * select, close, Escape, or ArrowLeft resets it to. Deduped, so an already-empty
+   * query resetting again is silent and a consumer sees nothing while `searchable`
+   * is false.
+   *
+   * This is the `searchable` search box only. In `editable` mode the typed text
+   * arrives via `onChange`, not here.
+   *
+   * Client-side filtering of `options` is unaffected — this is an additional
+   * signal for consumers that also resolve matches server-side.
+   */
+  onSearchChange?: (query: string) => void
   /** Placeholder for search input */
   searchPlaceholder?: string
   /** Size variant */
@@ -159,6 +175,7 @@ const Combobox = memo(
         disabled,
         editable = false,
         overlayContent,
+        overlayLabel,
         inputProps = {},
         inputRef: externalInputRef,
         filterOptions = editable,
@@ -169,6 +186,7 @@ const Combobox = memo(
         onOpenChange,
         onArrowLeft,
         searchable = false,
+        onSearchChange,
         searchPlaceholder = 'Search...',
         align = 'start',
         dropdownWidth = 'trigger',
@@ -184,13 +202,73 @@ const Combobox = memo(
       const listboxId = useId()
       const [open, setOpen] = useState(false)
       const [highlightedIndex, setHighlightedIndex] = useState(-1)
-      const [searchQuery, setSearchQuery] = useState('')
+      const [searchQuery, setSearchQueryState] = useState('')
+      /**
+       * Read through a ref so `updateSearchQuery` keeps a stable identity —
+       * `handleSelect`, `handleBlur`, and `handleKeyDown` all capture it without
+       * listing it as a dependency.
+       */
+      const onSearchChangeRef = useRef(onSearchChange)
+      useEffect(() => {
+        onSearchChangeRef.current = onSearchChange
+      }, [onSearchChange])
+      /**
+       * Single write path for the search box so `onSearchChange` cannot be missed on a
+       * reset. Deduped because several paths reset redundantly — Escape both handles the
+       * key and lets the popover dismiss, and an editable select blurs after selecting —
+       * which the raw setState absorbed silently but a consumer callback would not.
+       */
+      const searchQueryRef = useRef('')
+      const updateSearchQuery = useCallback((next: string) => {
+        if (searchQueryRef.current === next) return
+        searchQueryRef.current = next
+        setSearchQueryState(next)
+        onSearchChangeRef.current?.(next)
+      }, [])
+      /**
+       * Read through a ref so `changeOpen` keeps a stable identity — every path
+       * that opens or closes the dropdown captures it without listing it as a
+       * dependency.
+       */
+      const onOpenChangeRef = useRef(onOpenChange)
+      useEffect(() => {
+        onOpenChangeRef.current = onOpenChange
+      }, [onOpenChange])
+      /**
+       * Single write path for the open state so `onOpenChange` cannot be missed.
+       * The popover is controlled, so Radix reports only the dismissals it initiates
+       * itself; the trigger, chevron, focus, keyboard, and selection paths are all
+       * state writes here, and a consumer that refreshes its options on open — or,
+       * like the agent block's tool picker, builds them only while open — hears about
+       * none of them unless each one reports. Deduped, because several paths both
+       * close and let the popover dismiss, which the raw setState absorbed silently
+       * but a consumer callback would not. The ref also lets the toggles read the
+       * current value without re-creating their handlers on every open.
+       */
+      const openRef = useRef(false)
+      const changeOpen = useCallback(
+        (next: boolean) => {
+          if (openRef.current === next) return
+          openRef.current = next
+          setOpen(next)
+          if (!next) updateSearchQuery('')
+          onOpenChangeRef.current?.(next)
+        },
+        [updateSearchQuery]
+      )
       const searchInputRef = useRef<HTMLInputElement>(null)
       const containerRef = useRef<HTMLDivElement>(null)
       const dropdownRef = useRef<HTMLDivElement>(null)
       const blurTimeoutRef = useRef<ReturnType<typeof setTimeout>>(null)
       const internalInputRef = useRef<HTMLInputElement>(null)
       const inputRef = externalInputRef || internalInputRef
+      /**
+       * True while a pointer press that began inside the dropdown is still held.
+       * Grabbing the list's native scrollbar blurs the editable input and parks
+       * focus on `<body>` — which `handleBlur` would otherwise read as "focus
+       * left the combobox" and close the dropdown mid-drag.
+       */
+      const pointerDownInsideRef = useRef(false)
 
       const effectiveSelectedValue = selectedValue ?? value
 
@@ -200,6 +278,34 @@ const Combobox = memo(
           if (blurTimeoutRef.current) clearTimeout(blurTimeoutRef.current)
         }
       }, [])
+
+      /**
+       * Releases the pointer-press window and restores focus to the editable input,
+       * which a scrollbar drag left on `<body>`. Bound to `window` so a release
+       * outside the popover still clears the flag; `pointercancel` is included
+       * because a touch scroll gesture ends there instead of `pointerup`.
+       *
+       * Focus is only restored when the press actually stole it — a press inside the
+       * popover parks it on `<body>` or the `tabIndex={-1}` content, but option
+       * mousedown is prevented, so it often never left the input or the search box.
+       */
+      useEffect(() => {
+        if (!editable) return
+        const endPointerPress = () => {
+          if (!pointerDownInsideRef.current) return
+          pointerDownInsideRef.current = false
+          const active = document.activeElement
+          const isTextEntry =
+            active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement
+          if (!isTextEntry) inputRef.current?.focus({ preventScroll: true })
+        }
+        window.addEventListener('pointerup', endPointerPress)
+        window.addEventListener('pointercancel', endPointerPress)
+        return () => {
+          window.removeEventListener('pointerup', endPointerPress)
+          window.removeEventListener('pointercancel', endPointerPress)
+        }
+      }, [editable, inputRef])
 
       // Flatten groups into options if groups are provided
       const allOptions = useMemo(() => {
@@ -291,7 +397,9 @@ const Combobox = memo(
       }, [groups, searchable, searchQuery])
 
       /**
-       * Handles selection of an option
+       * Handles selection of an option. In editable mode the input is blurred on
+       * purpose, so the pointer-press window is ended first — otherwise the `pointerup`
+       * that follows would hand focus back and reopen the dropdown.
        */
       const handleSelect = useCallback(
         (selectedValue: string, customOnSelect?: () => void, keepOpen?: boolean) => {
@@ -299,10 +407,10 @@ const Combobox = memo(
           if (customOnSelect) {
             customOnSelect()
             // Always reset search/highlight so stale queries don't filter new options
-            setSearchQuery('')
+            updateSearchQuery('')
             setHighlightedIndex(-1)
             if (!keepOpen) {
-              setOpen(false)
+              changeOpen(false)
             }
             return
           }
@@ -316,16 +424,26 @@ const Combobox = memo(
           } else {
             onChange?.(selectedValue)
             if (!keepOpen) {
-              setOpen(false)
+              changeOpen(false)
               setHighlightedIndex(-1)
-              setSearchQuery('')
+              updateSearchQuery('')
               if (editable && inputRef.current) {
+                pointerDownInsideRef.current = false
                 inputRef.current.blur()
               }
             }
           }
         },
-        [onChange, multiSelect, onMultiSelectChange, multiSelectValues, editable, inputRef]
+        [
+          onChange,
+          multiSelect,
+          onMultiSelectChange,
+          multiSelectValues,
+          editable,
+          inputRef,
+          changeOpen,
+          updateSearchQuery,
+        ]
       )
 
       /**
@@ -344,10 +462,10 @@ const Combobox = memo(
        */
       const handleFocus = useCallback(() => {
         if (!disabled) {
-          setOpen(true)
+          changeOpen(true)
           setHighlightedIndex(-1)
         }
-      }, [disabled])
+      }, [disabled, changeOpen])
 
       /**
        * Handles blur for editable mode
@@ -357,18 +475,19 @@ const Combobox = memo(
         if (blurTimeoutRef.current) clearTimeout(blurTimeoutRef.current)
         // Delay to allow dropdown clicks
         blurTimeoutRef.current = setTimeout(() => {
+          if (pointerDownInsideRef.current) return
           const activeElement = document.activeElement
           // Check if focus is in the container, dropdown, or search input
           const isInContainer = containerRef.current?.contains(activeElement)
           const isInDropdown = dropdownRef.current?.contains(activeElement)
           const isSearchInput = activeElement === searchInputRef.current
           if (!activeElement || (!isInContainer && !isInDropdown && !isSearchInput)) {
-            setOpen(false)
+            changeOpen(false)
             setHighlightedIndex(-1)
-            setSearchQuery('')
+            updateSearchQuery('')
           }
         }, 150)
-      }, [])
+      }, [changeOpen, updateSearchQuery])
 
       /**
        * Handles keyboard navigation
@@ -378,9 +497,9 @@ const Combobox = memo(
           if (disabled) return
 
           if (e.key === 'Escape') {
-            setOpen(false)
+            changeOpen(false)
             setHighlightedIndex(-1)
-            setSearchQuery('')
+            updateSearchQuery('')
             if (editable && inputRef.current) {
               inputRef.current.blur()
             }
@@ -396,7 +515,7 @@ const Combobox = memo(
               }
             } else if (!editable) {
               e.preventDefault()
-              setOpen(true)
+              changeOpen(true)
               setHighlightedIndex(0)
             }
             return
@@ -405,7 +524,7 @@ const Combobox = memo(
           if (e.key === ' ' && !editable) {
             e.preventDefault()
             if (!open) {
-              setOpen(true)
+              changeOpen(true)
               setHighlightedIndex(0)
             }
             return
@@ -414,7 +533,7 @@ const Combobox = memo(
           if (e.key === 'ArrowDown') {
             e.preventDefault()
             if (!open) {
-              setOpen(true)
+              changeOpen(true)
               setHighlightedIndex(0)
             } else {
               setHighlightedIndex((prev) => (prev < filteredOptions.length - 1 ? prev + 1 : 0))
@@ -442,7 +561,7 @@ const Combobox = memo(
             if (open && onArrowLeft) {
               e.preventDefault()
               onArrowLeft()
-              setSearchQuery('')
+              updateSearchQuery('')
               setHighlightedIndex(-1)
             }
           }
@@ -456,6 +575,8 @@ const Combobox = memo(
           editable,
           inputRef,
           onArrowLeft,
+          changeOpen,
+          updateSearchQuery,
         ]
       )
 
@@ -464,10 +585,10 @@ const Combobox = memo(
        */
       const handleToggle = useCallback(() => {
         if (!disabled && !editable) {
-          setOpen((prev) => !prev)
+          changeOpen(!openRef.current)
           setHighlightedIndex(-1)
         }
-      }, [disabled, editable])
+      }, [disabled, editable, changeOpen])
 
       /**
        * Handles chevron click for editable mode
@@ -477,16 +598,14 @@ const Combobox = memo(
           e.preventDefault()
           e.stopPropagation()
           if (!disabled) {
-            setOpen((prev) => {
-              const newOpen = !prev
-              if (newOpen && editable && inputRef.current) {
-                inputRef.current.focus()
-              }
-              return newOpen
-            })
+            const nextOpen = !openRef.current
+            changeOpen(nextOpen)
+            if (nextOpen && editable && inputRef.current) {
+              inputRef.current.focus()
+            }
           }
         },
-        [disabled, editable, inputRef]
+        [disabled, editable, inputRef, changeOpen]
       )
 
       const effectiveHighlightedIndex =
@@ -519,16 +638,11 @@ const Combobox = memo(
       }, [effectiveHighlightedIndex])
 
       const SelectedIcon = selectedOption?.icon
+      const visualLabel =
+        overlayLabel ?? multiSelectLabel ?? (selectedOption ? selectedOption.label : placeholder)
 
       return (
-        <Popover
-          open={open}
-          onOpenChange={(next) => {
-            setOpen(next)
-            if (!next) setSearchQuery('')
-            onOpenChange?.(next)
-          }}
-        >
+        <Popover open={open} onOpenChange={changeOpen}>
           <div ref={containerRef} className='relative w-full' {...props}>
             <PopoverAnchor asChild>
               <div className='w-full'>
@@ -537,7 +651,7 @@ const Combobox = memo(
                     <Input
                       ref={inputRef}
                       className={cn(
-                        'w-full pr-10 font-medium transition-colors',
+                        'w-full pr-10 transition-colors',
                         (overlayContent || SelectedIcon) && 'text-transparent caret-foreground',
                         SelectedIcon && !overlayContent && 'pl-7',
                         open && 'focus-visible:border-[var(--border-1)]',
@@ -551,11 +665,16 @@ const Combobox = memo(
                       onKeyDown={handleKeyDown}
                       disabled={disabled}
                       {...inputProps}
+                      role='combobox'
+                      aria-expanded={open}
+                      aria-haspopup='listbox'
+                      aria-controls={listboxId}
+                      aria-autocomplete='list'
                     />
                     {(overlayContent || SelectedIcon) && (
                       <div
                         className={cn(
-                          'pointer-events-none absolute top-0 right-[42px] bottom-0 left-0 flex items-center bg-transparent px-2 py-1.5 font-medium font-sans text-sm',
+                          'pointer-events-none absolute top-0 right-[42px] bottom-0 left-0 flex items-center bg-transparent px-2 py-1.5 font-sans text-sm',
                           disabled && 'opacity-50'
                         )}
                       >
@@ -564,9 +683,10 @@ const Combobox = memo(
                         ) : (
                           <>
                             {SelectedIcon && <SelectedIcon className='mr-2 size-3 flex-shrink-0' />}
-                            <span className='truncate text-[var(--text-primary)]'>
-                              {selectedOption?.label}
-                            </span>
+                            <OverflowText
+                              label={selectedOption?.label ?? ''}
+                              className='text-[var(--text-primary)]'
+                            />
                           </>
                         )}
                       </div>
@@ -603,15 +723,14 @@ const Combobox = memo(
                     onClick={handleToggle}
                     onKeyDown={handleKeyDown}
                   >
-                    <span
+                    <OverflowText
+                      label={visualLabel}
                       className={cn(
-                        'flex-1 truncate',
+                        'flex-1',
                         !selectedOption && !multiSelectLabel && 'text-[var(--text-muted)]',
                         overlayContent && 'text-transparent'
                       )}
-                    >
-                      {multiSelectLabel ?? (selectedOption ? selectedOption.label : placeholder)}
-                    </span>
+                    />
                     <ChevronDown
                       className={cn(
                         'ml-2 size-4 flex-shrink-0 opacity-50 transition-transform',
@@ -620,7 +739,9 @@ const Combobox = memo(
                     />
                     {overlayContent && (
                       <div className='pointer-events-none absolute inset-y-0 right-[24px] left-0 flex items-center px-2'>
-                        <div className='w-full truncate'>{overlayContent}</div>
+                        <OverflowText label={visualLabel} className='w-full' tooltipEnabled={false}>
+                          {overlayContent}
+                        </OverflowText>
                       </div>
                     )}
                   </div>
@@ -646,6 +767,9 @@ const Combobox = memo(
                   setTimeout(() => searchInputRef.current?.focus(), 0)
                 }
               }}
+              onPointerDownCapture={() => {
+                if (editable) pointerDownInsideRef.current = true
+              }}
               onInteractOutside={(e) => {
                 // If the user clicks the anchor/trigger while the popover is open,
                 // prevent Radix from auto-closing on mousedown. Our own toggle handler
@@ -664,7 +788,7 @@ const Combobox = memo(
                     className='w-full bg-transparent text-[var(--text-primary)] text-small placeholder:text-[var(--text-muted)] focus:outline-none'
                     placeholder={searchPlaceholder}
                     value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onChange={(e) => updateSearchQuery(e.target.value)}
                     onKeyDown={(e) => {
                       // Forward navigation keys to main handler
                       // Only forward ArrowLeft/ArrowRight when cursor is at the boundary
@@ -762,10 +886,19 @@ const Combobox = memo(
                                   !option.disabled && setHighlightedIndex(globalIndex)
                                 }
                                 className={cn(
-                                  'relative flex cursor-pointer select-none items-center gap-2 rounded-sm px-1.5 font-medium font-sans',
+                                  'relative flex cursor-pointer select-none items-center gap-2 rounded-sm px-1.5 font-sans',
                                   size === 'sm' ? 'py-[5px] text-caption' : 'py-1.5 text-sm',
-                                  'hover-hover:bg-[var(--surface-active)]',
-                                  (isHighlighted || isSelected) && 'bg-[var(--surface-active)]',
+                                  /*
+                                     No CSS `:hover` here — `isHighlighted` is the
+                                     single source of truth for the cursor, because
+                                     it is also what Enter commits. A `:hover` class
+                                     tracks the pointer continuously while
+                                     `highlightedIndex` only moves on `mouseenter`,
+                                     so after the list scrolls under a stationary
+                                     pointer the two disagree and the row that looks
+                                     selected is not the one Enter would choose.
+                                  */
+                                  (isHighlighted || isSelected) && chipActiveSurfaceClass,
                                   option.disabled && 'cursor-not-allowed opacity-50'
                                 )}
                               >
@@ -774,9 +907,10 @@ const Combobox = memo(
                                   : OptionIcon && (
                                       <OptionIcon className='size-[14px] flex-shrink-0' />
                                     )}
-                                <span className='flex-1 truncate text-[var(--text-primary)]'>
-                                  {option.label}
-                                </span>
+                                <OverflowText
+                                  label={option.label}
+                                  className='flex-1 text-[var(--text-primary)]'
+                                />
                                 {option.suffixElement}
                                 {multiSelect && isSelected && (
                                   <Check className='ml-2 size-[12px] flex-shrink-0 text-[var(--text-primary)]' />
@@ -802,15 +936,18 @@ const Combobox = memo(
                           }}
                           onMouseEnter={() => setHighlightedIndex(-1)}
                           className={cn(
-                            'relative flex cursor-pointer select-none items-center rounded-sm px-1.5 font-medium font-sans',
+                            'relative flex cursor-pointer select-none items-center rounded-sm px-1.5 font-sans',
                             size === 'sm' ? 'py-[5px] text-caption' : 'py-1.5 text-sm',
-                            'hover-hover:bg-[var(--surface-active)]',
-                            !multiSelectValues?.length && 'bg-[var(--surface-active)]'
+                            // Clears the highlight rather than taking it, so unlike option rows it hovers.
+                            !multiSelectValues?.length
+                              ? chipActiveSurfaceClass
+                              : chipHoverSurfaceClass
                           )}
                         >
-                          <span className='flex-1 truncate text-[var(--text-primary)]'>
-                            {allOptionLabel}
-                          </span>
+                          <OverflowText
+                            label={allOptionLabel}
+                            className='flex-1 text-[var(--text-primary)]'
+                          />
                         </div>
                       )}
                       {filteredOptions.map((option, index) => {
@@ -836,19 +973,20 @@ const Combobox = memo(
                             }}
                             onMouseEnter={() => !option.disabled && setHighlightedIndex(index)}
                             className={cn(
-                              'relative flex cursor-pointer select-none items-center gap-2 rounded-sm px-1.5 font-medium font-sans',
+                              'relative flex cursor-pointer select-none items-center gap-2 rounded-sm px-1.5 font-sans',
                               size === 'sm' ? 'py-[5px] text-caption' : 'py-1.5 text-sm',
-                              'hover-hover:bg-[var(--surface-active)]',
-                              (isHighlighted || isSelected) && 'bg-[var(--surface-active)]',
+                              // See above: `isHighlighted` alone, so paint matches what Enter commits.
+                              (isHighlighted || isSelected) && chipActiveSurfaceClass,
                               option.disabled && 'cursor-not-allowed opacity-50'
                             )}
                           >
                             {option.iconElement
                               ? option.iconElement
                               : OptionIcon && <OptionIcon className='size-[14px] flex-shrink-0' />}
-                            <span className='flex-1 truncate text-[var(--text-primary)]'>
-                              {option.label}
-                            </span>
+                            <OverflowText
+                              label={option.label}
+                              className='flex-1 text-[var(--text-primary)]'
+                            />
                             {option.suffixElement}
                             {multiSelect && isSelected && (
                               <Check className='ml-2 size-[12px] flex-shrink-0 text-[var(--text-primary)]' />

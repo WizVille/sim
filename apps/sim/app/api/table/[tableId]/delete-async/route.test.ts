@@ -1,10 +1,15 @@
 /**
  * @vitest-environment node
  */
-import { hybridAuthMockFns } from '@sim/testing'
+import {
+  createTableDefinition,
+  hybridAuthMockFns,
+  resetEnvFlagsMock,
+  setEnvFlags,
+  type TableDefinitionFactoryOptions,
+} from '@sim/testing'
 import { NextRequest, NextResponse } from 'next/server'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { TableDefinition } from '@/lib/table'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
   mockCheckAccess,
@@ -13,7 +18,6 @@ const {
   mockRunTableDelete,
   mockTableFilterError,
   mockTasksTrigger,
-  flags,
 } = vi.hoisted(() => ({
   mockCheckAccess: vi.fn(),
   mockMarkTableJobRunning: vi.fn(),
@@ -21,7 +25,6 @@ const {
   mockRunTableDelete: vi.fn(),
   mockTableFilterError: vi.fn(),
   mockTasksTrigger: vi.fn(),
-  flags: { triggerDev: false },
 }))
 
 vi.mock('@sim/utils/id', () => ({
@@ -33,11 +36,6 @@ vi.mock('@/lib/table/jobs/service', () => ({
   releaseJobClaim: mockReleaseJobClaim,
 }))
 vi.mock('@/lib/table/delete-runner', () => ({ runTableDelete: mockRunTableDelete }))
-vi.mock('@/lib/core/config/env-flags', () => ({
-  get isTriggerDevEnabled() {
-    return flags.triggerDev
-  },
-}))
 vi.mock('@/background/table-delete', () => ({ tableDeleteTask: { id: 'table-delete' } }))
 vi.mock('@/lib/core/async-jobs/region', () => ({
   resolveTriggerRegion: vi.fn().mockResolvedValue('us-east-1'),
@@ -63,22 +61,11 @@ vi.mock('@/app/api/table/utils', async () => {
 
 import { POST } from '@/app/api/table/[tableId]/delete-async/route'
 
-function buildTable(overrides: Partial<TableDefinition> = {}): TableDefinition {
-  return {
-    id: 'tbl_1',
-    name: 'People',
-    description: null,
-    schema: { columns: [{ name: 'status', type: 'string' }] },
-    metadata: null,
-    rowCount: 1000,
-    maxRows: 1_000_000,
-    workspaceId: 'workspace-1',
-    createdBy: 'user-1',
-    archivedAt: null,
-    createdAt: new Date(),
-    updatedAt: new Date(),
-    ...overrides,
-  }
+afterAll(resetEnvFlagsMock)
+
+const TABLE_FIXTURE: TableDefinitionFactoryOptions = {
+  columns: [{ name: 'status', type: 'string' }],
+  rowCount: 1000,
 }
 
 function makeRequest(body: unknown, tableId = 'tbl_1') {
@@ -104,12 +91,12 @@ describe('POST /api/table/[tableId]/delete-async', () => {
       userId: 'user-1',
       authType: 'session',
     })
-    mockCheckAccess.mockResolvedValue({ ok: true, table: buildTable() })
+    mockCheckAccess.mockResolvedValue({ ok: true, table: createTableDefinition(TABLE_FIXTURE) })
     mockMarkTableJobRunning.mockResolvedValue(true)
     mockRunTableDelete.mockResolvedValue(undefined)
     mockTableFilterError.mockReturnValue(null)
     mockTasksTrigger.mockResolvedValue({ id: 'run_1' })
-    flags.triggerDev = false
+    setEnvFlags({ isTriggerDevEnabled: false })
   })
 
   it('claims the job slot and kicks off the delete worker with filter + exclusions', async () => {
@@ -173,7 +160,10 @@ describe('POST /api/table/[tableId]/delete-async', () => {
   })
 
   it('returns 400 when the table is archived', async () => {
-    mockCheckAccess.mockResolvedValue({ ok: true, table: buildTable({ archivedAt: new Date() }) })
+    mockCheckAccess.mockResolvedValue({
+      ok: true,
+      table: createTableDefinition({ ...TABLE_FIXTURE, archivedAt: new Date() }),
+    })
     const response = await makeRequest(validBody)
     expect(response.status).toBe(400)
     expect(mockRunTableDelete).not.toHaveBeenCalled()
@@ -185,7 +175,7 @@ describe('POST /api/table/[tableId]/delete-async', () => {
   })
 
   it('routes through trigger.dev (ISO cutoff, tagged) when the flag is on', async () => {
-    flags.triggerDev = true
+    setEnvFlags({ isTriggerDevEnabled: true })
     const response = await makeRequest(validBody)
 
     expect(response.status).toBe(200)
@@ -204,7 +194,7 @@ describe('POST /api/table/[tableId]/delete-async', () => {
   })
 
   it('releases the job claim when the trigger.dev dispatch fails (no ghost running job)', async () => {
-    flags.triggerDev = true
+    setEnvFlags({ isTriggerDevEnabled: true })
     mockTasksTrigger.mockRejectedValueOnce(new Error('trigger.dev unreachable'))
 
     const response = await makeRequest(validBody)
@@ -212,5 +202,26 @@ describe('POST /api/table/[tableId]/delete-async', () => {
     expect(response.status).toBe(500)
     expect(mockReleaseJobClaim).toHaveBeenCalledWith('tbl_1', 'job-id-xyz')
     expect(mockRunTableDelete).not.toHaveBeenCalled()
+  })
+
+  /**
+   * PR #6067 review finding (greptile P1 / bugbot High): a hybrid filter — group
+   * key AND leaf keys on one node — passes the dual-grammar union via the
+   * non-stripping legacy branch, and the downgrade used to convert group-first,
+   * silently dropping the leaf and WIDENING an async select-all delete.
+   */
+  it('rejects a hybrid group+leaf filter with 400 instead of widening the delete', async () => {
+    const response = await makeRequest({
+      workspaceId: 'workspace-1',
+      filter: {
+        all: [{ field: 'tenant_id', op: 'eq', value: 'acme' }],
+        field: 'status',
+        op: 'eq',
+        value: 'archived',
+      },
+    })
+    expect(response.status).toBe(400)
+    const body = await response.json()
+    expect(body.error).toMatch(/not both/)
   })
 })

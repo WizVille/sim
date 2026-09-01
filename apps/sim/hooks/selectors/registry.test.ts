@@ -1,43 +1,74 @@
 /**
  * @vitest-environment node
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-
-const { mockEnsureQueryData, mockGetWorkflows, mockGetFolderMap } = vi.hoisted(() => ({
-  mockEnsureQueryData: vi.fn().mockResolvedValue(undefined),
-  mockGetWorkflows: vi.fn(),
-  mockGetFolderMap: vi.fn().mockReturnValue({}),
-}))
-
-vi.mock('@/app/_shell/providers/get-query-client', () => ({
-  getQueryClient: vi.fn(() => ({
-    ensureQueryData: mockEnsureQueryData,
-  })),
-}))
-
-vi.mock('@/hooks/queries/utils/workflow-cache', () => ({
-  getWorkflows: mockGetWorkflows,
-  getWorkflowById: vi.fn((workspaceId: string, workflowId: string) =>
-    mockGetWorkflows(workspaceId).find((workflow: { id: string }) => workflow.id === workflowId)
-  ),
-}))
-
-vi.mock('@/hooks/queries/utils/folder-cache', () => ({
-  getFolderMap: mockGetFolderMap,
-}))
-
-vi.mock('@/hooks/queries/utils/workflow-list-query', () => ({
-  getWorkflowListQueryOptions: vi.fn((workspaceId: string) => ({
-    queryKey: ['workflows', 'list', workspaceId, 'active'],
-  })),
-}))
-
+import type { QueryClient } from '@tanstack/react-query'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import * as getQueryClientModule from '@/app/_shell/providers/get-query-client'
+import * as folderCacheModule from '@/hooks/queries/utils/folder-cache'
+import * as workflowCacheModule from '@/hooks/queries/utils/workflow-cache'
+import * as workflowListQueryModule from '@/hooks/queries/utils/workflow-list-query'
 import { getSelectorDefinition } from '@/hooks/selectors/registry'
+
+const mockEnsureQueryData = vi.fn().mockResolvedValue(undefined)
+const mockFetchQuery = vi.fn().mockResolvedValue(undefined)
+
+/**
+ * Spy on the real module namespaces instead of vi.mock: under `isolate: false`
+ * `@/hooks/selectors/registry` may already be cached bound to the real
+ * cache/query modules, so patching the shared namespaces is the only wiring
+ * that always applies.
+ */
+const getQueryClientSpy = vi.spyOn(getQueryClientModule, 'getQueryClient').mockImplementation(
+  () =>
+    ({
+      ensureQueryData: mockEnsureQueryData,
+      fetchQuery: mockFetchQuery,
+    }) as unknown as QueryClient
+)
+const mockGetWorkflows = vi.spyOn(workflowCacheModule, 'getWorkflows')
+const getWorkflowByIdSpy = vi
+  .spyOn(workflowCacheModule, 'getWorkflowById')
+  .mockImplementation((workspaceId: string, workflowId: string) =>
+    mockGetWorkflows(workspaceId).find((workflow: { id: string }) => workflow.id === workflowId)
+  )
+const mockGetFolderMap = vi.spyOn(folderCacheModule, 'getFolderMap').mockReturnValue({})
+const getWorkflowListQueryOptionsSpy = vi
+  .spyOn(workflowListQueryModule, 'getWorkflowListQueryOptions')
+  .mockImplementation(
+    (workspaceId: string) =>
+      ({
+        queryKey: ['workflows', 'list', workspaceId, 'active'],
+      }) as unknown as ReturnType<typeof workflowListQueryModule.getWorkflowListQueryOptions>
+  )
+
+afterAll(() => {
+  getQueryClientSpy.mockRestore()
+  mockGetWorkflows.mockRestore()
+  getWorkflowByIdSpy.mockRestore()
+  mockGetFolderMap.mockRestore()
+  getWorkflowListQueryOptionsSpy.mockRestore()
+})
 
 describe('sim.workflows selector', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockEnsureQueryData.mockResolvedValue(undefined)
+    getQueryClientSpy.mockImplementation(
+      () =>
+        ({
+          ensureQueryData: mockEnsureQueryData,
+          fetchQuery: mockFetchQuery,
+        }) as unknown as QueryClient
+    )
+    getWorkflowByIdSpy.mockImplementation((workspaceId: string, workflowId: string) =>
+      mockGetWorkflows(workspaceId).find((workflow: { id: string }) => workflow.id === workflowId)
+    )
+    getWorkflowListQueryOptionsSpy.mockImplementation(
+      (workspaceId: string) =>
+        ({
+          queryKey: ['workflows', 'list', workspaceId, 'active'],
+        }) as unknown as ReturnType<typeof workflowListQueryModule.getWorkflowListQueryOptions>
+    )
     mockGetWorkflows.mockReturnValue([
       { id: 'wf-1', name: 'Alpha Workflow', folderId: null },
       { id: 'wf-2', name: 'Bravo Workflow', folderId: null },
@@ -146,5 +177,63 @@ describe('sim.workflows selector', () => {
     })
 
     expect(option).toEqual({ id: 'wf-1', label: 'Pipeline (Alpha)' })
+  })
+})
+
+describe('table column selectors', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockFetchQuery.mockResolvedValue({
+      schema: {
+        columns: [
+          { id: 'col_email', name: 'Email', type: 'string', unique: true },
+          { id: 'col_name', name: 'Name', type: 'string' },
+        ],
+      },
+    })
+  })
+
+  it('stores stable column ids while displaying column names', async () => {
+    const definition = getSelectorDefinition('table.outputColumns')
+
+    const options = await definition.fetchList!({
+      key: 'table.outputColumns',
+      context: { workspaceId: 'ws-1', tableId: 'tbl-1' },
+    })
+
+    expect(options).toEqual([
+      { id: 'col_email', label: 'Email' },
+      { id: 'col_name', label: 'Name' },
+    ])
+  })
+
+  it('resolves a saved column id to its current name', async () => {
+    const definition = getSelectorDefinition('table.outputColumns')
+    const context = { workspaceId: 'ws-1', tableId: 'tbl-1' }
+
+    const existing = await definition.fetchById!({
+      key: 'table.outputColumns',
+      context,
+      detailId: 'col_email',
+    })
+    const missing = await definition.fetchById!({
+      key: 'table.outputColumns',
+      context,
+      detailId: 'Missing',
+    })
+
+    expect(existing).toEqual({ id: 'col_email', label: 'Email' })
+    expect(missing).toBeNull()
+  })
+
+  it('keeps the existing conflict-column selector limited to unique columns', async () => {
+    const definition = getSelectorDefinition('table.columns')
+
+    const options = await definition.fetchList!({
+      key: 'table.columns',
+      context: { workspaceId: 'ws-1', tableId: 'tbl-1' },
+    })
+
+    expect(options).toEqual([{ id: 'col_email', label: 'Email' }])
   })
 })

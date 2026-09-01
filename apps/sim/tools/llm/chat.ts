@@ -1,6 +1,7 @@
 import { createLogger } from '@sim/logger'
+import { type ModelCost, resolveProxiedModelCost } from '@/providers/cost-policy'
 import { getProviderFromModel } from '@/providers/utils'
-import type { ToolConfig, ToolResponse } from '@/tools/types'
+import type { InternalToolConfig, ToolResponse } from '@/tools/types'
 
 const logger = createLogger('LLMChatTool')
 
@@ -34,10 +35,11 @@ interface LLMChatResponse extends ToolResponse {
       completion?: number
       total?: number
     }
+    cost?: ModelCost
   }
 }
 
-export const llmChatTool: ToolConfig<LLMChatParams, LLMChatResponse> = {
+export const llmChatTool: InternalToolConfig<LLMChatParams, LLMChatResponse> = {
   id: 'llm_chat',
   name: 'LLM Chat',
   description: 'Send a chat completion request to any supported LLM provider',
@@ -125,13 +127,16 @@ export const llmChatTool: ToolConfig<LLMChatParams, LLMChatResponse> = {
     },
   },
 
-  request: {
-    url: () => '/api/providers',
-    method: 'POST',
-    headers: () => ({
-      'Content-Type': 'application/json',
-    }),
-    body: (params) => {
+  operation: {
+    modelInput: {
+      mode: 'project',
+      select: (params) => ({
+        systemPrompt: params.systemPrompt,
+        context: params.context,
+      }),
+      privateInputPaths: () => [['systemPrompt'], ['context']],
+    },
+    input: (params) => {
       const provider = getProviderFromModel(params.model)
 
       return {
@@ -150,11 +155,6 @@ export const llmChatTool: ToolConfig<LLMChatParams, LLMChatResponse> = {
         bedrockAccessKeyId: params.bedrockAccessKeyId,
         bedrockSecretKey: params.bedrockSecretKey,
         bedrockRegion: params.bedrockRegion,
-        // The executor attaches the billing-attribution header on internal
-        // routes whenever the execution scope carries one, and /api/providers
-        // rejects that header unless the body names the workspace it is
-        // validated against.
-        ...(params._context?.workspaceId ? { workspaceId: params._context.workspaceId } : {}),
       }
     },
   },
@@ -175,6 +175,7 @@ export const llmChatTool: ToolConfig<LLMChatParams, LLMChatResponse> = {
         content: data.content,
         model: data.model,
         tokens: data.tokens,
+        cost: resolveProxiedModelCost(data.cost),
       },
     }
   },
@@ -183,5 +184,6 @@ export const llmChatTool: ToolConfig<LLMChatParams, LLMChatResponse> = {
     content: { type: 'string', description: 'The generated response content' },
     model: { type: 'string', description: 'The model used for generation' },
     tokens: { type: 'object', description: 'Token usage information' },
+    cost: { type: 'object', description: 'Model cost for this call in dollars' },
   },
 }

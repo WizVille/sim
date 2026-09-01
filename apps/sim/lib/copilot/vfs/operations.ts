@@ -1,4 +1,36 @@
+import { createLogger } from '@sim/logger'
+import { truncate } from '@sim/utils/string'
 import micromatch from 'micromatch'
+import { decodeVfsSegmentSafe } from '@/lib/copilot/vfs/path-utils'
+import {
+  isNonGreppablePlaceholder,
+  type PlaceholderKind,
+} from '@/lib/copilot/vfs/read-placeholders'
+import {
+  compileLinearRegex,
+  isPlainText,
+  type LinearRegex,
+  literalRegex,
+} from '@/lib/core/security/linear-regex'
+
+const logger = createLogger('VfsOperations')
+
+/**
+ * Maximum characters returned for one matched (or context) line in grep
+ * `content` mode. Minified single-line files (workflow JSON, persisted tool
+ * results) make one match the entire file otherwise — a single grep can then
+ * blow through the inline tool-result budget and the caller's context window.
+ */
+const GREP_MATCH_MAX_CHARS = 2_000
+
+/**
+ * Truncates one grep match line to {@link GREP_MATCH_MAX_CHARS}, noting the
+ * original length so the caller knows the line continues.
+ */
+function capGrepMatchContent(line: string): string {
+  if (line.length <= GREP_MATCH_MAX_CHARS) return line
+  return truncate(line, GREP_MATCH_MAX_CHARS, ` … [line truncated: ${line.length} chars total]`)
+}
 
 export interface GrepMatch {
   path: string
@@ -38,18 +70,6 @@ export class WorkspaceFileGrepError extends Error {
 }
 
 /**
- * True when file content is one of `readFileRecord`'s non-text placeholders
- * (binary, unparseable, or over the inline read cap) — these carry no searchable
- * content, so grepping them should report the placeholder instead.
- */
-function isNonGreppablePlaceholder(content: string, totalLines: number): boolean {
-  if (totalLines !== 1) return false
-  return /^\[(File too large|Image too large|Document too large|Could not parse|Binary file|Compiled artifact too large)/.test(
-    content.trim()
-  )
-}
-
-/**
  * Run a single-file content grep over an already-resolved file read result,
  * shared by workspace-file grep (`WorkspaceVFS.grepFile`) and chat-upload grep.
  * Throws {@link WorkspaceFileGrepError} when the file has no searchable text
@@ -59,7 +79,12 @@ function isNonGreppablePlaceholder(content: string, totalLines: number): boolean
  */
 export function grepReadResult(
   path: string,
-  result: { content: string; totalLines: number; attachment?: unknown },
+  result: {
+    content: string
+    totalLines: number
+    placeholder?: PlaceholderKind
+    attachment?: unknown
+  },
   pattern: string,
   readHint: string,
   options?: GrepOptions
@@ -69,7 +94,7 @@ export function grepReadResult(
       `Cannot grep "${path}" — it has no searchable text (image/binary). Use read("${readHint}") to view it.`
     )
   }
-  if (isNonGreppablePlaceholder(result.content, result.totalLines)) {
+  if (isNonGreppablePlaceholder(result)) {
     throw new WorkspaceFileGrepError(result.content)
   }
   return grep(new Map([[path, result.content]]), pattern, undefined, options)
@@ -78,19 +103,35 @@ export function grepReadResult(
 export interface ReadResult {
   content: string
   totalLines: number
+  placeholder?: PlaceholderKind
 }
 
 /**
  * Micromatch options tuned to match the prior in-house glob: `bash: false` so a single `*`
- * never crosses path slashes (required for `files` + star + `meta.json` style paths). `nobrace`
- * and `noext` disable brace and extglob expansion like the old builder. Uses `micromatch` for
+ * never crosses path slashes (required for `files` + star + `meta.json` style paths). Brace
+ * expansion is ON — `workflows/{A,B}/**` and `*.{png,md}` are the natural way to batch a
+ * glob, and with `nobrace` they silently matched nothing, which reads as "no such files".
+ * `noext` still disables extglob expansion like the old builder. Uses `micromatch` for
  * well-tested `**` and edge cases instead of a custom `RegExp`.
  */
+/**
+ * Matching is decode-normalized: canonical keys are percent-encoded, but the
+ * model routinely writes the decoded display form ("Elder v2"). Comparing both
+ * sides decoded makes scope/glob matching tolerant of the encoding difference
+ * while canonical (encoded) inputs behave exactly as before. Returned paths
+ * are always the canonical encoded keys.
+ */
+function decodePathForMatch(path: string): string {
+  return path
+    .split('/')
+    .map((segment) => decodeVfsSegmentSafe(segment))
+    .join('/')
+}
+
 const VFS_GLOB_OPTIONS: micromatch.Options = {
   bash: false,
   dot: false,
   windows: false,
-  nobrace: true,
   noext: true,
 }
 
@@ -114,18 +155,32 @@ function splitLinesForGrep(content: string): string[] {
  */
 export function pathWithinGrepScope(filePath: string, scope: string): boolean {
   const scopeUsesStarOrQuestionGlob = /[*?]/.test(scope)
+  const decodedPath = decodePathForMatch(filePath)
+  const decodedScope = decodePathForMatch(scope)
   if (scopeUsesStarOrQuestionGlob) {
-    return micromatch.isMatch(filePath, scope, VFS_GLOB_OPTIONS)
+    return (
+      micromatch.isMatch(filePath, scope, VFS_GLOB_OPTIONS) ||
+      micromatch.isMatch(decodedPath, decodedScope, VFS_GLOB_OPTIONS)
+    )
   }
-  const base = scope.replace(/\/+$/, '')
+  const base = decodedScope.replace(/\/+$/, '')
   if (base === '') {
     return true
   }
-  return filePath === base || filePath.startsWith(`${base}/`)
+  return decodedPath === base || decodedPath.startsWith(`${base}/`)
 }
 
 /**
- * Regex search over VFS file contents using ECMAScript `RegExp` syntax.
+ * Regex search over VFS file contents using RE2 syntax — a subset of
+ * ECMAScript `RegExp` (see `@/lib/core/security/linear-regex`).
+ *
+ * A pattern RE2 cannot represent — negative lookaround, backreferences — is
+ * matched as a literal instead of on the backtracking engine, as is a pattern
+ * that does not compile at all (which previously returned no results). Both
+ * cases log a warning: the return shape carries results only, so there is
+ * nowhere to tell the caller inline, and a literal fallback can match the
+ * pattern's own text when grepping source that contains regexes.
+ *
  * `content` and `count` are line-oriented (split on newline, CR stripped per line).
  * `files_with_matches` tests the entire file string once, so multiline patterns can match there
  * but not in line modes.
@@ -142,19 +197,27 @@ export function grep(
   const showLineNumbers = opts?.lineNumbers ?? true
   const contextLines = opts?.context ?? 0
 
-  const flags = ignoreCase ? 'gi' : 'g'
-  let regex: RegExp
-  try {
-    regex = new RegExp(pattern, flags)
-  } catch {
-    return []
+  // Caller-supplied pattern over caller-supplied file content on the shared
+  // event loop — matched by RE2 so it cannot backtrack. Syntax RE2 cannot
+  // represent degrades to a literal rather than to the backtracking engine.
+  let regex: LinearRegex
+  if (isPlainText(pattern)) {
+    regex = literalRegex(pattern, { ignoreCase })
+  } else {
+    const linear = compileLinearRegex(pattern, { ignoreCase })
+    if (!linear) {
+      // The return shape carries results only, so the caller cannot be told
+      // inline that its regex was taken literally — log it, since silently
+      // returning "no matches" reads as "not in the file".
+      logger.warn('Grep pattern is not RE2-representable; matching it literally', { pattern })
+    }
+    regex = linear ?? literalRegex(pattern, { ignoreCase })
   }
 
   if (outputMode === 'files_with_matches') {
     const matchingFiles: string[] = []
     for (const [filePath, content] of files) {
       if (path && !pathWithinGrepScope(filePath, path)) continue
-      regex.lastIndex = 0
       if (regex.test(content)) {
         matchingFiles.push(filePath)
         if (matchingFiles.length >= maxResults) break
@@ -170,7 +233,6 @@ export function grep(
       const lines = splitLinesForGrep(content)
       let count = 0
       for (const line of lines) {
-        regex.lastIndex = 0
         if (regex.test(line)) count++
       }
       if (count > 0) {
@@ -188,7 +250,6 @@ export function grep(
 
     const lines = splitLinesForGrep(content)
     for (let i = 0; i < lines.length; i++) {
-      regex.lastIndex = 0
       if (regex.test(lines[i])) {
         if (contextLines > 0) {
           const start = Math.max(0, i - contextLines)
@@ -197,14 +258,14 @@ export function grep(
             matches.push({
               path: filePath,
               line: showLineNumbers ? j + 1 : 0,
-              content: lines[j],
+              content: capGrepMatchContent(lines[j]),
             })
           }
         } else {
           matches.push({
             path: filePath,
             line: showLineNumbers ? i + 1 : 0,
-            content: lines[i],
+            content: capGrepMatchContent(lines[i]),
           })
         }
         if (matches.length >= maxResults) return matches
@@ -235,15 +296,22 @@ export function glob(files: Map<string, string>, pattern: string): string[] {
     }
   }
 
+  const decodedPattern = decodePathForMatch(pattern)
   for (const filePath of files.keys()) {
     if (filePath.endsWith('/.folder')) continue
-    if (micromatch.isMatch(filePath, pattern, VFS_GLOB_OPTIONS)) {
+    if (
+      micromatch.isMatch(filePath, pattern, VFS_GLOB_OPTIONS) ||
+      micromatch.isMatch(decodePathForMatch(filePath), decodedPattern, VFS_GLOB_OPTIONS)
+    ) {
       result.add(filePath)
     }
   }
 
   for (const dir of directories) {
-    if (micromatch.isMatch(dir, pattern, VFS_GLOB_OPTIONS)) {
+    if (
+      micromatch.isMatch(dir, pattern, VFS_GLOB_OPTIONS) ||
+      micromatch.isMatch(decodePathForMatch(dir), decodedPattern, VFS_GLOB_OPTIONS)
+    ) {
       result.add(dir)
     }
   }

@@ -12,43 +12,18 @@ import {
 } from '@sim/emcn'
 import { createLogger } from '@sim/logger'
 import { isApiClientError } from '@/lib/api/client/errors'
-import type {
-  TokenServiceAccountDescriptor,
-  TokenServiceAccountField,
+import {
+  getTokenServiceAccountErrorMessage,
+  type TokenServiceAccountDescriptor,
+  type TokenServiceAccountField,
 } from '@/lib/credentials/token-service-accounts/descriptors'
+import { withBrandIcon } from '@/blocks/brand-icon'
 import {
   useCreateWorkspaceCredential,
   useUpdateWorkspaceCredential,
 } from '@/hooks/queries/credentials'
 
 const logger = createLogger('TokenServiceAccountModal')
-
-const FALLBACK_ERROR_MESSAGE = "We couldn't add this credential. Try again in a moment."
-
-/**
- * Maps server `error.code` values from token service-account verification to
- * user-facing messages, personalized with the provider's own token noun.
- */
-function messageForTokenAccountError(
-  err: unknown,
-  descriptor: TokenServiceAccountDescriptor
-): string {
-  if (isApiClientError(err) && err.code) {
-    switch (err.code) {
-      case 'invalid_credentials':
-        return `We couldn't authenticate with that ${descriptor.tokenNoun}. Double-check it in ${descriptor.serviceLabel} and try again.`
-      case 'site_not_found':
-        return "We couldn't find an account at that domain. Check the spelling and try again."
-      case 'provider_unavailable':
-        return `We couldn't reach ${descriptor.serviceLabel} to verify these credentials. Try again in a moment.`
-      case 'duplicate_display_name':
-        return 'A credential with that name already exists in this workspace.'
-      default:
-        return FALLBACK_ERROR_MESSAGE
-    }
-  }
-  return FALLBACK_ERROR_MESSAGE
-}
 
 function normalizeDomainInput(raw: string): string {
   return raw
@@ -72,6 +47,8 @@ interface TokenServiceAccountModalProps {
   credentialId?: string
   initialDisplayName?: string
   initialDescription?: string
+  /** Called with the credential id after a successful create or reconnect. */
+  onCreated?: (credentialId: string) => void
 }
 
 /**
@@ -91,6 +68,7 @@ export function TokenServiceAccountModal({
   credentialId,
   initialDisplayName,
   initialDescription,
+  onCreated,
 }: TokenServiceAccountModalProps) {
   const [apiToken, setApiToken] = useState('')
   const [domain, setDomain] = useState('')
@@ -138,8 +116,9 @@ export function TokenServiceAccountModal({
           displayName: displayName.trim() || undefined,
           description: description.trim() || undefined,
         })
+        onCreated?.(credentialId)
       } else {
-        await createCredential.mutateAsync({
+        const created = await createCredential.mutateAsync({
           workspaceId,
           type: 'service_account',
           providerId: descriptor.providerId,
@@ -147,10 +126,12 @@ export function TokenServiceAccountModal({
           displayName: displayName.trim() || undefined,
           description: description.trim() || undefined,
         })
+        onCreated?.(created.credential.id)
       }
       onOpenChange(false)
     } catch (err: unknown) {
-      setError(messageForTokenAccountError(err, descriptor))
+      const code = isApiClientError(err) ? err.code : undefined
+      setError(getTokenServiceAccountErrorMessage(descriptor, code))
       logger.error(`Failed to add ${descriptor.serviceLabel} service account credential`, err)
     }
   }
@@ -161,7 +142,7 @@ export function TokenServiceAccountModal({
       onOpenChange={onOpenChange}
       srTitle={`Add ${serviceName} ${descriptor.connectNoun}`}
     >
-      <ChipModalHeader icon={ServiceIcon} onClose={() => onOpenChange(false)}>
+      <ChipModalHeader icon={withBrandIcon(ServiceIcon)} onClose={() => onOpenChange(false)}>
         Add {serviceName} {descriptor.connectNoun}
       </ChipModalHeader>
       <ChipModalBody>

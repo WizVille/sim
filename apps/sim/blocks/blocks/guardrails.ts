@@ -40,6 +40,20 @@ export const GuardrailsBlock: BlockConfig<GuardrailsResponse> = {
   category: 'blocks',
   bgColor: '#3D642D',
   icon: ShieldCheckIcon,
+  canvasPresentation: {
+    defaultTitle: 'Guardrails',
+    sentences: {
+      default: [
+        {
+          text: 'Validate content using',
+          field: 'validationType',
+          core: true,
+        },
+        { text: ', matching', field: 'regex' },
+        { text: ', grounded in', field: 'knowledgeBaseId' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'input',
@@ -76,7 +90,11 @@ export const GuardrailsBlock: BlockConfig<GuardrailsResponse> = {
         enabled: true,
         prompt: `Generate a regular expression pattern based on the user's description.
 The regex should be:
-- Valid JavaScript regex syntax
+- Valid RE2 syntax: no lookahead ((?=...), (?!...)), no lookbehind ((?<=...), (?<!...)),
+  no backreferences (\\1), and no \\uXXXX escapes (use \\x41 or the literal character).
+  Patterns are matched by a linear-time engine that does not implement these, and one
+  that uses them fails every check. To express "must NOT contain X", match X and invert
+  the result downstream with a Condition block instead of using negative lookahead.
 - Properly escaped for special characters
 - Optimized for the use case
 

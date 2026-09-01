@@ -56,6 +56,28 @@ export const microsoftSelectors = {
       }))
     },
   },
+  'outlook.calendars': {
+    key: 'outlook.calendars',
+    contracts: [selectorContracts.outlookCalendarsSelectorContract],
+    staleTime: SELECTOR_STALE,
+    getQueryKey: ({ context }: SelectorQueryArgs) => [
+      'selectors',
+      'outlook.calendars',
+      context.oauthCredential ?? 'none',
+    ],
+    enabled: ({ context }) => Boolean(context.oauthCredential),
+    fetchList: async ({ context, signal }: SelectorQueryArgs) => {
+      const credentialId = ensureCredential(context, 'outlook.calendars')
+      const data = await requestJson(selectorContracts.outlookCalendarsSelectorContract, {
+        query: { credentialId },
+        signal,
+      })
+      return (data.calendars || []).map((calendar) => ({
+        id: calendar.id,
+        label: calendar.name,
+      }))
+    },
+  },
   'microsoft.teams': {
     key: 'microsoft.teams',
     contracts: [selectorContracts.microsoftTeamsSelectorContract],
@@ -205,12 +227,13 @@ export const microsoftSelectors = {
       'selectors',
       'onedrive.folders',
       context.oauthCredential ?? 'none',
+      context.driveId ?? 'none',
     ],
     enabled: ({ context }) => Boolean(context.oauthCredential),
     fetchList: async ({ context, signal }: SelectorQueryArgs) => {
       const credentialId = ensureCredential(context, 'onedrive.folders')
       const data = await requestJson(selectorContracts.onedriveFoldersSelectorContract, {
-        query: { credentialId },
+        query: { credentialId, driveId: context.driveId },
         signal,
       })
       return (data.files || []).map((file) => ({
@@ -338,6 +361,7 @@ export const microsoftSelectors = {
       'selectors',
       'microsoft.word',
       context.oauthCredential ?? 'none',
+      context.driveId ?? 'none',
       search ?? '',
     ],
     enabled: ({ context }) => Boolean(context.oauthCredential),
@@ -347,6 +371,7 @@ export const microsoftSelectors = {
         query: {
           credentialId,
           query: search,
+          driveId: context.driveId,
           workflowId: context.workflowId,
           fileType: 'word',
         },
@@ -363,6 +388,7 @@ export const microsoftSelectors = {
     SelectorKey,
     | 'microsoft.planner.plans'
     | 'outlook.folders'
+    | 'outlook.calendars'
     | 'microsoft.teams'
     | 'microsoft.chats'
     | 'microsoft.channels'

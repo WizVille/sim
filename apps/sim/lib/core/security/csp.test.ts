@@ -1,4 +1,4 @@
-import { createEnvMock, envFlagsMock } from '@sim/testing'
+import { createEnvMock } from '@sim/testing'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@/lib/core/config/env', () =>
@@ -16,8 +16,6 @@ vi.mock('@/lib/core/config/env', () =>
     NEXT_PUBLIC_TERMS_URL: 'https://legal.example.com/terms',
   })
 )
-
-vi.mock('@/lib/core/config/env-flags', () => envFlagsMock)
 
 import {
   addCSPSource,
@@ -272,6 +270,10 @@ describe('buildTimeCSPDirectives', () => {
   it('should allow Google fonts', () => {
     expect(buildTimeCSPDirectives['style-src']).toContain('https://fonts.googleapis.com')
     expect(buildTimeCSPDirectives['font-src']).toContain('https://fonts.gstatic.com')
+  })
+
+  it('allows the hosted app to read the Sim status page', () => {
+    expect(getMainCSPPolicy()).toMatch(/connect-src[^;]*https:\/\/status\.sim\.ai/)
   })
 
   it('should allow data: and blob: for images', () => {

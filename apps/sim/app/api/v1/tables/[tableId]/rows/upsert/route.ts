@@ -1,24 +1,28 @@
 import { createLogger } from '@sim/logger'
-import { toError } from '@sim/utils/errors'
 import { type NextRequest, NextResponse } from 'next/server'
 import { v1UpsertTableRowContract } from '@/lib/api/contracts/v1/tables'
-import { parseRequest, validationErrorResponseFromError } from '@/lib/api/server'
+import { parseRequest } from '@/lib/api/server'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import type { RowData, TableSchema } from '@/lib/table'
+import { upsertRow } from '@/lib/table'
+import { namedRowMapper } from '@/lib/table/cell-format'
+import { buildIdByName, rowDataNameToId } from '@/lib/table/column-keys'
+import { signalTableRowsChanged } from '@/lib/table/events'
+import { createExactEmptyTableRowSecretProvenance } from '@/lib/table/rows/secret-provenance'
 import {
-  buildIdByName,
-  buildNameById,
-  rowDataIdToName,
-  rowDataNameToId,
-  upsertRow,
-} from '@/lib/table'
-import { accessError, checkAccess } from '@/app/api/table/utils'
+  accessError,
+  checkAccess,
+  orchestrationErrorResponse,
+  tableLockErrorResponse,
+} from '@/app/api/table/utils'
 import {
   checkRateLimit,
   checkWorkspaceScope,
   createRateLimitResponse,
   resolveWorkspaceRequestActor,
+  v1ValidationErrorResponse,
+  v1ValidationErrorResponseFromError,
 } from '@/app/api/v1/middleware'
 
 const logger = createLogger('V1TableUpsertAPI')
@@ -41,7 +45,9 @@ export const POST = withRouteHandler(async (request: NextRequest, context: Upser
     }
 
     const userId = rateLimit.userId!
-    const parsed = await parseRequest(v1UpsertTableRowContract, request, context)
+    const parsed = await parseRequest(v1UpsertTableRowContract, request, context, {
+      validationErrorResponse: v1ValidationErrorResponse,
+    })
     if (!parsed.success) return parsed.response
     const { tableId } = parsed.data.params
     const validated = parsed.data.body
@@ -63,25 +69,30 @@ export const POST = withRouteHandler(async (request: NextRequest, context: Upser
     }
 
     const idByName = buildIdByName(table.schema as TableSchema)
-    const nameById = buildNameById(table.schema as TableSchema)
+    const toNamedRow = namedRowMapper((table.schema as TableSchema).columns)
+    const rowData = rowDataNameToId(validated.data as RowData, idByName)
     const upsertResult = await upsertRow(
       {
         tableId,
         workspaceId: validated.workspaceId,
-        data: rowDataNameToId(validated.data as RowData, idByName),
+        data: rowData,
         userId: actorUserId,
         conflictTarget: validated.conflictTarget,
+        secretProvenance: createExactEmptyTableRowSecretProvenance(rowData),
       },
       table,
       requestId
     )
+
+    // Live-collab: tell open viewers the change landed so they refetch.
+    signalTableRowsChanged(tableId)
 
     return NextResponse.json({
       success: true,
       data: {
         row: {
           id: upsertResult.row.id,
-          data: rowDataIdToName(upsertResult.row.data, nameById),
+          data: toNamedRow(upsertResult.row.data),
           createdAt:
             upsertResult.row.createdAt instanceof Date
               ? upsertResult.row.createdAt.toISOString()
@@ -96,22 +107,13 @@ export const POST = withRouteHandler(async (request: NextRequest, context: Upser
       },
     })
   } catch (error) {
-    const validationResponse = validationErrorResponseFromError(error)
+    const lockError = tableLockErrorResponse(error)
+    if (lockError) return lockError
+    const validationResponse = v1ValidationErrorResponseFromError(error)
     if (validationResponse) return validationResponse
 
-    const errorMessage = toError(error).message
-
-    if (
-      errorMessage.includes('unique column') ||
-      errorMessage.includes('Unique constraint violation') ||
-      errorMessage.includes('conflictTarget') ||
-      errorMessage.includes('row limit') ||
-      errorMessage.includes('Schema validation') ||
-      errorMessage.includes('Upsert requires') ||
-      errorMessage.includes('Row size exceeds')
-    ) {
-      return NextResponse.json({ error: errorMessage }, { status: 400 })
-    }
+    const classified = orchestrationErrorResponse(error)
+    if (classified) return classified
 
     logger.error(`[${requestId}] Error upserting row:`, error)
     return NextResponse.json({ error: 'Failed to upsert row' }, { status: 500 })

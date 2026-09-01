@@ -1,15 +1,18 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { ExecutorDelegationOrigin } from '@/executor/types'
+import { mergeToolParameters } from '@/tools/merge-params'
+import * as toolMetadata from '@/tools/metadata'
 import {
-  createExecutionToolSchema,
   createLLMToolSchema,
   createUserToolSchema,
   filterSchemaForLLM,
   formatParameterLabel,
+  getSubBlocksForToolInput,
   getToolParametersConfig,
   isPasswordParameter,
-  mergeToolParameters,
   type ToolParameterConfig,
   type ToolSchema,
+  ToolSchemaEnrichmentError,
   type ValidationResult,
   validateToolParameters,
 } from '@/tools/params'
@@ -54,14 +57,33 @@ const mockToolConfig = {
   },
 }
 
-vi.mock('@/tools/utils', () => ({
-  getTool: vi.fn((toolId: string) => {
-    if (toolId === 'test_tool') {
-      return mockToolConfig
+/**
+ * Spy on the real module namespace instead of vi.mock: under `isolate: false`
+ * `@/tools/params` may already be cached bound to the real `@/tools/metadata`
+ * module, so patching the shared namespace is the only wiring that always
+ * applies.
+ */
+const getToolSpy = vi.spyOn(toolMetadata, 'getToolMetadata').mockImplementation(((
+  toolId: string
+) => {
+  if (toolId === 'test_tool') {
+    return mockToolConfig
+  }
+  if (toolId === 'workflow_executor') {
+    return {
+      id: 'workflow_executor',
+      name: 'Workflow Executor',
+      description: '',
+      version: '1.0.0',
+      params: {},
     }
-    return null
-  }),
-}))
+  }
+  return null
+}) as unknown as typeof toolMetadata.getToolMetadata)
+
+afterAll(() => {
+  getToolSpy.mockRestore()
+})
 
 describe('Tool Parameters Utils', () => {
   describe('getToolParametersConfig', () => {
@@ -108,6 +130,27 @@ describe('Tool Parameters Utils', () => {
       expect(schema.properties).not.toHaveProperty('timeout') // user-only, never shown to LLM
       expect(schema.required).not.toContain('apiKey') // user-only, never required for LLM
       expect(schema.required).toContain('message') // user-or-llm + required: true
+    })
+
+    it('wraps tool enrichment failures so execution boundaries can fail fast', async () => {
+      const cause = new Error('table metadata unavailable')
+      const toolConfig = {
+        ...mockToolConfig,
+        toolEnrichment: {
+          dependsOn: 'tableId',
+          enrichTool: vi.fn().mockRejectedValue(cause),
+        },
+      }
+
+      const error = await createLLMToolSchema(toolConfig, { tableId: 'tbl_123' }).catch(
+        (caught) => caught
+      )
+
+      expect(error).toBeInstanceOf(ToolSchemaEnrichmentError)
+      expect(error).toMatchObject({
+        message: 'Failed to enrich schema for tool "test_tool"',
+        cause,
+      })
     })
   })
 
@@ -361,21 +404,6 @@ describe('Tool Parameters Utils', () => {
     })
   })
 
-  describe('createExecutionToolSchema', () => {
-    it.concurrent('should create complete schema with all parameters', () => {
-      const schema = createExecutionToolSchema(mockToolConfig)
-
-      expect(schema.properties).toHaveProperty('apiKey')
-      expect(schema.properties).toHaveProperty('message')
-      expect(schema.properties).toHaveProperty('channel')
-      expect(schema.properties).toHaveProperty('timeout')
-      expect(schema.required).toContain('apiKey')
-      expect(schema.required).toContain('message')
-      expect(schema.required).not.toContain('channel')
-      expect(schema.required).not.toContain('timeout')
-    })
-  })
-
   describe('mergeToolParameters', () => {
     it.concurrent('should merge parameters with user-provided taking precedence', () => {
       const userProvided = {
@@ -605,6 +633,108 @@ describe('Tool Parameters Utils', () => {
       })
     })
 
+    describe('createLLMToolSchema - child workflow input enrichment', () => {
+      const mockReadWorkflowInputFields = vi.fn()
+      const executorDelegationOrigin: ExecutorDelegationOrigin = {
+        subjectUserId: 'user-1',
+        workflowId: 'parent-workflow',
+        executionId: 'execution-1',
+        principal: { kind: 'session', userId: 'user-1', sessionId: 'session-1' },
+        currentWorkflow: { workflowId: 'parent-workflow', mode: 'draft' },
+      }
+
+      beforeEach(() => {
+        mockReadWorkflowInputFields.mockReset()
+        mockReadWorkflowInputFields.mockResolvedValue([
+          { name: 'email', type: 'string', description: 'Recipient address' },
+          { name: 'attempts', type: 'number' },
+        ])
+      })
+
+      it('binds the delegation to the execution subject and the target workflow', async () => {
+        const { schema } = await createLLMToolSchema(
+          mockWorkflowExecutorConfig,
+          { workflowId: 'child-workflow' },
+          {
+            userId: 'user-1',
+            workflowId: 'parent-workflow',
+            executionId: 'execution-1',
+            workspaceId: 'workspace-1',
+            executorDelegationOrigin,
+          },
+          mockReadWorkflowInputFields
+        )
+
+        expect(mockReadWorkflowInputFields).toHaveBeenCalledWith('child-workflow', {
+          userId: 'user-1',
+          workflowId: 'parent-workflow',
+          executionId: 'execution-1',
+          workspaceId: 'workspace-1',
+          executorDelegationOrigin,
+        })
+        expect(schema.properties.inputMapping.properties).toEqual({
+          email: { type: 'string', description: 'Recipient address' },
+          attempts: { type: 'number', description: 'Input field: attempts' },
+        })
+        expect(schema.properties.inputMapping.required).toEqual(['email', 'attempts'])
+      })
+
+      it('carries the executionId when the target is the running workflow', async () => {
+        await createLLMToolSchema(
+          mockWorkflowExecutorConfig,
+          { workflowId: 'parent-workflow' },
+          {
+            userId: 'user-1',
+            workflowId: 'parent-workflow',
+            executionId: 'execution-1',
+            executorDelegationOrigin,
+          },
+          mockReadWorkflowInputFields
+        )
+
+        expect(mockReadWorkflowInputFields).toHaveBeenCalledWith('parent-workflow', {
+          userId: 'user-1',
+          workflowId: 'parent-workflow',
+          executionId: 'execution-1',
+          executorDelegationOrigin,
+        })
+      })
+
+      it('leaves inputMapping untyped and issues no request without trusted execution authority', async () => {
+        const { schema } = await createLLMToolSchema(
+          mockWorkflowExecutorConfig,
+          { workflowId: 'child-workflow' },
+          { workflowId: 'parent-workflow', executionId: 'execution-1' },
+          mockReadWorkflowInputFields
+        )
+
+        expect(mockReadWorkflowInputFields).not.toHaveBeenCalled()
+        expect(schema.properties.inputMapping.properties).toBeUndefined()
+      })
+
+      it('leaves inputMapping untyped when the workflow read is rejected', async () => {
+        mockReadWorkflowInputFields.mockRejectedValue(new Error('Unauthorized'))
+
+        const { schema } = await createLLMToolSchema(
+          mockWorkflowExecutorConfig,
+          { workflowId: 'child-workflow' },
+          {
+            userId: 'user-1',
+            workflowId: 'parent-workflow',
+            executorDelegationOrigin,
+          },
+          mockReadWorkflowInputFields
+        )
+
+        expect(mockReadWorkflowInputFields).toHaveBeenCalledWith('child-workflow', {
+          userId: 'user-1',
+          workflowId: 'parent-workflow',
+          executorDelegationOrigin,
+        })
+        expect(schema.properties.inputMapping.properties).toBeUndefined()
+      })
+    })
+
     describe('mergeToolParameters - inputMapping deep merge', () => {
       it.concurrent('should deep merge inputMapping when user provides empty object', () => {
         const userProvided = {
@@ -812,6 +942,52 @@ describe('Tool Parameters Utils', () => {
           }
         })
       }
+    })
+  })
+})
+
+describe('custom block agent-tool rendering', () => {
+  // Mirrors buildCustomBlockConfig: hidden workflowId/inputMapping wiring + per-field
+  // sub-blocks keyed by the source field's stable id.
+  const customBlockConfig = {
+    subBlocks: [
+      { id: 'workflowId', type: 'short-input', hidden: true },
+      { id: 'inputMapping', type: 'code', language: 'json', hidden: true },
+      { id: 'field-question', title: 'Question', type: 'short-input', required: true },
+      { id: 'field-files', title: 'Attachments', type: 'file-upload', multiple: true },
+    ],
+  } as any
+
+  describe('getToolParametersConfig', () => {
+    it('surfaces the field sub-blocks, never workflowId/inputMapping', () => {
+      const result = getToolParametersConfig(
+        'workflow_executor',
+        'custom_block_abc',
+        undefined,
+        customBlockConfig
+      )
+      expect(result).not.toBeNull()
+      const ids = result!.userInputParameters.map((p) => p.id)
+      expect(ids).toEqual(['field-question', 'field-files'])
+      expect(ids).not.toContain('workflowId')
+      expect(ids).not.toContain('inputMapping')
+      expect(result!.userInputParameters.every((p) => p.visibility === 'user-or-llm')).toBe(true)
+      expect(result!.requiredParameters.map((p) => p.id)).toEqual(['field-question'])
+    })
+  })
+
+  describe('getSubBlocksForToolInput', () => {
+    it('returns field sub-blocks as user-or-llm and drops reserved/hidden wiring', () => {
+      const result = getSubBlocksForToolInput(
+        'workflow_executor',
+        'custom_block_abc',
+        undefined,
+        undefined,
+        customBlockConfig
+      )
+      expect(result).not.toBeNull()
+      expect(result!.subBlocks.map((sb) => sb.id)).toEqual(['field-question', 'field-files'])
+      expect(result!.subBlocks.every((sb) => sb.paramVisibility === 'user-or-llm')).toBe(true)
     })
   })
 })

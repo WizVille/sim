@@ -10,13 +10,50 @@ export const CursorBlock: BlockConfig<CursorResponse> = {
   description: 'Launch and manage Cursor cloud agents to work on GitHub repositories',
   longDescription:
     'Interact with Cursor Cloud Agents API to launch AI agents that can work on your GitHub repositories. Supports launching agents, adding follow-up instructions, checking status, viewing conversations, and managing agent lifecycle.',
-  docsLink: 'https://cursor.com/docs/cloud-agent/api/endpoints',
+  docsLink: 'https://docs.sim.ai/integrations/cursor',
   category: 'tools',
   integrationType: IntegrationType.DevOps,
   bgColor: '#1E1E1E',
   icon: CursorIcon,
+  canvasPresentation: {
+    defaultTitle: 'Cursor',
+    sentences: {
+      byOperation: {
+        cursor_launch_agent: [
+          { text: 'Launch an agent on', field: 'repository', core: true },
+          { text: 'to', field: 'promptText' },
+        ],
+        cursor_add_followup: [
+          { text: 'Send follow-up', field: 'followupPromptText', core: true },
+          { text: 'to agent', field: 'agentId', core: true },
+        ],
+        cursor_get_agent: [{ text: 'Check the status of agent', field: 'agentId', core: true }],
+        cursor_get_conversation: [
+          { text: 'Read the conversation history of agent', field: 'agentId', core: true },
+        ],
+        cursor_list_agents: [
+          'List agents',
+          { text: ', for pull request', field: 'prUrl' },
+          { text: ', up to', field: 'limit', after: 'results' },
+        ],
+        cursor_stop_agent: [{ text: 'Stop agent', field: 'agentId', core: true }],
+        cursor_delete_agent: [{ text: 'Permanently delete agent', field: 'agentId', core: true }],
+        cursor_list_artifacts: [
+          { text: 'List artifacts produced by agent', field: 'agentId', core: true },
+        ],
+        cursor_download_artifact: [
+          { text: 'Download artifact', field: 'path', core: true },
+          { text: 'from agent', field: 'agentId', core: true },
+        ],
+        cursor_list_models: ['List models available for launching agents'],
+        cursor_list_repositories: ['List accessible GitHub repositories'],
+        cursor_get_api_key_info: ['Read details of the API key in use'],
+      },
+    },
+  },
   authMode: AuthMode.ApiKey,
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'cursor_v2' },
   subBlocks: [
     {
       id: 'operation',
@@ -223,6 +260,7 @@ export const CursorBlock: BlockConfig<CursorResponse> = {
 
 export const CursorV2Block: BlockConfig<CursorResponse> = {
   ...CursorBlock,
+  sunset: undefined,
   type: 'cursor_v2',
   name: 'Cursor',
   description: 'Launch and manage Cursor cloud agents to work on GitHub repositories',
@@ -314,7 +352,7 @@ export const CursorBlockMeta = {
     },
     {
       icon: CursorIcon,
-      title: 'Test fix delegator',
+      title: 'Cursor test-fix delegator',
       prompt:
         'Build a workflow triggered by a failing GitHub Actions test run that extracts the failing test name and error, launches a targeted Cursor cloud agent to fix only that test, downloads the artifact diff when ready, and replies on the failed run with the proposed patch.',
       modules: ['agent', 'workflows'],
@@ -324,7 +362,7 @@ export const CursorBlockMeta = {
     },
     {
       icon: CursorIcon,
-      title: 'Refactor follow-up loop',
+      title: 'Cursor refactor follow-up loop',
       prompt:
         'Create a workflow that picks up review comments on a Cursor-authored pull request, formulates each comment as a follow-up instruction, sends them to the originating Cursor cloud agent, and waits for the updated diff before re-requesting review.',
       modules: ['agent', 'workflows'],
@@ -343,7 +381,7 @@ export const CursorBlockMeta = {
     },
     {
       icon: CursorIcon,
-      title: 'Stuck-agent cleaner',
+      title: 'Cursor stuck-agent cleaner',
       prompt:
         'Create a scheduled workflow that runs hourly, lists Cursor cloud agents, detects agents stuck in the same state longer than a configurable threshold, stops or deletes them based on rules, and posts a Slack report of the cleanup actions taken.',
       modules: ['scheduled', 'agent', 'workflows'],

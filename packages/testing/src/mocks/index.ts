@@ -33,27 +33,53 @@ export {
   createMockGetTool,
   mockBlockConfigs,
   mockToolConfigs,
+  toolsMetadataMock,
   toolsUtilsMock,
 } from './blocks.mock'
 // Copilot HTTP mocks (for @/lib/copilot/request/http)
 export { copilotHttpMock, copilotHttpMockFns } from './copilot-http.mock'
 // Database mocks
 export {
-  createMockDb,
   createMockSql,
   createMockSqlOperators,
   databaseMock,
   dbChainMock,
   dbChainMockFns,
   drizzleOrmMock,
+  flattenMockConditions,
+  hasMockCondition,
+  type MockCondition,
+  queueTableRows,
   resetDbChainMock,
 } from './database.mock'
 // Encryption mocks
 export { encryptionMock, encryptionMockFns } from './encryption.mock'
 // Env mocks
-export { createEnvMock, createMockGetEnv, defaultMockEnv, envMock } from './env.mock'
+export {
+  createEnvMock,
+  createMockGetEnv,
+  defaultMockEnv,
+  type EnvMockValue,
+  envMock,
+  envMockFns,
+  mockEnvObject,
+  resetEnvMock,
+  setEnv,
+} from './env.mock'
 // Env flag mocks
-export { envFlagsMock } from './env-flags.mock'
+export {
+  type EnvFlagsMockState,
+  envFlagsMock,
+  envFlagsMockFns,
+  resetEnvFlagsMock,
+  setEnvFlags,
+} from './env-flags.mock'
+// Environment utils mocks (for @/lib/environment/utils)
+export {
+  environmentUtilsMock,
+  environmentUtilsMockFns,
+  resetEnvironmentUtilsMock,
+} from './environment-utils.mock'
 // Execution preprocessing mocks (for @/lib/execution/preprocessing)
 export {
   executionPreprocessingMock,
@@ -70,6 +96,10 @@ export {
   mockNextFetchResponse,
   setupGlobalFetchMock,
 } from './fetch.mock'
+export {
+  foldersOrchestrationMock,
+  foldersOrchestrationMockFns,
+} from './folders-orchestration.mock'
 // Hybrid auth mocks
 export { hybridAuthMock, hybridAuthMockFns } from './hybrid-auth.mock'
 // Input validation mocks
@@ -90,6 +120,7 @@ export {
   McpOauthRedirectRequiredMock,
   mcpOauthMock,
   mcpOauthMockFns,
+  OauthStepTimeoutErrorMock,
 } from './mcp-oauth.mock'
 // Permission mocks
 export { permissionsMock, permissionsMockFns } from './permissions.mock'
@@ -98,7 +129,11 @@ export { posthogServerMock, posthogServerMockFns } from './posthog-server.mock'
 // Redis client mocks (for Redis client objects)
 export { clearRedisMocks, createMockRedis, type MockRedis } from './redis.mock'
 // Redis config mocks (for @/lib/core/config/redis)
-export { redisConfigMock, redisConfigMockFns } from './redis-config.mock'
+export {
+  redisConfigMock,
+  redisConfigMockFns,
+  resetRedisConfigMock,
+} from './redis-config.mock'
 // Request mocks
 export {
   createMockFormDataRequest,
@@ -136,7 +171,15 @@ export {
   terminalConsoleMockFns,
 } from './terminal-console.mock'
 // URL mocks
-export { urlsMock, urlsMockFns } from './urls.mock'
+export { LOCALHOST_HOSTNAMES_MOCK, resetUrlsMock, urlsMock, urlsMockFns } from './urls.mock'
+export {
+  MockV2ApiKeyUnauthenticatedError,
+  V2_OPERATION_RATE_LIMIT_ALLOWED,
+  V2_PREAUTH_RATE_LIMIT_ALLOWED,
+  v2ApiKeyAuthModuleMock,
+  v2RateLimiterModuleMock,
+  v2RouteMocks,
+} from './v2-route.mock'
 // Workflow authz package mocks (for @sim/platform-authz/workflow)
 export { workflowAuthzMock, workflowAuthzMockFns } from './workflow-authz.mock'
 // Workflows API utils mocks (for @/app/api/workflows/utils)

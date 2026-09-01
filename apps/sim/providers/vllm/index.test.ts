@@ -1,7 +1,8 @@
 /**
  * @vitest-environment node
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { resetEnvMock, setEnv } from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
   mockCreate,
@@ -14,7 +15,6 @@ const {
   mockValidateUrlWithDNS,
   mockCreatePinnedFetch,
   pinnedFetchFn,
-  envState,
 } = vi.hoisted(() => {
   const openAIArgs: Array<Record<string, unknown>> = []
   const mockCreate = vi.fn()
@@ -36,15 +36,10 @@ const {
     mockValidateUrlWithDNS: vi.fn(),
     mockCreatePinnedFetch: vi.fn(() => pinnedFetchFn),
     pinnedFetchFn,
-    envState: {
-      VLLM_BASE_URL: 'http://localhost:8000',
-      VLLM_API_KEY: undefined as string | undefined,
-    },
   }
 })
 
 vi.mock('openai', () => ({ default: mockOpenAI }))
-vi.mock('@/lib/core/config/env', () => ({ env: envState }))
 vi.mock('@/lib/core/security/input-validation.server', () => ({
   validateUrlWithDNS: mockValidateUrlWithDNS,
   createPinnedFetch: mockCreatePinnedFetch,
@@ -65,6 +60,11 @@ vi.mock('@/providers/trace-enrichment', () => ({
   enrichLastModelSegmentFromChatCompletions: vi.fn(),
 }))
 vi.mock('@/providers/utils', () => ({
+  isFunctionToolCall: (toolCall: unknown) =>
+    typeof toolCall === 'object' &&
+    toolCall !== null &&
+    'function' in toolCall &&
+    (toolCall as { function?: unknown }).function != null,
   calculateCost: vi.fn(() => ({ input: 0, output: 0, total: 0 })),
   prepareToolExecution: vi.fn((_tool, args) => ({ toolParams: args, executionParams: args })),
   prepareToolsWithUsageControl: mockPrepareTools,
@@ -80,6 +80,7 @@ vi.mock('@/stores/providers', () => ({
 }))
 
 import { clearProviderClientCacheForTests } from '@/providers/client-cache'
+import type { AgentStreamEvent } from '@/providers/stream-events'
 import type { ProviderToolConfig } from '@/providers/types'
 import { vllmProvider } from '@/providers/vllm/index'
 
@@ -89,9 +90,13 @@ interface ToolCall {
   function: { name: string; arguments: string }
 }
 
-function chatResponse(content: string | null, toolCalls?: ToolCall[]) {
+function chatResponse(
+  content: string | null,
+  toolCalls?: ToolCall[],
+  reasoning?: { reasoning?: string; reasoning_content?: string }
+) {
   return {
-    choices: [{ message: { content, tool_calls: toolCalls } }],
+    choices: [{ message: { content, tool_calls: toolCalls, ...reasoning } }],
     usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
   }
 }
@@ -99,7 +104,6 @@ function chatResponse(content: string | null, toolCalls?: ToolCall[]) {
 function makeTool(id: string): ProviderToolConfig {
   return {
     id,
-    name: id,
     description: '',
     params: {},
     parameters: { type: 'object', properties: {}, required: [] },
@@ -115,13 +119,24 @@ const toolCall = (id: string, name: string, args = '{}'): ToolCall => ({
 /** Payload passed to the Nth `chat.completions.create` call. */
 const createPayload = (callIndex: number) => mockCreate.mock.calls[callIndex][0]
 
+async function readAgentEvents(stream: ReadableStream<AgentStreamEvent>) {
+  const events: AgentStreamEvent[] = []
+  const reader = stream.getReader()
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) return events
+    events.push(value)
+  }
+}
+
+afterAll(resetEnvMock)
+
 describe('vllmProvider', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     clearProviderClientCacheForTests()
     openAIArgs.length = 0
-    envState.VLLM_BASE_URL = 'http://localhost:8000'
-    envState.VLLM_API_KEY = undefined
+    setEnv({ VLLM_BASE_URL: 'http://localhost:8000', VLLM_API_KEY: undefined })
     mockPrepareTools.mockReturnValue({
       tools: [{ type: 'function', function: { name: 'myTool' } }],
       toolChoice: 'auto',
@@ -150,6 +165,18 @@ describe('vllmProvider', () => {
       expect(openAIArgs[0].fetch).toBeUndefined()
     })
 
+    it('does not duplicate an existing /v1 API prefix', async () => {
+      setEnv({ VLLM_BASE_URL: 'http://localhost:1234/v1', VLLM_API_KEY: undefined })
+      mockCreate.mockResolvedValueOnce(chatResponse('hi'))
+
+      await vllmProvider.executeRequest({
+        model: 'vllm/lmstudio-model',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+
+      expect(openAIArgs[0].baseURL).toBe('http://localhost:1234/v1')
+    })
+
     it('validates a user-supplied endpoint and pins the connection to the resolved IP', async () => {
       mockCreate.mockResolvedValueOnce(chatResponse('hi'))
 
@@ -165,6 +192,24 @@ describe('vllmProvider', () => {
         { allowHttp: true }
       )
       expect(mockCreatePinnedFetch).toHaveBeenCalledWith('203.0.113.10')
+      expect(openAIArgs[0].baseURL).toBe('https://my-vllm.example.com/v1')
+      expect(openAIArgs[0].fetch).toBe(pinnedFetchFn)
+    })
+
+    it('preserves an existing /v1 prefix on a user-supplied endpoint', async () => {
+      mockCreate.mockResolvedValueOnce(chatResponse('hi'))
+
+      await vllmProvider.executeRequest({
+        model: 'vllm/llama-3',
+        messages: [{ role: 'user', content: 'hi' }],
+        azureEndpoint: 'https://my-vllm.example.com/v1',
+      })
+
+      expect(mockValidateUrlWithDNS).toHaveBeenCalledWith(
+        'https://my-vllm.example.com/v1',
+        'vLLM endpoint',
+        { allowHttp: true }
+      )
       expect(openAIArgs[0].baseURL).toBe('https://my-vllm.example.com/v1')
       expect(openAIArgs[0].fetch).toBe(pinnedFetchFn)
     })
@@ -220,7 +265,8 @@ describe('vllmProvider', () => {
     const payload = createPayload(0)
     expect(payload.model).toBe('llama-3')
     expect(payload.temperature).toBe(0.7)
-    expect(payload.max_completion_tokens).toBe(256)
+    expect(payload.max_tokens).toBe(256)
+    expect(payload.max_completion_tokens).toBeUndefined()
     expect(payload.messages.map((m: { role: string }) => m.role)).toEqual([
       'system',
       'user',
@@ -283,6 +329,40 @@ describe('vllmProvider', () => {
     expect(result.toolCalls).toHaveLength(1)
     expect(result.toolCalls?.[0]).toMatchObject({ name: 'myTool', success: true })
     expect(result.toolResults).toHaveLength(1)
+  })
+
+  it('replays vLLM assistant content and emitted reasoning fields on the second request', async () => {
+    mockCreate
+      .mockResolvedValueOnce(
+        chatResponse('I will use the tool.', [toolCall('call_1', 'myTool', '{"x":1}')], {
+          reasoning: 'Current vLLM reasoning.',
+          reasoning_content: 'Legacy vLLM reasoning.',
+        })
+      )
+      .mockResolvedValueOnce(chatResponse('final answer'))
+
+    await vllmProvider.executeRequest({
+      model: 'vllm/llama-3',
+      messages: [{ role: 'user', content: 'use a tool' }],
+      tools: [makeTool('myTool')],
+    })
+
+    const assistant = createPayload(1).messages.find(
+      (message: { role: string }) => message.role === 'assistant'
+    )
+    expect(assistant).toEqual({
+      role: 'assistant',
+      content: 'I will use the tool.',
+      reasoning: 'Current vLLM reasoning.',
+      reasoning_content: 'Legacy vLLM reasoning.',
+      tool_calls: [
+        {
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'myTool', arguments: '{"x":1}' },
+        },
+      ],
+    })
   })
 
   it('records a failed tool result without throwing', async () => {
@@ -357,19 +437,33 @@ describe('vllmProvider', () => {
     expect('stream' in result && 'execution' in result).toBe(true)
   })
 
-  it('uses tool_choice "none" on the final streaming call after tool processing', async () => {
-    mockCreate.mockResolvedValueOnce(chatResponse('answer')).mockResolvedValueOnce({})
+  it('projects the settled tool-loop answer without a final streaming call', async () => {
+    mockCreate
+      .mockResolvedValueOnce(chatResponse(null, [toolCall('call_1', 'myTool')]))
+      .mockResolvedValueOnce(chatResponse('answer'))
 
-    await vllmProvider.executeRequest({
+    const result = await vllmProvider.executeRequest({
       model: 'vllm/llama-3',
       messages: [{ role: 'user', content: 'hi' }],
       stream: true,
       tools: [makeTool('myTool')],
     })
 
-    const streamingPayload = createPayload(1)
-    expect(streamingPayload.stream).toBe(true)
-    expect(streamingPayload.tool_choice).toBe('none')
+    expect(mockCreate).toHaveBeenCalledTimes(2)
+    expect(mockExecuteTool).toHaveBeenCalledTimes(1)
+    expect('stream' in result).toBe(true)
+    if (!('stream' in result)) throw new Error('Expected streaming execution')
+    expect(result.execution.output.content).toBe('answer')
+    expect(result.execution.output.tokens).toEqual({ input: 20, output: 10, total: 30 })
+    expect(result.execution.output.providerTiming?.iterations).toBe(2)
+    expect(
+      result.execution.output.providerTiming?.timeSegments?.filter(
+        (segment) => segment.type === 'model'
+      )
+    ).toHaveLength(2)
+    await expect(
+      readAgentEvents(result.stream as ReadableStream<AgentStreamEvent>)
+    ).resolves.toEqual([{ type: 'text_delta', text: 'answer', turn: 'final' }])
   })
 
   it('throws a ProviderError carrying the vLLM error message on API failure', async () => {
@@ -386,7 +480,7 @@ describe('vllmProvider', () => {
   })
 
   it('throws when no base URL is configured', async () => {
-    envState.VLLM_BASE_URL = ''
+    setEnv({ VLLM_BASE_URL: '' })
 
     await expect(
       vllmProvider.executeRequest({

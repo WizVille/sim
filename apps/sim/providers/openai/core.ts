@@ -1,38 +1,116 @@
+import { createHash } from 'node:crypto'
 import type { Logger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
+import { truncate } from '@sim/utils/string'
 import type OpenAI from 'openai'
-import type { IterationToolCall, StreamingExecution } from '@/executor/types'
+import type { NormalizedBlockOutput, StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
+import { createOpenAIResponsesStreamingToolLoopStream } from '@/providers/openai/streaming-tool-loop'
+import { enrichLastModelSegmentFromOpenAIResponse } from '@/providers/openai/trace'
+import {
+  addOpenAIUsage,
+  buildOpenAIUsageCost,
+  buildOpenAIUsageTokens,
+  createOpenAIUsageAccumulator,
+} from '@/providers/openai/usage'
+import { executeProviderTool } from '@/providers/runtime-context'
 import { createStreamingExecution } from '@/providers/streaming-execution'
+import { isAbortError, parseToolArguments } from '@/providers/streaming-tool-loop-shared'
 import { adaptOpenAIChatToolSchema } from '@/providers/tool-schema-adapter'
-import { enrichLastModelSegment, parseToolCallArguments } from '@/providers/trace-enrichment'
 import type { Message, ProviderRequest, ProviderResponse, TimeSegment } from '@/providers/types'
 import { ProviderError } from '@/providers/types'
 import {
-  calculateCost,
   enforceStrictSchema,
   prepareToolExecution,
   prepareToolsWithUsageControl,
-  sumToolCosts,
+  supportsReasoningEffort,
   trackForcedToolUsage,
 } from '@/providers/utils'
-import { executeTool } from '@/tools'
 import {
   buildResponsesInputFromMessages,
   convertResponseOutputToInputItems,
   convertToolsToResponses,
   createReadableStreamFromResponses,
-  extractResponseReasoning,
   extractResponseText,
   extractResponseToolCalls,
+  isMaxOutputTokensIncompleteResponse,
   parseResponsesUsage,
   type ResponsesInputItem,
   type ResponsesToolCall,
+  responseContainsFunctionCall,
   toResponsesToolChoice,
 } from './utils'
 
+/**
+ * Rejects a `/v1/responses` body reporting a generation that did not succeed — the
+ * endpoint answers HTTP 200 for both `status: 'failed'` and `status: 'incomplete'`.
+ *
+ * The tolerated case must stay matched to `streamResponsesTurn`: `incomplete` is accepted
+ * only when truncated by `max_output_tokens` AND carrying no function call. Truncated
+ * prose is a usable partial answer, but a truncated `function_call` holds half-written
+ * JSON that makes `parseToolArguments` throw a confusing tool failure.
+ *
+ * An absent `status` is deliberately not treated as a failure: this path is shared with
+ * Azure OpenAI and OpenAI-compatible gateways.
+ */
+function assertUsableResponse(response: OpenAI.Responses.Response, providerLabel: string): void {
+  if (response.error) {
+    const code = response.error.code ? ` (${response.error.code})` : ''
+    throw new Error(`${providerLabel} generation failed${code}: ${response.error.message}`)
+  }
+
+  if (response.status === 'failed') {
+    throw new Error(
+      `${providerLabel} generation failed, and the API returned no error detail explaining why.`
+    )
+  }
+
+  if (response.status === 'incomplete') {
+    const reason = response.incomplete_details?.reason ?? 'unknown'
+    if (responseContainsFunctionCall(response)) {
+      throw new Error(
+        `${providerLabel} generation stopped before completion (${reason}), truncating a tool call mid-argument. Raise the max output tokens or reduce the tool schema size.`
+      )
+    }
+    if (!isMaxOutputTokensIncompleteResponse(response)) {
+      throw new Error(`${providerLabel} generation stopped before completion: ${reason}.`)
+    }
+    return
+  }
+
+  if (response.status && response.status !== 'completed') {
+    throw new Error(
+      `${providerLabel} returned a response with status "${response.status}", which carries no finished generation.`
+    )
+  }
+}
+
+/**
+ * Transport failures annotated once already. The error-body read is annotated where the
+ * phase is known, then rethrown through an outer catch that would otherwise append a
+ * second, wrong phase to the same message.
+ */
+const annotatedTransportFailures = new WeakSet<Error>()
+
 type PreparedTools = ReturnType<typeof prepareToolsWithUsageControl>
 type ToolChoice = PreparedTools['toolChoice']
+
+/**
+ * Stable routing key for OpenAI's prompt cache, scoped to one agent block.
+ *
+ * Per-block rather than per-workflow: two blocks in the same workflow have
+ * different prefixes, so sharing a key would pull them onto the same engine and
+ * lower the hit rate. Hashed so no internal identifier leaves the system.
+ * Returns `undefined` when the caller has no stable identity to key on.
+ */
+function buildPromptCacheKey(request: ProviderRequest): string | undefined {
+  if (!request.workflowId || !request.blockId) return undefined
+  return createHash('sha256')
+    .update(`${request.workflowId}:${request.blockId}`)
+    .digest('hex')
+    .slice(0, 32)
+}
 
 export interface ResponsesProviderConfig {
   providerId: string
@@ -61,6 +139,9 @@ export async function executeResponsesProviderRequest(
 
   logger.info(`Preparing ${config.providerLabel} request`, {
     model: request.model,
+    workflowId: request.workflowId,
+    blockId: request.blockId,
+    executionId: request.executionId,
     hasSystemPrompt: !!request.systemPrompt,
     hasMessages: !!request.messages?.length,
     hasTools: !!request.tools?.length,
@@ -95,13 +176,39 @@ export async function executeResponsesProviderRequest(
     model: config.modelName,
   }
 
+  /**
+   * OpenAI prompt caching is automatic and free, so there is nothing to toggle
+   * — but requests only hit a warm cache when they route to the same engine.
+   * A stable key per agent block sharpens that routing and is required for
+   * reliable matching on GPT-5.6+.
+   *
+   * `prompt_cache_key` is absent from the pinned SDK's typings, which is
+   * harmless: this body is a plain object posted through `fetch`, never
+   * `responses.create()`. Do not delete it as an unknown parameter.
+   */
+  const promptCacheKey = buildPromptCacheKey(request)
+  if (promptCacheKey) basePayload.prompt_cache_key = promptCacheKey
+
   if (request.temperature !== undefined) basePayload.temperature = request.temperature
   if (request.maxTokens != null) basePayload.max_output_tokens = request.maxTokens
 
-  if (request.reasoningEffort !== undefined && request.reasoningEffort !== 'auto') {
-    basePayload.reasoning = {
-      effort: request.reasoningEffort,
-      summary: 'auto',
+  /**
+   * Reasoning summaries feed Thinking chrome. They are requested when an
+   * explicit effort is set (pre-agent-events payload always paired
+   * `summary: 'auto'` with `effort` — kept for parity) and on agent-events
+   * runs even without an explicit effort. Summaries require OpenAI
+   * organization verification; see the strip-and-retry fallback in the
+   * request helpers below.
+   */
+  if (supportsReasoningEffort(config.modelName)) {
+    const hasExplicitEffort =
+      request.reasoningEffort !== undefined && request.reasoningEffort !== 'auto'
+    const reasoning: Record<string, unknown> = {
+      ...(request.agentEvents === true || hasExplicitEffort ? { summary: 'auto' } : {}),
+      ...(hasExplicitEffort ? { effort: request.reasoningEffort } : {}),
+    }
+    if (Object.keys(reasoning).length > 0) {
+      basePayload.reasoning = reasoning
     }
   }
 
@@ -111,11 +218,6 @@ export async function executeResponsesProviderRequest(
       verbosity: request.verbosity,
     }
   }
-
-  // Store response format config - for Azure with tools, we defer applying it until after tool calls complete
-  let deferredTextFormat: OpenAI.Responses.ResponseFormatTextJSONSchemaConfig | undefined
-  const hasTools = !!request.tools?.length
-  const isAzure = config.providerId === 'azure-openai'
 
   if (request.responseFormat) {
     const isStrict = request.responseFormat.strict !== false
@@ -130,20 +232,11 @@ export async function executeResponsesProviderRequest(
       strict: isStrict,
     }
 
-    // Azure OpenAI has issues combining tools + response_format in the same request
-    // Defer the format until after tool calls complete for Azure
-    if (isAzure && hasTools) {
-      deferredTextFormat = textFormat
-      logger.info(
-        `Deferring JSON schema response format for ${config.providerLabel} (will apply after tool calls complete)`
-      )
-    } else {
-      basePayload.text = {
-        ...((basePayload.text as Record<string, unknown>) ?? {}),
-        format: textFormat,
-      }
-      logger.info(`Added JSON schema response format to ${config.providerLabel} request`)
+    basePayload.text = {
+      ...((basePayload.text as Record<string, unknown>) ?? {}),
+      format: textFormat,
     }
+    logger.info(`Added JSON schema response format to ${config.providerLabel} request`)
   }
 
   const tools = request.tools?.length
@@ -201,52 +294,269 @@ export async function executeResponsesProviderRequest(
     ...overrides,
   })
 
-  const parseErrorResponse = async (response: Response): Promise<string> => {
-    const text = await response.text()
+  /**
+   * Names the request phase an opaque transport failure died in.
+   *
+   * Bun raises only `TimeoutError: The operation timed out.`, which cannot distinguish
+   * "never answered" from "answered, but the body never arrived" — opposite owners,
+   * opposite fixes. undici splits these as `UND_ERR_HEADERS_TIMEOUT` vs
+   * `UND_ERR_BODY_TIMEOUT`; this records the equivalent for a runtime that reports
+   * neither.
+   *
+   * The phase rides the error message because that reaches the block's trace span, which
+   * survives when a task has stopped shipping logs; `x-request-id` is the only handle the
+   * provider can trace the call by. Self-describing API errors are left untouched.
+   */
+  const annotateTransportFailure = (
+    error: unknown,
+    phase: 'awaiting-response-headers' | 'reading-response-body',
+    startedAt: number,
+    detail?: Record<string, string | number | null>
+  ): unknown => {
+    if (!(error instanceof Error)) return error
+    if (error.name !== 'TimeoutError' && error.name !== 'AbortError') return error
+    if (annotatedTransportFailures.has(error)) return error
+
+    const elapsedMs = Date.now() - startedAt
+    const fields = Object.entries(detail ?? {})
+      .filter(([, value]) => value !== null && value !== undefined)
+      .map(([key, value]) => `${key}=${value}`)
+    const context = [`phase=${phase}`, `elapsedMs=${elapsedMs}`, ...fields].join(' ')
+
+    logger.error(`${config.providerLabel} request failed in transport`, {
+      phase,
+      elapsedMs,
+      errorName: error.name,
+      model: config.modelName,
+      workflowId: request.workflowId,
+      blockId: request.blockId,
+      executionId: request.executionId,
+      ...detail,
+    })
+
+    /**
+     * A new Error rather than a mutation: the runtime raises these as `DOMException`,
+     * whose `message` is a readonly getter, so assigning to it throws a `TypeError` and
+     * destroys the very failure being reported. `name` is copied and the original hangs
+     * off `cause` so the classification survives the `ProviderError` wrapping below,
+     * which overwrites `name`.
+     */
+    const annotated = new Error(`${error.message} [${context}]`, { cause: error })
+    annotated.name = error.name
+    annotatedTransportFailures.add(annotated)
+    return annotated
+  }
+
+  /**
+   * The response-side facts worth carrying on a transport failure. `x-request-id` is the
+   * only handle the provider can trace a failed call by.
+   */
+  const describeResponse = (response: Response): Record<string, string | number | null> => ({
+    status: response.status,
+    requestId: response.headers.get('x-request-id'),
+    contentLength: response.headers.get('content-length'),
+    contentEncoding: response.headers.get('content-encoding'),
+  })
+
+  /**
+   * A non-JSON body is usually a gateway or CDN error page and reaches the user-facing
+   * block error, so it is bounded and falls back to `statusText`. A structured provider
+   * message is returned untruncated on purpose: the reasoning-summary strip-and-retry
+   * fallback matches on its text.
+   *
+   * A failed body read is annotated rather than swallowed: a deadline or a cancellation
+   * here must stay distinguishable from an error response that simply carried no body.
+   * The headers already arrived, so this is the body phase even though the status is 4xx.
+   */
+  const parseErrorResponse = async (response: Response, startedAt: number): Promise<string> => {
+    let text: string
+    try {
+      text = await response.text()
+    } catch (error) {
+      throw annotateTransportFailure(
+        error,
+        'reading-response-body',
+        startedAt,
+        describeResponse(response)
+      )
+    }
     try {
       const payload = JSON.parse(text)
-      return payload?.error?.message || text
-    } catch {
-      return text
+      if (payload?.error?.message) return payload.error.message
+    } catch {}
+    return truncate(text.trim(), 500) || response.statusText || `HTTP ${response.status}`
+  }
+
+  /**
+   * OpenAI rejects `reasoning.summary` with a 400 for organizations that have
+   * not completed verification. Summaries are best-effort chrome, so on that
+   * specific failure the request is retried once without the summary field
+   * rather than failing the run.
+   */
+  const isReasoningSummaryVerificationError = (status: number, message: string): boolean =>
+    status === 400 &&
+    message.includes('reasoning.summary') &&
+    message.toLowerCase().includes('verif')
+
+  const stripReasoningSummary = (body: Record<string, unknown>): Record<string, unknown> | null => {
+    const reasoning = body.reasoning as Record<string, unknown> | undefined
+    if (!reasoning || reasoning.summary === undefined) return null
+    const { summary: _summary, ...reasoningRest } = reasoning
+    const { reasoning: _reasoning, ...bodyRest } = body
+    return Object.keys(reasoningRest).length > 0
+      ? { ...bodyRest, reasoning: reasoningRest }
+      : bodyRest
+  }
+
+  let reasoningSummariesUnavailable = false
+
+  /**
+   * The single point every Responses request leaves through, so a stall waiting for
+   * headers is named on the streaming paths too — they call
+   * {@link fetchResponsesWithSummaryFallback} directly and never reach `postResponses`,
+   * which is where the annotation used to live.
+   */
+  const postOnce = async (
+    payload: Record<string, unknown>,
+    abortSignal: AbortSignal | undefined,
+    startedAt: number
+  ): Promise<Response> => {
+    try {
+      return await fetchImpl(config.endpoint, {
+        method: 'POST',
+        headers: config.headers,
+        body: JSON.stringify(payload),
+        signal: abortSignal,
+      })
+    } catch (error) {
+      throw annotateTransportFailure(error, 'awaiting-response-headers', startedAt)
     }
+  }
+
+  const fetchResponsesWithSummaryFallback = async (
+    requestedBody: Record<string, unknown>,
+    startedAt: number,
+    abortSignal = request.abortSignal
+  ): Promise<Response> => {
+    const body = reasoningSummariesUnavailable
+      ? (stripReasoningSummary(requestedBody) ?? requestedBody)
+      : requestedBody
+    const response = await postOnce(body, abortSignal, startedAt)
+    if (response.ok) return response
+
+    const message = await parseErrorResponse(response, startedAt)
+    const strippedBody = isReasoningSummaryVerificationError(response.status, message)
+      ? stripReasoningSummary(body)
+      : null
+    if (!strippedBody) {
+      throw new Error(`${config.providerLabel} API error (${response.status}): ${message}`)
+    }
+
+    reasoningSummariesUnavailable = true
+    logger.warn(
+      `${config.providerLabel} rejected reasoning summaries (organization not verified); retrying without summary`,
+      { model: config.modelName }
+    )
+    const retryResponse = await postOnce(strippedBody, abortSignal, startedAt)
+    if (!retryResponse.ok) {
+      const retryMessage = await parseErrorResponse(retryResponse, startedAt)
+      throw new Error(
+        `${config.providerLabel} API error (${retryResponse.status}): ${retryMessage}`
+      )
+    }
+    return retryResponse
   }
 
   const postResponses = async (
     body: Record<string, unknown>
   ): Promise<OpenAI.Responses.Response> => {
-    const response = await fetchImpl(config.endpoint, {
-      method: 'POST',
-      headers: config.headers,
-      body: JSON.stringify(body),
-      signal: request.abortSignal,
-    })
+    const startedAt = Date.now()
 
-    if (!response.ok) {
-      const message = await parseErrorResponse(response)
-      throw new Error(`${config.providerLabel} API error (${response.status}): ${message}`)
+    const response = await fetchResponsesWithSummaryFallback(body, startedAt)
+
+    const responseMeta = { ...describeResponse(response), ttfbMs: Date.now() - startedAt }
+
+    let parsed: OpenAI.Responses.Response
+    try {
+      parsed = await response.json()
+    } catch (error) {
+      throw annotateTransportFailure(error, 'reading-response-body', startedAt, responseMeta)
     }
 
-    return response.json()
+    /**
+     * Placed here so every tool-loop turn is covered, and outside the transport `try` so
+     * a rejected generation is not misreported as a transport failure.
+     */
+    assertUsableResponse(parsed, config.providerLabel)
+    return parsed
   }
 
   const providerStartTime = Date.now()
   const providerStartTimeISO = new Date(providerStartTime).toISOString()
 
   try {
-    if (request.stream && (!tools || tools.length === 0)) {
+    const hasActiveTools = Array.isArray(basePayload.tools) && basePayload.tools.length > 0
+
+    if (request.stream && hasActiveTools) {
+      logger.info(`Using live streaming tool loop for ${config.providerLabel} request`)
+      const timeSegments: TimeSegment[] = []
+
+      return createStreamingExecution({
+        model: request.model,
+        providerStartTime,
+        providerStartTimeISO,
+        timing: {
+          kind: 'accumulated',
+          modelTime: 0,
+          toolsTime: 0,
+          firstResponseTime: 0,
+          iterations: 1,
+          timeSegments,
+        },
+        initialTokens: { input: 0, output: 0, total: 0 },
+        initialCost: { input: 0, output: 0, total: 0 },
+        isStreaming: true,
+        streamFormat: 'agent-events-v1',
+        createStream: ({ output, finalizeTiming }) =>
+          createOpenAIResponsesStreamingToolLoopStream({
+            providerId: config.providerId,
+            providerLabel: config.providerLabel,
+            request,
+            initialInput,
+            initialToolChoice: responsesToolChoice,
+            forcedTools: preparedTools?.forcedTools,
+            createStream: (input, overrides, abortSignal) =>
+              fetchResponsesWithSummaryFallback(
+                createRequestBody(input, overrides),
+                Date.now(),
+                abortSignal
+              ),
+            logger,
+            timeSegments,
+            onComplete: (result) => {
+              output.content = result.content
+              output.tokens = result.tokens
+              output.cost = result.cost
+              output.toolCalls = result.toolCalls as NormalizedBlockOutput['toolCalls']
+              if (output.providerTiming) {
+                output.providerTiming.modelTime = result.modelTime
+                output.providerTiming.toolsTime = result.toolsTime
+                output.providerTiming.firstResponseTime = result.firstResponseTime
+                output.providerTiming.iterations = result.iterations
+              }
+              finalizeTiming()
+            },
+          }),
+      })
+    }
+
+    if (request.stream && !hasActiveTools) {
       logger.info(`Using streaming response for ${config.providerLabel} request`)
 
-      const streamResponse = await fetchImpl(config.endpoint, {
-        method: 'POST',
-        headers: config.headers,
-        body: JSON.stringify(createRequestBody(initialInput, { stream: true })),
-        signal: request.abortSignal,
-      })
-
-      if (!streamResponse.ok) {
-        const message = await parseErrorResponse(streamResponse)
-        throw new Error(`${config.providerLabel} API error (${streamResponse.status}): ${message}`)
-      }
+      const streamResponse = await fetchResponsesWithSummaryFallback(
+        createRequestBody(initialInput, { stream: true }),
+        Date.now()
+      )
 
       const streamingResult = createStreamingExecution({
         model: request.model,
@@ -255,24 +565,22 @@ export async function executeResponsesProviderRequest(
         timing: { kind: 'simple', segmentName: request.model },
         initialTokens: { input: 0, output: 0, total: 0 },
         initialCost: { input: 0, output: 0, total: 0 },
+        streamFormat: 'agent-events-v1',
         createStream: ({ output, finalizeTiming }) =>
-          createReadableStreamFromResponses(streamResponse, (content, usage) => {
-            output.content = content
-            output.tokens = {
-              input: usage?.promptTokens || 0,
-              output: usage?.completionTokens || 0,
-              total: usage?.totalTokens || 0,
-            }
+          createReadableStreamFromResponses(streamResponse, (content, usage, thinking) => {
+            const accumulator = createOpenAIUsageAccumulator()
+            addOpenAIUsage(accumulator, usage)
 
-            const costResult = calculateCost(
-              request.model,
-              usage?.promptTokens || 0,
-              usage?.completionTokens || 0
-            )
-            output.cost = {
-              input: costResult.input,
-              output: costResult.output,
-              total: costResult.total,
+            output.content = content
+            output.tokens = buildOpenAIUsageTokens(accumulator)
+            output.cost = buildOpenAIUsageCost(request.model, accumulator)
+
+            if (thinking) {
+              const segment = output.providerTiming?.timeSegments?.[0]
+              if (segment) {
+                // Label honestly: these are reasoning *summaries*, not raw CoT.
+                segment.thinkingContent = thinking
+              }
             }
 
             finalizeTiming()
@@ -313,12 +621,8 @@ export async function executeResponsesProviderRequest(
     )
     const firstResponseTime = Date.now() - initialCallTime
 
-    const initialUsage = parseResponsesUsage(currentResponse.usage)
-    const tokens = {
-      input: initialUsage?.promptTokens || 0,
-      output: initialUsage?.completionTokens || 0,
-      total: initialUsage?.totalTokens || 0,
-    }
+    const usage = createOpenAIUsageAccumulator()
+    addOpenAIUsage(usage, parseResponsesUsage(currentResponse.usage))
 
     const toolCalls = []
     const toolResults: Record<string, unknown>[] = []
@@ -380,29 +684,55 @@ export async function executeResponsesProviderRequest(
         const toolName = toolCall.name
 
         try {
-          const toolArgs = toolCall.arguments ? JSON.parse(toolCall.arguments) : {}
+          const toolArgs = parseToolArguments(toolCall.arguments, toolName)
           const tool = request.tools?.find((t) => t.id === toolName)
 
           if (!tool) {
-            return null
+            const toolCallEndTime = Date.now()
+            return {
+              toolCall,
+              toolName,
+              toolParams: {},
+              result: {
+                success: false,
+                output: undefined,
+                error: `Tool "${toolName}" is not available`,
+              },
+              startTime: toolCallStartTime,
+              endTime: toolCallEndTime,
+              duration: toolCallEndTime - toolCallStartTime,
+            }
           }
 
-          const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-          const result = await executeTool(toolName, executionParams, {
-            signal: request.abortSignal,
-          })
+          const { toolParams, executionParams } = prepareToolExecution(
+            tool,
+            toolArgs,
+            request,
+            toolCall.id
+          )
+          const { rawResponse, modelResponse } = await executeProviderTool(
+            toolName,
+            executionParams,
+            {
+              signal: request.abortSignal,
+            }
+          )
           const toolCallEndTime = Date.now()
 
           return {
             toolCall,
             toolName,
             toolParams,
-            result,
+            result: rawResponse,
+            modelResult: modelResponse,
             startTime: toolCallStartTime,
             endTime: toolCallEndTime,
             duration: toolCallEndTime - toolCallStartTime,
           }
         } catch (error) {
+          if (isAbortError(error) || request.abortSignal?.aborted) {
+            throw error
+          }
           const toolCallEndTime = Date.now()
           logger.error('Error processing tool call:', { error, toolName })
 
@@ -422,13 +752,15 @@ export async function executeResponsesProviderRequest(
         }
       })
 
-      const executionResults = await Promise.allSettled(toolExecutionPromises)
+      const executionResults = await Promise.all(toolExecutionPromises)
 
-      for (const settledResult of executionResults) {
-        if (settledResult.status === 'rejected' || !settledResult.value) continue
-
+      for (const executionResult of executionResults) {
         const { toolCall, toolName, toolParams, result, startTime, endTime, duration } =
-          settledResult.value
+          executionResult
+        const modelResult =
+          'modelResult' in executionResult && executionResult.modelResult
+            ? executionResult.modelResult
+            : result
 
         timeSegments.push({
           type: 'tool',
@@ -439,10 +771,12 @@ export async function executeResponsesProviderRequest(
           toolCallId: toolCall.id,
         })
 
-        let resultContent: Record<string, unknown>
-        if (result.success && result.output) {
-          toolResults.push(result.output)
-          resultContent = result.output as Record<string, unknown>
+        let resultContent: unknown
+        if (result.success) {
+          if (isRecordLike(result.output)) {
+            toolResults.push(result.output)
+          }
+          resultContent = result.output ?? null
         } else {
           resultContent = {
             error: true,
@@ -450,6 +784,13 @@ export async function executeResponsesProviderRequest(
             tool: toolName,
           }
         }
+        const modelResultContent = modelResult.success
+          ? (modelResult.output ?? null)
+          : {
+              error: true,
+              message: modelResult.error || 'Tool execution failed',
+              tool: toolName,
+            }
 
         toolCalls.push({
           name: toolName,
@@ -464,7 +805,7 @@ export async function executeResponsesProviderRequest(
         currentInput.push({
           type: 'function_call_output',
           call_id: toolCall.id,
-          output: JSON.stringify(resultContent),
+          output: JSON.stringify(modelResultContent),
         })
       }
 
@@ -520,12 +861,7 @@ export async function executeResponsesProviderRequest(
 
       modelTime += thisModelTime
 
-      const usage = parseResponsesUsage(currentResponse.usage)
-      if (usage) {
-        tokens.input += usage.promptTokens
-        tokens.output += usage.completionTokens
-        tokens.total += usage.totalTokens
-      }
+      addOpenAIUsage(usage, parseResponsesUsage(currentResponse.usage))
 
       iterationCount++
     }
@@ -542,172 +878,6 @@ export async function executeResponsesProviderRequest(
       )
     }
 
-    // For Azure with deferred format: make a final call with the response format applied
-    // This happens whenever we have a deferred format, even if no tools were called
-    // (the initial call was made without the format, so we need to apply it now)
-    let appliedDeferredFormat = false
-    if (deferredTextFormat) {
-      logger.info(
-        `Applying deferred JSON schema response format for ${config.providerLabel} (iterationCount: ${iterationCount})`
-      )
-
-      const finalFormatStartTime = Date.now()
-
-      // Determine what input to use for the formatted call
-      let formattedInput: ResponsesInputItem[]
-
-      if (iterationCount > 0) {
-        // Tools were called - include the conversation history with tool results
-        const lastOutputItems = convertResponseOutputToInputItems(currentResponse.output)
-        if (lastOutputItems.length) {
-          currentInput.push(...lastOutputItems)
-        }
-        formattedInput = currentInput
-      } else {
-        // No tools were called - just retry the initial call with format applied
-        // Don't include the model's previous unformatted response
-        formattedInput = initialInput
-      }
-
-      // Make final call with the response format - build payload without tools
-      const finalPayload: Record<string, unknown> = {
-        model: config.modelName,
-        input: formattedInput,
-        text: {
-          ...((basePayload.text as Record<string, unknown>) ?? {}),
-          format: deferredTextFormat,
-        },
-      }
-
-      // Copy over non-tool related settings
-      if (request.temperature !== undefined) finalPayload.temperature = request.temperature
-      if (request.maxTokens != null) finalPayload.max_output_tokens = request.maxTokens
-      if (request.reasoningEffort !== undefined && request.reasoningEffort !== 'auto') {
-        finalPayload.reasoning = {
-          effort: request.reasoningEffort,
-          summary: 'auto',
-        }
-      }
-      if (request.verbosity !== undefined && request.verbosity !== 'auto') {
-        finalPayload.text = {
-          ...((finalPayload.text as Record<string, unknown>) ?? {}),
-          verbosity: request.verbosity,
-        }
-      }
-
-      currentResponse = await postResponses(finalPayload)
-
-      const finalFormatEndTime = Date.now()
-      const finalFormatDuration = finalFormatEndTime - finalFormatStartTime
-
-      timeSegments.push({
-        type: 'model',
-        name: 'Final formatted response',
-        startTime: finalFormatStartTime,
-        endTime: finalFormatEndTime,
-        duration: finalFormatDuration,
-      })
-
-      modelTime += finalFormatDuration
-
-      const finalUsage = parseResponsesUsage(currentResponse.usage)
-      if (finalUsage) {
-        tokens.input += finalUsage.promptTokens
-        tokens.output += finalUsage.completionTokens
-        tokens.total += finalUsage.totalTokens
-      }
-
-      // Update content with the formatted response
-      const formattedText = extractResponseText(currentResponse.output)
-      if (formattedText) {
-        content = formattedText
-      }
-
-      enrichLastModelSegmentFromOpenAIResponse(
-        timeSegments,
-        currentResponse,
-        formattedText,
-        extractResponseToolCalls(currentResponse.output),
-        { model: request.model }
-      )
-
-      appliedDeferredFormat = true
-    }
-
-    // Skip streaming if we already applied deferred format - we have the formatted content
-    // Making another streaming call would lose the formatted response
-    if (request.stream && !appliedDeferredFormat) {
-      logger.info('Using streaming for final response after tool processing')
-
-      const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
-
-      // For Azure with deferred format in streaming mode, include the format in the streaming call
-      const streamOverrides: Record<string, unknown> = { stream: true, tool_choice: 'auto' }
-      if (deferredTextFormat) {
-        streamOverrides.text = {
-          ...((basePayload.text as Record<string, unknown>) ?? {}),
-          format: deferredTextFormat,
-        }
-      }
-
-      const streamResponse = await fetchImpl(config.endpoint, {
-        method: 'POST',
-        headers: config.headers,
-        body: JSON.stringify(createRequestBody(currentInput, streamOverrides)),
-        signal: request.abortSignal,
-      })
-
-      if (!streamResponse.ok) {
-        const message = await parseErrorResponse(streamResponse)
-        throw new Error(`${config.providerLabel} API error (${streamResponse.status}): ${message}`)
-      }
-
-      const streamingResult = createStreamingExecution({
-        model: request.model,
-        providerStartTime,
-        providerStartTimeISO,
-        timing: {
-          kind: 'accumulated',
-          modelTime,
-          toolsTime,
-          firstResponseTime,
-          iterations: iterationCount + 1,
-          timeSegments,
-        },
-        initialTokens: { input: tokens.input, output: tokens.output, total: tokens.total },
-        initialCost: {
-          input: accumulatedCost.input,
-          output: accumulatedCost.output,
-          total: accumulatedCost.total,
-        },
-        toolCalls: toolCalls.length > 0 ? { list: toolCalls, count: toolCalls.length } : undefined,
-        createStream: ({ output }) =>
-          createReadableStreamFromResponses(streamResponse, (content, usage) => {
-            output.content = content
-            output.tokens = {
-              input: tokens.input + (usage?.promptTokens || 0),
-              output: tokens.output + (usage?.completionTokens || 0),
-              total: tokens.total + (usage?.totalTokens || 0),
-            }
-
-            const streamCost = calculateCost(
-              request.model,
-              usage?.promptTokens || 0,
-              usage?.completionTokens || 0
-            )
-            const tc = sumToolCosts(toolResults)
-            output.cost = {
-              input: accumulatedCost.input + streamCost.input,
-              output: accumulatedCost.output + streamCost.output,
-              toolCost: tc || undefined,
-              total: accumulatedCost.total + streamCost.total + tc,
-            }
-          }),
-      })
-
-      return streamingResult
-    }
-
     const providerEndTime = Date.now()
     const providerEndTimeISO = new Date(providerEndTime).toISOString()
     const totalDuration = providerEndTime - providerStartTime
@@ -715,7 +885,13 @@ export async function executeResponsesProviderRequest(
     return {
       content,
       model: request.model,
-      tokens,
+      tokens: buildOpenAIUsageTokens(usage),
+      /**
+       * No tool cost here: `executeProviderRequest` re-derives it from
+       * `toolResults` for non-streaming responses, so folding it in would
+       * double-charge it.
+       */
+      cost: buildOpenAIUsageCost(request.model, usage),
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       toolResults: toolResults.length > 0 ? toolResults : undefined,
       timing: {
@@ -739,89 +915,18 @@ export async function executeResponsesProviderRequest(
       duration: totalDuration,
     })
 
-    throw new ProviderError(toError(error).message, {
-      startTime: providerStartTimeISO,
-      endTime: providerEndTimeISO,
-      duration: totalDuration,
-    })
-  }
-}
+    if (isAbortError(error) || request.abortSignal?.aborted) {
+      throw error
+    }
 
-/**
- * Determines a finish reason for an OpenAI Responses API response.
- * Maps to conventional values: 'tool_calls' | 'length' | 'stop'.
- */
-function deriveOpenAIFinishReason(
-  response: OpenAI.Responses.Response,
-  toolCalls: ResponsesToolCall[]
-): string | undefined {
-  const incompleteReason = response.incomplete_details?.reason
-  if (incompleteReason === 'max_output_tokens') return 'length'
-  if (incompleteReason === 'content_filter') return 'content_filter'
-  if (toolCalls.length > 0) return 'tool_calls'
-  if (incompleteReason) return incompleteReason
-  if (response.status === 'failed') return 'error'
-  if (response.status === 'incomplete') return 'length'
-  if (response.status && response.status !== 'completed') return response.status
-  return 'stop'
-}
-
-/**
- * Enriches the last model segment with per-iteration content extracted from an
- * OpenAI Responses API response: assistant text, tool calls, finish reason,
- * and token usage for the iteration.
- */
-function enrichLastModelSegmentFromOpenAIResponse(
-  timeSegments: TimeSegment[],
-  response: OpenAI.Responses.Response,
-  assistantText: string,
-  toolCallsInResponse: ResponsesToolCall[],
-  extras?: {
-    model?: string
-    ttft?: number
-    errorType?: string
-    errorMessage?: string
-  }
-): void {
-  const toolCalls: IterationToolCall[] = toolCallsInResponse.map((tc) => ({
-    id: tc.id,
-    name: tc.name,
-    arguments:
-      typeof tc.arguments === 'string' ? parseToolCallArguments(tc.arguments) : tc.arguments,
-  }))
-
-  const usage = parseResponsesUsage(response.usage)
-  const thinkingContent = extractResponseReasoning(response.output)
-
-  let cost: { input: number; output: number; total: number } | undefined
-  if (extras?.model && usage) {
-    const full = calculateCost(
-      extras.model,
-      usage.promptTokens,
-      usage.completionTokens,
-      usage.cachedTokens > 0
+    throw new ProviderError(
+      toError(error).message,
+      {
+        startTime: providerStartTimeISO,
+        endTime: providerEndTimeISO,
+        duration: totalDuration,
+      },
+      { cause: error }
     )
-    cost = { input: full.input, output: full.output, total: full.total }
   }
-
-  enrichLastModelSegment(timeSegments, {
-    assistantContent: assistantText || undefined,
-    thinkingContent: thinkingContent || undefined,
-    toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-    finishReason: deriveOpenAIFinishReason(response, toolCallsInResponse),
-    tokens: usage
-      ? {
-          input: usage.promptTokens,
-          output: usage.completionTokens,
-          total: usage.totalTokens,
-          ...(usage.cachedTokens > 0 && { cacheRead: usage.cachedTokens }),
-          ...(usage.reasoningTokens > 0 && { reasoning: usage.reasoningTokens }),
-        }
-      : undefined,
-    cost,
-    provider: 'openai',
-    ttft: extras?.ttft,
-    errorType: extras?.errorType,
-    errorMessage: extras?.errorMessage,
-  })
 }

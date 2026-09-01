@@ -75,6 +75,7 @@ export const VideoGeneratorBlock: BlockConfig<VideoBlockResponse> = {
   name: 'Video Generator (Legacy)',
   description: 'Generate videos from text using AI',
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'video_generator_v3' },
   authMode: AuthMode.ApiKey,
   longDescription:
     'Generate high-quality videos from text prompts using leading AI providers. Supports multiple models, aspect ratios, resolutions, and provider-specific features like world consistency, camera controls, and audio generation.',
@@ -83,6 +84,15 @@ export const VideoGeneratorBlock: BlockConfig<VideoBlockResponse> = {
   integrationType: IntegrationType.AI,
   bgColor: '#181C1E',
   icon: VideoIcon,
+  canvasPresentation: {
+    defaultTitle: 'Video Generator',
+    sentences: {
+      default: [
+        { text: 'Generate a video from', field: 'prompt', core: true },
+        { text: ', using', field: 'model' },
+      ],
+    },
+  },
 
   subBlocks: [
     // Provider selection
@@ -892,6 +902,7 @@ export const VideoGeneratorV2Block: BlockConfig<VideoBlockResponse> = {
   type: 'video_generator_v2',
   name: 'Video Generator',
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'video_generator_v3' },
   subBlocks: [
     {
       id: 'provider',
@@ -1649,6 +1660,7 @@ export const VideoGeneratorV2Block: BlockConfig<VideoBlockResponse> = {
 
 export const VideoGeneratorV3Block: BlockConfig<VideoBlockResponse> = {
   ...VideoGeneratorV2Block,
+  sunset: undefined,
   type: 'video_generator_v3',
   name: 'Video Generator',
   description: 'Generate videos from text using AI',

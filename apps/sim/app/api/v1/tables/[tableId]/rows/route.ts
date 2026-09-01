@@ -7,38 +7,40 @@ import {
   v1ListTableRowsContract,
   v1UpdateRowsByFilterContract,
 } from '@/lib/api/contracts/v1/tables'
-import {
-  parseRequest,
-  validationErrorResponse,
-  validationErrorResponseFromError,
-} from '@/lib/api/server'
+import { parseRequest } from '@/lib/api/server'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import type { Filter, RowData, TableSchema } from '@/lib/table'
 import {
   batchInsertRows,
-  buildIdByName,
-  buildNameById,
   deleteRowsByFilter,
   deleteRowsByIds,
-  filterNamesToIds,
   insertRow,
-  rowDataIdToName,
-  rowDataNameToId,
-  sortNamesToIds,
   updateRowsByFilter,
   validateBatchRows,
   validateRowData,
   validateRowSize,
 } from '@/lib/table'
+import { namedRowMapper } from '@/lib/table/cell-format'
+import {
+  buildIdByName,
+  filterNamesToIds,
+  rowDataNameToId,
+  sortNamesToIds,
+} from '@/lib/table/column-keys'
+import { TableQueryValidationError } from '@/lib/table/errors'
+import { signalTableRowsChanged } from '@/lib/table/events'
+import { createExactEmptyTableRowSecretProvenance } from '@/lib/table/rows/secret-provenance'
 import { queryRows } from '@/lib/table/rows/service'
-import { TableQueryValidationError } from '@/lib/table/sql'
-import { accessError, checkAccess, rowWriteErrorResponse } from '@/app/api/table/utils'
+import { resolveFilterSelectValues } from '@/lib/table/select-values'
+import { accessError, checkAccess, orchestrationErrorResponse } from '@/app/api/table/utils'
 import {
   checkRateLimit,
   checkWorkspaceScope,
   createRateLimitResponse,
   resolveWorkspaceRequestActor,
+  v1ValidationErrorResponse,
+  v1ValidationErrorResponseFromError,
 } from '@/app/api/v1/middleware'
 
 const logger = createLogger('V1TableRowsAPI')
@@ -68,7 +70,7 @@ async function handleBatchInsert(
 
   // External callers key row data by column name; storage keys by id.
   const idByName = buildIdByName(table.schema as TableSchema)
-  const nameById = buildNameById(table.schema as TableSchema)
+  const toNamedRow = namedRowMapper((table.schema as TableSchema).columns)
   const rows = (validated.rows as RowData[]).map((r) => rowDataNameToId(r, idByName))
 
   const validation = await validateBatchRows({
@@ -85,17 +87,19 @@ async function handleBatchInsert(
         rows,
         workspaceId: validated.workspaceId,
         userId: actorUserId,
+        secretProvenance: rows.map(createExactEmptyTableRowSecretProvenance),
       },
       table,
       requestId
     )
+    signalTableRowsChanged(tableId)
 
     return NextResponse.json({
       success: true,
       data: {
         rows: insertedRows.map((r) => ({
           id: r.id,
-          data: rowDataIdToName(r.data, nameById),
+          data: toNamedRow(r.data),
           position: r.position,
           createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt,
           updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : r.updatedAt,
@@ -105,7 +109,7 @@ async function handleBatchInsert(
       },
     })
   } catch (error) {
-    const response = rowWriteErrorResponse(error)
+    const response = orchestrationErrorResponse(error)
     if (response) return response
 
     logger.error(`[${requestId}] Error batch inserting rows:`, error)
@@ -133,7 +137,7 @@ export const GET = withRouteHandler(async (request: NextRequest, context: TableR
         if (hasJsonError) {
           return NextResponse.json({ error: 'Invalid filter or sort JSON' }, { status: 400 })
         }
-        return validationErrorResponse(error)
+        return v1ValidationErrorResponse(error)
       },
     })
     if (!parsed.success) return parsed.response
@@ -154,9 +158,12 @@ export const GET = withRouteHandler(async (request: NextRequest, context: TableR
 
     // Translate name-keyed filter/sort fields → column ids; translate rows back.
     const idByName = buildIdByName(table.schema as TableSchema)
-    const nameById = buildNameById(table.schema as TableSchema)
+    const toNamedRow = namedRowMapper((table.schema as TableSchema).columns)
     const filter = validated.filter
-      ? filterNamesToIds(validated.filter as Filter, idByName)
+      ? resolveFilterSelectValues(
+          filterNamesToIds(validated.filter as Filter, idByName),
+          (table.schema as TableSchema).columns
+        )
       : undefined
     const sort = validated.sort ? sortNamesToIds(validated.sort, idByName) : undefined
 
@@ -178,7 +185,7 @@ export const GET = withRouteHandler(async (request: NextRequest, context: TableR
       data: {
         rows: result.rows.map((r) => ({
           id: r.id,
-          data: rowDataIdToName(r.data, nameById),
+          data: toNamedRow(r.data),
           position: r.position,
           createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : String(r.createdAt),
           updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : String(r.updatedAt),
@@ -187,10 +194,14 @@ export const GET = withRouteHandler(async (request: NextRequest, context: TableR
         totalCount: result.totalCount,
         limit: result.limit,
         offset: result.offset,
+        // Non-null when more rows exist; a page may return fewer than `limit`
+        // rows (byte budget) with more remaining, so page fullness is not a
+        // termination signal — external pagers should stop on null.
+        nextCursor: result.nextCursor,
       },
     })
   } catch (error) {
-    const validationResponse = validationErrorResponseFromError(error)
+    const validationResponse = v1ValidationErrorResponseFromError(error)
     if (validationResponse) return validationResponse
 
     if (error instanceof TableQueryValidationError) {
@@ -214,7 +225,9 @@ export const POST = withRouteHandler(
       }
 
       const userId = rateLimit.userId!
-      const parsed = await parseRequest(v1CreateTableRowContract, request, context)
+      const parsed = await parseRequest(v1CreateTableRowContract, request, context, {
+        validationErrorResponse: v1ValidationErrorResponse,
+      })
       if (!parsed.success) return parsed.response
 
       const { tableId } = parsed.data.params
@@ -253,7 +266,7 @@ export const POST = withRouteHandler(
       }
 
       const idByName = buildIdByName(table.schema as TableSchema)
-      const nameById = buildNameById(table.schema as TableSchema)
+      const toNamedRow = namedRowMapper((table.schema as TableSchema).columns)
       const rowData = rowDataNameToId(validated.data as RowData, idByName)
 
       const validation = await validateRowData({
@@ -269,17 +282,19 @@ export const POST = withRouteHandler(
           data: rowData,
           workspaceId: validated.workspaceId,
           userId: actorUserId,
+          secretProvenance: createExactEmptyTableRowSecretProvenance(rowData),
         },
         table,
         requestId
       )
+      signalTableRowsChanged(tableId)
 
       return NextResponse.json({
         success: true,
         data: {
           row: {
             id: row.id,
-            data: rowDataIdToName(row.data, nameById),
+            data: toNamedRow(row.data),
             position: row.position,
             createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt,
             updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : row.updatedAt,
@@ -288,10 +303,10 @@ export const POST = withRouteHandler(
         },
       })
     } catch (error) {
-      const validationResponse = validationErrorResponseFromError(error)
+      const validationResponse = v1ValidationErrorResponseFromError(error)
       if (validationResponse) return validationResponse
 
-      const response = rowWriteErrorResponse(error)
+      const response = orchestrationErrorResponse(error)
       if (response) return response
 
       logger.error(`[${requestId}] Error inserting row:`, error)
@@ -311,7 +326,9 @@ export const PUT = withRouteHandler(async (request: NextRequest, context: TableR
     }
 
     const userId = rateLimit.userId!
-    const parsed = await parseRequest(v1UpdateRowsByFilterContract, request, context)
+    const parsed = await parseRequest(v1UpdateRowsByFilterContract, request, context, {
+      validationErrorResponse: v1ValidationErrorResponse,
+    })
     if (!parsed.success) return parsed.response
     const { tableId } = parsed.data.params
     const validated = parsed.data.body
@@ -346,13 +363,18 @@ export const PUT = withRouteHandler(async (request: NextRequest, context: TableR
     const result = await updateRowsByFilter(
       table,
       {
-        filter: filterNamesToIds(validated.filter as Filter, idByName),
+        filter: resolveFilterSelectValues(
+          filterNamesToIds(validated.filter as Filter, idByName),
+          (table.schema as TableSchema).columns
+        ),
         data: patchData,
         limit: validated.limit,
         actorUserId,
+        secretProvenance: createExactEmptyTableRowSecretProvenance(patchData),
       },
       requestId
     )
+    if (result.affectedCount > 0) signalTableRowsChanged(tableId)
 
     if (result.affectedCount === 0) {
       return NextResponse.json({
@@ -373,14 +395,14 @@ export const PUT = withRouteHandler(async (request: NextRequest, context: TableR
       },
     })
   } catch (error) {
-    const validationResponse = validationErrorResponseFromError(error)
+    const validationResponse = v1ValidationErrorResponseFromError(error)
     if (validationResponse) return validationResponse
 
     if (error instanceof TableQueryValidationError) {
       return NextResponse.json({ error: error.message }, { status: 400 })
     }
 
-    const response = rowWriteErrorResponse(error)
+    const response = orchestrationErrorResponse(error)
     if (response) return response
 
     logger.error(`[${requestId}] Error updating rows by filter:`, error)
@@ -400,7 +422,9 @@ export const DELETE = withRouteHandler(
       }
 
       const userId = rateLimit.userId!
-      const parsed = await parseRequest(v1DeleteTableRowsContract, request, context)
+      const parsed = await parseRequest(v1DeleteTableRowsContract, request, context, {
+        validationErrorResponse: v1ValidationErrorResponse,
+      })
       if (!parsed.success) return parsed.response
       const { tableId } = parsed.data.params
       const validated = parsed.data.body
@@ -419,9 +443,11 @@ export const DELETE = withRouteHandler(
 
       if (validated.rowIds) {
         const result = await deleteRowsByIds(
+          table,
           { tableId, rowIds: validated.rowIds, workspaceId: validated.workspaceId },
           requestId
         )
+        if (result.deletedCount > 0) signalTableRowsChanged(tableId)
 
         return NextResponse.json({
           success: true,
@@ -442,11 +468,15 @@ export const DELETE = withRouteHandler(
       const result = await deleteRowsByFilter(
         table,
         {
-          filter: filterNamesToIds(validated.filter as Filter, idByName),
+          filter: resolveFilterSelectValues(
+            filterNamesToIds(validated.filter as Filter, idByName),
+            (table.schema as TableSchema).columns
+          ),
           limit: validated.limit,
         },
         requestId
       )
+      if (result.affectedCount > 0) signalTableRowsChanged(tableId)
 
       return NextResponse.json({
         success: true,
@@ -460,14 +490,14 @@ export const DELETE = withRouteHandler(
         },
       })
     } catch (error) {
-      const validationResponse = validationErrorResponseFromError(error)
+      const validationResponse = v1ValidationErrorResponseFromError(error)
       if (validationResponse) return validationResponse
 
       if (error instanceof TableQueryValidationError) {
         return NextResponse.json({ error: error.message }, { status: 400 })
       }
 
-      const response = rowWriteErrorResponse(error)
+      const response = orchestrationErrorResponse(error)
       if (response) return response
 
       logger.error(`[${requestId}] Error deleting rows:`, error)

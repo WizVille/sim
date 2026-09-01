@@ -1,10 +1,13 @@
-import { GoogleCalendarIcon, TwilioIcon } from '@/components/icons'
+import { GoogleCalendarIcon } from '@/components/icons'
 import { getScopesForService } from '@/lib/oauth/utils'
 import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
 import { createVersionedToolSelector, SERVICE_ACCOUNT_SUBBLOCKS } from '@/blocks/utils'
 import type { GoogleCalendarResponse } from '@/tools/google_calendar/types'
 import { getTrigger } from '@/triggers'
+
+const CALENDAR_FIELD = ['calendarId', 'manualCalendarId'] as const
+const DESTINATION_CALENDAR_FIELD = ['destinationCalendar', 'manualDestinationCalendarId'] as const
 
 export const GoogleCalendarBlock: BlockConfig<GoogleCalendarResponse> = {
   type: 'google_calendar',
@@ -18,7 +21,107 @@ export const GoogleCalendarBlock: BlockConfig<GoogleCalendarResponse> = {
   integrationType: IntegrationType.Productivity,
   bgColor: '#FFFFFF',
   icon: GoogleCalendarIcon,
+  canvasPresentation: {
+    defaultTitle: 'Google Calendar',
+    /*
+     * The poller watches one calendar, so the calendar is the scope worth
+     * reading. `eventTypeFilter` sits in front of the calendar because its
+     * labels are past participles — "Runs on an event created in Work" — and it
+     * defaults to every type, where the clause simply drops.
+     */
+    triggerSentences: {
+      default: [
+        'Run on an event',
+        { field: 'eventTypeFilter' },
+        { text: 'in', field: CALENDAR_FIELD, core: true },
+        { text: ', matching', field: 'searchTerm' },
+      ],
+    },
+    sentences: {
+      byOperation: {
+        create: [
+          { text: 'Create event', field: 'summary', core: true },
+          { text: 'on', field: CALENDAR_FIELD },
+          { text: ', starting', field: 'startDateTime' },
+        ],
+        list: [
+          'List events',
+          { text: 'on', field: CALENDAR_FIELD },
+          { text: ', matching', field: 'q' },
+          { text: ', from', field: 'timeMin' },
+        ],
+        get: [
+          { text: 'Read event', field: 'eventId', core: true },
+          { text: 'from', field: CALENDAR_FIELD },
+        ],
+        update: [
+          { text: 'Update event', field: 'eventId', core: true },
+          { text: 'on', field: CALENDAR_FIELD },
+          { text: ', setting title to', field: 'summary' },
+        ],
+        delete: [
+          { text: 'Delete event', field: 'eventId', core: true },
+          { text: 'from', field: CALENDAR_FIELD },
+        ],
+        move: [
+          { text: 'Move event', field: 'eventId', core: true },
+          { text: 'from', field: CALENDAR_FIELD },
+          {
+            text: 'to',
+            field: DESTINATION_CALENDAR_FIELD,
+            core: true,
+          },
+        ],
+        instances: [
+          { text: 'List instances of recurring event', field: 'eventId', core: true },
+          { text: 'on', field: CALENDAR_FIELD },
+        ],
+        list_calendars: [
+          'List calendars',
+          { text: ', with at least', field: 'minAccessRole', after: 'access' },
+          { text: ', up to', field: 'maxResults' },
+        ],
+        quick_add: [
+          { text: 'Create an event from', field: 'text', core: true },
+          { text: 'on', field: CALENDAR_FIELD },
+        ],
+        invite: [
+          { text: 'Invite', field: 'attendees', core: true },
+          { text: 'to event', field: 'eventId', core: true },
+        ],
+        freebusy: [
+          { text: 'Check free/busy for', field: 'calendarIds', core: true },
+          { text: ', starting', field: 'timeMin' },
+          { text: ', through', field: 'timeMax' },
+        ],
+        create_calendar: [
+          { text: 'Create calendar', field: 'summary', core: true },
+          { text: 'in time zone', field: 'timeZone' },
+        ],
+        update_calendar: [
+          { text: 'Update calendar', field: CALENDAR_FIELD, core: true },
+          { text: ', setting name to', field: 'summary' },
+          { text: ', time zone to', field: 'timeZone' },
+        ],
+        delete_calendar: [{ text: 'Delete calendar', field: CALENDAR_FIELD, core: true }],
+        share_calendar: [
+          { text: 'Share', field: CALENDAR_FIELD, core: true },
+          { text: 'with', field: ['scopeValue', 'scopeType'] },
+        ],
+        update_acl: [
+          { text: 'Set sharing rule', field: 'ruleId', core: true },
+          { text: 'to', field: 'role' },
+        ],
+        list_acl: ['List sharing rules', { text: 'on', field: CALENDAR_FIELD }],
+        unshare_calendar: [
+          { text: 'Remove sharing rule', field: 'ruleId', core: true },
+          { text: 'from', field: CALENDAR_FIELD },
+        ],
+      },
+    },
+  },
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'google_calendar_v2' },
   subBlocks: [
     {
       id: 'operation',
@@ -925,6 +1028,7 @@ Return ONLY the timestamp string - no explanations, no quotes, no extra text.`,
 
 export const GoogleCalendarV2Block: BlockConfig<GoogleCalendarResponse> = {
   ...GoogleCalendarBlock,
+  sunset: undefined,
   type: 'google_calendar_v2',
   name: 'Google Calendar',
   hideFromToolbar: false,
@@ -998,7 +1102,7 @@ export const GoogleCalendarBlockMeta = {
   templates: [
     {
       icon: GoogleCalendarIcon,
-      title: 'Meeting prep agent',
+      title: 'Calendar meeting prep agent',
       prompt:
         'Create an agent that checks my Google Calendar each morning, researches every attendee and topic on the web, and prepares a brief for each meeting so I walk in fully prepared. Schedule it to run every weekday morning.',
       image: '/templates/meeting-prep-dark.png',
@@ -1008,8 +1112,8 @@ export const GoogleCalendarBlockMeta = {
       featured: true,
     },
     {
-      icon: TwilioIcon,
-      title: 'SMS appointment reminders',
+      icon: GoogleCalendarIcon,
+      title: 'Calendar SMS appointment reminders',
       prompt:
         'Create a scheduled workflow that checks Google Calendar each morning for appointments in the next 24 hours, and sends an SMS reminder to each attendee via Twilio with the meeting time, location, and any prep notes.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -1029,7 +1133,7 @@ export const GoogleCalendarBlockMeta = {
     },
     {
       icon: GoogleCalendarIcon,
-      title: 'Daily agenda digest',
+      title: 'Calendar daily agenda digest',
       prompt:
         'Create a scheduled weekday workflow that lists my Google Calendar events for the day, summarizes them with attendee context and prep notes, and posts a clean morning agenda to Slack.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -1039,7 +1143,7 @@ export const GoogleCalendarBlockMeta = {
     },
     {
       icon: GoogleCalendarIcon,
-      title: 'Interview scheduling coordinator',
+      title: 'Calendar interview scheduler',
       prompt:
         "Build a workflow that when a candidate reaches the interview stage finds open slots across the panel's Google Calendars, creates the interview event with the video link, invites everyone, and emails the candidate the confirmation.",
       modules: ['agent', 'workflows'],
@@ -1049,7 +1153,7 @@ export const GoogleCalendarBlockMeta = {
     },
     {
       icon: GoogleCalendarIcon,
-      title: 'Meeting-load weekly report',
+      title: 'Calendar meeting-load weekly report',
       prompt:
         'Create a scheduled weekly workflow that lists Google Calendar events for the team, computes total meeting hours and recurring-meeting load per person, writes the breakdown to a table, and flags anyone over the focus-time threshold.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],

@@ -17,7 +17,7 @@ interface MothershipResponse extends ToolResponse {
 
 export const MothershipBlock: BlockConfig<MothershipResponse> = {
   type: 'mothership',
-  name: 'Sim',
+  name: 'Sim Chat',
   description: 'Talk to Sim',
   longDescription:
     'The Sim block sends messages to Sim, which has access to subagents, integration tools, and workspace context. Use it to perform complex multi-step reasoning, cross-service queries, or any task that benefits from the full Sim intelligence within a workflow.',
@@ -28,6 +28,16 @@ export const MothershipBlock: BlockConfig<MothershipResponse> = {
   category: 'blocks',
   bgColor: '#802FDE',
   icon: Blimp,
+  canvasPresentation: {
+    defaultTitle: 'Sim Chat',
+    sentences: {
+      default: [
+        { text: 'Ask', field: 'prompt', core: true },
+        { text: ', with', field: ['attachmentFiles', 'fileReferences'], after: 'attached' },
+        { text: ', using', field: 'tools' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'prompt',
@@ -72,6 +82,30 @@ export const MothershipBlock: BlockConfig<MothershipResponse> = {
       type: 'skill-input',
       defaultValue: [],
     },
+    {
+      id: 'secretScope',
+      title: 'Secret access',
+      type: 'dropdown',
+      mode: 'advanced',
+      hideFromCopilot: true,
+      options: [
+        { label: 'All secrets', id: 'all' },
+        { label: 'Selected secrets', id: 'selected' },
+      ],
+      value: () => 'all',
+    },
+    {
+      id: 'mountedSecrets',
+      title: 'Secrets',
+      type: 'dropdown',
+      selectorKey: 'workspace.rawSecretNames',
+      mode: 'advanced',
+      hideFromCopilot: true,
+      multiSelect: true,
+      searchable: true,
+      preserveLabelCase: true,
+      condition: { field: 'secretScope', value: 'selected' },
+    },
   ],
   tools: {
     access: [],
@@ -91,6 +125,8 @@ export const MothershipBlock: BlockConfig<MothershipResponse> = {
     },
     tools: { type: 'json', description: 'MCP tools available to Sim for this request' },
     skills: { type: 'json', description: 'Skills activated for this request' },
+    secretScope: { type: 'string', description: 'Secret access mode: all or selected' },
+    mountedSecrets: { type: 'json', description: 'Secret names available to Sim code execution' },
   },
   outputs: {
     content: { type: 'string', description: 'Generated response content' },

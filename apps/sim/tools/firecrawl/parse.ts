@@ -1,7 +1,16 @@
+import {
+  applyProjectedModelVisibleFileNames,
+  selectModelVisibleFileNames,
+} from '@/lib/uploads/utils/model-input'
+import { firecrawlHosting } from '@/tools/firecrawl/hosting'
+import {
+  applyFirecrawlFormatModelInput,
+  selectFirecrawlFormatModelInput,
+} from '@/tools/firecrawl/model-input'
 import type { ParseParams, ParseResponse } from '@/tools/firecrawl/types'
-import type { ToolConfig } from '@/tools/types'
+import type { InternalToolConfig } from '@/tools/types'
 
-export const parseTool: ToolConfig<ParseParams, ParseResponse> = {
+export const parseTool: InternalToolConfig<ParseParams, ParseResponse> = {
   id: 'firecrawl_parse',
   name: 'Firecrawl Document Parser',
   description:
@@ -83,42 +92,31 @@ export const parseTool: ToolConfig<ParseParams, ParseResponse> = {
     },
   },
 
-  hosting: {
-    envKeyPrefix: 'FIRECRAWL_API_KEY',
-    apiKeyParam: 'apiKey',
-    byokProviderId: 'firecrawl',
-    pricing: {
-      type: 'custom',
-      getCost: (_params, output) => {
-        const creditsUsed = (output.metadata as { creditsUsed?: number })?.creditsUsed
-        if (creditsUsed == null) {
-          throw new Error('Firecrawl response missing creditsUsed field')
-        }
+  hosting: firecrawlHosting(),
 
-        if (Number.isNaN(creditsUsed)) {
-          throw new Error('Firecrawl response returned a non-numeric creditsUsed field')
-        }
-
+  operation: {
+    modelInput: {
+      mode: 'project',
+      select: (params) => {
+        const file = selectModelVisibleFileNames(params.file)
         return {
-          cost: creditsUsed * 0.001,
-          metadata: { creditsUsed },
+          formats: selectFirecrawlFormatModelInput(params.formats),
+          ...(file === undefined ? {} : { file }),
         }
       },
+      applyProjected: (selectedParams, projectedSelection) => ({
+        formats: applyFirecrawlFormatModelInput(selectedParams.formats, projectedSelection.formats),
+        ...(Object.hasOwn(projectedSelection, 'file')
+          ? {
+              file: applyProjectedModelVisibleFileNames(
+                selectedParams.file,
+                projectedSelection.file
+              ),
+            }
+          : {}),
+      }),
     },
-    rateLimit: {
-      mode: 'per_request',
-      requestsPerMinute: 100,
-    },
-  },
-
-  request: {
-    method: 'POST',
-    url: '/api/tools/firecrawl/parse',
-    headers: () => ({
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    }),
-    body: (params) => {
+    input: (params) => {
       if (!params.apiKey || typeof params.apiKey !== 'string' || params.apiKey.trim() === '') {
         throw new Error('Missing or invalid API key: A valid Firecrawl API key is required')
       }
@@ -168,6 +166,7 @@ export const parseTool: ToolConfig<ParseParams, ParseResponse> = {
         links: result.links ?? [],
         metadata: result.metadata ?? null,
         warning: result.warning ?? null,
+        creditsUsed: result.creditsUsed,
       },
     }
   },

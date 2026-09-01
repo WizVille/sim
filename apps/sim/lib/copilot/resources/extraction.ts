@@ -1,22 +1,19 @@
+import { toRecord } from '@sim/utils/object'
 import {
-  CreateFile,
+  CreateEmptyFile,
   CreateWorkflow,
-  DeleteFile,
-  DeleteFileFolder,
-  DeleteWorkflow,
-  DownloadToWorkspaceFile,
+  DownloadFile,
   EditWorkflow,
   Ffmpeg,
-  FunctionExecute,
   GenerateAudio,
   GenerateImage,
   GenerateVideo,
   Knowledge,
-  KnowledgeBase,
-  ManageFolder,
-  ManageScheduledTask,
+  ManageKnowledgeBase,
+  PrepareFileEdit,
+  Rm,
+  RunFunction,
   UserTable,
-  WorkspaceFile,
 } from '@/lib/copilot/generated/tool-catalog-v1'
 import type { MothershipResource, MothershipResourceType } from './types'
 
@@ -25,15 +22,14 @@ type ResourceType = MothershipResourceType
 
 const RESOURCE_TOOL_NAMES: Set<string> = new Set([
   UserTable.id,
-  CreateFile.id,
-  WorkspaceFile.id,
-  DownloadToWorkspaceFile.id,
+  CreateEmptyFile.id,
+  PrepareFileEdit.id,
+  DownloadFile.id,
   CreateWorkflow.id,
   EditWorkflow.id,
-  FunctionExecute.id,
-  KnowledgeBase.id,
+  RunFunction.id,
+  ManageKnowledgeBase.id,
   Knowledge.id,
-  ManageScheduledTask.id,
   GenerateImage.id,
   GenerateVideo.id,
   GenerateAudio.id,
@@ -44,19 +40,15 @@ export function isResourceToolName(toolName: string): boolean {
   return RESOURCE_TOOL_NAMES.has(toolName)
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
-}
-
 function getOperation(params: Record<string, unknown> | undefined): string | undefined {
-  const args = asRecord(params?.args)
+  const args = toRecord(params?.args)
   return (args.operation ?? params?.operation) as string | undefined
 }
 
 function getWorkspaceFileTarget(
   params: Record<string, unknown> | undefined
 ): Record<string, unknown> {
-  return asRecord(params?.target)
+  return toRecord(params?.target)
 }
 
 const READ_ONLY_TABLE_OPS = new Set(['get', 'get_schema', 'get_row', 'query_rows'])
@@ -75,8 +67,8 @@ export function extractResourcesFromToolResult(
 ): ChatResource[] {
   if (!isResourceToolName(toolName)) return []
 
-  const result = asRecord(output)
-  const data = asRecord(result.data)
+  const result = toRecord(output)
+  const data = toRecord(result.data)
 
   switch (toolName) {
     case UserTable.id: {
@@ -100,11 +92,11 @@ export function extractResourcesFromToolResult(
           },
         ]
       }
-      const table = asRecord(data.table)
+      const table = toRecord(data.table)
       if (table.id) {
         return [{ type: 'table', id: table.id as string, title: (table.name as string) || 'Table' }]
       }
-      const args = asRecord(params?.args)
+      const args = toRecord(params?.args)
       const tableId =
         (data.tableId as string) ?? (args.tableId as string) ?? (params?.tableId as string)
       if (tableId) {
@@ -115,9 +107,9 @@ export function extractResourcesFromToolResult(
       return []
     }
 
-    case CreateFile.id:
-    case WorkspaceFile.id: {
-      const file = asRecord(data.file)
+    case CreateEmptyFile.id:
+    case PrepareFileEdit.id: {
+      const file = toRecord(data.file)
       if (file.id) {
         return [{ type: 'file', id: file.id as string, title: (file.name as string) || 'File' }]
       }
@@ -129,7 +121,7 @@ export function extractResourcesFromToolResult(
       return []
     }
 
-    case FunctionExecute.id: {
+    case RunFunction.id: {
       if (result.tableId) {
         return [
           {
@@ -151,7 +143,7 @@ export function extractResourcesFromToolResult(
       return []
     }
 
-    case DownloadToWorkspaceFile.id:
+    case DownloadFile.id:
     case GenerateImage.id:
     case GenerateVideo.id:
     case GenerateAudio.id:
@@ -186,10 +178,10 @@ export function extractResourcesFromToolResult(
       return []
     }
 
-    case KnowledgeBase.id: {
+    case ManageKnowledgeBase.id: {
       if (READ_ONLY_KB_OPS.has(getOperation(params) ?? '')) return []
 
-      const args = asRecord(params?.args)
+      const args = toRecord(params?.args)
       const kbId =
         (args.knowledgeBaseId as string) ??
         (params?.knowledgeBaseId as string) ??
@@ -224,33 +216,29 @@ export function extractResourcesFromToolResult(
       return resources
     }
 
-    case ManageScheduledTask.id: {
-      // Read-only ops never auto-open; only create/update surface the task.
-      const op = getOperation(params)
-      if (op === 'list' || op === 'get') return []
-      const jobId = (result.jobId as string) ?? (data.jobId as string)
-      if (jobId) {
-        const args = asRecord(params?.args)
-        const title = (result.title as string) ?? (args.title as string) ?? 'Scheduled Task'
-        return [{ type: 'scheduledtask', id: jobId, title }]
-      }
-      return []
-    }
-
     default:
       return []
   }
 }
 
 const DELETE_CAPABLE_TOOL_RESOURCE_TYPE: Record<string, ResourceType> = {
-  [DeleteWorkflow.id]: 'workflow',
-  [DeleteFile.id]: 'file',
-  [DeleteFileFolder.id]: 'filefolder',
-  [WorkspaceFile.id]: 'file',
+  [PrepareFileEdit.id]: 'file',
   [UserTable.id]: 'table',
-  [KnowledgeBase.id]: 'knowledgebase',
-  [ManageFolder.id]: 'folder',
-  [ManageScheduledTask.id]: 'scheduledtask',
+  [ManageKnowledgeBase.id]: 'knowledgebase',
+  // rm spans categories, so unlike every other entry its resource type comes
+  // from each outcome's kind rather than from this map. The entry exists so
+  // hasDeleteCapability(rm) holds; the rm case below ignores this value.
+  [Rm.id]: 'file',
+}
+
+/** rm reports what it deleted per path; map that kind to the type the UI tracks. */
+const RM_KIND_RESOURCE_TYPE: Record<string, ResourceType> = {
+  file: 'file',
+  file_folder: 'filefolder',
+  workflow: 'workflow',
+  workflow_folder: 'folder',
+  table: 'table',
+  manage_knowledge_base: 'knowledgebase',
 }
 
 export function hasDeleteCapability(toolName: string): boolean {
@@ -270,64 +258,27 @@ export function extractDeletedResourcesFromToolResult(
   const resourceType = DELETE_CAPABLE_TOOL_RESOURCE_TYPE[toolName]
   if (!resourceType) return []
 
-  const result = asRecord(output)
-  const data = asRecord(result.data)
-  const args = asRecord(params?.args)
+  const result = toRecord(output)
+  const data = toRecord(result.data)
+  const args = toRecord(params?.args)
   const operation = (args.operation ?? params?.operation) as string | undefined
 
   switch (toolName) {
-    case DeleteWorkflow.id: {
-      const deleted = Array.isArray(result.deleted) ? result.deleted : []
-      const resources = deleted.flatMap((entry): ChatResource[] => {
-        const deletedWorkflow = asRecord(entry)
-        const workflowId = deletedWorkflow.workflowId
-        if (typeof workflowId !== 'string' || !workflowId) return []
-        return [
-          {
-            type: resourceType,
-            id: workflowId,
-            title: typeof deletedWorkflow.name === 'string' ? deletedWorkflow.name : 'Workflow',
-          },
-        ]
-      })
-      if (resources.length > 0) return resources
-
-      // Backward compatibility for historical single-workflow tool results.
-      const workflowId = (result.workflowId as string) ?? (params?.workflowId as string)
-      if (workflowId && result.deleted === true) {
-        return [
-          { type: resourceType, id: workflowId, title: (result.name as string) || 'Workflow' },
-        ]
-      }
-      return []
-    }
-
-    case DeleteFile.id: {
-      const deleted = Array.isArray(data.deleted) ? data.deleted : []
-      return deleted.flatMap((entry): ChatResource[] => {
-        const deletedFile = asRecord(entry)
-        const fileId = deletedFile.id
-        if (typeof fileId !== 'string' || !fileId) return []
-        return [
-          {
-            type: resourceType,
-            id: fileId,
-            title: typeof deletedFile.name === 'string' ? deletedFile.name : 'File',
-          },
-        ]
+    case Rm.id: {
+      const outcomes = Array.isArray(result.results) ? result.results : []
+      return outcomes.flatMap((entry): ChatResource[] => {
+        const outcome = toRecord(entry)
+        if (outcome.error) return []
+        const { id, kind, from } = outcome
+        if (typeof id !== 'string' || !id || typeof kind !== 'string') return []
+        const type = RM_KIND_RESOURCE_TYPE[kind]
+        if (!type) return []
+        const path = typeof from === 'string' ? from : ''
+        const leaf = path.split('/').filter(Boolean).pop() ?? ''
+        return [{ type, id, title: leaf ? decodeURIComponent(leaf) : 'Deleted resource' }]
       })
     }
-
-    case DeleteFileFolder.id: {
-      const deletedFolderIds = Array.isArray(data.deletedFolderIds)
-        ? data.deletedFolderIds.filter(
-            (id): id is string => typeof id === 'string' && id.length > 0
-          )
-        : []
-      return deletedFolderIds.map((id) => ({ type: resourceType, id, title: 'Folder' }))
-    }
-
-    case WorkspaceFile.id: {
+    case PrepareFileEdit.id: {
       if (operation !== 'delete') return []
       const target = getWorkspaceFileTarget(params)
       const fileId = (data.id as string) ?? (target.fileId as string) ?? (args.fileId as string)
@@ -352,11 +303,11 @@ export function extractDeletedResourcesFromToolResult(
       return []
     }
 
-    case KnowledgeBase.id: {
+    case ManageKnowledgeBase.id: {
       if (operation !== 'delete') return []
       const deleted = Array.isArray(data.deleted) ? data.deleted : []
       const resources = deleted.flatMap((entry): ChatResource[] => {
-        const deletedKnowledgeBase = asRecord(entry)
+        const deletedKnowledgeBase = toRecord(entry)
         const knowledgeBaseId = deletedKnowledgeBase.id
         if (typeof knowledgeBaseId !== 'string' || !knowledgeBaseId) return []
         return [
@@ -376,20 +327,6 @@ export function extractDeletedResourcesFromToolResult(
         return [{ type: resourceType, id: kbId, title: (data.name as string) || 'Knowledge Base' }]
       }
       return []
-    }
-
-    case ManageFolder.id: {
-      if (operation !== 'delete') return []
-      const deletedIds = Array.isArray(result.deleted) ? (result.deleted as unknown[]) : []
-      return deletedIds.flatMap((id): ChatResource[] =>
-        typeof id === 'string' && id ? [{ type: resourceType, id, title: 'Folder' }] : []
-      )
-    }
-
-    case ManageScheduledTask.id: {
-      if (operation !== 'delete') return []
-      const deletedIds = Array.isArray(result.deleted) ? (result.deleted as string[]) : []
-      return deletedIds.map((id) => ({ type: resourceType, id, title: 'Scheduled Task' }))
     }
 
     default:

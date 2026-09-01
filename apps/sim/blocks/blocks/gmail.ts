@@ -1,5 +1,5 @@
 import { ClipboardList } from '@sim/emcn/icons'
-import { GmailIcon, LemlistIcon } from '@/components/icons'
+import { GmailIcon } from '@/components/icons'
 import { getScopesForService } from '@/lib/oauth/utils'
 import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
@@ -44,6 +44,17 @@ function selectGmailToolId(params: Record<string, any>): string {
   }
 }
 
+/**
+ * Canonical basic/advanced pairs, shared by the card sentences below. Listing
+ * both members is what keeps a sentence working for an advanced-mode user, who
+ * has only the manual field filled.
+ */
+const ATTACHMENTS_FIELD = ['attachmentFiles', 'attachments'] as const
+const FOLDER_FIELD = ['folder', 'manualFolder'] as const
+const DESTINATION_LABEL_FIELD = ['destinationLabel', 'manualDestinationLabel'] as const
+const SOURCE_LABEL_FIELD = ['sourceLabel', 'manualSourceLabel'] as const
+const MANAGE_LABEL_FIELD = ['labelSelector', 'manualLabelId'] as const
+
 export const GmailBlock: BlockConfig<GmailToolResponse> = {
   type: 'gmail',
   name: 'Gmail (Legacy)',
@@ -56,7 +67,78 @@ export const GmailBlock: BlockConfig<GmailToolResponse> = {
   integrationType: IntegrationType.Email,
   bgColor: '#FFFFFF',
   icon: GmailIcon,
+  canvasPresentation: {
+    typeLabel: 'Gmail',
+    defaultTitle: 'Send Email',
+    triggerSentences: {
+      byTrigger: {
+        gmail_poller: [
+          'Run on email',
+          { text: 'to', field: 'labelIds', core: true },
+          { text: 'matching', field: 'searchQuery' },
+        ],
+      },
+    },
+    operationSubBlockId: 'operation',
+    operationRowTitle: 'Action',
+    sentences: {
+      byOperation: {
+        send_gmail: [
+          { text: 'Send', field: 'subject', core: true },
+          { text: 'to', field: 'to', core: true },
+          { text: ', attaching', field: ATTACHMENTS_FIELD },
+        ],
+        draft_gmail: [
+          { text: 'Draft', field: 'subject', core: true },
+          { text: 'to', field: 'to', core: true },
+          { text: ', attaching', field: ATTACHMENTS_FIELD },
+        ],
+        edit_draft_gmail: [
+          { text: 'Update draft', field: 'draftId', core: true },
+          { text: ', addressed to', field: 'to' },
+        ],
+        read_gmail: [
+          {
+            text: 'Read up to',
+            field: 'maxResults',
+            after: 'messages',
+            core: true,
+          },
+          { text: 'in', field: FOLDER_FIELD, core: true },
+        ],
+        search_gmail: [
+          { text: 'Search messages matching', field: 'query', core: true },
+          { text: ', up to', field: 'maxResults', after: 'results' },
+        ],
+        move_gmail: [
+          { text: 'Move message', field: 'moveMessageId', core: true },
+          { text: 'from', field: SOURCE_LABEL_FIELD },
+          { text: 'to', field: DESTINATION_LABEL_FIELD, core: true },
+        ],
+        mark_read_gmail: [
+          { text: 'Mark message', field: 'actionMessageId', core: true, after: 'as read' },
+        ],
+        mark_unread_gmail: [
+          { text: 'Mark message', field: 'actionMessageId', core: true, after: 'as unread' },
+        ],
+        archive_gmail: [{ text: 'Archive message', field: 'actionMessageId', core: true }],
+        unarchive_gmail: [{ text: 'Unarchive message', field: 'actionMessageId', core: true }],
+        delete_gmail: [
+          { text: 'Move message', field: 'actionMessageId', core: true, after: 'to trash' },
+        ],
+        add_label_gmail: [
+          { text: 'Add label', field: MANAGE_LABEL_FIELD, core: true },
+          { text: 'to message', field: 'labelActionMessageId' },
+        ],
+        remove_label_gmail: [
+          { text: 'Remove label', field: MANAGE_LABEL_FIELD, core: true },
+          { text: 'from message', field: 'labelActionMessageId' },
+        ],
+      },
+    },
+  },
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'gmail_v2' },
   triggerAllowed: true,
   subBlocks: [
     // Operation selector
@@ -116,6 +198,7 @@ export const GmailBlock: BlockConfig<GmailToolResponse> = {
     {
       id: 'to',
       title: 'To',
+      canvasNoun: 'a recipient',
       type: 'short-input',
       placeholder: 'Recipient email address',
       condition: { field: 'operation', value: ['send_gmail', 'draft_gmail', 'edit_draft_gmail'] },
@@ -575,6 +658,7 @@ Return ONLY the search query - no explanations, no extra text.`,
 
 export const GmailV2Block: BlockConfig<GmailToolResponse> = {
   ...GmailBlock,
+  sunset: undefined,
   type: 'gmail_v2',
   name: 'Gmail',
   hideFromToolbar: false,
@@ -649,7 +733,7 @@ export const GmailBlockMeta = {
   templates: [
     {
       icon: GmailIcon,
-      title: 'Auto-reply agent',
+      title: 'Gmail auto-reply agent',
       prompt:
         'Create a workflow that reads my Gmail inbox, identifies emails that need a response, and drafts contextual replies for each one. Schedule it to run every hour.',
       image: '/templates/gmail-agent-dark.png',
@@ -659,8 +743,8 @@ export const GmailBlockMeta = {
       featured: true,
     },
     {
-      icon: LemlistIcon,
-      title: 'Outbound sequence builder',
+      icon: GmailIcon,
+      title: 'Gmail outbound sequence builder',
       prompt:
         'Build a workflow that reads leads from my table, researches each prospect and their company on the web, writes a personalized cold email tailored to their role and pain points, and sends it via Gmail. Schedule it to run daily to process new leads automatically.',
       modules: ['tables', 'agent', 'workflows'],
@@ -669,7 +753,7 @@ export const GmailBlockMeta = {
     },
     {
       icon: GmailIcon,
-      title: 'Email knowledge search',
+      title: 'Gmail knowledge search',
       prompt:
         'Create a knowledge base connected to my Gmail so all my emails are automatically synced, chunked, and searchable. Then build an agent I can ask things like "what did Sarah say about the pricing proposal?" or "find the contract John sent last month" and get instant answers with the original email cited.',
       modules: ['knowledge-base', 'agent'],
@@ -678,7 +762,7 @@ export const GmailBlockMeta = {
     },
     {
       icon: GmailIcon,
-      title: 'Email triage assistant',
+      title: 'Gmail triage assistant',
       prompt:
         'Build a workflow that scans my Gmail inbox every hour, categorizes emails by urgency and type (action needed, FYI, follow-up), drafts replies for routine messages, and sends me a prioritized summary in Slack so I only open what matters. Schedule it to run hourly.',
       modules: ['agent', 'scheduled', 'workflows'],
@@ -688,7 +772,7 @@ export const GmailBlockMeta = {
     },
     {
       icon: ClipboardList,
-      title: 'Invoice processor',
+      title: 'Gmail invoice processor',
       prompt:
         'Build a workflow that processes invoice PDFs from Gmail, extracts vendor name, amount, due date, and line items, then logs everything to a tracking table and sends a Slack alert for invoices due within 7 days.',
       modules: ['files', 'tables', 'agent', 'workflows'],
@@ -719,7 +803,7 @@ export const GmailBlockMeta = {
 
     {
       icon: GmailIcon,
-      title: 'Save incoming emails to Notion databases',
+      title: 'Gmail to Notion email capture',
       prompt:
         'Build a workflow that monitors Gmail for incoming emails, extracts structured data from each one, and stores it as a Notion database entry — useful for lead capture, support tickets, and meeting scheduling.',
       modules: ['agent', 'workflows'],

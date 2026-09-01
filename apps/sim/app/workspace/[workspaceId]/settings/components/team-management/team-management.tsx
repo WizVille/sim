@@ -1,23 +1,27 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Plus } from '@sim/emcn'
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { useSession } from '@/lib/auth/auth-client'
 import { getSubscriptionAccessState } from '@/lib/billing/client/utils'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import { generateSlug, isAdminOrOwner, type Member } from '@/lib/workspaces/organization'
+import { InviteModal } from '@/app/workspace/[workspaceId]/components/invite-modal'
+import { SettingsEmptyState } from '@/app/workspace/[workspaceId]/settings/components/settings-empty-state'
 import { SettingsPanel } from '@/app/workspace/[workspaceId]/settings/components/settings-panel'
 import {
   NoOrganizationView,
-  OrganizationInviteModal,
   OrganizationMemberLists,
   RemoveMemberDialog,
   TeamSeatsOverview,
   TransferOwnershipDialog,
 } from '@/app/workspace/[workspaceId]/settings/components/team-management/components'
+import { useSettingsSearch } from '@/app/workspace/[workspaceId]/settings/components/use-settings-search'
 import {
   useCreateOrganization,
+  useMemberRemovalImpact,
   useOrganization,
   useOrganizationBilling,
   useOrganizationRoster,
@@ -31,22 +35,33 @@ const logger = createLogger('TeamManagement')
 
 interface TeamManagementProps {
   organizationId: string
-  billingHref?: string
+  /**
+   * Required: organization billing is reached only through a workspace, so the
+   * caller — which knows the workspace — is the only thing that can build it.
+   */
+  billingHref: string
 }
 
-export function TeamManagement({
-  organizationId,
-  billingHref = `/organization/${organizationId}/settings/billing`,
-}: TeamManagementProps) {
+export function TeamManagement({ organizationId, billingHref }: TeamManagementProps) {
   const { data: session } = useSession()
   const { isInvitationsDisabled } = usePermissionConfig()
+  const [memberQuery, setMemberQuery] = useSettingsSearch()
 
-  const { data: userSubscriptionData } = useSubscriptionData()
+  const { data: organization, isLoading, error: orgError } = useOrganization(organizationId)
+  /**
+   * Personal billing only supports the legacy missing-organization recovery view. A valid
+   * organization page derives its plan from organization billing, so avoid that unrelated read
+   * on the normal first paint.
+   */
+  const shouldLoadRecoverySubscription = !isLoading && !orgError && !organization
+  const { data: userSubscriptionData, isPending: isRecoverySubscriptionPending } =
+    useSubscriptionData({
+      enabled: shouldLoadRecoverySubscription,
+    })
   const subscriptionAccess = getSubscriptionAccessState(userSubscriptionData?.data)
   const hasTeamPlan = subscriptionAccess.hasUsableTeamAccess
   const hasEnterprisePlan = subscriptionAccess.hasUsableEnterpriseAccess
 
-  const { data: organization, isLoading, error: orgError } = useOrganization(organizationId)
   const adminOrOwner = isAdminOrOwner(organization, session?.user?.email)
 
   const { data: organizationBillingData, isLoading: isOrgBillingLoading } = useOrganizationBilling(
@@ -75,8 +90,25 @@ export function TeamManagement({
   const [orgName, setOrgName] = useState('')
   const [orgSlug, setOrgSlug] = useState('')
 
+  /**
+   * `isFetching` (not `isLoading`) gates the confirm button: a background
+   * refetch of cached data must also hold removal so the admin never
+   * confirms against a stale credential-impact list.
+   */
+  const {
+    data: removalImpactCredentials,
+    isFetching: isRemovalImpactFetching,
+    isError: isRemovalImpactError,
+  } = useMemberRemovalImpact(organizationId, removeMemberDialog.memberId, {
+    enabled: removeMemberDialog.open,
+  })
+
+  const disclosedBreakingCredentials = [
+    ...new Set(removalImpactCredentials?.map((credential) => credential.displayName) ?? []),
+  ]
+
   const totalSeats = organizationBillingData?.data?.totalSeats ?? 0
-  const usedSeats = organizationBillingData?.data?.members?.length ?? 0
+  const usedSeats = organizationBillingData?.data?.membersTotal ?? 0
   const reservedSeats = organizationBillingData?.data?.usedSeats ?? 0
   const pendingSeats = Math.max(0, reservedSeats - usedSeats)
 
@@ -96,32 +128,6 @@ export function TeamManagement({
         referenceId: orgBilling.organizationId,
       }
     : null
-
-  const externalEmails = useMemo(() => {
-    const emails: string[] = []
-    for (const member of roster?.members ?? []) {
-      if (member.role === 'external') emails.push(member.email)
-    }
-    return emails
-  }, [roster])
-
-  /**
-   * Pending invitations for emails that already belong to a member are
-   * excluded: members can always be re-invited to additional workspaces (the
-   * server dedupes per workspace), so only non-member pending emails are
-   * blocked in the invite modal.
-   */
-  const pendingEmails = useMemo(() => {
-    const memberEmailSet = new Set<string>()
-    for (const member of roster?.members ?? []) {
-      if (member.role !== 'external') memberEmailSet.add(member.email.toLowerCase())
-    }
-    const emails: string[] = []
-    for (const invitation of roster?.pendingInvitations ?? []) {
-      if (!memberEmailSet.has(invitation.email.toLowerCase())) emails.push(invitation.email)
-    }
-    return emails
-  }, [roster])
 
   useEffect(() => {
     if ((hasTeamPlan || hasEnterprisePlan) && session?.user?.name && !orgName) {
@@ -269,20 +275,30 @@ export function TeamManagement({
           portalWindow?.close()
           logger.error('Failed to open billing portal from transfer dialog', { error })
           setTransferPortalError(
-            error instanceof Error
-              ? error.message
-              : 'Failed to open Stripe billing portal. Please try again.'
+            getErrorMessage(error, 'Failed to open Stripe billing portal. Please try again.')
           )
         },
       }
     )
   }, [organizationId, openBillingPortal])
 
-  const queryError = orgError
-  const errorMessage = queryError instanceof Error ? queryError.message : null
   const displayOrganization = organization
 
   if (isLoading && !displayOrganization) {
+    return null
+  }
+
+  if (orgError && !displayOrganization) {
+    return (
+      <SettingsPanel>
+        <SettingsEmptyState tone='error'>
+          {getErrorMessage(orgError, 'Failed to load organization')}
+        </SettingsEmptyState>
+      </SettingsPanel>
+    )
+  }
+
+  if (!displayOrganization && shouldLoadRecoverySubscription && isRecoverySubscriptionPending) {
     return null
   }
 
@@ -297,7 +313,11 @@ export function TeamManagement({
         onOrgNameChange={handleOrgNameChange}
         onCreateOrganization={handleCreateOrganization}
         isCreatingOrg={createOrgMutation.isPending}
-        error={errorMessage}
+        error={
+          createOrgMutation.error
+            ? getErrorMessage(createOrgMutation.error, 'Failed to create organization')
+            : null
+        }
         createOrgDialogOpen={createOrgDialogOpen}
         setCreateOrgDialogOpen={setCreateOrgDialogOpen}
       />
@@ -307,6 +327,11 @@ export function TeamManagement({
   return (
     <>
       <SettingsPanel
+        search={{
+          value: memberQuery,
+          onChange: setMemberQuery,
+          placeholder: 'Search members...',
+        }}
         actions={
           adminOrOwner
             ? [
@@ -339,19 +364,18 @@ export function TeamManagement({
           roster={roster ?? null}
           isLoadingRoster={isLoadingRoster}
           currentUserId={session?.user?.id ?? ''}
+          query={memberQuery}
           onRemoveMember={handleRemoveMember}
           onTransferOwnership={handleOpenTransferDialog}
         />
       </SettingsPanel>
 
       {adminOrOwner && (
-        <OrganizationInviteModal
+        <InviteModal
           open={inviteModalOpen}
           onOpenChange={setInviteModalOpen}
           organizationId={displayOrganization.id}
-          workspaces={roster?.workspaces ?? []}
-          externalEmails={externalEmails}
-          pendingEmails={pendingEmails}
+          canInvite={adminOrOwner}
         />
       )}
 
@@ -375,6 +399,9 @@ export function TeamManagement({
         memberName={removeMemberDialog.memberName}
         isSelfRemoval={removeMemberDialog.isSelfRemoval}
         isExternalRemoval={removeMemberDialog.isExternalRemoval}
+        breakingCredentials={disclosedBreakingCredentials}
+        credentialImpactPending={isRemovalImpactFetching}
+        credentialImpactFailed={isRemovalImpactError}
         isSubmitting={removeMemberMutation.isPending}
         error={removeMemberMutation.error}
         onOpenChange={(open: boolean) => {

@@ -14,6 +14,16 @@ export const GooglePagespeedBlock: BlockConfig<GooglePagespeedAnalyzeResponse> =
   bgColor: '#FFFFFF',
   icon: GooglePagespeedIcon,
   authMode: AuthMode.ApiKey,
+  canvasPresentation: {
+    defaultTitle: 'Google PageSpeed',
+    sentences: {
+      default: [
+        { text: 'Analyze', field: 'url', core: true },
+        { text: 'on', field: 'strategy' },
+        { text: ', scoring', field: 'category' },
+      ],
+    },
+  },
 
   subBlocks: [
     {
@@ -181,7 +191,7 @@ export const GooglePagespeedBlockMeta = {
     },
     {
       icon: GooglePagespeedIcon,
-      title: 'Core Web Vitals release gate',
+      title: 'PageSpeed CWV release gate',
       prompt:
         'Create a workflow triggered after a marketing-site deploy that runs Google PageSpeed Insights on the key landing pages for both mobile and desktop, compares Core Web Vitals against the prior baseline, and posts a pass/fail summary to Slack with the specific metrics that regressed.',
       modules: ['agent', 'workflows'],

@@ -1,6 +1,5 @@
 'use client'
 
-import type React from 'react'
 import { useMemo, useState } from 'react'
 import {
   Button,
@@ -14,15 +13,15 @@ import {
   FieldDivider,
   Label,
   Loader,
+  OverflowText,
   Switch,
   Tooltip,
   toast,
 } from '@sim/emcn'
-import { ArrowLeft, ChevronDown, X } from '@sim/emcn/icons'
+import { ArrowLeft, ChevronDown, SquareArrowUpRight, X } from '@sim/emcn/icons'
 import { toError } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, RepeatIcon, SplitIcon } from 'lucide-react'
 import { findValidationIssue, isValidationError } from '@/lib/api/client/errors'
 import { requestJson } from '@/lib/api/client/request'
 import type {
@@ -43,6 +42,7 @@ import type {
 } from '@/lib/table'
 import { getColumnId } from '@/lib/table/column-keys'
 import { columnTypeForLeaf, deriveOutputColumnName } from '@/lib/table/column-naming'
+import { columnTypeById } from '@/lib/table/column-types'
 import {
   type FlattenOutputsBlockInput,
   type FlattenOutputsEdgeInput,
@@ -57,8 +57,7 @@ import {
   RequiredLabel,
 } from '@/app/workspace/[workspaceId]/tables/[tableId]/components/sidebar-fields'
 import { PreviewWorkflow } from '@/app/workspace/[workspaceId]/w/components/preview'
-import { getBlock } from '@/blocks'
-import { getTileIconColorClass } from '@/blocks/icon-color'
+import { BlockTile } from '@/blocks/block-tile'
 import {
   useAddWorkflowGroup,
   useUpdateColumn,
@@ -140,8 +139,6 @@ interface BlockOutputGroup {
   blockId: string
   blockName: string
   blockType: string
-  blockIcon: string | React.ComponentType<{ className?: string }>
-  blockColor: string
   paths: string[]
 }
 
@@ -161,36 +158,8 @@ interface WorkflowStatePayload {
 }
 
 function tableColumnTypeToInputType(colType: ColumnDefinition['type'] | undefined): string {
-  switch (colType) {
-    case 'number':
-      return 'number'
-    case 'boolean':
-      return 'boolean'
-    case 'json':
-      return 'object'
-    default:
-      return 'string'
-  }
+  return columnTypeById(colType).workflowInputType
 }
-
-const TagIcon: React.FC<{
-  icon: string | React.ComponentType<{ className?: string }>
-  color: string
-}> = ({ icon, color }) => (
-  <div
-    className='flex size-[14px] flex-shrink-0 items-center justify-center rounded'
-    style={{ background: color }}
-  >
-    {typeof icon === 'string' ? (
-      <span className={cn(getTileIconColorClass(color, true), 'font-bold text-micro')}>{icon}</span>
-    ) : (
-      (() => {
-        const IconComponent = icon
-        return <IconComponent className={cn(getTileIconColorClass(color, true), 'size-[9px]')} />
-      })()
-    )}
-  </div>
-)
 
 /**
  * Right-edge sidebar for workflow group configuration. Three flows:
@@ -477,20 +446,10 @@ export function WorkflowSidebarBody({
     for (const f of flat) {
       let group = groupsByBlockId.get(f.blockId)
       if (!group) {
-        const blockConfig = getBlock(f.blockType)
-        const blockColor = blockConfig?.bgColor || '#2F55FF'
-        let blockIcon: string | React.ComponentType<{ className?: string }> = f.blockName
-          .charAt(0)
-          .toUpperCase()
-        if (blockConfig?.icon) blockIcon = blockConfig.icon
-        else if (f.blockType === 'loop') blockIcon = RepeatIcon
-        else if (f.blockType === 'parallel') blockIcon = SplitIcon
         group = {
           blockId: f.blockId,
           blockName: f.blockName,
           blockType: f.blockType,
-          blockIcon,
-          blockColor,
           paths: [],
         }
         groupsByBlockId.set(f.blockId, group)
@@ -513,10 +472,12 @@ export function WorkflowSidebarBody({
         section: group.blockName,
         sectionElement: (
           <div className='flex items-center gap-1.5 px-1.5 pt-1.5 pb-1'>
-            <TagIcon icon={group.blockIcon} color={group.blockColor} />
-            <span className='font-medium text-[var(--text-secondary)] text-caption'>
-              {group.blockName}
-            </span>
+            <BlockTile
+              blockType={group.blockType}
+              fallbackLabel={group.blockName.charAt(0).toUpperCase()}
+              size='sm'
+            />
+            <span className='text-[var(--text-secondary)] text-caption'>{group.blockName}</span>
           </div>
         ),
         items: group.paths.map((path) => ({
@@ -803,7 +764,9 @@ export function WorkflowSidebarBody({
               <ArrowLeft className='size-[14px]' />
             </Button>
           )}
-          <h2 className='truncate font-medium text-[var(--text-primary)] text-small'>{title}</h2>
+          <h2 className='flex min-w-0'>
+            <OverflowText label={title} className='text-[var(--text-primary)] text-small' />
+          </h2>
         </div>
         <Button
           variant='ghost'
@@ -910,7 +873,7 @@ export function WorkflowSidebarBody({
                             }
                             className='absolute right-[6px] bottom-1.5 z-10 size-[24px] cursor-pointer border border-[var(--border)] bg-[var(--surface-2)] p-0 hover-hover:bg-[var(--surface-4)]'
                           >
-                            <ExternalLink className='size-[12px]' />
+                            <SquareArrowUpRight className='size-[12px]' />
                           </Button>
                         </Tooltip.Trigger>
                         <Tooltip.Content side='top'>Open workflow</Tooltip.Content>
@@ -1016,7 +979,7 @@ export function WorkflowSidebarBody({
                   <button
                     type='button'
                     onClick={() => setShowAdvanced((v) => !v)}
-                    className='flex items-center gap-1.5 whitespace-nowrap font-medium text-[var(--text-secondary)] text-small hover-hover:text-[var(--text-primary)]'
+                    className='flex items-center gap-1.5 whitespace-nowrap text-[var(--text-secondary)] text-small hover-hover:text-[var(--text-primary)]'
                   >
                     {showAdvanced ? 'Hide additional fields' : 'Show additional fields'}
                     <ChevronDown

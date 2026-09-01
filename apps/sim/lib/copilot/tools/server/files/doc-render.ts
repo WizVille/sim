@@ -1,5 +1,6 @@
-import { executeInE2B } from '@/lib/execution/e2b'
+import { OrchestrationError } from '@/lib/core/orchestration/types'
 import { CodeLanguage } from '@/lib/execution/languages'
+import { executeInSandbox } from '@/lib/execution/remote-sandbox'
 
 const RENDER_TIMEOUT_MS = 150_000
 // Bound the visual-QA cost: cap pages and rasterization DPI so the JPEGs the
@@ -37,7 +38,10 @@ export async function renderDocToGrid(args: {
 }): Promise<DocRender> {
   const ext = args.ext.toLowerCase()
   if (!isRenderableDocExt(ext)) {
-    throw new Error(`Cannot render .${ext} to images (supported: pptx, docx, pdf)`)
+    throw new OrchestrationError(
+      'validation',
+      `Cannot render .${ext} to images (supported: pptx, docx, pdf)`
+    )
   }
 
   const script = `
@@ -84,7 +88,7 @@ else:
         print("__SIM_RESULT__=" + json.dumps({"grid": base64.b64encode(f.read()).decode(), "pageCount": n}))
 `.trim()
 
-  const result = await executeInE2B({
+  const result = await executeInSandbox({
     code: script,
     language: CodeLanguage.Python,
     timeoutMs: RENDER_TIMEOUT_MS,
@@ -99,7 +103,7 @@ else:
   })
 
   if (result.error) {
-    throw new Error(`Document render failed: ${result.error}`)
+    throw new OrchestrationError('validation', `Document render failed: ${result.error}`)
   }
   const payload = result.result as { grid?: string | null; pageCount?: number } | null
   if (!payload?.grid) {

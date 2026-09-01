@@ -31,6 +31,99 @@ export const ShopifyBlock: BlockConfig<ShopifyResponse> = {
   integrationType: IntegrationType.Commerce,
   icon: ShopifyIcon,
   bgColor: '#FFFFFF',
+  canvasPresentation: {
+    defaultTitle: 'Shopify',
+    sentences: {
+      byOperation: {
+        shopify_create_product: [
+          { text: 'Create product', field: 'title', core: true },
+          { text: ', of type', field: 'productType' },
+          { text: ', as', field: 'status' },
+        ],
+        shopify_get_product: [{ text: 'Fetch product', field: 'productId', core: true }],
+        shopify_list_products: [
+          'List products',
+          { text: ', matching', field: 'productQuery' },
+          { text: ', up to', field: 'first', after: 'results' },
+        ],
+        shopify_update_product: [
+          { text: 'Update product', field: 'productId', core: true },
+          { text: ', renaming to', field: 'title' },
+          { text: ', setting status to', field: 'status' },
+        ],
+        shopify_delete_product: [{ text: 'Delete product', field: 'productId', core: true }],
+        shopify_get_order: [{ text: 'Fetch order', field: 'orderId', core: true }],
+        shopify_list_orders: [
+          'List orders',
+          { text: ', matching', field: 'orderQuery' },
+          { text: ', up to', field: 'first', after: 'results' },
+        ],
+        shopify_update_order: [
+          { text: 'Update order', field: 'orderId', core: true },
+          { text: ', setting email to', field: 'orderEmail' },
+          { text: ', with note', field: 'orderNote' },
+        ],
+        shopify_cancel_order: [
+          { text: 'Cancel order', field: 'orderId', core: true },
+          { text: ', citing', field: 'cancelReason' },
+        ],
+        shopify_create_customer: [
+          'Create a customer',
+          { text: 'named', field: 'firstName' },
+          { text: 'with email', field: 'customerEmail' },
+        ],
+        shopify_get_customer: [{ text: 'Fetch customer', field: 'customerId', core: true }],
+        shopify_list_customers: [
+          'List customers',
+          { text: ', matching', field: 'customerQuery' },
+          { text: ', up to', field: 'first', after: 'results' },
+        ],
+        shopify_update_customer: [
+          { text: 'Update customer', field: 'customerId', core: true },
+          { text: ', setting email to', field: 'customerEmail' },
+          { text: ', with phone', field: 'phone' },
+        ],
+        shopify_delete_customer: [{ text: 'Delete customer', field: 'customerId', core: true }],
+        shopify_list_inventory_items: [
+          'List inventory items',
+          { text: ', matching', field: 'inventoryQuery' },
+          { text: ', up to', field: 'first', after: 'results' },
+        ],
+        shopify_get_inventory_level: [
+          { text: 'Read the inventory level of item', field: 'inventoryItemId', core: true },
+          { text: 'at location', field: 'locationId' },
+        ],
+        shopify_adjust_inventory: [
+          { text: 'Adjust inventory of item', field: 'inventoryItemId', core: true },
+          { text: 'by', field: 'delta' },
+          { text: 'at location', field: 'locationId' },
+        ],
+        shopify_list_locations: [
+          'List inventory locations',
+          { text: ', up to', field: 'first', after: 'results' },
+        ],
+        shopify_create_fulfillment: [
+          {
+            text: 'Mark fulfillment order',
+            field: 'fulfillmentOrderId',
+            after: 'as shipped',
+            core: true,
+          },
+          { text: ', via', field: 'trackingCompany' },
+          { text: ', tracking', field: 'trackingNumber' },
+        ],
+        shopify_list_collections: [
+          'List collections',
+          { text: ', matching', field: 'collectionQuery' },
+          { text: ', up to', field: 'first', after: 'results' },
+        ],
+        shopify_get_collection: [
+          { text: 'Fetch collection', field: 'collectionId', core: true },
+          { text: ', with up to', field: 'productsFirst', after: 'products' },
+        ],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -1035,7 +1128,7 @@ export const ShopifyBlockMeta = {
   templates: [
     {
       icon: ShopifyIcon,
-      title: 'E-commerce order monitor',
+      title: 'Shopify order monitor',
       prompt:
         'Build a workflow that monitors Shopify orders, flags high-value or unusual orders for review, tracks fulfillment status in a table, and sends daily inventory and sales summaries to Slack with restock alerts when items run low.',
       modules: ['tables', 'scheduled', 'agent', 'workflows'],
@@ -1045,7 +1138,7 @@ export const ShopifyBlockMeta = {
     },
     {
       icon: ShopifyIcon,
-      title: 'Unpaid order recovery',
+      title: 'Shopify unpaid order recovery',
       prompt:
         'Build a scheduled workflow that lists Shopify orders left open and unpaid in the past day, drafts a personalized recovery email referencing the items, and sends it via Gmail while logging recovery attempts to a table.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -1055,7 +1148,7 @@ export const ShopifyBlockMeta = {
     },
     {
       icon: ShopifyIcon,
-      title: 'Low-stock restock alerter',
+      title: 'Shopify restock alerter',
       prompt:
         'Create a scheduled hourly workflow that lists Shopify inventory items, computes days-of-cover from recent sales velocity, flags SKUs below a configurable threshold, and posts a Slack alert to the operations channel with the variant, location, and recommended reorder quantity.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -1074,7 +1167,7 @@ export const ShopifyBlockMeta = {
     },
     {
       icon: ShopifyIcon,
-      title: 'Fulfillment status tracker',
+      title: 'Shopify fulfillment tracker',
       prompt:
         'Create a scheduled workflow that lists Shopify orders and their fulfillment status, updates a status table with shipped, in-transit, and delivered states, and proactively emails customers when their order misses an SLA so support gets ahead of the inquiry.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -1084,7 +1177,7 @@ export const ShopifyBlockMeta = {
     },
     {
       icon: ShopifyIcon,
-      title: 'Product launch publisher',
+      title: 'Shopify product launcher',
       prompt:
         'Build a workflow that takes a new product brief, creates the product in Shopify with variants and pricing, adds it to the right collection, drafts a launch announcement, and queues a Slack and email broadcast for marketing review before going live.',
       modules: ['agent', 'workflows'],
@@ -1094,7 +1187,7 @@ export const ShopifyBlockMeta = {
     },
     {
       icon: ShopifyIcon,
-      title: 'Order anomaly detector',
+      title: 'Shopify order anomaly detector',
       prompt:
         'Create a scheduled workflow that runs every fifteen minutes, lists recent Shopify orders, scores each for anomalies — high value, unusual destination, mismatched billing — flags suspects in a review queue table, and Slacks the operations team for hands-on inspection.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],

@@ -6,22 +6,36 @@ import { sleep } from '@sim/utils/helpers'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TraceCollector } from '@/lib/copilot/request/trace'
 
-const { isSimExecuted, executeTool, ensureHandlersRegistered } = vi.hoisted(() => ({
-  isSimExecuted: vi.fn().mockReturnValue(true),
-  executeTool: vi.fn().mockResolvedValue({ success: true, output: { ok: true } }),
-  ensureHandlersRegistered: vi.fn(),
+const { isSimExecuted, executeTool, ensureHandlersRegistered, toolRequiresApproval } = vi.hoisted(
+  () => ({
+    isSimExecuted: vi.fn().mockReturnValue(true),
+    executeTool: vi.fn().mockResolvedValue({ success: true, output: { ok: true } }),
+    ensureHandlersRegistered: vi.fn(),
+    toolRequiresApproval: vi.fn().mockReturnValue(false),
+  })
+)
+
+const {
+  upsertAsyncToolCall,
+  markAsyncToolRunning,
+  completeAsyncToolCall,
+  claimWorkflowToolExecution,
+} = vi.hoisted(() => ({
+  upsertAsyncToolCall: vi.fn(),
+  markAsyncToolRunning: vi.fn(),
+  completeAsyncToolCall: vi.fn(),
+  claimWorkflowToolExecution: vi.fn().mockResolvedValue(null),
 }))
 
-const { upsertAsyncToolCall, markAsyncToolRunning, completeAsyncToolCall, markAsyncToolDelivered } =
+const { waitForClientToolCompletion, waitForToolCompletion, waitForWorkflowToolCompletion } =
   vi.hoisted(() => ({
-    upsertAsyncToolCall: vi.fn(),
-    markAsyncToolRunning: vi.fn(),
-    completeAsyncToolCall: vi.fn(),
-    markAsyncToolDelivered: vi.fn(),
+    waitForClientToolCompletion: vi.fn(),
+    waitForToolCompletion: vi.fn(),
+    waitForWorkflowToolCompletion: vi.fn(),
   }))
 
-const { waitForToolCompletion } = vi.hoisted(() => ({
-  waitForToolCompletion: vi.fn(),
+const { sealClientToolContext } = vi.hoisted(() => ({
+  sealClientToolContext: vi.fn(),
 }))
 
 vi.mock('@/lib/copilot/tool-executor', () => ({
@@ -29,6 +43,7 @@ vi.mock('@/lib/copilot/tool-executor', () => ({
   executeTool,
   ensureHandlersRegistered,
   getToolEntry: vi.fn().mockReturnValue(undefined),
+  toolRequiresApproval,
 }))
 
 vi.mock('@/lib/copilot/async-runs/repository', () => ({
@@ -46,16 +61,23 @@ vi.mock('@/lib/copilot/async-runs/repository', () => ({
   releaseCompletedAsyncToolClaim: vi.fn(),
   upsertAsyncToolCall,
   markAsyncToolRunning,
-  markAsyncToolDelivered,
   completeAsyncToolCall,
+  claimWorkflowToolExecution,
 }))
 
 vi.mock('@/lib/copilot/request/tools/client', () => ({
+  waitForClientToolCompletion,
   waitForToolCompletion,
+  waitForWorkflowToolCompletion,
+}))
+
+vi.mock('@/lib/copilot/request/tools/client-completion-seal.server', () => ({
+  sealClientToolContext,
 }))
 
 import {
   MothershipStreamV1AsyncToolRecordStatus,
+  MothershipStreamV1CompletionStatus,
   MothershipStreamV1EventType,
   MothershipStreamV1ResourceOp,
   MothershipStreamV1RunKind,
@@ -65,9 +87,14 @@ import {
   MothershipStreamV1ToolOutcome,
   MothershipStreamV1ToolPhase,
 } from '@/lib/copilot/generated/mothership-stream-v1'
-import { Read as ReadTool } from '@/lib/copilot/generated/tool-catalog-v1'
-import { sseHandlers, subAgentHandlers } from '@/lib/copilot/request/handlers'
+import { Read as ReadTool, RunFunction } from '@/lib/copilot/generated/tool-catalog-v1'
+import {
+  prePersistClientExecutableToolCall,
+  sseHandlers,
+  subAgentHandlers,
+} from '@/lib/copilot/request/handlers'
 import type { ExecutionContext, StreamEvent, StreamingContext } from '@/lib/copilot/request/types'
+import { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
 
 describe('sse-handlers tool lifecycle', () => {
   let context: StreamingContext
@@ -79,8 +106,12 @@ describe('sse-handlers tool lifecycle', () => {
     upsertAsyncToolCall.mockResolvedValue(null)
     markAsyncToolRunning.mockResolvedValue(null)
     completeAsyncToolCall.mockResolvedValue(null)
-    markAsyncToolDelivered.mockResolvedValue(null)
     waitForToolCompletion.mockResolvedValue(null)
+    waitForClientToolCompletion.mockResolvedValue(null)
+    waitForWorkflowToolCompletion.mockResolvedValue(null)
+    sealClientToolContext.mockResolvedValue({
+      __sealedClientToolContextV1: 'sealed-context',
+    })
     context = {
       chatId: undefined,
       messageId: 'msg-1',
@@ -100,11 +131,252 @@ describe('sse-handlers tool lifecycle', () => {
       streamComplete: false,
       wasAborted: false,
       errors: [],
+      toolPermissions: {
+        enabled: false,
+        autoAllowed: new Set(),
+      },
     }
     execContext = {
       userId: 'user-1',
       workflowId: 'workflow-1',
+      resolvedSecretTraceRegistry: new ResolvedSecretTraceRegistry([]),
     }
+  })
+
+  it('pins the workflow target into the args it persists and forwards', async () => {
+    // The browser resolved its own target from the open tab while the server
+    // resolved the run's workflow; in a workspace chat those disagreed and every
+    // omitted-argument call was rejected. One stamped field ends that.
+    isSimExecuted.mockReturnValue(false)
+    context.runId = 'run-1'
+    const event = {
+      type: MothershipStreamV1EventType.tool,
+      payload: {
+        toolCallId: 'run-workflow-1',
+        toolName: 'run_workflow',
+        arguments: {},
+        executor: MothershipStreamV1ToolExecutor.client,
+        mode: MothershipStreamV1ToolMode.async,
+        phase: MothershipStreamV1ToolPhase.call,
+      },
+    } satisfies StreamEvent
+
+    await prePersistClientExecutableToolCall(event, context, {}, execContext)
+
+    // Forwarded frame — this is what the browser POSTs back with.
+    expect((event.payload as { arguments?: Record<string, unknown> }).arguments).toEqual({
+      workflowId: 'workflow-1',
+    })
+    expect(upsertAsyncToolCall).toHaveBeenCalledWith(
+      expect.objectContaining({ toolCallId: 'run-workflow-1', args: { workflowId: 'workflow-1' } })
+    )
+  })
+
+  it('leaves an explicit workflow target untouched', async () => {
+    isSimExecuted.mockReturnValue(false)
+    context.runId = 'run-1'
+    const event = {
+      type: MothershipStreamV1EventType.tool,
+      payload: {
+        toolCallId: 'run-workflow-2',
+        toolName: 'run_workflow',
+        arguments: { workflowId: 'workflow-explicit' },
+        executor: MothershipStreamV1ToolExecutor.client,
+        mode: MothershipStreamV1ToolMode.async,
+        phase: MothershipStreamV1ToolPhase.call,
+      },
+    } satisfies StreamEvent
+
+    await prePersistClientExecutableToolCall(event, context, {}, execContext)
+
+    expect(upsertAsyncToolCall).toHaveBeenCalledWith(
+      expect.objectContaining({ args: { workflowId: 'workflow-explicit' } })
+    )
+  })
+
+  it('pre-persists browser tools as pending for the desktop authorization claim', async () => {
+    isSimExecuted.mockReturnValue(false)
+    context.runId = 'run-1'
+
+    await prePersistClientExecutableToolCall(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'browser-tool-1',
+          toolName: 'browser_list_tabs',
+          arguments: {},
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      {},
+      execContext
+    )
+
+    expect(upsertAsyncToolCall).toHaveBeenCalledWith({
+      runId: 'run-1',
+      toolCallId: 'browser-tool-1',
+      toolName: 'browser_list_tabs',
+      args: {},
+      sealedContext: { __sealedClientToolContextV1: 'sealed-context' },
+      status: MothershipStreamV1AsyncToolRecordStatus.pending,
+    })
+    expect(sealClientToolContext).toHaveBeenCalledWith({
+      toolCallId: 'browser-tool-1',
+      runId: 'run-1',
+      userId: 'user-1',
+      registry: execContext.resolvedSecretTraceRegistry,
+      toolInput: {},
+    })
+  })
+
+  it('persists a gated sim tool and stamps the frame so a reload can still answer it', async () => {
+    toolRequiresApproval.mockReturnValue(true)
+    context.runId = 'run-1'
+    context.toolPermissions = {
+      enabled: true,
+      autoAllowed: new Set(),
+    }
+
+    const event = {
+      type: MothershipStreamV1EventType.tool,
+      payload: {
+        toolCallId: 'deploy-1',
+        toolName: 'deploy_as_api',
+        arguments: { versionName: 'v2' },
+        executor: MothershipStreamV1ToolExecutor.sim,
+        mode: MothershipStreamV1ToolMode.async,
+        phase: MothershipStreamV1ToolPhase.call,
+      },
+    } satisfies StreamEvent
+
+    await prePersistClientExecutableToolCall(event, context, {})
+
+    // A sim-routed tool normally gets no durable row at all; a gated one must,
+    // because the decision is posted against it after a reload.
+    expect(upsertAsyncToolCall).toHaveBeenCalledWith({
+      runId: 'run-1',
+      toolCallId: 'deploy-1',
+      toolName: 'deploy_as_api',
+      args: { versionName: 'v2' },
+      status: MothershipStreamV1AsyncToolRecordStatus.pending,
+    })
+    expect(event.payload.status).toBe('awaiting_approval')
+  })
+
+  it('clears a Go-stamped approval frame when the gate is off', async () => {
+    // Go stamps integration calls regardless of Sim's feature flag. Forwarding
+    // that stamp with nothing gating behind it would draw a card whose buttons
+    // answer into a disabled endpoint.
+    toolRequiresApproval.mockReturnValue(false)
+    context.runId = 'run-1'
+    context.toolPermissions = {
+      enabled: false,
+      autoAllowed: new Set(),
+    }
+
+    const event = {
+      type: MothershipStreamV1EventType.tool,
+      payload: {
+        toolCallId: 'gmail-1',
+        toolName: 'gmail_read_v2',
+        arguments: {},
+        executor: MothershipStreamV1ToolExecutor.sim,
+        mode: MothershipStreamV1ToolMode.async,
+        phase: MothershipStreamV1ToolPhase.call,
+        status: 'awaiting_approval',
+      },
+    } as unknown as StreamEvent
+
+    await prePersistClientExecutableToolCall(event, context, {})
+
+    expect((event.payload as { status?: string }).status).toBeUndefined()
+    expect(upsertAsyncToolCall).not.toHaveBeenCalled()
+  })
+
+  it('clears a Go-stamped approval frame on an internal tool', async () => {
+    toolRequiresApproval.mockReturnValue(true)
+    context.runId = 'run-1'
+    context.toolPermissions = {
+      enabled: true,
+      autoAllowed: new Set(),
+    }
+
+    const event = {
+      type: MothershipStreamV1EventType.tool,
+      payload: {
+        toolCallId: 'internal-1',
+        toolName: 'deploy',
+        arguments: {},
+        executor: MothershipStreamV1ToolExecutor.sim,
+        mode: MothershipStreamV1ToolMode.async,
+        phase: MothershipStreamV1ToolPhase.call,
+        status: 'awaiting_approval',
+        ui: { internal: true },
+      },
+    } as unknown as StreamEvent
+
+    await prePersistClientExecutableToolCall(event, context, {})
+
+    // An internal tool draws no row at all, so it can never host a prompt.
+    expect((event.payload as { status?: string }).status).toBeUndefined()
+    expect(upsertAsyncToolCall).not.toHaveBeenCalled()
+  })
+
+  it('leaves an already always-allowed tool ungated', async () => {
+    toolRequiresApproval.mockReturnValue(true)
+    context.runId = 'run-1'
+    context.toolPermissions = {
+      enabled: true,
+      autoAllowed: new Set(['deploy_as_api']),
+    }
+
+    const event = {
+      type: MothershipStreamV1EventType.tool,
+      payload: {
+        toolCallId: 'deploy-2',
+        toolName: 'deploy_as_api',
+        arguments: {},
+        executor: MothershipStreamV1ToolExecutor.sim,
+        mode: MothershipStreamV1ToolMode.async,
+        phase: MothershipStreamV1ToolPhase.call,
+      },
+    } satisfies StreamEvent
+
+    await prePersistClientExecutableToolCall(event, context, {})
+
+    expect(event.payload.status).toBeUndefined()
+    expect(upsertAsyncToolCall).not.toHaveBeenCalled()
+  })
+
+  it('keeps non-browser client tools in the established running state', async () => {
+    isSimExecuted.mockReturnValue(false)
+    context.runId = 'run-1'
+
+    await prePersistClientExecutableToolCall(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'client-tool-1',
+          toolName: 'run_workflow',
+          arguments: { workflowId: 'workflow-1' },
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context
+    )
+
+    expect(upsertAsyncToolCall).toHaveBeenCalledWith({
+      runId: 'run-1',
+      toolCallId: 'client-tool-1',
+      toolName: 'run_workflow',
+      args: { workflowId: 'workflow-1' },
+      status: MothershipStreamV1AsyncToolRecordStatus.running,
+    })
   })
 
   it('keeps only the latest post-tool assistant text for headless final content', async () => {
@@ -195,6 +467,7 @@ describe('sse-handlers tool lifecycle', () => {
 
     const updated = context.toolCalls.get('tool-1')
     expect(updated?.status).toBe(MothershipStreamV1ToolOutcome.success)
+    expect(updated?.agentId).toBe('main')
     // Display titles are derived client-side from the tool name (+args), not the
     // stream; read with no path resolves to the static "Reading file".
     expect(updated?.displayTitle).toBe('Reading file')
@@ -208,6 +481,33 @@ describe('sse-handlers tool lifecycle', () => {
         }),
       })
     )
+  })
+
+  it('registers but never dispatches an inband-owned sim tool call', async () => {
+    // Go executes inband-owned calls itself via /api/copilot/tools/execute;
+    // dispatching here too ran the tool twice, racing on mutations.
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-inband',
+          toolName: ReadTool.id,
+          arguments: { path: 'files/a.md' },
+          executor: MothershipStreamV1ToolExecutor.sim,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+          ui: { inbandOwned: true },
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { interactive: true }
+    )
+    await sleep(0)
+
+    expect(context.toolCalls.get('tool-inband')).toBeDefined()
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(context.pendingToolPromises.has('tool-inband')).toBe(false)
   })
 
   it('preserves primitive tool outputs through async completion persistence', async () => {
@@ -258,8 +558,86 @@ describe('sse-handlers tool lifecycle', () => {
     expect(updated?.result?.output).toBe('done')
   })
 
-  it('marks background client workflow tools delivered after synthetic result emission', async () => {
-    waitForToolCompletion.mockResolvedValueOnce({
+  it('projects resolved Function output while leaving resource metadata unchanged', async () => {
+    const registry = new ResolvedSecretTraceRegistry([
+      {
+        name: 'SECRET',
+        plaintext: 'secret-value',
+        encryptedValue: 'encrypted-secret-value',
+      },
+    ])
+    registry.recordResolved('SECRET', 'secret-value')
+    execContext.resolvedSecretTraceRegistry = registry
+    execContext.chatId = 'chat-1'
+    executeTool.mockImplementationOnce(async (_name, _params, toolContext) => {
+      toolContext.resolvedSecretTraceRegistry?.recordResolved('SECRET', 'secret-value', {
+        propagated: true,
+      })
+      return {
+        success: true,
+        output: {
+          result: 'secret-value',
+          stdout: 'prefix secret-value',
+        },
+        resources: [{ type: 'file', id: 'file-1', title: 'secret-value.txt' }],
+      }
+    })
+    const onEvent = vi.fn()
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-function',
+          toolName: RunFunction.id,
+          arguments: { code: 'return {{SECRET}}' },
+          executor: MothershipStreamV1ToolExecutor.sim,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { onEvent, interactive: false, timeout: 1000 }
+    )
+
+    await sleep(0)
+
+    const safeOutput = {
+      result: '{{SECRET}}',
+      stdout: 'prefix {{SECRET}}',
+    }
+    expect(completeAsyncToolCall).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolCallId: 'tool-function',
+        result: safeOutput,
+      })
+    )
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          toolCallId: 'tool-function',
+          output: safeOutput,
+        }),
+      })
+    )
+    expect(context.toolCalls.get('tool-function')?.result?.output).toEqual(safeOutput)
+    expect(onEvent).toHaveBeenCalledWith({
+      type: MothershipStreamV1EventType.resource,
+      payload: {
+        op: MothershipStreamV1ResourceOp.upsert,
+        resource: {
+          type: 'file',
+          id: 'file-1',
+          title: 'secret-value.txt',
+        },
+      },
+    })
+    expect(JSON.stringify(completeAsyncToolCall.mock.calls)).not.toContain('secret-value')
+  })
+
+  it('emits a structural result for a detached background workflow tool', async () => {
+    waitForWorkflowToolCompletion.mockResolvedValueOnce({
       status: 'background',
       data: { detached: true },
     })
@@ -285,7 +663,15 @@ describe('sse-handlers tool lifecycle', () => {
     await sleep(0)
     await Promise.allSettled(context.pendingToolPromises.values())
 
-    expect(markAsyncToolDelivered).toHaveBeenCalledWith('tool-background')
+    // The waiter always receives a signal now: the server fallback needs a
+    // handle to cancel its own wait if it ends up running the tool itself.
+    expect(waitForWorkflowToolCompletion).toHaveBeenCalledWith({
+      toolCallId: 'tool-background',
+      workflowId: 'workflow-1',
+      timeoutMs: 1000,
+      abortSignal: expect.any(AbortSignal),
+      registry: execContext.resolvedSecretTraceRegistry,
+    })
     expect(onEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         type: MothershipStreamV1EventType.tool,
@@ -301,6 +687,317 @@ describe('sse-handlers tool lifecycle', () => {
     expect(context.toolCalls.get('tool-background')?.status).toBe(
       MothershipStreamV1ToolOutcome.skipped
     )
+  })
+
+  it('settles an explicitly async workflow launch as successful', async () => {
+    waitForWorkflowToolCompletion.mockResolvedValueOnce({
+      status: 'background',
+      data: { workflowId: 'workflow-1', executionId: 'execution-1' },
+    })
+    const onEvent = vi.fn()
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-async-workflow',
+          toolName: 'run_workflow',
+          arguments: { workflowId: 'workflow-1', async: true },
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { onEvent, interactive: true, timeout: 1000 }
+    )
+
+    await Promise.allSettled(context.pendingToolPromises.values())
+
+    expect(context.toolCalls.get('tool-async-workflow')?.status).toBe(
+      MothershipStreamV1ToolOutcome.success
+    )
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MothershipStreamV1EventType.tool,
+        payload: expect.objectContaining({
+          toolCallId: 'tool-async-workflow',
+          phase: MothershipStreamV1ToolPhase.result,
+          status: MothershipStreamV1ToolOutcome.success,
+          success: true,
+        }),
+      })
+    )
+  })
+
+  it('runs a workflow tool server-side when no browser picks it up', async () => {
+    // Nobody claims it, the wait expires, and the server wins the claim.
+    waitForWorkflowToolCompletion.mockResolvedValue(null)
+    claimWorkflowToolExecution.mockResolvedValueOnce({ toolCallId: 'tool-unclaimed' })
+    executeTool.mockResolvedValueOnce({ success: true, output: { ran: 'on-server' } })
+    const onEvent = vi.fn()
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-unclaimed',
+          toolName: 'run_workflow',
+          arguments: { workflowId: 'workflow-1' },
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { onEvent, interactive: true, timeout: 1 }
+    )
+
+    await Promise.allSettled(context.pendingToolPromises.values())
+
+    // Regression guard: the wait sets the call to 'executing' before parking,
+    // and executeToolAndReport short-circuits anything already 'executing'. If
+    // the handoff stops resetting the status, executeTool is never reached and
+    // the workflow silently does not run.
+    expect(executeTool).toHaveBeenCalled()
+    expect(executeTool.mock.calls.at(-1)?.[0]).toBe('run_workflow')
+    // The claimed execution id must reach the handler so the run is attributable.
+    expect(executeTool.mock.calls.at(-1)?.[2]?.boundWorkflowExecutionId).toBeTruthy()
+
+    const workflowResults = onEvent.mock.calls
+      .map(([event]) => event)
+      .filter(
+        (event) =>
+          event?.type === MothershipStreamV1EventType.tool &&
+          event.payload?.toolCallId === 'tool-unclaimed' &&
+          event.payload?.phase === MothershipStreamV1ToolPhase.result
+      )
+    // Exactly one result, from the sim path — no client-flavored duplicate on top.
+    expect(workflowResults).toHaveLength(1)
+    expect(workflowResults[0].payload.executor).toBe(MothershipStreamV1ToolExecutor.sim)
+  })
+
+  it('claims and runs the same workflow when the call omits an explicit workflowId', async () => {
+    // The waiter resolves the target via resolveWorkflowToolTargetId(args, ctx)
+    // while the handler resolves it as params.workflowId || context.workflowId.
+    // If those two ever diverge, the fallback would claim one workflow and run
+    // another.
+    waitForWorkflowToolCompletion.mockResolvedValue(null)
+    claimWorkflowToolExecution.mockResolvedValueOnce({ toolCallId: 'tool-implicit-workflow' })
+    executeTool.mockResolvedValueOnce({ success: true, output: {} })
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-implicit-workflow',
+          toolName: 'run_workflow',
+          arguments: {},
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { onEvent: vi.fn(), interactive: true, timeout: 1 }
+    )
+
+    await Promise.allSettled(context.pendingToolPromises.values())
+
+    expect(waitForWorkflowToolCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({ workflowId: 'workflow-1' })
+    )
+    expect(executeTool.mock.calls.at(-1)?.[2]?.workflowId).toBe('workflow-1')
+  })
+
+  it('refuses a workflow tool call with no resolvable workflow target', async () => {
+    // A workspace chat has no run-scoped workflow, so an omitted workflowId
+    // cannot be resolved by anyone on this side. Dispatching would only buy a
+    // rejection the model cannot read, so fail with something it can act on.
+    const workspaceExecContext = { ...execContext, workflowId: '' }
+    const onEvent = vi.fn()
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-unbound-workflow',
+          toolName: 'run_workflow',
+          arguments: {},
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      workspaceExecContext,
+      { onEvent, interactive: true, timeout: 1000 }
+    )
+
+    await Promise.allSettled(context.pendingToolPromises.values())
+
+    // Never handed to a browser, and never claimed server-side.
+    expect(waitForWorkflowToolCompletion).not.toHaveBeenCalled()
+    expect(claimWorkflowToolExecution).not.toHaveBeenCalled()
+
+    const results = onEvent.mock.calls
+      .map(([event]) => event)
+      .filter(
+        (event) =>
+          event?.type === MothershipStreamV1EventType.tool &&
+          event.payload?.toolCallId === 'tool-unbound-workflow' &&
+          event.payload?.phase === MothershipStreamV1ToolPhase.result
+      )
+    expect(results).toHaveLength(1)
+    expect(results[0].payload.status).toBe(MothershipStreamV1ToolOutcome.error)
+    // The message has to name the fix, or the model just retries identically.
+    expect(results[0].payload.output?.error).toContain('workflowId')
+    expect(context.toolCalls.get('tool-unbound-workflow')?.status).toBe(
+      MothershipStreamV1ToolOutcome.error
+    )
+  })
+
+  it('does not run a workflow tool server-side when a browser holds the claim', async () => {
+    waitForWorkflowToolCompletion.mockResolvedValue(null)
+    claimWorkflowToolExecution.mockResolvedValueOnce(null)
+    executeTool.mockClear()
+    const onEvent = vi.fn()
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-claimed-elsewhere',
+          toolName: 'run_workflow',
+          arguments: { workflowId: 'workflow-1' },
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { onEvent, interactive: true, timeout: 1 }
+    )
+
+    await Promise.allSettled(context.pendingToolPromises.values())
+
+    expect(executeTool).not.toHaveBeenCalled()
+  })
+
+  it('waits for the desktop client when a static VFS read is explicitly user-local', async () => {
+    waitForClientToolCompletion.mockResolvedValueOnce({
+      status: 'success',
+      message: 'Read {{SECRET}}',
+      data: { content: '{{SECRET}}', totalLines: 1 },
+    })
+    const onEvent = vi.fn()
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-user-local-read',
+          toolName: 'read',
+          arguments: { path: 'user-local/Project--mount/README.md' },
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { onEvent, interactive: true, timeout: 1000 }
+    )
+
+    await Promise.allSettled(context.pendingToolPromises.values())
+
+    expect(waitForClientToolCompletion).toHaveBeenCalledWith({
+      toolCallId: 'tool-user-local-read',
+      runId: context.runId,
+      userId: 'user-1',
+      timeoutMs: 1000,
+      abortSignal: undefined,
+      registry: execContext.resolvedSecretTraceRegistry,
+    })
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MothershipStreamV1EventType.tool,
+        payload: expect.objectContaining({
+          phase: MothershipStreamV1ToolPhase.result,
+          output: { content: '{{SECRET}}', totalLines: 1 },
+        }),
+      })
+    )
+    expect(JSON.stringify(context.toolCalls.get('tool-user-local-read'))).not.toContain(
+      'resolved-secret'
+    )
+    expect(JSON.stringify(onEvent.mock.calls)).not.toContain('resolved-secret')
+    expect(executeTool).not.toHaveBeenCalled()
+  })
+
+  it('bounds a retired browser takeover that can no longer execute in the client', async () => {
+    isSimExecuted.mockReturnValue(false)
+    waitForClientToolCompletion.mockResolvedValueOnce({
+      status: 'success',
+      message: 'Browser hand-back completed',
+      data: { completed: true },
+    })
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-browser-takeover',
+          toolName: 'browser_request_takeover',
+          arguments: { reason: 'Please sign in' },
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { interactive: true, timeout: 1000 }
+    )
+
+    await Promise.allSettled(context.pendingToolPromises.values())
+
+    expect(waitForClientToolCompletion).toHaveBeenCalledWith({
+      toolCallId: 'tool-browser-takeover',
+      runId: context.runId,
+      userId: 'user-1',
+      timeoutMs: 1000,
+      abortSignal: undefined,
+      registry: execContext.resolvedSecretTraceRegistry,
+    })
+  })
+
+  it('keeps an ordinary static VFS read on the Sim executor', async () => {
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-workspace-read',
+          toolName: 'read',
+          arguments: { path: 'WORKSPACE.md' },
+          executor: MothershipStreamV1ToolExecutor.client,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { onEvent: vi.fn(), interactive: true, timeout: 1000 }
+    )
+
+    await Promise.allSettled(context.pendingToolPromises.values())
+
+    expect(executeTool).toHaveBeenCalled()
+    expect(waitForToolCompletion).not.toHaveBeenCalled()
   })
 
   it('does not add hidden tool calls to content blocks', async () => {
@@ -419,6 +1116,53 @@ describe('sse-handlers tool lifecycle', () => {
     expect(context.toolCalls.has('glob-generating')).toBe(false)
   })
 
+  it('executes finalized main-tool arguments instead of a generating snapshot', async () => {
+    executeTool.mockResolvedValueOnce({ success: true, output: { ok: true } })
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'function-finalized-args',
+          toolName: RunFunction.id,
+          arguments: { language: 'javascript', code: 'return {{STALE_SECRET}}' },
+          executor: MothershipStreamV1ToolExecutor.sim,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+          status: 'generating',
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { interactive: false, timeout: 1000 }
+    )
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'function-finalized-args',
+          toolName: RunFunction.id,
+          arguments: { language: 'javascript', code: 'return 1' },
+          executor: MothershipStreamV1ToolExecutor.sim,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { interactive: false, timeout: 1000 }
+    )
+
+    await sleep(0)
+
+    expect(executeTool).toHaveBeenCalledWith(
+      RunFunction.id,
+      { language: 'javascript', code: 'return 1' },
+      expect.any(Object)
+    )
+  })
+
   it('updates stored params when a subagent generating event is followed by the final tool call', async () => {
     executeTool.mockResolvedValueOnce({ success: true, output: { ok: true } })
     context.toolCalls.set('parent-1', {
@@ -439,6 +1183,7 @@ describe('sse-handlers tool lifecycle', () => {
           mode: MothershipStreamV1ToolMode.async,
           phase: MothershipStreamV1ToolPhase.call,
           status: 'generating',
+          arguments: { name: 'Stale Workflow' },
         },
       } satisfies StreamEvent,
       context,
@@ -473,9 +1218,11 @@ describe('sse-handlers tool lifecycle', () => {
       expect.any(Object)
     )
     expect(context.toolCalls.get('sub-tool-1')?.params).toEqual({ name: 'Example Workflow' })
+    expect(context.toolCalls.get('sub-tool-1')?.agentId).toBe('workflow')
     expect(context.subAgentToolCalls['parent-1']?.[0]?.params).toEqual({
       name: 'Example Workflow',
     })
+    expect(context.subAgentToolCalls['parent-1']?.[0]?.agentId).toBe('workflow')
   })
 
   it('routes subagent text using the event scope parent tool call id', async () => {
@@ -557,6 +1304,40 @@ describe('sse-handlers tool lifecycle', () => {
     await sleep(0)
 
     expect(context.subAgentToolCalls['parent-1']?.[0]?.id).toBe('sub-tool-scope-1')
+    expect(context.toolCalls.get('sub-tool-scope-1')?.agentId).toBe('deploy')
+  })
+
+  it('retains the first agent attribution on replayed partial tool calls', async () => {
+    context.toolCalls.set('replayed-read', {
+      id: 'replayed-read',
+      name: 'read',
+      status: 'executing',
+    })
+
+    const replayPartial = (agentId: string) =>
+      subAgentHandlers.tool(
+        {
+          type: MothershipStreamV1EventType.tool,
+          scope: { lane: 'subagent', parentToolCallId: 'parent-1', agentId },
+          payload: {
+            toolCallId: 'replayed-read',
+            toolName: 'read',
+            executor: MothershipStreamV1ToolExecutor.go,
+            mode: MothershipStreamV1ToolMode.sync,
+            phase: MothershipStreamV1ToolPhase.call,
+            status: 'generating',
+            partial: true,
+          },
+        } satisfies StreamEvent,
+        context,
+        execContext,
+        { interactive: false, timeout: 1000 }
+      )
+
+    await replayPartial('workflow')
+    await replayPartial('deploy')
+
+    expect(context.toolCalls.get('replayed-read')?.agentId).toBe('workflow')
   })
 
   it('pairs compaction lifecycle events within each scoped subagent lane', async () => {
@@ -809,15 +1590,61 @@ describe('sse-handlers tool lifecycle', () => {
     const firstPromise = context.pendingToolPromises.get('tool-inflight')
     expect(firstPromise).toBeDefined()
 
-    await sseHandlers.tool(event as StreamEvent, context, execContext, { interactive: false })
+    await sseHandlers.tool(
+      {
+        ...event,
+        payload: {
+          ...event.payload,
+          arguments: { workflowId: 'workflow-2' },
+        },
+      } as StreamEvent,
+      context,
+      execContext,
+      { interactive: false }
+    )
 
     expect(executeTool).toHaveBeenCalledTimes(1)
     expect(context.pendingToolPromises.get('tool-inflight')).toBe(firstPromise)
+    expect(context.toolCalls.get('tool-inflight')?.params).toEqual({ workflowId: 'workflow-1' })
 
     resolveTool?.({ success: true, output: { ok: true } })
     await sleep(0)
 
     expect(context.pendingToolPromises.has('tool-inflight')).toBe(false)
+  })
+
+  it('leaves a complete terminal state when a tool is cancelled before dispatch', async () => {
+    // A tool cancelled because its stream was already aborted used to get a
+    // status but no `result`. The subagent join requires one, so that single
+    // half-finished tool call was turned into a thrown "missing result" that
+    // killed the entire turn and blamed an unrelated tool.
+    context.wasAborted = true
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'tool-stream-dead',
+          toolName: ReadTool.id,
+          arguments: { workflowId: 'workflow-1' },
+          executor: MothershipStreamV1ToolExecutor.sim,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { onEvent: vi.fn(), interactive: false, timeout: 1000 }
+    )
+
+    await sleep(0)
+
+    const toolCall = context.toolCalls.get('tool-stream-dead')
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(toolCall?.status).toBe(MothershipStreamV1ToolOutcome.cancelled)
+    // The part that was missing: a terminal tool must also be complete.
+    expect(toolCall?.result).toEqual({ success: false })
+    expect(toolCall?.error).toBeTruthy()
   })
 
   it('still executes the tool when async row upsert fails', async () => {
@@ -1150,6 +1977,58 @@ describe('sse-handlers tool lifecycle', () => {
     )
   })
 
+  it('forwards workspace secret references unchanged to the resolved integration operation', async () => {
+    isSimExecuted.mockReturnValue(false)
+    executeTool.mockResolvedValueOnce({ success: true, output: { searchResults: [] } })
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'gateway-serper',
+          toolName: 'call_integration_tool',
+          executor: MothershipStreamV1ToolExecutor.go,
+          mode: MothershipStreamV1ToolMode.sync,
+          phase: MothershipStreamV1ToolPhase.call,
+          status: 'generating',
+          partial: true,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { interactive: false, timeout: 1000 }
+    )
+
+    await sseHandlers.tool(
+      {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          toolCallId: 'gateway-serper',
+          toolName: 'serper_search',
+          arguments: {
+            query: 'invoice',
+            apiKey: '{{SERPER_API_KEY}}',
+          },
+          executor: MothershipStreamV1ToolExecutor.sim,
+          mode: MothershipStreamV1ToolMode.async,
+          phase: MothershipStreamV1ToolPhase.call,
+        },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { interactive: false, timeout: 1000 }
+    )
+
+    await sleep(0)
+
+    expect(executeTool).toHaveBeenCalledOnce()
+    expect(executeTool).toHaveBeenCalledWith(
+      'serper_search',
+      { query: 'invoice', apiKey: '{{SERPER_API_KEY}}' },
+      expect.any(Object)
+    )
+  })
+
   it('clears pending continuation state when a run resumes', async () => {
     context.awaitingAsyncContinuation = {
       checkpointId: 'cp-1',
@@ -1173,6 +2052,24 @@ describe('sse-handlers tool lifecycle', () => {
 
     expect(context.awaitingAsyncContinuation).toBeUndefined()
     expect(context.streamComplete).toBe(false)
+  })
+
+  it('records the terminal completion status so a finished turn can outrank an in-band failure', async () => {
+    context.errors.push('subagent build failed')
+
+    await sseHandlers.complete(
+      {
+        type: MothershipStreamV1EventType.complete,
+        payload: { status: MothershipStreamV1CompletionStatus.complete },
+      } satisfies StreamEvent,
+      context,
+      execContext,
+      { interactive: false, timeout: 1000 }
+    )
+
+    expect(context.completionStatus).toBe(MothershipStreamV1CompletionStatus.complete)
+    expect(context.streamComplete).toBe(true)
+    expect(context.errors).toEqual(['subagent build failed'])
   })
 
   it('routes resource events through an explicit main-lane handler', async () => {

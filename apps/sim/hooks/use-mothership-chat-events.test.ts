@@ -4,8 +4,20 @@
 
 import type { QueryClient } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const { suspendBrowserScope, suspendTerminalScope } = vi.hoisted(() => ({
+  suspendBrowserScope: vi.fn(async () => true),
+  suspendTerminalScope: vi.fn(async () => true),
+}))
+
+vi.mock('@/lib/browser-agent/transport', () => ({ suspendBrowserScope }))
+vi.mock('@/lib/terminal/transport', () => ({ suspendTerminalScope }))
+
 import { mothershipChatKeys } from '@/hooks/queries/mothership-chats'
-import { handleMothershipChatStatusEvent } from '@/hooks/use-mothership-chat-events'
+import {
+  handleMothershipChatStatusEvent,
+  resyncMothershipChatCaches,
+} from '@/hooks/use-mothership-chat-events'
 
 describe('handleMothershipChatStatusEvent', () => {
   const queryClient = {
@@ -32,7 +44,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(2)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
       queryKey: mothershipChatKeys.detail('chat-1'),
@@ -61,7 +73,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.removeQueries).not.toHaveBeenCalled()
   })
@@ -88,7 +100,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.removeQueries).not.toHaveBeenCalled()
   })
@@ -115,7 +127,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.removeQueries).not.toHaveBeenCalled()
   })
@@ -142,7 +154,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(2)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
       queryKey: mothershipChatKeys.detail('chat-1'),
@@ -172,7 +184,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(2)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
       queryKey: mothershipChatKeys.detail('chat-1'),
@@ -202,7 +214,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(2)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
       queryKey: mothershipChatKeys.detail('chat-1'),
@@ -223,7 +235,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(2)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
       queryKey: mothershipChatKeys.detail('chat-1'),
@@ -244,12 +256,14 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.removeQueries).toHaveBeenCalledTimes(1)
     expect(queryClient.removeQueries).toHaveBeenCalledWith({
       queryKey: mothershipChatKeys.detail('chat-1'),
     })
+    expect(suspendBrowserScope).toHaveBeenCalledWith('chat-1')
+    expect(suspendTerminalScope).toHaveBeenCalledWith('chat-1')
   })
 
   it('invalidates the task list and detail for started task events', () => {
@@ -265,7 +279,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(2)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
       queryKey: mothershipChatKeys.detail('chat-1'),
@@ -294,7 +308,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.removeQueries).not.toHaveBeenCalled()
   })
@@ -321,7 +335,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.removeQueries).not.toHaveBeenCalled()
   })
@@ -348,7 +362,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.removeQueries).not.toHaveBeenCalled()
   })
@@ -375,7 +389,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(2)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
       queryKey: mothershipChatKeys.detail('chat-1'),
@@ -396,7 +410,7 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1)
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: mothershipChatKeys.list('ws-1'),
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
     })
     expect(queryClient.removeQueries).not.toHaveBeenCalled()
   })
@@ -406,5 +420,32 @@ describe('handleMothershipChatStatusEvent', () => {
 
     expect(queryClient.invalidateQueries).not.toHaveBeenCalled()
     expect(queryClient.removeQueries).not.toHaveBeenCalled()
+  })
+})
+
+describe('resyncMothershipChatCaches', () => {
+  const queryClient = {
+    invalidateQueries: vi.fn().mockResolvedValue(undefined),
+  } satisfies Pick<QueryClient, 'invalidateQueries'>
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('invalidates the workspace lists', () => {
+    resyncMothershipChatCaches(queryClient, 'ws-1')
+
+    expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1)
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: mothershipChatKeys.workspaceLists('ws-1'),
+    })
+  })
+
+  it('leaves chat details untouched so a mounted stream cannot be refetched mid-turn', () => {
+    resyncMothershipChatCaches(queryClient, 'ws-1')
+
+    expect(queryClient.invalidateQueries).not.toHaveBeenCalledWith(
+      expect.objectContaining({ queryKey: mothershipChatKeys.details() })
+    )
   })
 })

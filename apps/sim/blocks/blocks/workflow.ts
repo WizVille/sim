@@ -9,6 +9,15 @@ export const WorkflowBlock: BlockConfig = {
   category: 'blocks',
   bgColor: '#6366F1',
   icon: WorkflowIcon,
+  canvasPresentation: {
+    defaultTitle: 'Workflow',
+    sentences: {
+      default: [
+        { text: 'Run', field: ['workflowId', 'manualWorkflowId'], core: true },
+        { text: ', passing', field: 'input' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'workflowId',
@@ -64,4 +73,5 @@ export const WorkflowBlock: BlockConfig = {
     },
   },
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'workflow_input' },
 }

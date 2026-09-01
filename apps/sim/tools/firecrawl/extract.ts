@@ -1,6 +1,11 @@
 import { createLogger } from '@sim/logger'
 import { sleep } from '@sim/utils/helpers'
 import { DEFAULT_EXECUTION_TIMEOUT_MS } from '@/lib/core/execution-limits'
+import { firecrawlHosting } from '@/tools/firecrawl/hosting'
+import {
+  applyFirecrawlScrapeOptionsModelInput,
+  selectFirecrawlScrapeOptionsModelInput,
+} from '@/tools/firecrawl/model-input'
 import type { ExtractParams, ExtractResponse } from '@/tools/firecrawl/types'
 import type { ToolConfig } from '@/tools/types'
 
@@ -80,35 +85,25 @@ export const extractTool: ToolConfig<ExtractParams, ExtractResponse> = {
     },
   },
 
-  hosting: {
-    envKeyPrefix: 'FIRECRAWL_API_KEY',
-    apiKeyParam: 'apiKey',
-    byokProviderId: 'firecrawl',
-    pricing: {
-      type: 'custom',
-      getCost: (_params, output) => {
-        if (output.creditsUsed == null) {
-          throw new Error('Firecrawl response missing creditsUsed field')
-        }
-
-        const creditsUsed = Number(output.creditsUsed)
-        if (Number.isNaN(creditsUsed)) {
-          throw new Error('Firecrawl response returned a non-numeric creditsUsed field')
-        }
-
-        return {
-          cost: creditsUsed * 0.001,
-          metadata: { creditsUsed },
-        }
-      },
-    },
-    rateLimit: {
-      mode: 'per_request',
-      requestsPerMinute: 100,
-    },
-  },
+  hosting: firecrawlHosting(),
 
   request: {
+    modelInput: {
+      mode: 'project',
+      select: (params) => ({
+        prompt: params.prompt,
+        schema: params.schema,
+        scrapeOptions: selectFirecrawlScrapeOptionsModelInput(params.scrapeOptions),
+      }),
+      applyProjected: (selectedParams, projectedSelection) => ({
+        prompt: projectedSelection.prompt,
+        schema: projectedSelection.schema,
+        scrapeOptions: applyFirecrawlScrapeOptionsModelInput(
+          selectedParams.scrapeOptions,
+          projectedSelection.scrapeOptions
+        ),
+      }),
+    },
     method: 'POST',
     url: 'https://api.firecrawl.dev/v2/extract',
     headers: (params) => ({

@@ -1,6 +1,7 @@
 import { useCallback } from 'react'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
+import type { WorkflowStateContractInput } from '@/lib/api/contracts/workflows'
 import { readSSEEvents } from '@/lib/core/utils/sse'
 import type {
   BlockChildWorkflowStartedData,
@@ -14,7 +15,10 @@ import type {
   ExecutionPausedData,
   ExecutionStartedData,
   StreamChunkData,
+  StreamChunkResetData,
   StreamDoneData,
+  StreamThinkingData,
+  StreamToolData,
 } from '@/lib/workflows/executor/execution-events'
 import type { SerializableExecutionState } from '@/executor/execution/types'
 
@@ -23,7 +27,8 @@ const logger = createLogger('useExecutionStream')
 export class ExecutionStreamHttpError extends Error {
   constructor(
     message: string,
-    public readonly httpStatus: number
+    public readonly httpStatus: number,
+    public readonly code?: string
   ) {
     super(message)
     this.name = 'ExecutionStreamHttpError'
@@ -121,8 +126,17 @@ export async function processSSEStream(
             case 'stream:chunk':
               await callbacks.onStreamChunk?.(event.data)
               break
+            case 'stream:chunk_reset':
+              await callbacks.onStreamChunkReset?.(event.data)
+              break
             case 'stream:done':
               await callbacks.onStreamDone?.(event.data)
+              break
+            case 'stream:thinking':
+              await callbacks.onStreamThinking?.(event.data)
+              break
+            case 'stream:tool':
+              await callbacks.onStreamTool?.(event.data)
               break
             default:
               logger.warn('Unknown event type:', (event as any).type)
@@ -164,7 +178,10 @@ export interface ExecutionStreamCallbacks {
   onBlockError?: (data: BlockErrorData) => void | Promise<void>
   onBlockChildWorkflowStarted?: (data: BlockChildWorkflowStartedData) => void | Promise<void>
   onStreamChunk?: (data: StreamChunkData) => void | Promise<void>
+  onStreamChunkReset?: (data: StreamChunkResetData) => void | Promise<void>
   onStreamDone?: (data: StreamDoneData) => void | Promise<void>
+  onStreamThinking?: (data: StreamThinkingData) => void | Promise<void>
+  onStreamTool?: (data: StreamToolData) => void | Promise<void>
   onEventId?: (eventId: number) => void | Promise<void>
 }
 
@@ -181,12 +198,7 @@ export interface ExecuteStreamOptions {
   triggerType?: string
   useDraftState?: boolean
   isClientSession?: boolean
-  workflowStateOverride?: {
-    blocks: Record<string, any>
-    edges: any[]
-    loops?: Record<string, any>
-    parallels?: Record<string, any>
-  }
+  workflowStateOverride?: WorkflowStateContractInput
   stopAfterBlockId?: string
   onExecutionId?: (executionId: string) => void
   callbacks?: ExecutionStreamCallbacks
@@ -195,8 +207,12 @@ export interface ExecuteStreamOptions {
 export interface ExecuteFromBlockOptions {
   workflowId: string
   startBlockId: string
-  sourceSnapshot: SerializableExecutionState
+  sourceSnapshot?: SerializableExecutionState
+  sourceExecutionId?: string
   input?: any
+  useDraftState?: boolean
+  isClientSession?: boolean
+  workflowStateOverride?: WorkflowStateContractInput
   onExecutionId?: (executionId: string) => void
   callbacks?: ExecutionStreamCallbacks
 }
@@ -333,7 +349,11 @@ export function useExecutionStream() {
       workflowId,
       startBlockId,
       sourceSnapshot,
+      sourceExecutionId,
       input,
+      useDraftState,
+      isClientSession,
+      workflowStateOverride,
       onExecutionId,
       callbacks = {},
     } = options
@@ -355,7 +375,14 @@ export function useExecutionStream() {
         body: JSON.stringify({
           stream: true,
           input,
-          runFromBlock: { startBlockId, sourceSnapshot },
+          useDraftState,
+          isClientSession,
+          workflowStateOverride,
+          runFromBlock: {
+            startBlockId,
+            ...(sourceExecutionId ? { executionId: sourceExecutionId } : {}),
+            ...(sourceSnapshot ? { sourceSnapshot } : {}),
+          },
         }),
         signal: abortController.signal,
       })

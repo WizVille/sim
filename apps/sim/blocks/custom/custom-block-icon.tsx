@@ -2,8 +2,14 @@
 
 import { memo, type SVGProps } from 'react'
 import { cn } from '@sim/emcn'
-import { Box } from 'lucide-react'
+import { Box } from '@sim/emcn/icons'
+import {
+  CUSTOM_BLOCK_IMAGE_TILE_COLOR,
+  CUSTOM_BLOCK_TILE_COLOR,
+} from '@/blocks/custom/build-config'
 import type { BlockIcon } from '@/blocks/types'
+
+const cache = new Map<string, BlockIcon>()
 
 /**
  * Build a `BlockIcon` from an uploaded icon image URL. Rendered as an `<img>` so
@@ -11,24 +17,24 @@ import type { BlockIcon } from '@/blocks/types'
  * other block icon. Cached by URL so the component reference stays stable across
  * the many tiles/nodes that render a custom block.
  */
-const cache = new Map<string, BlockIcon>()
-
 export function makeImageIcon(url: string): BlockIcon {
   const cached = cache.get(url)
   if (cached) return cached
 
-  // Fill the tile so an uploaded image/logo reads at the same footprint as other
-  // blocks' colored tiles, instead of a small glyph floating in a transparent
-  // square. Trailing `size-full` beats a consumer size *class* (twMerge keeps the
-  // last of a conflict group) so a tiled surface (canvas/toolbar/palette) fills;
-  // it loses to a consumer inline `style` (specificity) so a tile-less inline
-  // surface that sizes via `style={{ width, height }}` still renders at its px.
+  /**
+   * `size-full` is only the DEFAULT (fills a fixed-size tile parent when no size
+   * is given); a consumer size class or inline style always wins, so flow
+   * surfaces that render icons at `size-[14px]` get exactly that. Tiled surfaces
+   * (canvas node, toolbar, search modal, …) pass a glyph-size class but want the
+   * image to fill the tile — they opt in with `[&_img]:size-full` on the fixed
+   * wrapper, which out-specifies the size class on the img.
+   */
   const ImageComponent = memo(({ className, style }: SVGProps<SVGSVGElement>) => (
     <img
       src={url}
       alt=''
       style={style}
-      className={cn('rounded-[4px] object-contain', className, 'size-full')}
+      className={cn('size-full rounded-[4px] object-contain', className)}
     />
   ))
   // double-cast-allowed: an <img> renderer must satisfy the SVG-typed BlockIcon slot
@@ -39,17 +45,27 @@ export function makeImageIcon(url: string): BlockIcon {
 }
 
 /** Fallback icon for custom blocks published without an uploaded image. */
-// double-cast-allowed: a lucide icon component fills the SVG-typed BlockIcon slot
-export const DefaultCustomBlockIcon: BlockIcon = Box as unknown as BlockIcon
+export const DefaultCustomBlockIcon: BlockIcon = Box
 
 /**
- * Resolve a custom block's icon: the uploaded image, else the org's whitelabel logo
- * (`fallbackUrl`), else the default glyph.
+ * Resolve a custom block's icon and the tile it sits on: the uploaded image, else
+ * the org's whitelabel logo (`fallbackUrl`), else the default glyph. Both fall out
+ * of the same precedence, so a block can never paint a tile its icon disagrees with.
  */
+export function getCustomBlockTile(
+  iconUrl: string | null | undefined,
+  fallbackUrl?: string | null
+): { icon: BlockIcon; bgColor: string } {
+  const url = iconUrl || fallbackUrl
+  return url
+    ? { icon: makeImageIcon(url), bgColor: CUSTOM_BLOCK_IMAGE_TILE_COLOR }
+    : { icon: DefaultCustomBlockIcon, bgColor: CUSTOM_BLOCK_TILE_COLOR }
+}
+
+/** The icon half of {@link getCustomBlockTile}, for surfaces that paint no tile. */
 export function getCustomBlockIcon(
   iconUrl: string | null | undefined,
   fallbackUrl?: string | null
 ): BlockIcon {
-  const url = iconUrl || fallbackUrl
-  return url ? makeImageIcon(url) : DefaultCustomBlockIcon
+  return getCustomBlockTile(iconUrl, fallbackUrl).icon
 }

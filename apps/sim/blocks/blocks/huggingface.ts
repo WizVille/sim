@@ -15,6 +15,16 @@ export const HuggingFaceBlock: BlockConfig<HuggingFaceChatResponse> = {
   integrationType: IntegrationType.AI,
   bgColor: '#0B0F19',
   icon: HuggingFaceIcon,
+  canvasPresentation: {
+    defaultTitle: 'Hugging Face',
+    sentences: {
+      default: [
+        { text: 'Prompt', field: 'model', core: true },
+        { text: 'with', field: 'content' },
+        { text: ', via', field: 'provider' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'systemPrompt',
@@ -136,7 +146,7 @@ export const HuggingFaceBlockMeta = {
     },
     {
       icon: HuggingFaceIcon,
-      title: 'Open-source sentiment scorer',
+      title: 'Hugging Face sentiment scorer',
       prompt:
         'Create a workflow that scores customer feedback with a Hugging Face chat model, writes sentiment and score columns back to the table, and pings Slack on a sudden negative spike.',
       modules: ['tables', 'agent', 'workflows'],

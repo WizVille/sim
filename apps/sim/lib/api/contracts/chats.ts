@@ -4,6 +4,32 @@ import { defineRouteContract } from '@/lib/api/contracts/types'
 export const chatAuthTypeSchema = z.enum(['public', 'password', 'email', 'sso'])
 export type ChatAuthType = z.output<typeof chatAuthTypeSchema>
 
+/**
+ * Shared cap for chat deployment passwords. The set path and the deployed-chat
+ * login path must agree: a password long enough to save but too long to submit
+ * would lock every visitor out of the deployment permanently.
+ */
+const MAX_CHAT_PASSWORD_CHARS = 1024
+const MIN_CHAT_PASSWORD_CHARS = 15
+
+/**
+ * Password accepted when setting or changing a chat deployment's password. The
+ * empty string is allowed and means "keep the stored password"; a whitespace-only
+ * value is rejected because the login form refuses to submit one, which would
+ * strand the deployment behind an unenterable password.
+ */
+export const chatDeploymentPasswordSchema = z
+  .string()
+  .max(MAX_CHAT_PASSWORD_CHARS, 'Password is too long')
+  .refine(
+    (password) => password.length === 0 || password.trim().length > 0,
+    'Password cannot contain only whitespace'
+  )
+  .refine(
+    (password) => password.length === 0 || password.length >= MIN_CHAT_PASSWORD_CHARS,
+    `Password must be at least ${MIN_CHAT_PASSWORD_CHARS} characters`
+  )
+
 export const chatIdParamsSchema = z.object({
   id: z.string().min(1),
 })
@@ -38,9 +64,13 @@ export const createChatBodySchema = z.object({
   description: z.string().optional(),
   customizations: chatCustomizationsSchema,
   authType: chatAuthTypeSchema.default('public'),
-  password: z.string().optional(),
+  password: chatDeploymentPasswordSchema.optional(),
   allowedEmails: z.array(z.string()).optional().default([]),
   outputConfigs: z.array(chatOutputConfigSchema).optional().default([]),
+  /** When true, clients may receive thinking SSE if they also send the protocol header. Default off. */
+  includeThinking: z.boolean().optional().default(false),
+  /** When true, clients may receive tool lifecycle SSE if they also send the protocol header. */
+  includeToolCalls: z.boolean().optional().default(false),
 })
 export type CreateChatBody = z.input<typeof createChatBodySchema>
 
@@ -55,9 +85,11 @@ export const updateChatBodySchema = z.object({
   description: z.string().optional(),
   customizations: chatCustomizationsSchema.optional(),
   authType: chatAuthTypeSchema.optional(),
-  password: z.string().optional(),
+  password: chatDeploymentPasswordSchema.optional(),
   allowedEmails: z.array(z.string()).optional(),
   outputConfigs: z.array(chatOutputConfigSchema).optional(),
+  includeThinking: z.boolean().optional(),
+  includeToolCalls: z.boolean().optional(),
 })
 export type UpdateChatBody = z.input<typeof updateChatBodySchema>
 
@@ -80,6 +112,11 @@ export const deleteChatResponseSchema = z.object({
   message: z.string(),
 })
 
+export const chatPasswordResponseSchema = z.object({
+  password: z.string(),
+})
+export type ChatPasswordResponse = z.output<typeof chatPasswordResponseSchema>
+
 export const deployedChatConfigSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -101,11 +138,15 @@ export const deployedChatConfigSchema = z.object({
     (value) => value ?? undefined,
     z.array(deployedChatOutputConfigSchema).optional()
   ),
+  /** Policy for thinking SSE; clients still need the X-Sim-Stream-Protocol opt-in. */
+  includeThinking: z.preprocess((value) => value ?? false, z.boolean()),
+  /** Policy for tool lifecycle SSE; clients still need the protocol opt-in. */
+  includeToolCalls: z.preprocess((value) => value ?? false, z.boolean()),
 })
 export type DeployedChatConfig = z.output<typeof deployedChatConfigSchema>
 
 export const deployedChatAuthBodySchema = z.object({
-  password: z.string().max(1024, 'Password is too long').optional(),
+  password: z.string().max(MAX_CHAT_PASSWORD_CHARS, 'Password is too long').optional(),
   email: z.string().email('Invalid email format').optional().or(z.literal('')),
 })
 export type DeployedChatAuthBody = z.input<typeof deployedChatAuthBodySchema>
@@ -127,7 +168,7 @@ export const deployedChatFileSchema = z.object({
 
 export const deployedChatPostBodySchema = z.object({
   input: z.string().max(MAX_CHAT_INPUT_CHARS, 'Input is too long').optional(),
-  password: z.string().max(1024, 'Password is too long').optional(),
+  password: z.string().max(MAX_CHAT_PASSWORD_CHARS, 'Password is too long').optional(),
   email: z.string().email('Invalid email format').optional().or(z.literal('')),
   conversationId: z.string().max(256, 'Conversation ID is too long').optional(),
   files: z
@@ -209,8 +250,13 @@ export const deployedChatPostContract = defineRouteContract({
   params: chatIdentifierParamsSchema,
   body: deployedChatPostBodySchema,
   response: {
-    mode: 'json',
-    schema: deployedChatConfigSchema,
+    /**
+     * Message posts return SSE (`text/event-stream`). Auth-only POSTs use
+     * authenticateDeployedChatContract (JSON). Terminal frames: `final` or one
+     * `error`, then `[DONE]`. Thinking and tool frames use independent deployment
+     * policies; both require the protocol header.
+     */
+    mode: 'stream',
   },
 })
 
@@ -275,5 +321,19 @@ export const deleteChatContract = defineRouteContract({
   response: {
     mode: 'json',
     schema: deleteChatResponseSchema,
+  },
+})
+
+/**
+ * Admin-only reveal of a chat deployment's current password. The route
+ * decrypts the stored password after re-verifying workspace admin access.
+ */
+export const getChatPasswordContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/chat/manage/[id]/password',
+  params: chatIdParamsSchema,
+  response: {
+    mode: 'json',
+    schema: chatPasswordResponseSchema,
   },
 })

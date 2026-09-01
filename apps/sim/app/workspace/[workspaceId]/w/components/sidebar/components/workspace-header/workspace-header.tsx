@@ -2,9 +2,11 @@
 
 import { memo, type ReactElement, useEffect, useRef, useState } from 'react'
 import {
-  ChevronDown,
   Chip,
+  ChipChevronDown,
   ChipConfirmModal,
+  ChipInput,
+  chipContentLabelClass,
   chipGeometryClass,
   chipVariants,
   cn,
@@ -12,28 +14,49 @@ import {
   DropdownMenuContent,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  OverflowText,
   Plus,
   Send,
   Skeleton,
   Tooltip,
+  toast,
 } from '@sim/emcn'
-import { ManageWorkspace, PanelLeft } from '@sim/emcn/icons'
+import { MoreHorizontal, PanelLeft, Pin, Search } from '@sim/emcn/icons'
 import { createLogger } from '@sim/logger'
-import { MoreHorizontal } from 'lucide-react'
-import { useActiveOrganization } from '@/lib/auth/auth-client'
+import { getErrorMessage } from '@sim/utils/errors'
+import { useQueryClient } from '@tanstack/react-query'
 import { isBillingEnabled } from '@/lib/core/config/env-flags'
+import { InviteModal } from '@/app/workspace/[workspaceId]/components/invite-modal'
+import { useWorkspacePermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import { ContextMenu } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workflow-list/components/context-menu/context-menu'
 import { DeleteModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workflow-list/components/delete-modal/delete-modal'
+import { CreateWorkspaceModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workspace-header/components/create-workspace-modal/create-workspace-modal'
+import { ViewInvitationsMenuItem } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workspace-header/components/pending-invitations/view-invitations-menu-item'
+import { ViewInvitationsModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workspace-header/components/pending-invitations/view-invitations-modal'
+import { SIDEBAR_RAIL_CHIP_CLASS } from '@/app/workspace/[workspaceId]/w/components/sidebar/constants'
+import { invitationKeys } from '@/hooks/queries/invitations'
 import {
-  CreateWorkspaceModal,
-  type CreateWorkspaceTarget,
-} from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workspace-header/components/create-workspace-modal/create-workspace-modal'
-import { InviteModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workspace-header/components/invite-modal'
-import type { Workspace, WorkspaceCreationPolicy } from '@/hooks/queries/workspace'
+  type Workspace,
+  type WorkspaceCreationPolicy,
+  workspaceKeys,
+} from '@/hooks/queries/workspace'
 import { usePermissionConfig } from '@/hooks/use-permission-config'
 import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
+import { SIDEBAR_WIDTH } from '@/stores/constants'
 
 const logger = createLogger('WorkspaceHeader')
+
+/**
+ * Show the search input once the workspace list reaches this count, and size the
+ * list viewport to exactly this many rows — so the sixth workspace is the one that
+ * both fills the viewport and brings in search.
+ *
+ * The viewport's `max-h-[190px]` is derived from it: 6 rows at `chipGeometryClass`'s
+ * 30px plus the 2px `gap-0.5` between them (6 * 30 + 5 * 2). Tailwind arbitrary
+ * values must be statically analyzable, so the arithmetic cannot live in the class —
+ * change the two together.
+ */
+const WORKSPACE_SEARCH_THRESHOLD = 6
 
 /**
  * Derives the single-letter avatar initial for a workspace, ignoring the word
@@ -70,8 +93,12 @@ interface WorkspaceHeaderProps {
   activeWorkspace?: { name: string } | null
   /** Current workspace ID */
   workspaceId: string
-  /** List of available workspaces */
+  /** List of available workspaces, already ordered pinned-first */
   workspaces: Workspace[]
+  /** Ids of workspaces the viewer pinned to the top of the switcher */
+  pinnedWorkspaceIds: ReadonlySet<string>
+  /** Callback to toggle a workspace's pinned state */
+  onToggleWorkspacePin: (workspaceId: string) => void
   /** Server-derived workspace creation policy for the current user context */
   workspaceCreationPolicy?: WorkspaceCreationPolicy | null
   /** Whether workspaces are loading */
@@ -113,6 +140,8 @@ function WorkspaceHeaderImpl({
   activeWorkspace,
   workspaceId,
   workspaces,
+  pinnedWorkspaceIds,
+  onToggleWorkspacePin,
   workspaceCreationPolicy,
   isWorkspacesLoading,
   isCreatingWorkspace,
@@ -132,6 +161,7 @@ function WorkspaceHeaderImpl({
 }: WorkspaceHeaderProps) {
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false)
+  const [isViewInvitationsOpen, setIsViewInvitationsOpen] = useState(false)
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<Workspace | null>(null)
   const [isLeaveModalOpen, setIsLeaveModalOpen] = useState(false)
@@ -144,20 +174,109 @@ function WorkspaceHeaderImpl({
   const [isContextMenuOpen, setIsContextMenuOpen] = useState(false)
   const [menuOpenWorkspaceId, setMenuOpenWorkspaceId] = useState<string | null>(null)
   const contextMenuRef = useRef<HTMLDivElement | null>(null)
+  /**
+   * The row a context-menu action targets. Set alongside `menuOpenWorkspaceId` in
+   * {@link openContextMenuAt}, but only that state re-renders — so anything the menu
+   * *renders* must read the state, and only handlers may read this ref.
+   */
   const capturedWorkspaceRef = useRef<Workspace | null>(null)
-  const isRenamingRef = useRef(false)
+  /**
+   * Set by context-menu actions whose result is only visible in the still-open
+   * switcher — renaming (the inline input lives there) and pinning (the row moves
+   * to the pinned group).
+   */
+  const keepWorkspaceMenuOpenRef = useRef(false)
   const isContextMenuOpeningRef = useRef(false)
   const contextMenuClosedRef = useRef(true)
   const hasInputFocusedRef = useRef(false)
   const renameInputRef = useRef<HTMLInputElement | null>(null)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const workspaceListRef = useRef<HTMLDivElement>(null)
+
+  const [workspaceSearch, setWorkspaceSearch] = useState('')
+  const [highlightedId, setHighlightedId] = useState<string | null>(null)
+  /**
+   * Which input the user is currently driving the list with. The highlight is only
+   * painted in keyboard mode, because it renders in `--surface-active` — the same
+   * token hover uses — so a highlight left behind by the pointer is indistinguishable
+   * from a stuck hover, and sits alongside the equally-`--surface-active` current
+   * workspace as a second phantom-hovered row.
+   *
+   * `highlightedId` itself still tracks the pointer, so Enter always targets the row
+   * the user last touched; only whether it is *drawn* depends on the mode. Mirrors
+   * `isKeyboardNav` in emcn's popover ("prevent dual highlights") and the single
+   * modality-driven focus marker Headless UI's Combobox exposes.
+   */
+  const [isKeyboardNav, setIsKeyboardNav] = useState(false)
+
+  const showSearch = workspaces.length >= WORKSPACE_SEARCH_THRESHOLD
+  const searchQuery = workspaceSearch.trim().toLowerCase()
+  const filteredWorkspaces =
+    showSearch && searchQuery
+      ? workspaces.filter((w) => w.name.toLowerCase().includes(searchQuery))
+      : workspaces
+
+  /**
+   * The highlighted row resolved from the highlighted workspace's identity, not
+   * a stored position. Tracking the id (rather than a numeric index) keeps the
+   * highlight on the same workspace when the list shrinks, grows, or reorders
+   * while the menu is open (a live membership change or background refetch);
+   * a missing id (filtered out) or no selection falls back to the first row.
+   * `activeIndex` is the single source of truth for Enter, the visual highlight,
+   * and the scroll target, so those three can never diverge.
+   */
+  const activeIndex = highlightedId
+    ? Math.max(
+        0,
+        filteredWorkspaces.findIndex((w) => w.id === highlightedId)
+      )
+    : 0
+
+  useEffect(() => {
+    if (!showSearch || !isWorkspaceMenuOpen) return
+    const el = workspaceListRef.current?.querySelector<HTMLElement>(
+      `[data-workspace-row-idx="${activeIndex}"]`
+    )
+    el?.scrollIntoView({ block: 'nearest' })
+  }, [activeIndex, showSearch, isWorkspaceMenuOpen])
+
+  /**
+   * Seed the highlight to the first result whenever the current one is absent —
+   * on open, or after typing filters the highlighted workspace out. This keeps
+   * `highlightedId` pinned to a real workspace identity rather than falling back
+   * to a bare positional default, so a reorder or query change carries the
+   * highlight along with its workspace instead of stranding it on whatever now
+   * occupies the first row.
+   */
+  useEffect(() => {
+    if (!showSearch || !isWorkspaceMenuOpen || filteredWorkspaces.length === 0) return
+    const present = highlightedId !== null && filteredWorkspaces.some((w) => w.id === highlightedId)
+    if (!present) setHighlightedId(filteredWorkspaces[0].id)
+  }, [highlightedId, filteredWorkspaces, showSearch, isWorkspaceMenuOpen])
+
+  /**
+   * Clear the query and highlight whenever the menu closes, by any path —
+   * selecting a workspace closes it via `setIsWorkspaceMenuOpen(false)` without
+   * routing through `onOpenChange`, so resetting here (not in the open handler)
+   * keeps a stale search from persisting into the next open. Not gated on
+   * `showSearch`: if the list drops to the threshold while a query is active the
+   * search input unmounts, and this still clears the now-invisible filter. For
+   * users who never search, both setters no-op (same value) so there is no cost.
+   */
+  useEffect(() => {
+    if (isWorkspaceMenuOpen) return
+    setWorkspaceSearch('')
+    setHighlightedId(null)
+    setIsKeyboardNav(false)
+  }, [isWorkspaceMenuOpen])
 
   const [isMounted, setIsMounted] = useState(false)
   useEffect(() => {
     setIsMounted(true)
   }, [])
 
-  const { data: viewerActiveOrganization } = useActiveOrganization()
   const { navigateToSettings } = useSettingsNavigation()
+  const queryClient = useQueryClient()
 
   const activeWorkspaceFull = workspaces.find((w) => w.id === workspaceId) || null
   const isWorkspaceReady = !isWorkspacesLoading && activeWorkspaceFull !== null
@@ -165,19 +284,20 @@ function WorkspaceHeaderImpl({
   const createWorkspaceDisabledReason =
     workspaceCreationPolicy?.canCreate === false ? workspaceCreationPolicy.reason : null
   const { isInvitationsDisabled: isInvitationsDisabledByConfig } = usePermissionConfig()
+  /**
+   * Only workspace admins can invite. The modal takes this as a prop, so each
+   * entry point supplies it — the pre-consolidation modal derived it internally,
+   * and omitting it here left the form fully enabled for non-admins until the
+   * server refused the send.
+   */
+  const { userPermissions } = useWorkspacePermissionsContext()
+  /**
+   * Derived from the `workspaces` prop rather than {@link useWorkspaceInvitePolicy}:
+   * this component is already handed the list it would otherwise re-read, and the
+   * same object supplies the logo, color, and organization below.
+   */
   const inviteDisabledReason = activeWorkspaceFull?.inviteDisabledReason ?? null
   const isInvitationsDisabled = isInvitationsDisabledByConfig || inviteDisabledReason !== null
-  const createWorkspaceTarget: CreateWorkspaceTarget =
-    workspaceCreationPolicy?.workspaceMode === 'organization' &&
-    workspaceCreationPolicy.organizationId
-      ? {
-          type: 'organization',
-          organizationName:
-            viewerActiveOrganization?.id === workspaceCreationPolicy.organizationId
-              ? viewerActiveOrganization.name
-              : 'your organization',
-        }
-      : { type: 'personal' }
 
   /**
    * Save and exit edit mode when popover closes
@@ -231,10 +351,10 @@ function WorkspaceHeaderImpl({
     setMenuOpenWorkspaceId(null)
     const isOpeningAnother = isContextMenuOpeningRef.current
     isContextMenuOpeningRef.current = false
-    if (!isRenamingRef.current && !isOpeningAnother) {
+    if (!keepWorkspaceMenuOpenRef.current && !isOpeningAnother) {
       setIsWorkspaceMenuOpen(false)
     }
-    isRenamingRef.current = false
+    keepWorkspaceMenuOpenRef.current = false
   }
 
   /**
@@ -243,7 +363,7 @@ function WorkspaceHeaderImpl({
   const handleRenameAction = () => {
     if (!capturedWorkspaceRef.current) return
 
-    isRenamingRef.current = true
+    keepWorkspaceMenuOpenRef.current = true
     hasInputFocusedRef.current = false
     setEditingWorkspaceId(capturedWorkspaceRef.current.id)
     setEditingName(capturedWorkspaceRef.current.name)
@@ -278,6 +398,13 @@ function WorkspaceHeaderImpl({
     }
   }
 
+  const handleTogglePinAction = () => {
+    const target = capturedWorkspaceRef.current
+    if (!target) return
+    keepWorkspaceMenuOpenRef.current = true
+    onToggleWorkspacePin(target.id)
+  }
+
   const handleUploadLogoAction = () => {
     if (!capturedWorkspaceRef.current) return
     onUploadLogo(capturedWorkspaceRef.current.id)
@@ -295,6 +422,15 @@ function WorkspaceHeaderImpl({
       setLeaveTarget(null)
     } catch (error) {
       logger.error('Error leaving workspace:', error)
+      /**
+       * The endpoint refuses several standings it can explain — the billing
+       * account, the last admin, a derived organization admin. Logging alone
+       * left the confirm modal sitting open with no indication of why, so the
+       * server's reason is surfaced the way the teammates list surfaces it.
+       */
+      toast.error("Couldn't leave workspace", {
+        description: getErrorMessage(error, 'Please try again in a moment.'),
+      })
     }
   }
 
@@ -319,34 +455,38 @@ function WorkspaceHeaderImpl({
           type='button'
           aria-label='Expand sidebar'
           onClick={onExpandSidebar}
-          className={chipVariants({ fullWidth: true })}
+          className={cn(chipVariants({ fullWidth: true }), SIDEBAR_RAIL_CHIP_CLASS)}
         >
           <div className='relative flex size-[16px] flex-shrink-0 items-center justify-center'>
-            {!activeWorkspaceFull ? (
-              <Skeleton className='size-[16px] rounded-sm' />
-            ) : (
+            {activeWorkspaceFull?.logoUrl ? (
               <>
-                {activeWorkspaceFull.logoUrl ? (
-                  <img
-                    src={activeWorkspaceFull.logoUrl}
-                    alt={activeWorkspaceFull.name || 'Workspace logo'}
-                    className='size-[16px] rounded-sm object-cover group-hover:invisible'
-                  />
-                ) : (
-                  <div
-                    className='flex size-[16px] items-center justify-center rounded-sm font-medium text-[9px] text-white leading-none group-hover:invisible'
-                    style={{
-                      backgroundColor: activeWorkspaceFull.color ?? 'var(--brand-accent)',
-                    }}
-                  >
-                    {workspaceInitial}
-                  </div>
-                )}
+                <img
+                  src={activeWorkspaceFull.logoUrl}
+                  alt={activeWorkspaceFull.name || 'Workspace logo'}
+                  className='size-[16px] rounded-sm object-cover group-hover:invisible'
+                />
                 <PanelLeft
                   aria-hidden
                   className='pointer-events-none invisible absolute inset-0 m-auto size-[16px] rotate-180 text-[var(--text-icon)] group-hover:visible'
                 />
               </>
+            ) : activeWorkspace ? (
+              <>
+                <div
+                  className='flex size-[16px] items-center justify-center rounded-sm text-[9px] text-white leading-none group-hover:invisible'
+                  style={{
+                    backgroundColor: activeWorkspaceFull?.color ?? 'var(--brand-accent)',
+                  }}
+                >
+                  {workspaceInitial}
+                </div>
+                <PanelLeft
+                  aria-hidden
+                  className='pointer-events-none invisible absolute inset-0 m-auto size-[16px] rotate-180 text-[var(--text-icon)] group-hover:visible'
+                />
+              </>
+            ) : (
+              <Skeleton className='size-[16px] rounded-sm' />
             )}
           </div>
         </button>
@@ -360,7 +500,18 @@ function WorkspaceHeaderImpl({
             ) {
               return
             }
+            if (open) {
+              // Opening the switcher is the "user is looking" moment: refetch
+              // stale server state so a workspace the user was auto-added to,
+              // or a fresh pending invitation, appears without a page refresh
+              // (these are app-wide queries with no focus refetch on the web).
+              void queryClient.refetchQueries({ queryKey: workspaceKeys.lists(), stale: true })
+              void queryClient.refetchQueries({ queryKey: invitationKeys.mine(), stale: true })
+            }
             setIsWorkspaceMenuOpen(open)
+            if (open && showSearch) {
+              requestAnimationFrame(() => searchInputRef.current?.focus())
+            }
           }}
         >
           <DropdownMenuTrigger asChild>
@@ -368,7 +519,6 @@ function WorkspaceHeaderImpl({
               type='button'
               aria-label='Switch workspace'
               className={cn(chipVariants(), 'min-w-0 max-w-full')}
-              title={activeWorkspace?.name}
               onContextMenu={(e) => {
                 if (activeWorkspaceFull) {
                   handleContextMenu(e, activeWorkspaceFull)
@@ -384,7 +534,7 @@ function WorkspaceHeaderImpl({
                   />
                 ) : (
                   <div
-                    className='flex size-[16px] flex-shrink-0 items-center justify-center rounded-sm font-medium text-[9px] text-white leading-none'
+                    className='flex size-[16px] flex-shrink-0 items-center justify-center rounded-sm text-[9px] text-white leading-none'
                     style={{
                       backgroundColor: activeWorkspaceFull.color ?? 'var(--brand-accent)',
                     }}
@@ -397,10 +547,12 @@ function WorkspaceHeaderImpl({
               )}
               {!isCollapsed && activeWorkspace?.name && (
                 <>
-                  <span className='min-w-0 truncate text-[var(--text-body)] text-sm'>
-                    {activeWorkspace.name}
-                  </span>
-                  <ChevronDown className='h-[6px] w-[10px] flex-shrink-0 text-[var(--text-icon)]' />
+                  <OverflowText
+                    label={activeWorkspace.name}
+                    className={cn('flex-1', chipContentLabelClass)}
+                    focusTarget='nearest-interactive'
+                  />
+                  <ChipChevronDown />
                 </>
               )}
             </button>
@@ -409,31 +561,101 @@ function WorkspaceHeaderImpl({
             align='start'
             side={isCollapsed ? 'right' : 'bottom'}
             sideOffset={isCollapsed ? 16 : 8}
-            className='flex max-h-none flex-col overflow-hidden'
+            /* Overrides the 240px default cap so the six-row list is not clipped, but
+               still bounded by the space Radix measured — at six rows the menu is tall
+               enough that a short viewport would otherwise push the footer actions off
+               screen with nothing able to scroll to them. */
+            className='flex max-h-[var(--radix-dropdown-menu-content-available-height,400px)] flex-col overflow-y-auto'
             style={{
-              width: '248px',
+              width: `${SIDEBAR_WIDTH.DEFAULT}px`,
               maxWidth: 'calc(100vw - 24px)',
             }}
             onCloseAutoFocus={(e) => e.preventDefault()}
           >
             {isWorkspacesLoading ? (
-              <div className='px-2 py-[5px] font-medium text-[var(--text-secondary)] text-caption'>
+              <div className='px-2 py-[5px] text-[var(--text-secondary)] text-caption'>
                 Loading workspaces...
               </div>
             ) : (
               <>
-                <div className='-mx-1.5 flex max-h-[94px] flex-col gap-0.5 overflow-y-auto px-1.5'>
-                  {workspaces.map((workspace) => {
+                {showSearch && (
+                  <ChipInput
+                    ref={searchInputRef}
+                    icon={Search}
+                    placeholder='Search workspaces...'
+                    value={workspaceSearch}
+                    onChange={(e) => {
+                      // Typing is keyboard intent, so the cursor appears on the top
+                      // result and Enter has a visible target.
+                      setIsKeyboardNav(true)
+                      setWorkspaceSearch(e.target.value)
+                    }}
+                    onKeyDown={(e) => {
+                      e.stopPropagation()
+                      if (e.nativeEvent.isComposing) return
+                      if (filteredWorkspaces.length === 0) return
+                      if (e.key === 'ArrowDown') {
+                        e.preventDefault()
+                        setIsKeyboardNav(true)
+                        const next = (activeIndex + 1) % filteredWorkspaces.length
+                        setHighlightedId(filteredWorkspaces[next].id)
+                      } else if (e.key === 'ArrowUp') {
+                        e.preventDefault()
+                        setIsKeyboardNav(true)
+                        const next =
+                          (activeIndex - 1 + filteredWorkspaces.length) % filteredWorkspaces.length
+                        setHighlightedId(filteredWorkspaces[next].id)
+                      } else if (e.key === 'Enter') {
+                        // Only armed once a cursor is actually on screen. The search
+                        // field is focused on open, so acting on the seeded row here
+                        // would switch workspace with nothing marked — emcn's popover
+                        // likewise holds its selection at -1 until keyboard nav starts.
+                        if (!isKeyboardNav) return
+                        e.preventDefault()
+                        const target = filteredWorkspaces[activeIndex]
+                        if (target) onWorkspaceSwitch(target)
+                      }
+                    }}
+                    className='mb-1.5'
+                  />
+                )}
+                <div
+                  ref={workspaceListRef}
+                  className='-mx-1.5 flex max-h-[190px] flex-col gap-0.5 overflow-y-auto px-1.5'
+                >
+                  {filteredWorkspaces.length === 0 && workspaceSearch && (
+                    <div className='px-2 py-[5px] text-[var(--text-muted)] text-caption'>
+                      No results for "{workspaceSearch}"
+                    </div>
+                  )}
+                  {filteredWorkspaces.map((workspace, idx) => {
                     const initial = getWorkspaceInitial(workspace.name)
                     const isActive = workspace.id === workspaceId
                     const isMenuOpen = menuOpenWorkspaceId === workspace.id
+                    const isKeyboardHighlighted = showSearch && isKeyboardNav && idx === activeIndex
 
+                    /**
+                     * Hover-highlight is wired to `onMouseMove`, not `onMouseEnter`: a
+                     * keyboard-driven `scrollIntoView` slides rows under a stationary cursor
+                     * and fires `mouseenter`, which would hijack the keyboard selection.
+                     * `mousemove` only fires on real pointer motion, so hover follows the
+                     * mouse without fighting the arrow keys.
+                     */
                     return (
-                      <div key={workspace.id}>
+                      <div
+                        key={workspace.id}
+                        data-workspace-row-idx={showSearch ? idx : undefined}
+                        onMouseMove={
+                          showSearch
+                            ? () => {
+                                setIsKeyboardNav(false)
+                                setHighlightedId(workspace.id)
+                              }
+                            : undefined
+                        }
+                      >
                         {editingWorkspaceId === workspace.id ? (
-                          <div
-                            className={chipVariants({ active: true, fullWidth: true, flush: true })}
-                          >
+                          <div className={chipVariants({ active: true, fullWidth: true })}>
                             {workspace.logoUrl ? (
                               <img
                                 src={workspace.logoUrl}
@@ -442,7 +664,7 @@ function WorkspaceHeaderImpl({
                               />
                             ) : (
                               <div
-                                className='flex size-[16px] flex-shrink-0 items-center justify-center rounded-sm font-medium text-[9px] text-white leading-none'
+                                className='flex size-[16px] flex-shrink-0 items-center justify-center rounded-sm text-[9px] text-white leading-none'
                                 style={{
                                   backgroundColor: workspace.color ?? 'var(--brand-accent)',
                                 }}
@@ -506,15 +728,14 @@ function WorkspaceHeaderImpl({
                           <div
                             className={cn(
                               chipVariants({
-                                active: isActive || isMenuOpen,
+                                active: isActive || isMenuOpen || isKeyboardHighlighted,
                                 fullWidth: true,
-                                flush: true,
                               }),
                               'select-none'
                             )}
                             onClick={(e) => {
                               if (e.metaKey || e.ctrlKey) {
-                                window.open(`/workspace/${workspace.id}/home`, '_blank')
+                                window.open(`/workspace/${workspace.id}`, '_blank')
                                 return
                               }
                               onWorkspaceSwitch(workspace)
@@ -522,7 +743,7 @@ function WorkspaceHeaderImpl({
                             onAuxClick={(e) => {
                               if (e.button === 1) {
                                 e.preventDefault()
-                                window.open(`/workspace/${workspace.id}/home`, '_blank')
+                                window.open(`/workspace/${workspace.id}`, '_blank')
                               }
                             }}
                             onContextMenu={(e) => handleContextMenu(e, workspace)}
@@ -535,7 +756,7 @@ function WorkspaceHeaderImpl({
                               />
                             ) : (
                               <div
-                                className='flex size-[16px] flex-shrink-0 items-center justify-center rounded-sm font-medium text-[9px] text-white leading-none'
+                                className='flex size-[16px] flex-shrink-0 items-center justify-center rounded-sm text-[9px] text-white leading-none'
                                 style={{
                                   backgroundColor: workspace.color ?? 'var(--brand-accent)',
                                 }}
@@ -543,28 +764,45 @@ function WorkspaceHeaderImpl({
                                 {initial}
                               </div>
                             )}
-                            <span className='min-w-0 flex-1 truncate text-[var(--text-body)] text-sm'>
-                              {workspace.name}
-                            </span>
-                            <button
-                              type='button'
-                              aria-label='Workspace options'
-                              onMouseDown={() => {
-                                isContextMenuOpeningRef.current = true
-                              }}
-                              onClick={(e) => {
-                                e.preventDefault()
-                                e.stopPropagation()
-                                const rect = e.currentTarget.getBoundingClientRect()
-                                openContextMenuAt(workspace, rect.right, rect.top)
-                              }}
-                              className={cn(
-                                'flex size-[18px] flex-shrink-0 items-center justify-center rounded-sm opacity-0 transition-opacity group-hover:opacity-100',
-                                isMenuOpen && 'opacity-100'
+                            <OverflowText
+                              label={workspace.name}
+                              className='flex-1 text-[var(--text-body)] text-sm'
+                            />
+                            {/* Pin and options share one fixed slot, as the chat rows do:
+                                the trailing width never changes, so pinning cannot re-truncate
+                                the name under the user's cursor. */}
+                            <div className='relative flex size-[18px] flex-shrink-0 items-center justify-center'>
+                              {pinnedWorkspaceIds.has(workspace.id) && (
+                                <Pin
+                                  aria-hidden={false}
+                                  role='img'
+                                  aria-label='Pinned'
+                                  className={cn(
+                                    'absolute size-[12px] text-[var(--text-icon)] transition-opacity',
+                                    isMenuOpen ? 'opacity-0' : 'group-hover:opacity-0'
+                                  )}
+                                />
                               )}
-                            >
-                              <MoreHorizontal className='size-[14px] text-[var(--text-tertiary)]' />
-                            </button>
+                              <button
+                                type='button'
+                                aria-label='Workspace options'
+                                onMouseDown={() => {
+                                  isContextMenuOpeningRef.current = true
+                                }}
+                                onClick={(e) => {
+                                  e.preventDefault()
+                                  e.stopPropagation()
+                                  const rect = e.currentTarget.getBoundingClientRect()
+                                  openContextMenuAt(workspace, rect.right, rect.top)
+                                }}
+                                className={cn(
+                                  'absolute inset-0 flex items-center justify-center rounded-sm opacity-0 transition-opacity group-hover:opacity-100',
+                                  isMenuOpen && 'opacity-100'
+                                )}
+                              >
+                                <MoreHorizontal className='size-[14px] text-[var(--text-icon)]' />
+                              </button>
+                            </div>
                           </div>
                         )}
                       </div>
@@ -587,7 +825,6 @@ function WorkspaceHeaderImpl({
                       disabled={isCreatingWorkspace}
                       aria-disabled={!canCreateWorkspace || undefined}
                       fullWidth
-                      flush
                       className={cn(
                         'select-none',
                         !canCreateWorkspace &&
@@ -597,45 +834,30 @@ function WorkspaceHeaderImpl({
                       New workspace
                     </Chip>
                   </DisabledReasonTooltip>
+                  <DisabledReasonTooltip reason={inviteDisabledReason}>
+                    <Chip
+                      leftIcon={Send}
+                      onClick={() => {
+                        setIsWorkspaceMenuOpen(false)
+                        if (isInvitationsDisabled) {
+                          if (isBillingEnabled) navigateToSettings({ section: 'billing' })
+                          return
+                        }
+                        setIsInviteModalOpen(true)
+                      }}
+                      fullWidth
+                      className='select-none'
+                    >
+                      Invite teammates
+                    </Chip>
+                  </DisabledReasonTooltip>
+                  <ViewInvitationsMenuItem
+                    onOpen={() => {
+                      setIsWorkspaceMenuOpen(false)
+                      setIsViewInvitationsOpen(true)
+                    }}
+                  />
                 </div>
-
-                <DropdownMenuSeparator className='mx-0' />
-                <DisabledReasonTooltip reason={inviteDisabledReason}>
-                  <Chip
-                    leftIcon={Send}
-                    onClick={() => {
-                      setIsWorkspaceMenuOpen(false)
-                      if (isInvitationsDisabled) {
-                        if (isBillingEnabled) navigateToSettings({ section: 'billing' })
-                        return
-                      }
-                      setIsInviteModalOpen(true)
-                    }}
-                    fullWidth
-                    flush
-                    className='select-none'
-                  >
-                    Invite teammates
-                  </Chip>
-                </DisabledReasonTooltip>
-                <DisabledReasonTooltip reason={inviteDisabledReason}>
-                  <Chip
-                    leftIcon={ManageWorkspace}
-                    onClick={() => {
-                      setIsWorkspaceMenuOpen(false)
-                      if (isInvitationsDisabled) {
-                        if (isBillingEnabled) navigateToSettings({ section: 'billing' })
-                        return
-                      }
-                      navigateToSettings({ section: 'teammates' })
-                    }}
-                    fullWidth
-                    flush
-                    className='select-none'
-                  >
-                    Manage workspace
-                  </Chip>
-                </DisabledReasonTooltip>
               </>
             )}
           </DropdownMenuContent>
@@ -644,38 +866,36 @@ function WorkspaceHeaderImpl({
         <button
           type='button'
           aria-label='Switch workspace'
-          className={cn(
-            chipGeometryClass,
-            'mx-0.5',
-            isCollapsed ? 'flex' : 'inline-flex min-w-0 max-w-full'
-          )}
-          title={activeWorkspace?.name}
+          /* Geometry must match the live trigger it stands in for, or the switcher
+             shifts when the workspace resolves. Chips carry no margin, so neither
+             does this. */
+          className={cn(chipGeometryClass, isCollapsed ? 'flex' : 'inline-flex min-w-0 max-w-full')}
           disabled
         >
-          {activeWorkspaceFull ? (
-            activeWorkspaceFull.logoUrl ? (
-              <img
-                src={activeWorkspaceFull.logoUrl}
-                alt={activeWorkspaceFull.name || 'Workspace logo'}
-                className='size-[16px] flex-shrink-0 rounded-sm object-cover'
-              />
-            ) : (
-              <div
-                className='flex size-[16px] flex-shrink-0 items-center justify-center rounded-sm font-medium text-[9px] text-white leading-none'
-                style={{ backgroundColor: activeWorkspaceFull.color ?? 'var(--brand-accent)' }}
-              >
-                {workspaceInitial}
-              </div>
-            )
+          {activeWorkspaceFull?.logoUrl ? (
+            <img
+              src={activeWorkspaceFull.logoUrl}
+              alt={activeWorkspaceFull.name || 'Workspace logo'}
+              className='size-[16px] flex-shrink-0 rounded-sm object-cover'
+            />
+          ) : activeWorkspace ? (
+            <div
+              className='flex size-[16px] flex-shrink-0 items-center justify-center rounded-sm text-[9px] text-white leading-none'
+              style={{ backgroundColor: activeWorkspaceFull?.color ?? 'var(--brand-accent)' }}
+            >
+              {workspaceInitial}
+            </div>
           ) : (
             <Skeleton className='size-[16px] flex-shrink-0 rounded-sm' />
           )}
           {!isCollapsed && activeWorkspace?.name && (
             <>
-              <span className='min-w-0 truncate text-[var(--text-body)] text-sm'>
-                {activeWorkspace.name}
-              </span>
-              <ChevronDown className='h-[6px] w-[10px] flex-shrink-0 text-[var(--text-icon)]' />
+              <OverflowText
+                label={activeWorkspace.name}
+                className={cn('flex-1', chipContentLabelClass)}
+                focusTarget='nearest-interactive'
+              />
+              <ChipChevronDown />
             </>
           )}
         </button>
@@ -686,6 +906,15 @@ function WorkspaceHeaderImpl({
         const contextCanAdmin = capturedPermissions === 'admin'
         const capturedWorkspace = workspaces.find((w) => w.id === capturedWorkspaceRef.current?.id)
         const isOwner = capturedWorkspace && sessionUserId === capturedWorkspace.ownerId
+        /**
+         * An organization admin holds this workspace through their org role, not
+         * a permission row, so there is nothing to give up and the removal
+         * endpoint refuses it. `permissions === 'admin'` cannot tell them apart
+         * from an explicit workspace admin, who may leave. This menu has no
+         * tooltip affordance to explain a greyed row, so the entry is withheld
+         * rather than shown dead.
+         */
+        const canLeave = !isOwner && !capturedWorkspace?.isOrgAdmin && !!onLeaveWorkspace
 
         return (
           <ContextMenu
@@ -697,10 +926,13 @@ function WorkspaceHeaderImpl({
             renameInputRef={renameInputRef}
             onDelete={handleDeleteAction}
             onLeave={handleLeaveAction}
+            onTogglePin={handleTogglePinAction}
             onUploadLogo={handleUploadLogoAction}
+            showPin={true}
+            isPinned={Boolean(menuOpenWorkspaceId && pinnedWorkspaceIds.has(menuOpenWorkspaceId))}
             showRename={true}
             showUploadLogo={!!onUploadLogo}
-            showLeave={!isOwner && !!onLeaveWorkspace}
+            showLeave={canLeave}
             disableRename={!contextCanAdmin}
             disableDelete={!contextCanAdmin || workspaces.length <= 1}
             disableUploadLogo={!contextCanAdmin}
@@ -716,16 +948,18 @@ function WorkspaceHeaderImpl({
           setIsCreateModalOpen(false)
         }}
         isCreating={isCreatingWorkspace}
-        target={createWorkspaceTarget}
       />
 
       <InviteModal
         open={isInviteModalOpen}
         onOpenChange={setIsInviteModalOpen}
+        workspaceId={workspaceId}
         workspaceName={activeWorkspace?.name || 'Workspace'}
         inviteDisabledReason={inviteDisabledReason}
         organizationId={activeWorkspaceFull?.organizationId ?? null}
+        canInvite={userPermissions.canAdmin}
       />
+      <ViewInvitationsModal open={isViewInvitationsOpen} onOpenChange={setIsViewInvitationsOpen} />
       <DeleteModal
         isOpen={isDeleteModalOpen}
         onClose={() => setIsDeleteModalOpen(false)}

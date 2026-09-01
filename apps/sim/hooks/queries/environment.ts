@@ -1,5 +1,5 @@
 import { createLogger } from '@sim/logger'
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { requestJson } from '@/lib/api/client/request'
 import {
   type ContractBodyInput,
@@ -28,11 +28,16 @@ export const environmentKeys = {
 /**
  * Hook to fetch personal environment variables
  */
-export function usePersonalEnvironment() {
+export function usePersonalEnvironment(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: environmentKeys.personal(),
     queryFn: ({ signal }) => fetchPersonalEnvironment(signal),
+    enabled: options?.enabled ?? true,
     staleTime: PERSONAL_ENVIRONMENT_STALE_TIME,
+    // Pinned off (not inheriting the desktop QueryClient default): the secrets
+    // manager seeds an editable form from this data, so a background focus
+    // refetch during a concurrent edit would drop the user's unsaved rows.
+    refetchOnWindowFocus: false,
   })
 }
 
@@ -41,15 +46,17 @@ export function usePersonalEnvironment() {
  */
 export function useWorkspaceEnvironment<TData = WorkspaceEnvironmentData>(
   workspaceId: string,
-  options?: { select?: (data: WorkspaceEnvironmentData) => TData }
+  options?: { enabled?: boolean; select?: (data: WorkspaceEnvironmentData) => TData }
 ) {
   return useQuery({
     queryKey: environmentKeys.workspace(workspaceId),
     queryFn: ({ signal }) => fetchWorkspaceEnvironment(workspaceId, signal),
-    enabled: !!workspaceId,
+    enabled: Boolean(workspaceId) && (options?.enabled ?? true),
     staleTime: WORKSPACE_ENVIRONMENT_STALE_TIME,
-    placeholderData: keepPreviousData,
-    ...options,
+    // See usePersonalEnvironment: seeds an editable form, so a focus refetch
+    // during a concurrent workspace-env edit must not clobber unsaved rows.
+    refetchOnWindowFocus: false,
+    select: options?.select,
   })
 }
 

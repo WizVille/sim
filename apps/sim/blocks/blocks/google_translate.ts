@@ -149,6 +149,19 @@ export const GoogleTranslateBlock: BlockConfig = {
   bgColor: '#FFFFFF',
   icon: GoogleTranslateIcon,
   authMode: AuthMode.ApiKey,
+  canvasPresentation: {
+    defaultTitle: 'Google Translate',
+    sentences: {
+      byOperation: {
+        text: [
+          { text: 'Translate', field: 'text', core: true },
+          { text: 'from', field: 'source' },
+          { text: 'into', field: 'target' },
+        ],
+        detect: [{ text: 'Detect the language of', field: 'text', core: true }],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -232,7 +245,7 @@ export const GoogleTranslateBlockMeta = {
     },
     {
       icon: GoogleTranslateIcon,
-      title: 'Multilingual support replier',
+      title: 'Google Translate Intercom replier',
       prompt:
         'Build a workflow that detects the language of a new Intercom message, translates it to the agent language with Google Translate, drafts a reply, then translates the reply back before sending.',
       modules: ['agent', 'workflows'],
@@ -272,7 +285,7 @@ export const GoogleTranslateBlockMeta = {
     },
     {
       icon: GoogleTranslateIcon,
-      title: 'Multilingual support replies',
+      title: 'Google Translate ticket auto-reply',
       prompt:
         "Build a workflow that on a new support ticket detects the customer's language with Google Translate, translates the message to English for the agent, drafts a reply, then translates the response back into the customer's language before sending.",
       modules: ['agent', 'workflows'],
@@ -281,7 +294,7 @@ export const GoogleTranslateBlockMeta = {
     },
     {
       icon: GoogleTranslateIcon,
-      title: 'Slack channel translator',
+      title: 'Google Translate Slack translator',
       prompt:
         "Create a workflow that watches an international Slack channel, detects non-English messages with Google Translate, translates them to the team's language, and posts the translation in a thread so everyone stays in the loop.",
       modules: ['agent', 'workflows'],

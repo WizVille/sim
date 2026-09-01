@@ -17,6 +17,22 @@ export const PerplexityBlock: BlockConfig<PerplexityResponse> = {
   bgColor: '#20808D', // Perplexity turquoise color
   iconColor: '#20808D',
   icon: PerplexityIcon,
+  canvasPresentation: {
+    defaultTitle: 'Perplexity',
+    sentences: {
+      byOperation: {
+        perplexity_chat: [
+          { text: 'Answer', field: 'content', core: true },
+          { text: 'using', field: 'model' },
+        ],
+        perplexity_search: [
+          { text: 'Search the web for', field: 'query', core: true },
+          { text: 'within', field: 'search_domain_filter' },
+          { text: ', from the', field: 'search_recency_filter' },
+        ],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -286,7 +302,7 @@ export const PerplexityBlockMeta = {
     },
     {
       icon: PerplexityIcon,
-      title: 'Multi-source research agent',
+      title: 'Perplexity multi-source research',
       prompt:
         'Create an agent that triangulates a topic across Perplexity, Exa, and Tavily, deduplicates findings, and produces a consensus brief with confidence scores per claim.',
       modules: ['agent', 'files', 'workflows'],

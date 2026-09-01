@@ -30,6 +30,7 @@ export type MothershipStreamV1ToolExecutor = 'go' | 'sim' | 'client'
 export type MothershipStreamV1ToolMode = 'sync' | 'async'
 export type MothershipStreamV1ToolStatus =
   | 'generating'
+  | 'awaiting_approval'
   | 'executing'
   | 'success'
   | 'error'
@@ -159,6 +160,7 @@ export interface MothershipStreamV1AdditionalPropertiesMap {
 export interface MothershipStreamV1ToolUI {
   clientExecutable?: boolean
   hidden?: boolean
+  inbandOwned?: boolean
   internal?: boolean
 }
 export interface MothershipStreamV1ToolArgsDeltaEventEnvelope {
@@ -467,12 +469,14 @@ export type MothershipStreamV1RunKind =
   | 'resumed'
   | 'compaction_start'
   | 'compaction_done'
+  | 'steering_applied'
 
 export const MothershipStreamV1RunKind = {
   checkpoint_pause: 'checkpoint_pause',
   resumed: 'resumed',
   compaction_start: 'compaction_start',
   compaction_done: 'compaction_done',
+  steering_applied: 'steering_applied',
 } as const
 
 export type MothershipStreamV1SessionKind = 'trace' | 'chat' | 'title' | 'start'
@@ -546,6 +550,7 @@ export const MothershipStreamV1ToolPhase = {
 
 export const MothershipStreamV1ToolStatus = {
   generating: 'generating',
+  awaiting_approval: 'awaiting_approval',
   executing: 'executing',
   success: 'success',
   error: 'error',

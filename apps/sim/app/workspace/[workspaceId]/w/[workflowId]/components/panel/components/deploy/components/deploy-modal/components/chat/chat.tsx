@@ -5,40 +5,43 @@ import {
   ButtonGroup,
   ButtonGroupItem,
   ChipConfirmModal,
+  ChipEmailsInput,
   ChipInput,
   cn,
   Input,
   Label,
   Loader,
   Skeleton,
-  TagInput,
-  type TagItem,
+  Switch,
   Textarea,
   Tooltip,
 } from '@sim/emcn'
+import { Check, TriangleAlert } from '@sim/emcn/icons'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
-import { normalizeEmail } from '@sim/utils/string'
-import { AlertTriangle, Check } from 'lucide-react'
 import { GeneratedPasswordInput } from '@/components/ui'
-import { getEnv, isTruthy } from '@/lib/core/config/env'
+import { isSsoEnabled } from '@/lib/core/config/env-flags'
 import { getBaseUrl, getEmailDomain } from '@/lib/core/utils/urls'
-import { quickValidateEmail } from '@/lib/messaging/email/validation'
+import { validateAllowlistEntry } from '@/lib/messaging/email/validation'
 import { OutputSelect } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/chat/components/output-select/output-select'
 import {
   type AuthType,
   type ChatFormData,
   useCreateChat,
   useDeleteChat,
+  useRevealChatPassword,
   useUpdateChat,
 } from '@/hooks/queries/chats'
 import type { ChatDetail } from '@/hooks/queries/deployments'
+import { usePermissionConfig } from '@/hooks/use-permission-config'
 import { useIdentifierValidation } from './hooks'
 import {
   getPasswordHelperText,
   getPasswordPlaceholder,
   hasExistingPassword,
   isPasswordRequired,
+  isWhitespaceOnlyPassword,
+  shouldConfirmPasswordChange,
 } from './utils'
 
 const logger = createLogger('ChatDeploy')
@@ -55,6 +58,7 @@ interface ChatDeployProps {
   onRefetchChat: () => Promise<void>
   chatSubmitting: boolean
   setChatSubmitting: (submitting: boolean) => void
+  canRevealPassword: boolean
   onValidationChange?: (isValid: boolean) => void
   showDeleteConfirmation?: boolean
   setShowDeleteConfirmation?: (show: boolean) => void
@@ -83,6 +87,8 @@ const initialFormData: ChatFormData = {
   emails: [],
   welcomeMessage: 'Hi there! How can I help you today?',
   selectedOutputBlocks: [],
+  includeThinking: false,
+  includeToolCalls: false,
 }
 
 export function ChatDeploy({
@@ -93,6 +99,7 @@ export function ChatDeploy({
   onRefetchChat,
   chatSubmitting,
   setChatSubmitting,
+  canRevealPassword,
   onValidationChange,
   showDeleteConfirmation: externalShowDeleteConfirmation,
   setShowDeleteConfirmation: externalSetShowDeleteConfirmation,
@@ -102,6 +109,7 @@ export function ChatDeploy({
 }: ChatDeployProps) {
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const [internalShowDeleteConfirmation, setInternalShowDeleteConfirmation] = useState(false)
+  const [showPasswordChangeConfirmation, setShowPasswordChangeConfirmation] = useState(false)
 
   const showDeleteConfirmation =
     externalShowDeleteConfirmation !== undefined
@@ -149,6 +157,8 @@ export function ChatDeploy({
 
     if (isPasswordRequired(formData.authType, formData.password, existingPassword)) {
       newErrors.password = 'Password is required when using password protection'
+    } else if (formData.authType === 'password' && isWhitespaceOnlyPassword(formData.password)) {
+      newErrors.password = 'Password cannot contain only whitespace'
     }
 
     if (
@@ -171,6 +181,7 @@ export function ChatDeploy({
     Boolean(formData.title.trim()) &&
     formData.selectedOutputBlocks.length > 0 &&
     !isPasswordRequired(formData.authType, formData.password, existingPassword) &&
+    (formData.authType !== 'password' || !isWhitespaceOnlyPassword(formData.password)) &&
     ((formData.authType !== 'email' && formData.authType !== 'sso') || formData.emails.length > 0)
 
   useEffect(() => {
@@ -193,6 +204,8 @@ export function ChatDeploy({
               (config: { blockId: string; path: string }) => `${config.blockId}_${config.path}`
             )
           : [],
+        includeThinking: existingChat.includeThinking ?? false,
+        includeToolCalls: existingChat.includeToolCalls ?? false,
       })
 
       if (existingChat.customizations?.imageUrl) {
@@ -207,9 +220,7 @@ export function ChatDeploy({
     }
   }, [existingChat, isLoadingChat])
 
-  const handleSubmit = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault()
-
+  const submitChat = async (passwordChangeConfirmed = false) => {
     if (chatSubmitting) return
 
     setChatSubmitting(true)
@@ -221,14 +232,20 @@ export function ChatDeploy({
     try {
       if (!validateForm()) {
         newTab?.close()
-        setChatSubmitting(false)
         return
       }
 
       if (!isIdentifierValid && formData.identifier !== existingChat?.identifier) {
         newTab?.close()
         setError('identifier', 'Please wait for identifier validation to complete')
-        setChatSubmitting(false)
+        return
+      }
+
+      if (
+        !passwordChangeConfirmed &&
+        shouldConfirmPasswordChange(existingPassword, formData.authType, formData.password)
+      ) {
+        setShowPasswordChangeConfirmation(true)
         return
       }
 
@@ -277,6 +294,11 @@ export function ChatDeploy({
     }
   }
 
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    await submitChat()
+  }
+
   const handleDelete = async () => {
     if (!existingChat || !existingChat.id) return
 
@@ -300,6 +322,11 @@ export function ChatDeploy({
     }
   }
 
+  const handleConfirmPasswordChange = async () => {
+    setShowPasswordChangeConfirmation(false)
+    await submitChat(true)
+  }
+
   if (isLoadingChat) {
     return <LoadingSkeleton />
   }
@@ -310,11 +337,11 @@ export function ChatDeploy({
         id='chat-deploy-form'
         ref={formRef}
         onSubmit={handleSubmit}
-        className='-mx-1 space-y-4 overflow-y-auto px-1'
+        className='-mx-1 space-y-4 px-1'
       >
         {errors.general && (
           <div className='flex items-center gap-2 rounded-md border border-[color-mix(in_srgb,var(--text-error)_20%,transparent)] bg-[color-mix(in_srgb,var(--text-error)_10%,transparent)] px-3 py-2 text-[var(--text-error)] text-small'>
-            <AlertTriangle className='size-4 flex-shrink-0' />
+            <TriangleAlert className='size-4 flex-shrink-0' />
             <span>{errors.general}</span>
           </div>
         )}
@@ -332,7 +359,7 @@ export function ChatDeploy({
           <div>
             <Label
               htmlFor='title'
-              className='mb-[6.5px] block pl-0.5 font-medium text-[var(--text-primary)] text-small'
+              className='mb-[6.5px] block pl-0.5 text-[var(--text-primary)] text-small'
             >
               Title
             </Label>
@@ -350,7 +377,7 @@ export function ChatDeploy({
           </div>
 
           <div>
-            <Label className='mb-[6.5px] block pl-0.5 font-medium text-[var(--text-primary)] text-small'>
+            <Label className='mb-[6.5px] block pl-0.5 text-[var(--text-primary)] text-small'>
               Output
             </Label>
             <OutputSelect
@@ -359,6 +386,7 @@ export function ChatDeploy({
               onOutputSelect={(values) => updateField('selectedOutputBlocks', values)}
               placeholder='Select which block outputs to use'
               disabled={chatSubmitting}
+              size='md'
               className='w-full'
             />
             {errors.outputBlocks && (
@@ -368,9 +396,40 @@ export function ChatDeploy({
             )}
           </div>
 
+          <div className='flex items-center justify-between gap-3'>
+            <div className='min-w-0'>
+              <Label className='block pl-0.5 text-[var(--text-primary)] text-small'>
+                Include thinking
+              </Label>
+            </div>
+            <Switch
+              checked={formData.includeThinking}
+              disabled={chatSubmitting}
+              onCheckedChange={(checked) => updateField('includeThinking', checked)}
+              aria-label='Include thinking'
+            />
+          </div>
+
+          <div className='flex items-center justify-between gap-3'>
+            <div className='min-w-0'>
+              <Label className='block pl-0.5 text-[var(--text-primary)] text-small'>
+                Include tool calls
+              </Label>
+            </div>
+            <Switch
+              checked={formData.includeToolCalls}
+              disabled={chatSubmitting}
+              onCheckedChange={(checked) => updateField('includeToolCalls', checked)}
+              aria-label='Include tool calls'
+            />
+          </div>
+
           <AuthSelector
             key={`${existingChat?.id ?? 'new'}-${formInitCounter}`}
+            chatId={existingChat?.id ?? null}
+            canRevealPassword={canRevealPassword}
             authType={formData.authType}
+            savedAuthType={existingChat?.authType as AuthType | undefined}
             password={formData.password}
             emails={formData.emails}
             onAuthTypeChange={(type) => updateField('authType', type)}
@@ -383,7 +442,7 @@ export function ChatDeploy({
           <div>
             <Label
               htmlFor='welcomeMessage'
-              className='mb-[6.5px] block pl-0.5 font-medium text-[var(--text-primary)] text-small'
+              className='mb-[6.5px] block pl-0.5 text-[var(--text-primary)] text-small'
             >
               Welcome message
             </Label>
@@ -409,6 +468,21 @@ export function ChatDeploy({
           />
         </div>
       </form>
+
+      <ChipConfirmModal
+        open={showPasswordChangeConfirmation}
+        onOpenChange={setShowPasswordChangeConfirmation}
+        srTitle='Change deployment password'
+        title='Change deployment password?'
+        text='Are you sure you want to change the password for this deployment?'
+        confirm={{
+          label: 'Change Password and Redeploy',
+          onClick: handleConfirmPasswordChange,
+          variant: 'primary',
+          pending: chatSubmitting,
+          pendingLabel: 'Updating...',
+        }}
+      />
 
       <ChipConfirmModal
         open={showDeleteConfirmation}
@@ -511,7 +585,7 @@ function IdentifierInput({
     <div>
       <Label
         htmlFor='chat-url'
-        className='mb-[6.5px] block pl-0.5 font-medium text-[var(--text-primary)] text-small'
+        className='mb-[6.5px] block pl-0.5 text-[var(--text-primary)] text-small'
       >
         URL
       </Label>
@@ -521,7 +595,7 @@ function IdentifierInput({
           error && 'border-[var(--text-error)]'
         )}
       >
-        <div className='flex items-center whitespace-nowrap bg-[var(--surface-5)] pr-1.5 pl-2 font-medium text-[var(--text-secondary)] text-sm'>
+        <div className='flex items-center whitespace-nowrap bg-[var(--surface-5)] pr-1.5 pl-2 text-[var(--text-secondary)] text-sm'>
           {getDomainPrefix()}
         </div>
         <div className='relative flex-1'>
@@ -582,7 +656,11 @@ function IdentifierInput({
 }
 
 interface AuthSelectorProps {
+  chatId: string | null
+  canRevealPassword: boolean
   authType: AuthType
+  /** The persisted mode of an existing chat, kept selectable even if newly disallowed. */
+  savedAuthType?: AuthType
   password: string
   emails: string[]
   onAuthTypeChange: (type: AuthType) => void
@@ -601,7 +679,10 @@ const AUTH_LABELS: Record<AuthType, string> = {
 }
 
 function AuthSelector({
+  chatId,
+  canRevealPassword,
   authType,
+  savedAuthType,
   password,
   emails,
   onAuthTypeChange,
@@ -611,75 +692,41 @@ function AuthSelector({
   hasExistingPassword = false,
   error,
 }: AuthSelectorProps) {
-  const [emailError, setEmailError] = useState('')
-  const [invalidEmailItems, setInvalidEmailItems] = useState<TagItem[]>([])
+  const revealPasswordMutation = useRevealChatPassword()
 
-  const emailsRef = useRef(emails)
-  const invalidEmailItemsRef = useRef(invalidEmailItems)
+  /**
+   * Editing or regenerating the password clears a failed reveal. The mutation
+   * only drops its error on the next attempt, so it would otherwise keep
+   * reporting a stale failure over a field the admin has already moved on from.
+   */
+  const handlePasswordChange = (value: string) => {
+    if (revealPasswordMutation.isError) revealPasswordMutation.reset()
+    onPasswordChange(value)
+  }
+
+  const { config: permissionConfig } = usePermissionConfig()
+  const allowedAuthTypes = permissionConfig.allowedChatDeployAuthTypes
+
+  const ssoAvailable =
+    isSsoEnabled || savedAuthType === 'sso' || (allowedAuthTypes?.includes('sso') ?? false)
+  const baseAuthOptions: AuthType[] = ssoAvailable
+    ? ['public', 'password', 'email', 'sso']
+    : ['public', 'password', 'email']
+
+  const authOptions = baseAuthOptions.filter(
+    (type) => allowedAuthTypes === null || allowedAuthTypes.includes(type) || type === savedAuthType
+  )
 
   useEffect(() => {
-    emailsRef.current = emails
-  }, [emails])
-
-  const addEmail = (email: string): boolean => {
-    if (!email.trim()) return false
-
-    const normalized = normalizeEmail(email)
-    const isDomainPattern = normalized.startsWith('@')
-    const validation = quickValidateEmail(normalized)
-    const isValid = validation.isValid || isDomainPattern
-
-    if (
-      emailsRef.current.includes(normalized) ||
-      invalidEmailItemsRef.current.some((item) => item.value === normalized)
-    ) {
-      return false
+    if (authOptions.length > 0 && !authOptions.includes(authType)) {
+      onAuthTypeChange(authOptions[0])
     }
-
-    if (isValid) {
-      setEmailError('')
-      emailsRef.current = [...emailsRef.current, normalized]
-      onEmailsChange(emailsRef.current)
-    } else {
-      invalidEmailItemsRef.current = [
-        ...invalidEmailItemsRef.current,
-        { value: normalized, isValid, error: validation.reason ?? 'Invalid email format' },
-      ]
-      setInvalidEmailItems(invalidEmailItemsRef.current)
-    }
-
-    return isValid
-  }
-
-  const emailItems = [
-    ...emails.map((email) => ({ value: email, isValid: true })),
-    ...invalidEmailItems,
-  ]
-
-  const handleRemoveEmailItem = (_value: string, index: number) => {
-    const itemToRemove = emailItems[index]
-    if (!itemToRemove) return
-
-    if (itemToRemove.isValid) {
-      emailsRef.current = emailsRef.current.filter((e) => e !== itemToRemove.value)
-      onEmailsChange(emailsRef.current)
-    } else {
-      invalidEmailItemsRef.current = invalidEmailItemsRef.current.filter(
-        (item) => item.value !== itemToRemove.value
-      )
-      setInvalidEmailItems(invalidEmailItemsRef.current)
-    }
-  }
-
-  const ssoEnabled = isTruthy(getEnv('NEXT_PUBLIC_SSO_ENABLED'))
-  const authOptions = ssoEnabled
-    ? (['public', 'password', 'email', 'sso'] as const)
-    : (['public', 'password', 'email'] as const)
+  }, [authOptions, authType, onAuthTypeChange])
 
   return (
     <div className='space-y-4'>
       <div>
-        <Label className='mb-[6.5px] block pl-0.5 font-medium text-[var(--text-primary)] text-small'>
+        <Label className='mb-[6.5px] block pl-0.5 text-[var(--text-primary)] text-small'>
           Access control
         </Label>
         <ButtonGroup
@@ -697,16 +744,26 @@ function AuthSelector({
 
       {authType === 'password' && (
         <div>
-          <Label className='mb-[6.5px] block pl-0.5 font-medium text-[var(--text-primary)] text-small'>
+          <Label className='mb-[6.5px] block pl-0.5 text-[var(--text-primary)] text-small'>
             Password
           </Label>
           <GeneratedPasswordInput
             value={password}
-            onChange={onPasswordChange}
+            onChange={handlePasswordChange}
             disabled={disabled}
-            placeholder={getPasswordPlaceholder(hasExistingPassword)}
+            placeholder={hasExistingPassword ? '' : getPasswordPlaceholder(false)}
             required={!hasExistingPassword}
+            fetchCurrentPassword={
+              canRevealPassword && chatId && hasExistingPassword
+                ? () => revealPasswordMutation.mutateAsync({ chatId })
+                : undefined
+            }
           />
+          {canRevealPassword && revealPasswordMutation.isError && (
+            <p className='mt-[6.5px] text-[var(--text-error)] text-caption'>
+              Failed to load the current password
+            </p>
+          )}
           <p className='mt-[6.5px] text-[var(--text-secondary)] text-xs'>
             {getPasswordHelperText(hasExistingPassword)}
           </p>
@@ -715,25 +772,18 @@ function AuthSelector({
 
       {(authType === 'email' || authType === 'sso') && (
         <div>
-          <Label className='mb-[6.5px] block pl-0.5 font-medium text-[var(--text-primary)] text-small'>
+          <Label className='mb-[6.5px] block pl-0.5 text-[var(--text-primary)] text-small'>
             {authType === 'email' ? 'Allowed emails' : 'Allowed SSO emails'}
           </Label>
-          <TagInput
-            items={emailItems}
-            onAdd={(value) => addEmail(value)}
-            onRemove={handleRemoveEmailItem}
-            placeholder='Enter emails or domains (@example.com)'
-            placeholderWithTags='Add email'
+          <ChipEmailsInput
+            value={emails}
+            onChange={onEmailsChange}
+            validate={validateAllowlistEntry}
+            allowDomains
+            placeholder='Enter emails or domains'
+            placeholderWithTags='Add email or domain'
             disabled={disabled}
           />
-          {emailError && (
-            <p className='mt-[6.5px] text-[var(--text-error)] text-caption'>{emailError}</p>
-          )}
-          <p className='mt-[6.5px] text-[var(--text-secondary)] text-xs'>
-            {authType === 'email'
-              ? 'Add specific emails or entire domains (@example.com)'
-              : 'Add emails or domains that can access via SSO'}
-          </p>
         </div>
       )}
 

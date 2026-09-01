@@ -1,4 +1,3 @@
-import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { type NextRequest, NextResponse } from 'next/server'
 import {
   v1ListKnowledgeDocumentsContract,
@@ -11,22 +10,24 @@ import {
   resolveSystemBillingAttribution,
 } from '@/lib/billing/core/billing-attribution'
 import {
+  messageForOrchestrationError,
+  statusForOrchestrationError,
+} from '@/lib/core/orchestration/types'
+import {
+  isMultipartFieldValidationError,
   isPayloadSizeLimitError,
   MAX_MULTIPART_OVERHEAD_BYTES,
   readFormDataWithLimit,
 } from '@/lib/core/utils/stream-limits'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
-import {
-  createSingleDocument,
-  type DocumentData,
-  getDocuments,
-  processDocumentsWithQueue,
-} from '@/lib/knowledge/documents/service'
+import { getDocuments } from '@/lib/knowledge/documents/service'
 import type { DocumentSortField, SortOrder } from '@/lib/knowledge/documents/types'
+import { performUploadKnowledgeDocument } from '@/lib/knowledge/orchestration'
 import { uploadWorkspaceFile } from '@/lib/uploads/contexts/workspace'
+import { EXACT_EMPTY_WORKSPACE_FILE_SECRET_PROVENANCE } from '@/lib/uploads/contexts/workspace/workspace-file-secret-provenance'
 import { validateFileType } from '@/lib/uploads/utils/validation'
 import { handleError, resolveKnowledgeBase, serializeDate } from '@/app/api/v1/knowledge/utils'
-import { authenticateRequest } from '@/app/api/v1/middleware'
+import { authenticateRequest, v1ValidationErrorResponse } from '@/app/api/v1/middleware'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -44,7 +45,9 @@ export const GET = withRouteHandler(async (request: NextRequest, context: Docume
   const { requestId, userId, rateLimit } = auth
 
   try {
-    const parsed = await parseRequest(v1ListKnowledgeDocumentsContract, request, context)
+    const parsed = await parseRequest(v1ListKnowledgeDocumentsContract, request, context, {
+      validationErrorResponse: v1ValidationErrorResponse,
+    })
     if (!parsed.success) return parsed.response
 
     const { workspaceId, limit, offset, search, enabledFilter, sortBy, sortOrder } =
@@ -99,7 +102,9 @@ export const POST = withRouteHandler(
     const { requestId, userId, rateLimit } = auth
 
     try {
-      const parsed = await parseRequest(v1UploadKnowledgeDocumentContract, request, context)
+      const parsed = await parseRequest(v1UploadKnowledgeDocumentContract, request, context, {
+        validationErrorResponse: v1ValidationErrorResponse,
+      })
       if (!parsed.success) return parsed.response
       const { id: knowledgeBaseId } = parsed.data.params
 
@@ -112,6 +117,9 @@ export const POST = withRouteHandler(
       } catch (error) {
         if (isPayloadSizeLimitError(error)) {
           return NextResponse.json({ error: error.message }, { status: 413 })
+        }
+        if (isMultipartFieldValidationError(error)) {
+          return NextResponse.json({ error: error.message }, { status: 400 })
         }
         return NextResponse.json(
           { error: 'Request body must be valid multipart form data' },
@@ -182,50 +190,33 @@ export const POST = withRouteHandler(
         userId,
         buffer,
         file.name,
-        contentType
+        contentType,
+        { secretProvenance: EXACT_EMPTY_WORKSPACE_FILE_SECRET_PROVENANCE }
       )
 
-      const newDocument = await createSingleDocument(
-        {
+      const outcome = await performUploadKnowledgeDocument({
+        knowledgeBase: { id: knowledgeBaseId, name: result.kb.name, workspaceId },
+        document: {
           filename: file.name,
           fileUrl: uploadedFile.url,
           fileSize: file.size,
           mimeType: contentType,
         },
-        knowledgeBaseId,
+        startProcessing: 'queue',
+        billingAttribution,
+        uploadedBy: billingActorUserId,
+        userId,
+        source: 'api',
         requestId,
-        billingActorUserId
-      )
-
-      const documentData: DocumentData = {
-        documentId: newDocument.id,
-        filename: file.name,
-        fileUrl: uploadedFile.url,
-        fileSize: file.size,
-        mimeType: contentType,
-      }
-
-      processDocumentsWithQueue(
-        [documentData],
-        knowledgeBaseId,
-        {},
-        requestId,
-        billingAttribution
-      ).catch(() => {
-        // Processing errors are logged internally
-      })
-
-      recordAudit({
-        workspaceId,
-        actorId: userId,
-        action: AuditAction.DOCUMENT_UPLOADED,
-        resourceType: AuditResourceType.DOCUMENT,
-        resourceId: newDocument.id,
-        resourceName: file.name,
-        description: `Uploaded document "${file.name}" to knowledge base via API`,
-        metadata: { knowledgeBaseId, fileSize: file.size, mimeType: contentType },
         request,
       })
+      if (!outcome.success) {
+        return NextResponse.json(
+          { error: messageForOrchestrationError(outcome, 'Failed to upload document') },
+          { status: statusForOrchestrationError(outcome.errorCode) }
+        )
+      }
+      const newDocument = outcome.document
 
       return NextResponse.json({
         success: true,

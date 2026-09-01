@@ -24,6 +24,8 @@ import { getErrorMessage } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { normalizeEmail } from '@sim/utils/string'
 import { and, count, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm'
+import { invalidateMembershipCache } from '@/lib/auth/security-policy'
+import { applySessionPolicyToNewMember } from '@/lib/auth/session-policy'
 import { syncUsageLimitsFromSubscription } from '@/lib/billing/core/usage'
 import {
   assertNoUnresolvedEnterpriseIssuance,
@@ -45,6 +47,7 @@ import { enqueueOutboxEvent } from '@/lib/core/outbox/service'
 import { revokeWorkspaceCredentialMembershipsTx } from '@/lib/credentials/access'
 import type { DbOrTx } from '@/lib/db/types'
 import { acquireInvitationMutationLocks } from '@/lib/invitations/locks'
+import { removeWorkspaceSkillMembershipsTx } from '@/lib/skills/access'
 import {
   reassignWorkflowOwnershipForWorkspaceMemberRemovalTx,
   WorkspaceBillingAccountRemovalError,
@@ -95,6 +98,31 @@ export async function acquireOrgMembershipLock(
   await tx.execute(
     sql`select pg_advisory_xact_lock(hashtextextended(${`${userId}:${organizationId}`}, 0))`
   )
+}
+
+/**
+ * Acquires the canonical organization → user-billing-identity → membership
+ * lock sequence for a mutation whose validity depends on a user's standing in
+ * one or more organizations.
+ *
+ * Keeping this order in one helper lets organization access removal and
+ * credential creation share the same serialization fence. If credential
+ * creation wins, a later transfer sees the new source-owned credential and
+ * blocks. If transfer wins, credential creation re-reads access after the
+ * transfer and refuses the insert.
+ */
+export async function acquireOrganizationUserMutationLocks(
+  tx: DbOrTx,
+  params: { userId: string; organizationIds: string[] }
+): Promise<void> {
+  const organizationIds = [...new Set(params.organizationIds)].sort()
+  for (const organizationId of organizationIds) {
+    await acquireOrganizationMutationLock(tx, organizationId)
+  }
+  await acquireUserBillingIdentityLock(tx, params.userId)
+  for (const organizationId of organizationIds) {
+    await acquireOrgMembershipLock(tx, params.userId, organizationId)
+  }
 }
 
 export type BillingBlockReason = 'payment_failed' | 'dispute'
@@ -178,20 +206,14 @@ export interface RestoreProResult {
 
 /**
  * Restore a user's personal Pro subscription if it was paused
- * (`cancelAtPeriodEnd = true`) and merge any snapshotted Pro usage back
- * into their current-period usage.
+ * (`cancelAtPeriodEnd = true`). No usage moves — ledger entity stamps kept
+ * their personal usage attributed to them throughout the org membership.
  *
- * All DB mutations run inside a single transaction so partial progress
- * cannot be committed: either both the subscription un-pause and the
- * usage snapshot merge succeed, or neither does. Errors propagate to
- * the caller so webhook handlers can rely on Stripe retry semantics.
+ * Errors propagate to the caller so webhook handlers can rely on Stripe
+ * retry semantics.
  *
- * Idempotent:
- *   - Early returns when the user has no paused Pro subscription, so
- *     re-runs after a successful restore are no-ops.
- *   - The snapshot merge only runs when `proPeriodCostSnapshot > 0`,
- *     so a second call after a prior success (which zeroes the
- *     snapshot) does nothing.
+ * Idempotent: early returns when the user has no paused Pro subscription,
+ * so re-runs after a successful restore are no-ops.
  *
  * Called when:
  *   - A member leaves a team (via `removeUserFromOrganization`).
@@ -259,46 +281,6 @@ export async function restoreUserProSubscription(userId: string): Promise<Restor
     })
 
     result.restored = true
-
-    const [stats] = await tx
-      .select({
-        currentPeriodCost: userStats.currentPeriodCost,
-        proPeriodCostSnapshot: userStats.proPeriodCostSnapshot,
-      })
-      .from(userStats)
-      .where(eq(userStats.userId, userId))
-      .limit(1)
-
-    if (!stats) {
-      return
-    }
-
-    const currentNum = toNumber(toDecimal(stats.currentPeriodCost))
-    const snapshotNum = toNumber(toDecimal(stats.proPeriodCostSnapshot))
-
-    if (snapshotNum <= 0) {
-      return
-    }
-
-    const restoredUsage = (currentNum + snapshotNum).toString()
-
-    await tx
-      .update(userStats)
-      .set({
-        currentPeriodCost: restoredUsage,
-        proPeriodCostSnapshot: '0',
-        proPeriodCostSnapshotAt: null,
-      })
-      .where(eq(userStats.userId, userId))
-
-    result.usageRestored = true
-
-    logger.info('Restored Pro usage snapshot', {
-      userId,
-      previousUsage: currentNum,
-      snapshotUsage: snapshotNum,
-      restoredUsage,
-    })
   })
 
   if (result.restored) {
@@ -596,46 +578,6 @@ interface MembershipValidationResult {
   }
 }
 
-export async function ensureUserInOrganization(
-  params: AddMemberParams
-): Promise<EnsureMemberResult> {
-  const existingMembership = await getUserOrganization(params.userId)
-
-  if (existingMembership?.organizationId === params.organizationId) {
-    return {
-      success: true,
-      memberId: existingMembership.memberId,
-      alreadyMember: true,
-      billingActions: {
-        proUsageSnapshotted: false,
-        proCancelledAtPeriodEnd: false,
-      },
-    }
-  }
-
-  if (existingMembership) {
-    return {
-      success: false,
-      alreadyMember: false,
-      existingOrgId: existingMembership.organizationId,
-      failureCode: 'already-in-other-organization',
-      error:
-        'User is already a member of another organization. Users can only belong to one organization at a time.',
-      billingActions: {
-        proUsageSnapshotted: false,
-        proCancelledAtPeriodEnd: false,
-      },
-    }
-  }
-
-  const result = await addUserToOrganization(params)
-
-  return {
-    ...result,
-    alreadyMember: false,
-  }
-}
-
 /**
  * Transaction-enlisted invitation acceptance path. Membership, personal-Pro
  * handling, invitation status, and workspace permissions all commit or roll
@@ -799,88 +741,6 @@ export async function ensureUserInOrganizationTx(
   }
 }
 
-/**
- * Validate if a user can be added to an organization.
- * Checks single-org constraint and seat availability.
- */
-async function validateMembershipAddition(
-  userId: string,
-  organizationId: string,
-  options: { acceptingInvitationId?: string } = {}
-): Promise<MembershipValidationResult> {
-  const [userData] = await db.select({ id: user.id }).from(user).where(eq(user.id, userId)).limit(1)
-
-  if (!userData) {
-    return { canAdd: false, reason: 'User not found', failureCode: 'user-not-found' }
-  }
-
-  const [orgData] = await db
-    .select({ id: organization.id })
-    .from(organization)
-    .where(eq(organization.id, organizationId))
-    .limit(1)
-
-  if (!orgData) {
-    return {
-      canAdd: false,
-      reason: 'Organization not found',
-      failureCode: 'organization-not-found',
-    }
-  }
-
-  const existingMemberships = await db
-    .select({ organizationId: member.organizationId })
-    .from(member)
-    .where(eq(member.userId, userId))
-
-  if (existingMemberships.length > 0) {
-    const isAlreadyMemberOfThisOrg = existingMemberships.some(
-      (m) => m.organizationId === organizationId
-    )
-
-    if (isAlreadyMemberOfThisOrg) {
-      return {
-        canAdd: false,
-        reason: 'User is already a member of this organization',
-        failureCode: 'already-member',
-      }
-    }
-
-    return {
-      canAdd: false,
-      reason:
-        'User is already a member of another organization. Users can only belong to one organization at a time.',
-      failureCode: 'already-in-other-organization',
-      existingOrgId: existingMemberships[0].organizationId,
-    }
-  }
-
-  const seatValidation = await validateSeatAvailability(organizationId, 1, {
-    excludePendingInvitationId: options.acceptingInvitationId,
-  })
-  if (!seatValidation.canInvite) {
-    return {
-      canAdd: false,
-      reason: seatValidation.reason || 'No seats available',
-      failureCode: 'no-seats-available',
-      seatValidation: {
-        currentSeats: seatValidation.currentSeats,
-        maxSeats: seatValidation.maxSeats,
-        availableSeats: seatValidation.availableSeats,
-      },
-    }
-  }
-
-  return {
-    canAdd: true,
-    seatValidation: {
-      currentSeats: seatValidation.currentSeats,
-      maxSeats: seatValidation.maxSeats,
-      availableSeats: seatValidation.availableSeats,
-    },
-  }
-}
-
 interface PaidOrgJoinBillingActions {
   proUsageSnapshotted: boolean
   proCancelledAtPeriodEnd: boolean
@@ -888,10 +748,10 @@ interface PaidOrgJoinBillingActions {
 
 /**
  * Applies the billing side-effects of a user joining a paid (Team/Enterprise)
- * organization inside an existing transaction:
- *   - snapshots current Pro usage so new usage attributes to the org;
- *   - marks personal Pro subscription `cancelAtPeriodEnd=true` and enqueues
- *     the Stripe sync via the outbox;
+ * organization inside an existing transaction: marks the personal Pro
+ * subscription `cancelAtPeriodEnd=true` and enqueues the Stripe sync via the
+ * outbox. No usage is moved — ledger entity stamps already attribute
+ * post-join usage to the organization and pre-join usage to the user.
  *
  * Storage follows each workspace's routed payer independently. The workspace
  * payer-change transaction transfers that workspace's durable byte ledger; a
@@ -902,7 +762,8 @@ interface PaidOrgJoinBillingActions {
 async function applyPaidOrgJoinBillingTx(
   tx: DbOrTx,
   userId: string,
-  organizationId: string
+  organizationId: string,
+  options: { sourceOperationId?: string } = {}
 ): Promise<PaidOrgJoinBillingActions> {
   const actions: PaidOrgJoinBillingActions = {
     proUsageSnapshotted: false,
@@ -923,34 +784,6 @@ async function applyPaidOrgJoinBillingTx(
     .limit(1)
 
   if (personalPro && !personalPro.cancelAtPeriodEnd) {
-    const [userStatsRow] = await tx
-      .select({ currentPeriodCost: userStats.currentPeriodCost })
-      .from(userStats)
-      .where(eq(userStats.userId, userId))
-      .limit(1)
-
-    if (userStatsRow) {
-      const currentProUsage = userStatsRow.currentPeriodCost || '0'
-
-      await tx
-        .update(userStats)
-        .set({
-          proPeriodCostSnapshot: currentProUsage,
-          proPeriodCostSnapshotAt: new Date(),
-          currentPeriodCost: '0',
-          currentPeriodCopilotCost: '0',
-        })
-        .where(eq(userStats.userId, userId))
-
-      actions.proUsageSnapshotted = true
-
-      logger.info('Snapshotted Pro usage when joining paid org', {
-        userId,
-        proUsageSnapshot: currentProUsage,
-        organizationId,
-      })
-    }
-
     await tx
       .update(subscriptionTable)
       .set({ cancelAtPeriodEnd: true })
@@ -961,6 +794,7 @@ async function applyPaidOrgJoinBillingTx(
         stripeSubscriptionId: personalPro.stripeSubscriptionId,
         subscriptionId: personalPro.id,
         reason: 'joined-paid-org',
+        ...(options.sourceOperationId ? { sourceOperationId: options.sourceOperationId } : {}),
       })
     }
 
@@ -977,34 +811,6 @@ async function applyPaidOrgJoinBillingTx(
 }
 
 /**
- * Re-applies paid-org join billing for a user who is already a member of
- * the organization. Used on re-upgrade after a dormant transition: members
- * kept their org membership but had their personal Pro subscriptions
- * restored (`cancelAtPeriodEnd=false`) during the cancel/downgrade. When
- * the org becomes paid again, those Pros must be re-paused so the user
- * isn't double-billed.
- *
- * No-op when the org has no active Team/Enterprise subscription.
- */
-export async function reapplyPaidOrgJoinBillingForExistingMember(
-  userId: string,
-  organizationId: string
-): Promise<PaidOrgJoinBillingActions> {
-  return db.transaction(async (tx) => {
-    await acquireOrganizationMutationLock(tx, organizationId)
-    const [existingMembership] = await tx
-      .select({ id: member.id })
-      .from(member)
-      .where(and(eq(member.userId, userId), eq(member.organizationId, organizationId)))
-      .limit(1)
-    if (!existingMembership) {
-      return { proUsageSnapshotted: false, proCancelledAtPeriodEnd: false }
-    }
-    return reapplyPaidOrgJoinBillingForExistingMemberTx(tx, userId, organizationId)
-  })
-}
-
-/**
  * Transaction-enlisted variant used by subscription webhooks. Keeping the
  * subscription upsert, effective-limit update, provisioning completion, and
  * existing-member Pro handling in one transaction prevents a partially
@@ -1017,7 +823,8 @@ export async function reapplyPaidOrgJoinBillingForExistingMember(
 export async function reapplyPaidOrgJoinBillingForExistingMemberTx(
   tx: DbOrTx,
   userId: string,
-  organizationId: string
+  organizationId: string,
+  options: { sourceOperationId?: string } = {}
 ): Promise<PaidOrgJoinBillingActions> {
   await acquireUserBillingIdentityLock(tx, userId)
   const [orgSub] = await tx
@@ -1035,114 +842,7 @@ export async function reapplyPaidOrgJoinBillingForExistingMemberTx(
     return { proUsageSnapshotted: false, proCancelledAtPeriodEnd: false }
   }
 
-  return applyPaidOrgJoinBillingTx(tx, userId, organizationId)
-}
-
-/**
- * Add a user to an organization with full billing logic.
- *
- * Handles:
- * - Single organization constraint validation
- * - Seat availability validation
- * - Member record creation
- * - Pro usage snapshot when joining paid team
- * - Pro subscription cancellation at period end
- * - Usage limit sync
- */
-export async function addUserToOrganization(params: AddMemberParams): Promise<AddMemberResult> {
-  const {
-    userId,
-    organizationId,
-    role,
-    skipBillingLogic = false,
-    skipSeatValidation = false,
-    acceptingInvitationId,
-  } = params
-
-  const billingActions: AddMemberResult['billingActions'] = {
-    proUsageSnapshotted: false,
-    proCancelledAtPeriodEnd: false,
-  }
-
-  try {
-    if (!skipSeatValidation) {
-      const validation = await validateMembershipAddition(userId, organizationId, {
-        acceptingInvitationId,
-      })
-      if (!validation.canAdd) {
-        return {
-          success: false,
-          error: validation.reason,
-          failureCode: validation.failureCode,
-          billingActions,
-        }
-      }
-    } else {
-      const existingMemberships = await db
-        .select({ organizationId: member.organizationId })
-        .from(member)
-        .where(eq(member.userId, userId))
-
-      if (existingMemberships.length > 0) {
-        const isAlreadyMemberOfThisOrg = existingMemberships.some(
-          (m) => m.organizationId === organizationId
-        )
-
-        if (isAlreadyMemberOfThisOrg) {
-          return {
-            success: false,
-            error: 'User is already a member of this organization',
-            failureCode: 'already-member',
-            billingActions,
-          }
-        }
-
-        return {
-          success: false,
-          error:
-            'User is already a member of another organization. Users can only belong to one organization at a time.',
-          failureCode: 'already-in-other-organization',
-          billingActions,
-        }
-      }
-    }
-
-    const added = await db.transaction((tx) =>
-      ensureUserInOrganizationTx(tx, {
-        userId,
-        organizationId,
-        role,
-        skipBillingLogic,
-        skipSeatValidation,
-        acceptingInvitationId,
-      })
-    )
-    if (!added.success || !added.memberId || added.alreadyMember) {
-      return {
-        success: false,
-        error: added.alreadyMember ? 'User is already a member of this organization' : added.error,
-        failureCode: added.alreadyMember ? 'already-member' : added.failureCode,
-        billingActions: added.billingActions,
-      }
-    }
-
-    const memberId = added.memberId
-    billingActions.proUsageSnapshotted = added.billingActions.proUsageSnapshotted
-    billingActions.proCancelledAtPeriodEnd = added.billingActions.proCancelledAtPeriodEnd
-
-    logger.info('Added user to organization', {
-      userId,
-      organizationId,
-      role,
-      memberId,
-      billingActions,
-    })
-
-    return { success: true, memberId, billingActions }
-  } catch (error) {
-    logger.error('Failed to add user to organization', { userId, organizationId, error })
-    return { success: false, error: 'Failed to add user to organization', billingActions }
-  }
+  return applyPaidOrgJoinBillingTx(tx, userId, organizationId, options)
 }
 
 type InvitationRemovalScope = 'all' | 'external'
@@ -1215,16 +915,11 @@ export async function withInvitationSafeOrganizationAccessMutation<T>(
           invitationIds: candidate.invitationIds,
           workspaceIds: candidate.workspaceIds,
         })
-        const organizationIds = [
-          ...new Set([params.organizationId, ...(params.additionalOrganizationIds ?? [])]),
-        ].sort()
-        for (const organizationId of organizationIds) {
-          await acquireOrganizationMutationLock(tx, organizationId)
-        }
-        await acquireUserBillingIdentityLock(tx, params.userId)
-        for (const organizationId of organizationIds) {
-          await acquireOrgMembershipLock(tx, params.userId, organizationId)
-        }
+        const organizationIds = [params.organizationId, ...(params.additionalOrganizationIds ?? [])]
+        await acquireOrganizationUserMutationLocks(tx, {
+          userId: params.userId,
+          organizationIds,
+        })
 
         const current = await getInvitationRemovalLockSnapshot(tx, params)
         const candidateInvitations = new Set(candidate.invitationIds)
@@ -1343,7 +1038,7 @@ export async function transferUserBetweenOrganizations(
   }
 
   try {
-    return await withInvitationSafeOrganizationAccessMutation(
+    const transferResult = await withInvitationSafeOrganizationAccessMutation(
       {
         userId: params.userId,
         organizationId: params.sourceOrganizationId,
@@ -1462,26 +1157,7 @@ export async function transferUserBetweenOrganizations(
             workspaceIds,
             params.userId
           )
-        }
-
-        const [stats] = await tx
-          .select({ currentPeriodCost: userStats.currentPeriodCost })
-          .from(userStats)
-          .where(eq(userStats.userId, params.userId))
-          .for('update')
-          .limit(1)
-        const usageCaptured = toNumber(toDecimal(stats?.currentPeriodCost))
-        if (usageCaptured > 0) {
-          await tx
-            .update(organization)
-            .set({
-              departedMemberUsage: sql`${organization.departedMemberUsage} + ${usageCaptured}`,
-            })
-            .where(eq(organization.id, params.sourceOrganizationId))
-          await tx
-            .update(userStats)
-            .set({ currentPeriodCost: '0' })
-            .where(eq(userStats.userId, params.userId))
+          await removeWorkspaceSkillMembershipsTx(tx, workspaceIds, params.userId)
         }
 
         const added = await ensureUserInOrganizationTx(tx, {
@@ -1509,10 +1185,17 @@ export async function transferUserBetweenOrganizations(
           workspaceAccessRevoked,
           credentialMembershipsRevoked,
           pendingInvitationsCancelled: cancelledInvitations.length,
-          usageCaptured,
+          // Nothing to capture: the member's ledger rows stay stamped to the
+          // source org's period and are billed at its cycle close.
+          usageCaptured: 0,
         }
       }
     )
+    // The transferred member's fallbacks must resolve to the destination org
+    // immediately, and their sessions clamp to its policy — same treatment as
+    // invite acceptance. Best-effort.
+    await applySessionPolicyToNewMember(params.userId, params.destinationOrganizationId)
+    return transferResult
   } catch (error) {
     logger.error('Failed to transfer organization member', { ...params, error })
     return { success: false, error: getErrorMessage(error), ...emptyResult }
@@ -1524,10 +1207,11 @@ export async function transferUserBetweenOrganizations(
  *
  * Handles:
  * - Owner removal prevention
- * - Departed member usage capture
  * - Member record deletion
  * - Pro subscription restoration when leaving a paid team
- * - Pro usage restoration from snapshot
+ *
+ * No usage moves on departure: the member's ledger rows stay stamped to the
+ * org's billing period and are billed at its cycle close.
  *
  * Note: Users can only belong to one organization at a time.
  */
@@ -1622,34 +1306,6 @@ export async function removeUserFromOrganization(
               .returning({ id: invitation.id })
           : []
 
-        const captureDepartedUsage = async () => {
-          if (skipBillingLogic) return 0
-
-          const [departingUserStats] = await tx
-            .select({ currentPeriodCost: userStats.currentPeriodCost })
-            .from(userStats)
-            .where(eq(userStats.userId, userId))
-            .for('update')
-            .limit(1)
-
-          const usage = toNumber(toDecimal(departingUserStats?.currentPeriodCost))
-          if (usage <= 0) return 0
-
-          await tx
-            .update(organization)
-            .set({
-              departedMemberUsage: sql`${organization.departedMemberUsage} + ${usage}`,
-            })
-            .where(eq(organization.id, organizationId))
-
-          await tx
-            .update(userStats)
-            .set({ currentPeriodCost: '0' })
-            .where(eq(userStats.userId, userId))
-
-          return usage
-        }
-
         // Permission groups are organization-scoped, so a departing member's group
         // membership must be cleared whenever they leave the org — including the
         // zero-workspace early return below (a group can exist with members but no
@@ -1664,12 +1320,12 @@ export async function removeUserFromOrganization(
           )
 
         if (workspaceIds.length === 0) {
-          const capturedUsage = await captureDepartedUsage()
-
           return {
             skipped: false as const,
             workspaceIdsToRevoke: [] as string[],
-            usageCaptured: capturedUsage,
+            // Nothing to capture: the member's ledger rows stay stamped to
+            // this org's period and are billed at its cycle close.
+            usageCaptured: 0,
             credentialMembershipsRevoked: 0,
             pendingInvitationsCancelled: cancelledInvitations.length,
           }
@@ -1708,12 +1364,12 @@ export async function removeUserFromOrganization(
           workspaceIds,
           userId
         )
-        const capturedUsage = await captureDepartedUsage()
+        await removeWorkspaceSkillMembershipsTx(tx, workspaceIds, userId)
 
         return {
           skipped: false as const,
           workspaceIdsToRevoke: deletedPerms.map((row) => row.entityId),
-          usageCaptured: capturedUsage,
+          usageCaptured: 0,
           credentialMembershipsRevoked,
           pendingInvitationsCancelled: cancelledInvitations.length,
         }
@@ -1733,13 +1389,9 @@ export async function removeUserFromOrganization(
     billingActions.workspaceAccessRevoked = result.workspaceIdsToRevoke.length
     billingActions.pendingInvitationsCancelled = result.pendingInvitationsCancelled
 
-    if (result.usageCaptured > 0) {
-      logger.info('Captured departed member usage', {
-        organizationId,
-        userId,
-        usage: result.usageCaptured,
-      })
-    }
+    // The departed member's cookie-version/hook-clamp fallbacks must stop
+    // resolving to this org immediately, not after the membership-cache TTL.
+    invalidateMembershipCache(userId)
 
     logger.info('Removed member from organization', {
       organizationId,
@@ -1851,6 +1503,8 @@ export async function removeExternalUserFromOrganizationWorkspaces(params: {
           .limit(1)
         if (currentMember) throw new Error('User is an organization member')
 
+        await setOrgMemberUsageLimit(organizationId, userId, null, undefined, tx)
+
         const cancelledInvitations = invitationIds.length
           ? await tx
               .update(invitation)
@@ -1918,6 +1572,7 @@ export async function removeExternalUserFromOrganizationWorkspaces(params: {
           workspaceIds,
           userId
         )
+        await removeWorkspaceSkillMembershipsTx(tx, workspaceIds, userId)
 
         return {
           workspaceAccessRevoked: deletedPermissions.length,
@@ -2269,23 +1924,6 @@ export async function isSoleOwnerOfPaidOrganization(userId: string): Promise<{
   }
 }
 
-export async function isUserMemberOfOrganization(
-  userId: string,
-  organizationId: string
-): Promise<{ isMember: boolean; role?: string; memberId?: string }> {
-  const [memberRecord] = await db
-    .select({ id: member.id, role: member.role })
-    .from(member)
-    .where(and(eq(member.userId, userId), eq(member.organizationId, organizationId)))
-    .limit(1)
-
-  if (memberRecord) {
-    return { isMember: true, role: memberRecord.role, memberId: memberRecord.id }
-  }
-
-  return { isMember: false }
-}
-
 /**
  * Get user's current organization membership (if any).
  */
@@ -2304,4 +1942,239 @@ export async function getUserOrganization(
     .limit(1)
 
   return memberRecord || null
+}
+
+export async function ensureUserInOrganization(
+  params: AddMemberParams
+): Promise<EnsureMemberResult> {
+  const existingMembership = await getUserOrganization(params.userId)
+
+  if (existingMembership?.organizationId === params.organizationId) {
+    return {
+      success: true,
+      memberId: existingMembership.memberId,
+      alreadyMember: true,
+      billingActions: {
+        proUsageSnapshotted: false,
+        proCancelledAtPeriodEnd: false,
+      },
+    }
+  }
+
+  if (existingMembership) {
+    return {
+      success: false,
+      alreadyMember: false,
+      existingOrgId: existingMembership.organizationId,
+      failureCode: 'already-in-other-organization',
+      error:
+        'User is already a member of another organization. Users can only belong to one organization at a time.',
+      billingActions: {
+        proUsageSnapshotted: false,
+        proCancelledAtPeriodEnd: false,
+      },
+    }
+  }
+
+  const result = await addUserToOrganization(params)
+
+  if (result.success) {
+    // Invalidates the membership cache and clamps pre-join sessions to the
+    // org policy — same treatment as invite acceptance. Best-effort.
+    await applySessionPolicyToNewMember(params.userId, params.organizationId)
+  }
+
+  return {
+    ...result,
+    alreadyMember: false,
+  }
+}
+
+/**
+ * Add a user to an organization with full billing logic.
+ *
+ * Handles:
+ * - Single organization constraint validation
+ * - Seat availability validation
+ * - Member record creation
+ * - Pro usage snapshot when joining paid team
+ * - Pro subscription cancellation at period end
+ * - Usage limit sync
+ */
+export async function addUserToOrganization(params: AddMemberParams): Promise<AddMemberResult> {
+  const {
+    userId,
+    organizationId,
+    role,
+    skipBillingLogic = false,
+    skipSeatValidation = false,
+    acceptingInvitationId,
+  } = params
+
+  const billingActions: AddMemberResult['billingActions'] = {
+    proUsageSnapshotted: false,
+    proCancelledAtPeriodEnd: false,
+  }
+
+  try {
+    if (!skipSeatValidation) {
+      const validation = await validateMembershipAddition(userId, organizationId, {
+        acceptingInvitationId,
+      })
+      if (!validation.canAdd) {
+        return {
+          success: false,
+          error: validation.reason,
+          failureCode: validation.failureCode,
+          billingActions,
+        }
+      }
+    } else {
+      const existingMemberships = await db
+        .select({ organizationId: member.organizationId })
+        .from(member)
+        .where(eq(member.userId, userId))
+
+      if (existingMemberships.length > 0) {
+        const isAlreadyMemberOfThisOrg = existingMemberships.some(
+          (m) => m.organizationId === organizationId
+        )
+
+        if (isAlreadyMemberOfThisOrg) {
+          return {
+            success: false,
+            error: 'User is already a member of this organization',
+            failureCode: 'already-member',
+            billingActions,
+          }
+        }
+
+        return {
+          success: false,
+          error:
+            'User is already a member of another organization. Users can only belong to one organization at a time.',
+          failureCode: 'already-in-other-organization',
+          billingActions,
+        }
+      }
+    }
+
+    const added = await db.transaction((tx) =>
+      ensureUserInOrganizationTx(tx, {
+        userId,
+        organizationId,
+        role,
+        skipBillingLogic,
+        skipSeatValidation,
+        acceptingInvitationId,
+      })
+    )
+    if (!added.success || !added.memberId || added.alreadyMember) {
+      return {
+        success: false,
+        error: added.alreadyMember ? 'User is already a member of this organization' : added.error,
+        failureCode: added.alreadyMember ? 'already-member' : added.failureCode,
+        billingActions: added.billingActions,
+      }
+    }
+
+    const memberId = added.memberId
+    billingActions.proUsageSnapshotted = added.billingActions.proUsageSnapshotted
+    billingActions.proCancelledAtPeriodEnd = added.billingActions.proCancelledAtPeriodEnd
+
+    logger.info('Added user to organization', {
+      userId,
+      organizationId,
+      role,
+      memberId,
+      billingActions,
+    })
+
+    return { success: true, memberId, billingActions }
+  } catch (error) {
+    logger.error('Failed to add user to organization', { userId, organizationId, error })
+    return { success: false, error: 'Failed to add user to organization', billingActions }
+  }
+}
+
+/**
+ * Validate if a user can be added to an organization.
+ * Checks single-org constraint and seat availability.
+ */
+async function validateMembershipAddition(
+  userId: string,
+  organizationId: string,
+  options: { acceptingInvitationId?: string } = {}
+): Promise<MembershipValidationResult> {
+  const [userData] = await db.select({ id: user.id }).from(user).where(eq(user.id, userId)).limit(1)
+
+  if (!userData) {
+    return { canAdd: false, reason: 'User not found', failureCode: 'user-not-found' }
+  }
+
+  const [orgData] = await db
+    .select({ id: organization.id })
+    .from(organization)
+    .where(eq(organization.id, organizationId))
+    .limit(1)
+
+  if (!orgData) {
+    return {
+      canAdd: false,
+      reason: 'Organization not found',
+      failureCode: 'organization-not-found',
+    }
+  }
+
+  const existingMemberships = await db
+    .select({ organizationId: member.organizationId })
+    .from(member)
+    .where(eq(member.userId, userId))
+
+  if (existingMemberships.length > 0) {
+    const isAlreadyMemberOfThisOrg = existingMemberships.some(
+      (m) => m.organizationId === organizationId
+    )
+
+    if (isAlreadyMemberOfThisOrg) {
+      return {
+        canAdd: false,
+        reason: 'User is already a member of this organization',
+        failureCode: 'already-member',
+      }
+    }
+
+    return {
+      canAdd: false,
+      reason:
+        'User is already a member of another organization. Users can only belong to one organization at a time.',
+      failureCode: 'already-in-other-organization',
+      existingOrgId: existingMemberships[0].organizationId,
+    }
+  }
+
+  const seatValidation = await validateSeatAvailability(organizationId, 1, {
+    excludePendingInvitationId: options.acceptingInvitationId,
+  })
+  if (!seatValidation.canInvite) {
+    return {
+      canAdd: false,
+      reason: seatValidation.reason || 'No seats available',
+      failureCode: 'no-seats-available',
+      seatValidation: {
+        currentSeats: seatValidation.currentSeats,
+        maxSeats: seatValidation.maxSeats,
+        availableSeats: seatValidation.availableSeats,
+      },
+    }
+  }
+
+  return {
+    canAdd: true,
+    seatValidation: {
+      currentSeats: seatValidation.currentSeats,
+      maxSeats: seatValidation.maxSeats,
+      availableSeats: seatValidation.availableSeats,
+    },
+  }
 }

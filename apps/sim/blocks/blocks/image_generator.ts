@@ -57,6 +57,7 @@ export const ImageGeneratorBlock: BlockConfig<DalleResponse> = {
   name: 'Image Generator',
   description: 'Generate images',
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'image_generator_v2' },
   authMode: AuthMode.ApiKey,
   longDescription:
     'Integrate Image Generator into the workflow. Can generate images using DALL-E 3 and GPT Image models.',
@@ -65,6 +66,15 @@ export const ImageGeneratorBlock: BlockConfig<DalleResponse> = {
   integrationType: IntegrationType.AI,
   bgColor: '#4D5FFF',
   icon: ImageIcon,
+  canvasPresentation: {
+    defaultTitle: 'Image Generator',
+    sentences: {
+      default: [
+        { text: 'Generate an image from', field: 'prompt', core: true },
+        { text: 'with', field: 'model' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'model',
@@ -321,6 +331,15 @@ export const ImageGeneratorV2Block: BlockConfig<ImageGenerationResponse> = {
   integrationType: IntegrationType.AI,
   bgColor: '#4D5FFF',
   icon: ImageIcon,
+  canvasPresentation: {
+    defaultTitle: 'Image Generator',
+    sentences: {
+      default: [
+        { text: 'Generate an image from', field: 'prompt', core: true },
+        { text: 'with', field: 'model' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'provider',

@@ -201,6 +201,229 @@ export const RipplingBlock: BlockConfig = {
   bgColor: '#502D3C',
   icon: RipplingIcon,
   authMode: AuthMode.ApiKey,
+  canvasPresentation: {
+    defaultTitle: 'Rippling',
+    sentences: {
+      byOperation: {
+        list_workers: [
+          'List workers',
+          { text: ', matching', field: 'filter' },
+          { text: ', sorted by', field: 'orderBy' },
+        ],
+        get_worker: [{ text: 'Fetch worker', field: 'id', core: true }],
+        list_users: ['List users', { text: ', sorted by', field: 'orderBy' }],
+        get_user: [{ text: 'Fetch user', field: 'id', core: true }],
+        list_companies: ['List companies', { text: ', sorted by', field: 'orderBy' }],
+        get_current_user: ['Read SSO details for the current user'],
+        list_entitlements: ['List entitlements'],
+        list_departments: ['List departments', { text: ', sorted by', field: 'orderBy' }],
+        get_department: [{ text: 'Fetch department', field: 'id', core: true }],
+        create_department: [
+          { text: 'Create department', field: 'name', core: true },
+          { text: ', under parent', field: 'parentId' },
+        ],
+        update_department: [
+          { text: 'Update department', field: 'id', core: true },
+          { text: ', renaming to', field: 'name' },
+          { text: ', under parent', field: 'parentId' },
+        ],
+        list_teams: ['List teams', { text: ', sorted by', field: 'orderBy' }],
+        get_team: [{ text: 'Fetch team', field: 'id', core: true }],
+        list_employment_types: ['List employment types', { text: ', sorted by', field: 'orderBy' }],
+        get_employment_type: [{ text: 'Fetch employment type', field: 'id', core: true }],
+        list_titles: ['List job titles', { text: ', sorted by', field: 'orderBy' }],
+        get_title: [{ text: 'Fetch job title', field: 'id', core: true }],
+        create_title: [{ text: 'Create job title', field: 'name', core: true }],
+        update_title: [
+          { text: 'Update job title', field: 'id', core: true },
+          { text: ', renaming to', field: 'name' },
+        ],
+        delete_title: [{ text: 'Delete job title', field: 'id', core: true }],
+        list_custom_fields: ['List custom fields', { text: ', sorted by', field: 'orderBy' }],
+        list_job_functions: ['List job functions', { text: ', sorted by', field: 'orderBy' }],
+        get_job_function: [{ text: 'Fetch job function', field: 'id', core: true }],
+        list_work_locations: ['List work locations', { text: ', sorted by', field: 'orderBy' }],
+        get_work_location: [{ text: 'Fetch work location', field: 'id', core: true }],
+        create_work_location: [
+          { text: 'Create work location', field: 'name', core: true },
+          { text: 'at', field: 'streetAddress' },
+          { text: 'in', field: 'locality' },
+        ],
+        update_work_location: [
+          { text: 'Update work location', field: 'id', core: true },
+          { text: ', renaming to', field: 'name' },
+          { text: ', at', field: 'streetAddress' },
+        ],
+        delete_work_location: [{ text: 'Delete work location', field: 'id', core: true }],
+        list_business_partners: [
+          'List business partners',
+          { text: ', matching', field: 'filter' },
+          { text: ', sorted by', field: 'orderBy' },
+        ],
+        get_business_partner: [{ text: 'Fetch business partner', field: 'id', core: true }],
+        create_business_partner: [
+          { text: 'Make worker', field: 'workerId', core: true },
+          { text: 'a business partner in group', field: 'businessPartnerGroupId' },
+        ],
+        delete_business_partner: [{ text: 'Delete business partner', field: 'id', core: true }],
+        list_business_partner_groups: [
+          'List business partner groups',
+          { text: ', sorted by', field: 'orderBy' },
+        ],
+        get_business_partner_group: [
+          { text: 'Fetch business partner group', field: 'id', core: true },
+        ],
+        create_business_partner_group: [
+          { text: 'Create business partner group', field: 'name', core: true },
+          { text: ', for domain', field: 'domain' },
+        ],
+        delete_business_partner_group: [
+          { text: 'Delete business partner group', field: 'id', core: true },
+        ],
+        list_supergroups: [
+          'List supergroups',
+          { text: ', matching', field: 'filter' },
+          { text: ', sorted by', field: 'orderBy' },
+        ],
+        get_supergroup: [{ text: 'Fetch supergroup', field: 'id', core: true }],
+        list_supergroup_members: [{ text: 'List members of supergroup', field: 'id', core: true }],
+        list_supergroup_inclusion_members: [
+          { text: 'List inclusion members of supergroup', field: 'id', core: true },
+        ],
+        list_supergroup_exclusion_members: [
+          { text: 'List exclusion members of supergroup', field: 'id', core: true },
+        ],
+        update_supergroup_inclusion_members: [
+          { text: 'Update inclusion members of supergroup', field: 'id', core: true },
+          { text: ', with', field: 'data' },
+        ],
+        update_supergroup_exclusion_members: [
+          { text: 'Update exclusion members of supergroup', field: 'id', core: true },
+          { text: ', with', field: 'data' },
+        ],
+        list_custom_objects: ['List custom objects'],
+        get_custom_object: [{ text: 'Fetch custom object', field: 'id', core: true }],
+        create_custom_object: [
+          { text: 'Create custom object', field: 'name', core: true },
+          { text: ', in category', field: 'category' },
+        ],
+        update_custom_object: [
+          { text: 'Update custom object', field: 'id', core: true },
+          { text: ', renaming to', field: 'name' },
+          { text: ', in category', field: 'category' },
+        ],
+        delete_custom_object: [{ text: 'Delete custom object', field: 'id', core: true }],
+        list_custom_object_fields: [
+          { text: 'List fields of custom object', field: 'customObjectId', core: true },
+        ],
+        get_custom_object_field: [
+          { text: 'Fetch field', field: 'id', core: true },
+          { text: 'of custom object', field: 'customObjectId' },
+        ],
+        create_custom_object_field: [
+          { text: 'Create field', field: 'name', core: true },
+          { text: 'on custom object', field: 'customObjectId' },
+        ],
+        update_custom_object_field: [
+          { text: 'Update field', field: 'id', core: true },
+          { text: 'on custom object', field: 'customObjectId' },
+          { text: ', renaming to', field: 'name' },
+        ],
+        delete_custom_object_field: [
+          { text: 'Delete field', field: 'id', core: true },
+          { text: 'from custom object', field: 'customObjectId' },
+        ],
+        list_custom_object_records: [
+          { text: 'List records of custom object', field: 'customObjectId', core: true },
+        ],
+        get_custom_object_record: [
+          { text: 'Fetch record', field: 'id', core: true },
+          { text: 'from custom object', field: 'customObjectId' },
+        ],
+        get_custom_object_record_by_external_id: [
+          { text: 'Fetch the record with external ID', field: 'externalId', core: true },
+          { text: 'from custom object', field: 'customObjectId' },
+        ],
+        query_custom_object_records: [
+          { text: 'Query records of custom object', field: 'customObjectId', core: true },
+          { text: ', where', field: 'query' },
+          { text: ', up to', field: 'limit', after: 'records' },
+        ],
+        create_custom_object_record: [
+          { text: 'Create a record in custom object', field: 'customObjectId', core: true },
+          { text: ', with', field: 'data' },
+        ],
+        update_custom_object_record: [
+          { text: 'Update record', field: 'id', core: true },
+          { text: 'in custom object', field: 'customObjectId' },
+          { text: ', setting', field: 'data' },
+        ],
+        delete_custom_object_record: [
+          { text: 'Delete record', field: 'id', core: true },
+          { text: 'from custom object', field: 'customObjectId' },
+        ],
+        bulk_create_custom_object_records: [
+          { text: 'Bulk create', field: 'records', core: true },
+          { text: 'in custom object', field: 'customObjectId', core: true },
+        ],
+        bulk_update_custom_object_records: [
+          { text: 'Bulk update', field: 'records', core: true },
+          { text: 'in custom object', field: 'customObjectId', core: true },
+        ],
+        bulk_delete_custom_object_records: [
+          { text: 'Bulk delete', field: 'records', core: true },
+          { text: 'from custom object', field: 'customObjectId', core: true },
+        ],
+        list_custom_apps: ['List custom apps'],
+        get_custom_app: [{ text: 'Fetch custom app', field: 'id', core: true }],
+        create_custom_app: [
+          { text: 'Create custom app', field: 'name', core: true },
+          { text: ', with API name', field: 'apiName' },
+        ],
+        update_custom_app: [
+          { text: 'Update custom app', field: 'id', core: true },
+          { text: ', renaming to', field: 'name' },
+        ],
+        delete_custom_app: [{ text: 'Delete custom app', field: 'id', core: true }],
+        list_custom_pages: ['List custom pages'],
+        get_custom_page: [{ text: 'Fetch custom page', field: 'id', core: true }],
+        create_custom_page: [{ text: 'Create custom page', field: 'name', core: true }],
+        update_custom_page: [
+          { text: 'Update custom page', field: 'id', core: true },
+          { text: ', renaming to', field: 'name' },
+        ],
+        delete_custom_page: [{ text: 'Delete custom page', field: 'id', core: true }],
+        list_custom_settings: ['List custom settings', { text: ', sorted by', field: 'orderBy' }],
+        get_custom_setting: [{ text: 'Fetch custom setting', field: 'id', core: true }],
+        create_custom_setting: [
+          { text: 'Create custom setting', field: 'displayName', core: true },
+          { text: ', of type', field: 'settingDataType' },
+        ],
+        update_custom_setting: [
+          { text: 'Update custom setting', field: 'id', core: true },
+          { text: ', renaming to', field: 'displayName' },
+        ],
+        delete_custom_setting: [{ text: 'Delete custom setting', field: 'id', core: true }],
+        list_object_categories: ['List object categories'],
+        get_object_category: [{ text: 'Fetch object category', field: 'id', core: true }],
+        create_object_category: [
+          { text: 'Create object category', field: 'name', core: true },
+          { text: ', described as', field: 'description' },
+        ],
+        update_object_category: [
+          { text: 'Update object category', field: 'id', core: true },
+          { text: ', renaming to', field: 'name' },
+        ],
+        delete_object_category: [{ text: 'Delete object category', field: 'id', core: true }],
+        get_report_run: [{ text: 'Fetch report run', field: 'id', core: true }],
+        trigger_report_run: [
+          { text: 'Run report', field: 'id', core: true },
+          { text: ', output as', field: 'outputType' },
+        ],
+        create_draft_hires: [{ text: 'Create draft hires from', field: 'data', core: true }],
+      },
+    },
+  },
 
   subBlocks: [
     {
@@ -765,6 +988,7 @@ Return ONLY the JSON - no explanations, no extra text.`,
     {
       id: 'data',
       title: 'Data',
+      canvasNoun: 'a payload',
       type: 'long-input',
       placeholder: '{ "key": "value" }',
       condition: { field: 'operation', value: [...DATA_PASSTHROUGH_OPS] },
@@ -1499,7 +1723,7 @@ export const RipplingBlockMeta = {
     },
     {
       icon: RipplingIcon,
-      title: 'Org chart export and review',
+      title: 'Rippling org chart export',
       prompt:
         'Build a scheduled weekly workflow that pulls Rippling workers, departments, teams, and titles, writes an updated org chart file, diffs against last week to find structural changes, and Slacks people operations any unexpected moves for review.',
       modules: ['scheduled', 'agent', 'files', 'workflows'],
@@ -1509,7 +1733,7 @@ export const RipplingBlockMeta = {
     },
     {
       icon: RipplingIcon,
-      title: 'Custom object data sync',
+      title: 'Rippling custom object sync',
       prompt:
         'Create a workflow that reads rows from a Sim table representing custom Rippling objects — perks, equipment, allowances — and upserts them into Rippling so HR can manage company-specific data with the same governance as core worker records.',
       modules: ['tables', 'agent', 'workflows'],
@@ -1518,7 +1742,7 @@ export const RipplingBlockMeta = {
     },
     {
       icon: RipplingIcon,
-      title: 'Team and title auditor',
+      title: 'Rippling team and title audit',
       prompt:
         'Build a scheduled monthly workflow that lists Rippling teams, titles, and job functions, flags duplicates, unused values, and inconsistent naming, writes a cleanup report file, and opens a Linear task for the people operations owner of each issue.',
       modules: ['scheduled', 'agent', 'files', 'workflows'],
@@ -1528,7 +1752,7 @@ export const RipplingBlockMeta = {
     },
     {
       icon: RipplingIcon,
-      title: 'Manager change notifier',
+      title: 'Rippling manager change alerts',
       prompt:
         'Create a scheduled workflow that polls Rippling workers for manager reassignments, notifies the worker and the new manager via email, schedules a thirty-minute intro on Google Calendar, and logs the transition in a tracking table for HR visibility.',
       modules: ['scheduled', 'tables', 'agent', 'workflows'],
@@ -1538,7 +1762,7 @@ export const RipplingBlockMeta = {
     },
     {
       icon: RipplingIcon,
-      title: 'Department headcount digest',
+      title: 'Rippling headcount digest',
       prompt:
         'Build a scheduled weekly workflow that pulls Rippling workers grouped by department and employment type, computes headcount, open requisitions, and growth versus the prior week, writes a narrative summary, and emails it to department heads.',
       modules: ['scheduled', 'agent', 'workflows'],

@@ -1,19 +1,25 @@
 'use client'
 
 import { memo, useCallback, useMemo, useRef, useState } from 'react'
-import { chipVariants, cn } from '@sim/emcn'
-import { Lock } from '@sim/emcn/icons'
+import {
+  chipContentIconClass,
+  chipVariants,
+  cn,
+  disclosureChevronClass,
+  OverflowText,
+  toast,
+} from '@sim/emcn'
+import { ChevronRight, Folder, FolderOpen, Lock, MoreHorizontal } from '@sim/emcn/icons'
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
-import clsx from 'clsx'
-import { ChevronRight, Folder, FolderOpen, MoreHorizontal } from 'lucide-react'
 import { useRouter } from 'next/navigation'
 import { SIM_RESOURCES_DRAG_TYPE } from '@/lib/copilot/resource-types'
+import { generateSubfolderName } from '@/lib/workspaces/naming'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import { ContextMenu } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workflow-list/components/context-menu/context-menu'
 import { DeleteModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workflow-list/components/delete-modal/delete-modal'
 import {
-  useContextMenu,
   useFolderExpand,
   useItemDrag,
   useItemRename,
@@ -41,6 +47,7 @@ import {
 } from '@/hooks/queries/utils/folder-tree'
 import { getWorkflows } from '@/hooks/queries/utils/workflow-cache'
 import { useCreateWorkflow } from '@/hooks/queries/workflows'
+import { useContextMenu } from '@/hooks/use-context-menu'
 import { useFolderStore } from '@/stores/folders/store'
 import type { FolderTreeNode } from '@/stores/folders/types'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
@@ -65,6 +72,7 @@ export const FolderItem = memo(function FolderItem({ workspaceId, folder }: Fold
   const router = useRouter()
   const updateFolderMutation = useUpdateFolder()
   const createWorkflowMutation = useCreateWorkflow()
+  const createWorkflowMutate = createWorkflowMutation.mutate
   const createFolderMutation = useCreateFolder()
   const userPermissions = useUserPermissionsContext()
   const selectedFolders = useFolderStore((state) => state.selectedFolders)
@@ -149,25 +157,34 @@ export const FolderItem = memo(function FolderItem({ workspaceId, folder }: Fold
     const name = generateCreativeWorkflowName()
     const id = generateId()
 
-    createWorkflowMutation.mutate({
+    createWorkflowMutate({
       workspaceId,
       folderId: folder.id,
       name,
       id,
+      deduplicate: true,
     })
 
     useWorkflowRegistry.getState().markWorkflowCreating(id)
     expandFolder()
     router.push(`/workspace/${workspaceId}/w/${id}`)
     window.dispatchEvent(new CustomEvent(SIDEBAR_SCROLL_EVENT, { detail: { itemId: id } }))
-  }, [createWorkflowMutation, workspaceId, folder.id, effectiveLocked, router, expandFolder])
+  }, [createWorkflowMutate, workspaceId, folder.id, effectiveLocked, router, expandFolder])
 
   const handleCreateFolderInFolder = useCallback(async () => {
     if (effectiveLocked) return
     try {
+      /**
+       * The name has to be unique before it is sent: `folder` has a partial unique index on
+       * active (workspaceId, resourceType, parentId, name), so a hardcoded 'New folder'
+       * 409s on the second invocation — and the user never chose this name, so there is
+       * nothing for them to correct. Mirrors the root-level create in
+       * `use-folder-operations`, which already names through this helper.
+       */
+      const name = await generateSubfolderName(workspaceId, folder.id)
       const result = await createFolderMutation.mutateAsync({
         workspaceId,
-        name: 'New folder',
+        name,
         parentId: folder.id,
         id: generateId(),
       })
@@ -179,6 +196,7 @@ export const FolderItem = memo(function FolderItem({ workspaceId, folder }: Fold
       }
     } catch (error) {
       logger.error('Failed to create folder:', error)
+      toast.error(getErrorMessage(error, 'Failed to create folder'))
     }
   }, [createFolderMutation, workspaceId, folder.id, effectiveLocked, expandFolder])
 
@@ -464,6 +482,10 @@ export const FolderItem = memo(function FolderItem({ workspaceId, folder }: Fold
   const isMixedSelection = useMemo(() => {
     return capturedSelectionRef.current?.isMixed ?? false
   }, [isContextMenuOpen])
+  const contextMenuSelectedCount = capturedSelectionRef.current
+    ? capturedSelectionRef.current.workflowIds.length +
+      capturedSelectionRef.current.folderIds.length
+    : 1
 
   const hasExportableContent = useMemo(() => {
     if (!capturedSelectionRef.current) return hasWorkflows
@@ -491,22 +513,13 @@ export const FolderItem = memo(function FolderItem({ workspaceId, folder }: Fold
         onDragEnd={handleDragEnd}
       >
         <ChevronRight
-          className={clsx(
-            'size-[16px] flex-shrink-0 text-[var(--text-icon)] transition-transform duration-100',
-            isExpanded && 'rotate-90'
-          )}
+          className={cn(disclosureChevronClass, isExpanded && 'rotate-90')}
           aria-hidden='true'
         />
         {isExpanded ? (
-          <FolderOpen
-            className='size-[16px] flex-shrink-0 text-[var(--text-icon)]'
-            aria-hidden='true'
-          />
+          <FolderOpen className={chipContentIconClass} aria-hidden='true' />
         ) : (
-          <Folder
-            className='size-[16px] flex-shrink-0 text-[var(--text-icon)]'
-            aria-hidden='true'
-          />
+          <Folder className={chipContentIconClass} aria-hidden='true' />
         )}
         {isEditing ? (
           <input
@@ -529,20 +542,18 @@ export const FolderItem = memo(function FolderItem({ workspaceId, folder }: Fold
           />
         ) : (
           <div className='flex min-w-0 flex-1 items-center gap-2'>
-            <div className='flex min-w-0 flex-1 items-center gap-1'>
-              <span
-                className='min-w-0 truncate text-[var(--text-body)]'
-                onDoubleClick={handleDoubleClick}
-              >
-                {folder.name}
-              </span>
+            <div
+              className='flex min-w-0 flex-1 items-center gap-1'
+              onDoubleClick={handleDoubleClick}
+            >
+              <OverflowText label={folder.name} className='flex-1 text-[var(--text-body)]' />
             </div>
             <div className='relative size-[18px] flex-shrink-0'>
               {folder.locked && (
                 <span
                   role='img'
                   aria-label='Folder is locked'
-                  className={clsx(
+                  className={cn(
                     'pointer-events-none absolute inset-0 flex items-center justify-center transition-opacity',
                     !isAnyDragActive && 'group-hover:opacity-0',
                     isContextMenuOpen && 'opacity-0'
@@ -556,7 +567,7 @@ export const FolderItem = memo(function FolderItem({ workspaceId, folder }: Fold
                 aria-label='Folder options'
                 onPointerDown={handleMorePointerDown}
                 onClick={handleMoreClick}
-                className={clsx(
+                className={cn(
                   'pointer-events-none absolute inset-0 flex items-center justify-center rounded-sm opacity-0 transition-opacity',
                   !isAnyDragActive && 'group-hover:pointer-events-auto group-hover:opacity-100',
                   isContextMenuOpen && 'pointer-events-auto opacity-100'
@@ -581,8 +592,8 @@ export const FolderItem = memo(function FolderItem({ workspaceId, folder }: Fold
         onDuplicate={handleDuplicate}
         onExport={handleExport}
         onDelete={handleOpenDeleteModal}
-        showCreate={!isMixedSelection}
-        showCreateFolder={!isMixedSelection}
+        showCreate={!isMixedSelection && selectedFolders.size <= 1}
+        showCreateFolder={!isMixedSelection && selectedFolders.size <= 1}
         showRename={!isMixedSelection && selectedFolders.size <= 1}
         showDuplicate={true}
         showExport={true}
@@ -603,6 +614,7 @@ export const FolderItem = memo(function FolderItem({ workspaceId, folder }: Fold
         showLock={!isMixedSelection && selectedFolders.size <= 1}
         disableLock={!userPermissions.canAdmin || inheritedFolderLocked}
         isLocked={effectiveLocked}
+        selectedCount={contextMenuSelectedCount}
       />
 
       <DeleteModal

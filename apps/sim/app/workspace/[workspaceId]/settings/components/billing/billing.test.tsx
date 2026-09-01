@@ -10,6 +10,7 @@ const {
   mockPersonalQuery,
   mockUpdateOrganizationLimit,
   mockUpdateUserLimit,
+  mockUseInvoices,
   mockUseOrganizationBilling,
   mockUseSubscriptionData,
   mockUseUsageLimitData,
@@ -18,6 +19,7 @@ const {
   mockPersonalQuery: { current: null as unknown },
   mockUpdateOrganizationLimit: vi.fn(),
   mockUpdateUserLimit: vi.fn(),
+  mockUseInvoices: vi.fn(),
   mockUseOrganizationBilling: vi.fn(),
   mockUseSubscriptionData: vi.fn(),
   mockUseUsageLimitData: vi.fn(),
@@ -43,6 +45,12 @@ vi.mock('@sim/emcn', () => ({
     <a href={href}>{children}</a>
   ),
   Credit: () => <span />,
+  Label: ({ children, htmlFor }: { children: ReactNode; htmlFor?: string }) => (
+    <label htmlFor={htmlFor}>{children}</label>
+  ),
+  OverflowText: ({ label, children }: { label: string; children?: ReactNode }) => (
+    <span>{children ?? label}</span>
+  ),
   Switch: ({
     checked,
     disabled,
@@ -103,7 +111,10 @@ vi.mock('@/hooks/queries/organization', () => ({
 }))
 
 vi.mock('@/hooks/queries/subscription', () => ({
-  useInvoices: () => ({ data: { invoices: [], hasMore: false } }),
+  useInvoices: (...args: unknown[]) => {
+    mockUseInvoices(...args)
+    return { data: { invoices: [], hasMore: false } }
+  },
   useOpenBillingPortal: () => ({ isPending: false, mutate: vi.fn() }),
   useSubscriptionData: (...args: unknown[]) => {
     mockUseSubscriptionData(...args)
@@ -158,7 +169,20 @@ vi.mock(
 )
 
 vi.mock('@/app/workspace/[workspaceId]/settings/components/settings-panel', () => ({
-  SettingsPanel: ({ children }: { children: ReactNode }) => <main>{children}</main>,
+  SettingsPanel: ({ children, description }: { children: ReactNode; description?: string }) => (
+    <main>
+      {description && <p>{description}</p>}
+      {children}
+    </main>
+  ),
+}))
+
+vi.mock('@/app/workspace/[workspaceId]/settings/components/settings-empty-state', () => ({
+  SettingsEmptyState: ({ children, tone }: { children: ReactNode; tone?: 'muted' | 'error' }) => (
+    <div data-testid='settings-empty-state' data-tone={tone ?? 'muted'}>
+      {children}
+    </div>
+  ),
 }))
 
 vi.mock(
@@ -262,11 +286,16 @@ describe('Billing payer scope', () => {
     expect(mockUseSubscriptionData).toHaveBeenCalledWith(
       expect.objectContaining({ enabled: false })
     )
+    expect(mockUseInvoices).toHaveBeenCalledWith({
+      context: 'organization',
+      organizationId: 'org-target',
+    })
     expect(mockUseUsageLimitData).not.toHaveBeenCalled()
     expect(
       container.querySelector('a[href="/workspace/organization-workspace/upgrade"]')?.textContent
     ).toBe('Explore organization plans')
     expect(container.textContent).toContain('Organization Max for Teams plan')
+    expect(container.querySelector('main > p')).toBeNull()
     expect(container.textContent).toContain('billed annually')
     expect(container.textContent).toContain('Access until')
     expect(container.textContent).toContain('Subscription canceled')
@@ -299,6 +328,58 @@ describe('Billing payer scope', () => {
     expect(container.textContent).toContain('Personal Pro plan')
   })
 
+  it('does not override the route-owned header while billing transitions from loading to success', async () => {
+    mockPersonalQuery.current = {
+      data: undefined,
+      error: null,
+      isLoading: true,
+      refetch: vi.fn(),
+    }
+
+    await act(async () => {
+      root.render(<Billing scope='account' />)
+    })
+
+    expect(container.innerHTML).toBe('')
+
+    mockPersonalQuery.current = {
+      data: { success: true, context: 'user', data: PERSONAL_DATA },
+      error: null,
+      isLoading: false,
+      refetch: vi.fn(),
+    }
+
+    await act(async () => {
+      root.render(<Billing scope='account' />)
+    })
+
+    expect(container.textContent).toContain('Personal Pro plan')
+    expect(container.querySelector('main > p')).toBeNull()
+  })
+
+  it('does not add a dynamic header description for a free personal workspace', async () => {
+    mockPersonalQuery.current = {
+      data: {
+        success: true,
+        context: 'user',
+        data: { ...PERSONAL_DATA, plan: 'free', status: 'active' },
+      },
+      isLoading: false,
+      refetch: vi.fn(),
+    }
+
+    await act(async () => {
+      root.render(<Billing scope='account' />)
+    })
+
+    expect(container.textContent).toContain('Personal Free plan')
+    expect(container.querySelector('main > p')).toBeNull()
+    expect(mockUseInvoices).toHaveBeenCalledWith({
+      context: 'user',
+      organizationId: undefined,
+    })
+  })
+
   it('renders an explicit free organization state without subscription controls', async () => {
     mockOrganizationQuery.current = {
       data: organizationResponse({
@@ -322,6 +403,7 @@ describe('Billing payer scope', () => {
     expect(container.textContent).toContain('Organization Free plan')
     expect(container.textContent).toContain('No active organization subscription')
     expect(container.textContent).not.toContain('Payment method')
+    expect(container.querySelector('main > p')).toBeNull()
   })
 
   it('renders lapsed organization plans as ended rather than active', async () => {
@@ -345,8 +427,59 @@ describe('Billing payer scope', () => {
     expect(container.textContent).toContain('Organization Max for Teams plan ended')
     expect(container.textContent).toContain('Choose a new plan for this organization')
     expect(container.textContent).not.toContain('Cancel subscription')
+    expect(container.querySelector('main > p')).toBeNull()
     expect(
       container.querySelector('a[href="/workspace/organization-workspace/upgrade"]')?.textContent
     ).toBe('Explore organization plans')
+  })
+
+  it('renders the canonical error state when the active billing query fails', async () => {
+    mockPersonalQuery.current = {
+      data: undefined,
+      error: new Error('Billing temporarily unavailable'),
+      isLoading: false,
+      refetch: vi.fn(),
+    }
+
+    await act(async () => {
+      root.render(<Billing scope='account' />)
+    })
+
+    const errorState = container.querySelector('[data-testid="settings-empty-state"]')
+    expect(errorState).toHaveAttribute('data-tone', 'error')
+    expect(errorState?.textContent).toBe('Billing temporarily unavailable')
+  })
+
+  it('keeps cached billing content visible when a background refresh fails', async () => {
+    mockPersonalQuery.current = {
+      data: { success: true, context: 'user', data: PERSONAL_DATA },
+      error: new Error('Background refresh failed'),
+      isLoading: false,
+      refetch: vi.fn(),
+    }
+
+    await act(async () => {
+      root.render(<Billing scope='account' />)
+    })
+
+    expect(container.textContent).toContain('Personal Pro plan')
+    expect(container.querySelector('[data-testid="settings-empty-state"]')).toBeNull()
+  })
+
+  it('renders the canonical fallback error when billing completes without data', async () => {
+    mockOrganizationQuery.current = {
+      data: undefined,
+      error: null,
+      isLoading: false,
+      refetch: vi.fn(),
+    }
+
+    await act(async () => {
+      root.render(<Billing scope='organization' organizationId='org-target' />)
+    })
+
+    const errorState = container.querySelector('[data-testid="settings-empty-state"]')
+    expect(errorState).toHaveAttribute('data-tone', 'error')
+    expect(errorState?.textContent).toBe('Failed to load billing information')
   })
 })

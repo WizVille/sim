@@ -1,9 +1,9 @@
 import { db } from '@sim/db'
 import {
+  folder as folderTable,
   workflow,
   workflowBlocks,
   workflowEdges,
-  workflowFolder,
   workflowSubflows,
 } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
@@ -12,7 +12,12 @@ import {
   FolderLockedError,
 } from '@sim/platform-authz/workflow'
 import { generateId } from '@sim/utils/id'
-import { and, eq, isNull, min } from 'drizzle-orm'
+import { isRecordLike } from '@sim/utils/object'
+import {
+  normalizeWorkflowEdgeSourceHandle,
+  normalizeWorkflowEdgeTargetHandle,
+} from '@sim/workflow-types/workflow'
+import { and, eq } from 'drizzle-orm'
 import type { DbOrTx } from '@/lib/db/types'
 import { remapConditionEdgeHandle } from '@/lib/workflows/condition-ids'
 import {
@@ -22,6 +27,7 @@ import {
   type SubBlockRecord,
   sanitizeSubBlocksForDuplicate,
 } from '@/lib/workflows/persistence/remap-internal-ids'
+import { nextWorkflowSortOrder } from '@/lib/workflows/sort-order'
 import { deduplicateWorkflowName } from '@/lib/workflows/utils'
 import type { Variable } from '@/stores/variables/types'
 import type { LoopConfig, ParallelConfig } from '@/stores/workflows/workflow/types'
@@ -59,6 +65,9 @@ interface DuplicateWorkflowResult {
   blocksCount: number
   edgesCount: number
   subflowsCount: number
+  /** Stamped by this function, so a caller can present the copy without re-reading it. */
+  createdAt: Date
+  updatedAt: Date
 }
 
 async function assertTargetFolderMutable(
@@ -73,14 +82,14 @@ async function assertTargetFolderMutable(
     visited.add(currentFolderId)
     const [folder] = await tx
       .select({
-        id: workflowFolder.id,
-        parentId: workflowFolder.parentId,
-        workspaceId: workflowFolder.workspaceId,
-        locked: workflowFolder.locked,
-        archivedAt: workflowFolder.archivedAt,
+        id: folderTable.id,
+        parentId: folderTable.parentId,
+        workspaceId: folderTable.workspaceId,
+        locked: folderTable.locked,
+        archivedAt: folderTable.deletedAt,
       })
-      .from(workflowFolder)
-      .where(eq(workflowFolder.id, currentFolderId))
+      .from(folderTable)
+      .where(and(eq(folderTable.id, currentFolderId), eq(folderTable.resourceType, 'workflow')))
       .limit(1)
 
     if (!folder || folder.workspaceId !== targetWorkspaceId || folder.archivedAt) {
@@ -178,31 +187,7 @@ export async function duplicateWorkflow(
     const targetFolderId = folderId !== undefined ? folderId : source.folderId
     await assertTargetFolderMutable(tx, targetFolderId, targetWorkspaceId)
 
-    const workflowParentCondition = targetFolderId
-      ? eq(workflow.folderId, targetFolderId)
-      : isNull(workflow.folderId)
-    const folderParentCondition = targetFolderId
-      ? eq(workflowFolder.parentId, targetFolderId)
-      : isNull(workflowFolder.parentId)
-
-    const [[workflowMinResult], [folderMinResult]] = await Promise.all([
-      tx
-        .select({ minOrder: min(workflow.sortOrder) })
-        .from(workflow)
-        .where(and(eq(workflow.workspaceId, targetWorkspaceId), workflowParentCondition)),
-      tx
-        .select({ minOrder: min(workflowFolder.sortOrder) })
-        .from(workflowFolder)
-        .where(and(eq(workflowFolder.workspaceId, targetWorkspaceId), folderParentCondition)),
-    ])
-    const minSortOrder = [workflowMinResult?.minOrder, folderMinResult?.minOrder].reduce<
-      number | null
-    >((currentMin, candidate) => {
-      if (candidate == null) return currentMin
-      if (currentMin == null) return candidate
-      return Math.min(currentMin, candidate)
-    }, null)
-    const sortOrder = minSortOrder != null ? minSortOrder - 1 : 0
+    const sortOrder = await nextWorkflowSortOrder(targetWorkspaceId, targetFolderId, tx)
 
     // Mapping from old variable IDs to new variable IDs (populated during variable duplication)
     const varIdMapping = new Map<string, string>()
@@ -266,10 +251,7 @@ export async function duplicateWorkflow(
         const newBlockId = blockIdMapping.get(block.id)!
 
         // Update parent ID to point to the new parent block ID if it exists
-        const blockData =
-          block.data && typeof block.data === 'object' && !Array.isArray(block.data)
-            ? (block.data as any)
-            : {}
+        const blockData = isRecordLike(block.data) ? (block.data as any) : {}
         let newParentId = blockData.parentId
         if (blockData.parentId && blockIdMapping.has(blockData.parentId)) {
           newParentId = blockIdMapping.get(blockData.parentId)!
@@ -278,7 +260,7 @@ export async function duplicateWorkflow(
         // Update data.parentId and extent if they exist in the data object
         let updatedData = block.data
         let newExtent = blockData.extent
-        if (block.data && typeof block.data === 'object' && !Array.isArray(block.data)) {
+        if (isRecordLike(block.data)) {
           const dataObj = block.data as any
           if (dataObj.parentId && typeof dataObj.parentId === 'string') {
             updatedData = { ...dataObj }
@@ -293,29 +275,16 @@ export async function duplicateWorkflow(
 
         // Update variable references in subBlocks (e.g. variables-input assignments)
         let updatedSubBlocks = block.subBlocks
-        if (
-          updatedSubBlocks &&
-          typeof updatedSubBlocks === 'object' &&
-          !Array.isArray(updatedSubBlocks)
-        ) {
+        if (isRecordLike(updatedSubBlocks)) {
           updatedSubBlocks = sanitizeSubBlocksForDuplicate(updatedSubBlocks as SubBlockRecord)
         }
-        if (
-          varIdMapping.size > 0 &&
-          updatedSubBlocks &&
-          typeof updatedSubBlocks === 'object' &&
-          !Array.isArray(updatedSubBlocks)
-        ) {
+        if (varIdMapping.size > 0 && isRecordLike(updatedSubBlocks)) {
           updatedSubBlocks = remapVariableIdsInSubBlocks(
             updatedSubBlocks as SubBlockRecord,
             varIdMapping
           )
         }
-        if (
-          updatedSubBlocks &&
-          typeof updatedSubBlocks === 'object' &&
-          !Array.isArray(updatedSubBlocks)
-        ) {
+        if (isRecordLike(updatedSubBlocks)) {
           updatedSubBlocks = remapWorkflowReferencesInSubBlocks(
             updatedSubBlocks as SubBlockRecord,
             workflowIdMap
@@ -326,6 +295,7 @@ export async function duplicateWorkflow(
         if (updatedSubBlocks && typeof updatedSubBlocks === 'object') {
           updatedSubBlocks = remapConditionIdsInSubBlocks(
             updatedSubBlocks as Record<string, any>,
+            block.type,
             block.id,
             newBlockId
           )
@@ -391,7 +361,10 @@ export async function duplicateWorkflow(
             workflowId: newWorkflowId,
             sourceBlockId: newSourceBlockId,
             targetBlockId: newTargetBlockId,
-            sourceHandle: newSourceHandle,
+            /* Rows are copied straight across, bypassing save.ts — canonicalize
+               here so a copy never re-seeds a stale handle into a new workflow. */
+            sourceHandle: normalizeWorkflowEdgeSourceHandle(newSourceHandle),
+            targetHandle: normalizeWorkflowEdgeTargetHandle(edge.targetHandle),
             createdAt: now,
             updatedAt: now,
           },
@@ -510,6 +483,8 @@ export async function duplicateWorkflow(
       blocksCount: sourceBlocks.length,
       edgesCount: sourceEdges.length,
       subflowsCount: sourceSubflows.length,
+      createdAt: now,
+      updatedAt: now,
     }
   }
 

@@ -25,12 +25,14 @@ const ApiKeys = dynamic(() =>
 const BYOK = dynamic(() =>
   import('@/app/workspace/[workspaceId]/settings/components/byok/byok').then((m) => m.BYOK)
 )
-const Copilot = dynamic(() =>
-  import('@/app/workspace/[workspaceId]/settings/components/copilot/copilot').then((m) => m.Copilot)
-)
 const Forks = dynamic(() => import('@/ee/workspace-forking/components/forks').then((m) => m.Forks))
 const Secrets = dynamic(() =>
   import('@/app/workspace/[workspaceId]/settings/components/secrets/secrets').then((m) => m.Secrets)
+)
+const Sandboxes = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/sandboxes/sandboxes').then(
+    (m) => m.Sandboxes
+  )
 )
 const CustomTools = dynamic(() =>
   import('@/app/workspace/[workspaceId]/settings/components/custom-tools/custom-tools').then(
@@ -52,6 +54,11 @@ const RecentlyDeleted = dynamic(() =>
   import(
     '@/app/workspace/[workspaceId]/settings/components/recently-deleted/recently-deleted'
   ).then((m) => m.RecentlyDeleted)
+)
+const SelfHost = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/self-host/self-host').then(
+    (m) => m.SelfHost
+  )
 )
 const Billing = dynamic(() =>
   import('@/app/workspace/[workspaceId]/settings/components/billing/billing').then((m) => m.Billing)
@@ -77,10 +84,18 @@ const AccessControl = dynamic(() =>
 const CustomBlocks = dynamic(() =>
   import('@/ee/custom-blocks/components/custom-blocks').then((m) => m.CustomBlocks)
 )
+const CredentialGroups = dynamic(() =>
+  import('@/ee/credential-groups/components').then((m) => m.CredentialGroupsSettings)
+)
 const AuditLogs = dynamic(() =>
   import('@/ee/audit-logs/components/audit-logs').then((m) => m.AuditLogs)
 )
 const SSO = dynamic(() => import('@/ee/sso/components/sso-settings').then((m) => m.SSO))
+const SessionPolicySettings = dynamic(() =>
+  import('@/ee/session-policy/components/session-policy-settings').then(
+    (m) => m.SessionPolicySettings
+  )
+)
 const DataRetentionSettings = dynamic(() =>
   import('@/ee/data-retention/components/data-retention-settings').then(
     (m) => m.DataRetentionSettings
@@ -89,12 +104,24 @@ const DataRetentionSettings = dynamic(() =>
 const DataDrainsSettings = dynamic(() =>
   import('@/ee/data-drains/components/data-drains-settings').then((m) => m.DataDrainsSettings)
 )
-const WhitelabelingSettings = dynamic(
-  () =>
-    import('@/ee/whitelabeling/components/whitelabeling-settings').then(
-      (m) => m.WhitelabelingSettings
-    ),
-  { ssr: false }
+const UsageMonitoring = dynamic(() =>
+  import('@/ee/organization-usage/components/usage-monitoring').then((m) => m.UsageMonitoring)
+)
+const Desktop = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/desktop/desktop').then((m) => m.Desktop)
+)
+const Browser = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/browser/browser').then((m) => m.Browser)
+)
+const Terminal = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/terminal/terminal').then(
+    (m) => m.Terminal
+  )
+)
+const WhitelabelingSettings = dynamic(() =>
+  import('@/ee/whitelabeling/components/whitelabeling-settings').then(
+    (m) => m.WhitelabelingSettings
+  )
 )
 
 interface SettingsPageProps {
@@ -131,7 +158,13 @@ export function SettingsPage({ section }: SettingsPageProps) {
   return (
     <SettingsSectionProvider section={effectiveSection} meta={meta ?? undefined}>
       {effectiveSection === 'general' && <General />}
+      {effectiveSection === 'desktop' && <Desktop />}
+      {effectiveSection === 'browser' && <Browser />}
+      {effectiveSection === 'terminal' && <Terminal />}
       {effectiveSection === 'secrets' && <Secrets />}
+      {effectiveSection === 'credential-groups' && (
+        <CredentialGroups workspaceId={hostContext.workspace.id} />
+      )}
       {effectiveSection === 'access-control' && organizationId && (
         <AccessControl
           organizationId={organizationId}
@@ -141,6 +174,13 @@ export function SettingsPage({ section }: SettingsPageProps) {
       {effectiveSection === 'custom-blocks' && <CustomBlocks />}
       {effectiveSection === 'audit-logs' && organizationId && (
         <AuditLogs organizationId={organizationId} />
+      )}
+      {effectiveSection === 'usage' && organizationId && (
+        <UsageMonitoring
+          organizationId={organizationId}
+          eventsHref={`/workspace/${hostContext.workspace.id}/settings/usage/events`}
+          auditLogsHref={`/workspace/${hostContext.workspace.id}/settings/audit-logs`}
+        />
       )}
       {effectiveSection === 'apikeys' && <ApiKeys scope='combined' />}
       {isBillingEnabled && effectiveSection === 'billing' && (
@@ -158,6 +198,9 @@ export function SettingsPage({ section }: SettingsPageProps) {
         />
       )}
       {effectiveSection === 'sso' && organizationId && <SSO organizationId={organizationId} />}
+      {effectiveSection === 'sessions' && organizationId && (
+        <SessionPolicySettings key={organizationId} organizationId={organizationId} />
+      )}
       {effectiveSection === 'data-retention' && organizationId && (
         <DataRetentionSettings organizationId={organizationId} />
       )}
@@ -168,13 +211,14 @@ export function SettingsPage({ section }: SettingsPageProps) {
         <WhitelabelingSettings organizationId={organizationId} />
       )}
       {effectiveSection === 'byok' && <BYOK />}
-      {effectiveSection === 'copilot' && <Copilot />}
+      {effectiveSection === 'sandboxes' && <Sandboxes />}
       {effectiveSection === 'mcp' && <MCP />}
       {effectiveSection === 'forks' && <Forks />}
       {effectiveSection === 'custom-tools' && <CustomTools />}
       {effectiveSection === 'workflow-mcp-servers' && <WorkflowMcpServers />}
       {effectiveSection === 'inbox' && <Inbox />}
       {effectiveSection === 'recently-deleted' && <RecentlyDeleted />}
+      {effectiveSection === 'self-host' && <SelfHost />}
       {effectiveSection === 'admin' && <Admin />}
       {effectiveSection === 'mothership' && <Mothership />}
     </SettingsSectionProvider>

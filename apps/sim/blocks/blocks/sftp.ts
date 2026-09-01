@@ -1,12 +1,4 @@
-import {
-  ClipboardList,
-  Download,
-  File,
-  Search,
-  Server,
-  TrashOutline,
-  Upload,
-} from '@sim/emcn/icons'
+import { ClipboardList, Download, File, Search, Server, Trash, Upload } from '@sim/emcn/icons'
 import { SftpIcon } from '@/components/icons'
 import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
@@ -25,6 +17,25 @@ export const SftpBlock: BlockConfig<SftpUploadResult> = {
   bgColor: '#2D3748',
   icon: SftpIcon,
   authMode: AuthMode.ApiKey,
+  canvasPresentation: {
+    defaultTitle: 'SFTP',
+    sentences: {
+      byOperation: {
+        sftp_upload: [
+          { text: 'Upload', field: ['uploadFiles', 'files'], core: true },
+          { text: 'to', field: 'remotePath', core: true },
+        ],
+        sftp_create: [
+          { text: 'Create file', field: 'fileName', core: true },
+          { text: 'in', field: 'remotePath' },
+        ],
+        sftp_download: [{ text: 'Download', field: 'remotePath', core: true }],
+        sftp_list: [{ text: 'List the contents of', field: 'remotePath', core: true }],
+        sftp_delete: [{ text: 'Delete', field: 'remotePath', core: true }],
+        sftp_mkdir: [{ text: 'Create directory', field: 'remotePath', core: true }],
+      },
+    },
+  },
 
   subBlocks: [
     {
@@ -89,6 +100,7 @@ export const SftpBlock: BlockConfig<SftpUploadResult> = {
       id: 'privateKey',
       title: 'Private Key',
       type: 'code',
+      password: true,
       placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----\n...',
       condition: { field: 'authMethod', value: 'privateKey' },
       dependsOn: ['authMethod'],
@@ -114,6 +126,7 @@ export const SftpBlock: BlockConfig<SftpUploadResult> = {
     {
       id: 'uploadFiles',
       title: 'Files to Upload',
+      canvasNoun: 'files',
       type: 'file-upload',
       canonicalParamId: 'files',
       placeholder: 'Select files to upload',
@@ -326,7 +339,7 @@ export const SftpBlockMeta = {
   templates: [
     {
       icon: Download,
-      title: 'Pull new files from a remote drop folder',
+      title: 'Pull new files from an SFTP folder',
       prompt:
         'Build a workflow that runs on a schedule, lists a remote SFTP drop folder, downloads any new files, and passes their contents into the workflow for processing.',
       modules: ['scheduled', 'files', 'workflows'],
@@ -344,7 +357,7 @@ export const SftpBlockMeta = {
     },
     {
       icon: Server,
-      title: 'Mirror a local export to a remote directory',
+      title: 'Mirror a local export to SFTP',
       prompt:
         'Build a workflow that lists a remote SFTP directory, compares it to the files produced by an earlier block, and uploads any missing files to keep the remote directory in sync.',
       modules: ['files', 'scheduled', 'workflows'],
@@ -352,8 +365,8 @@ export const SftpBlockMeta = {
       tags: ['files', 'sync', 'sftp'],
     },
     {
-      icon: TrashOutline,
-      title: 'Archive and delete old files on a schedule',
+      icon: Trash,
+      title: 'Archive and delete old SFTP files',
       prompt:
         'Build a workflow that runs nightly, lists an SFTP directory, downloads files older than a threshold to archive them, and then deletes the originals from the remote server.',
       modules: ['scheduled', 'files', 'workflows'],
@@ -372,7 +385,7 @@ export const SftpBlockMeta = {
     },
     {
       icon: Search,
-      title: 'Inventory a remote directory listing',
+      title: 'Inventory an SFTP directory',
       prompt:
         'Build a workflow that lists a remote SFTP directory with detailed metadata and records the file names, sizes, and timestamps for auditing.',
       modules: ['files', 'workflows', 'tables'],
@@ -381,7 +394,7 @@ export const SftpBlockMeta = {
     },
     {
       icon: File,
-      title: 'Write a manifest file to a remote server',
+      title: 'Write a manifest file to SFTP',
       prompt:
         'Build a workflow that assembles a manifest of processed records and creates a manifest.txt file on a remote SFTP path so downstream systems know the batch is ready.',
       modules: ['files', 'workflows'],
@@ -390,7 +403,7 @@ export const SftpBlockMeta = {
     },
     {
       icon: Download,
-      title: 'Download a remote file and summarize it',
+      title: 'Download an SFTP file and summarize it',
       prompt:
         'Build a workflow that downloads a file from an SFTP server and passes its contents to an agent that summarizes the key points.',
       modules: ['files', 'agent', 'workflows'],

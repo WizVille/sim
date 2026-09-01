@@ -1,5 +1,6 @@
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
+import * as cheerio from 'cheerio'
 import { fetchWithRetry, VALIDATE_RETRY_OPTIONS } from '@/lib/knowledge/documents/utils'
 import { confluenceConnectorMeta } from '@/connectors/confluence/meta'
 import type { ConnectorConfig, ExternalDocument, ExternalDocumentList } from '@/connectors/types'
@@ -8,11 +9,172 @@ import { getConfluenceCloudId, normalizeConfluenceDomainHost } from '@/tools/con
 
 const logger = createLogger('ConfluenceConnector')
 
+/** Label prefixes for Confluence's built-in Info/Note/Warning/Tip macros, by their rendered CSS suffix. */
+const CALLOUT_LABELS: Record<string, string> = {
+  information: '[INFO]',
+  note: '[NOTE]',
+  warning: '[WARNING]',
+  tip: '[TIP]',
+  error: '[ERROR]',
+}
+
+/**
+ * Inline formatting tags whose text flows directly into their surrounding
+ * sentence with no implied word break — e.g. `un<b>believe</b>able` must stay
+ * `unbelievable`, and `Hello<b>!</b>` must stay `Hello!`, not gain an
+ * artificial space. Anything not in this set (p, li, td, div, headings, br,
+ * etc.) is treated as a block boundary that always implies a break, even when
+ * the source HTML has no literal whitespace there.
+ */
+const INLINE_FORMATTING_TAGS = new Set([
+  'b',
+  'strong',
+  'i',
+  'em',
+  'u',
+  's',
+  'strike',
+  'del',
+  'ins',
+  'sup',
+  'sub',
+  'small',
+  'mark',
+  'code',
+  'span',
+  'a',
+  'abbr',
+  'cite',
+  'q',
+  'kbd',
+  'var',
+  'samp',
+  'time',
+])
+
+/**
+ * Cheerio's `.text()` concatenates every descendant text node with no
+ * separator at all, so pulling a macro body's text in one call fuses adjacent
+ * blocks together (e.g. a `<p>...for:</p>` immediately followed by
+ * `<li>GitLab</li>` becomes `for:GitLab`, corrupting the very word boundaries
+ * RAG chunking depends on). Simply joining every text node with a space isn't
+ * right either — that would corrupt genuinely inline-formatted text the same
+ * way. This walks the DOM, accumulating text through inline tags without a
+ * separator (preserving exact source adjacency) and flushing to a new segment
+ * at every other tag boundary (a block always implies a break, regardless of
+ * source whitespace) — matching how `html-parser.ts` already walks HTML for a
+ * related reason elsewhere in this codebase, extended with the inline/block
+ * distinction real Confluence rich text requires.
+ */
+function extractBlockJoinedText($: cheerio.CheerioAPI, $el: cheerio.Cheerio<any>): string {
+  const parts: string[] = []
+  let current = ''
+
+  const flush = () => {
+    const text = current.trim()
+    if (text) parts.push(text)
+    current = ''
+  }
+
+  const visit = ($node: cheerio.Cheerio<any>) => {
+    $node.contents().each((_, child) => {
+      if (child.type === 'text') {
+        current += $(child).text()
+      } else if (child.type === 'tag') {
+        const tag = child.tagName?.toLowerCase()
+        if (tag && INLINE_FORMATTING_TAGS.has(tag)) {
+          visit($(child))
+        } else {
+          flush()
+          visit($(child))
+          flush()
+        }
+      }
+    })
+  }
+
+  visit($el)
+  flush()
+  return parts.join(' ').trim()
+}
+
+/** Matches either flavor of panel/macro this function rewrites. */
+const MACRO_SELECTOR = 'div.confluence-information-macro, div.panel'
+
+/**
+ * Confluence's rendered `view` HTML wraps Info/Note/Warning/Tip macros in
+ * `confluence-information-macro confluence-information-macro-{type}` divs, and
+ * the customizable Panel macro in `.panel` > `.panelHeader` + `.panelContent`
+ * divs. `htmlToPlainText`'s blind tag-stripping discards the divs' classes along
+ * with the tags, so a red "do not use" warning panel becomes indistinguishable
+ * from a plain paragraph once flattened — and its trailing whitespace collapse
+ * would erase any newline-based separation too. Each detected panel is rewritten
+ * into a single bracketed label plus its own text so the callout semantic
+ * survives both the tag strip and the whitespace collapse.
+ *
+ * A panel can itself contain another panel or macro (e.g. a nested Note inside
+ * a Warning panel). Processing matches in document order — outermost first —
+ * would read a not-yet-converted nested macro as plain body text before it
+ * ever got its own label, silently dropping the inner callout's semantic, and
+ * `.find('.panelHeader')` would then risk pulling a nested panel's header up
+ * as if it were the outer panel's own title. Converting only "leaf" macros
+ * (ones with no remaining nested macro/panel inside them) and repeating until
+ * none are left processes innermost-first, so a nested macro is already a
+ * bracketed `<p>` by the time its parent's body/header text is read — at which
+ * point it correctly reads as plain text carrying its own label.
+ */
+export function preserveConfluenceCallouts(html: string): string {
+  if (!html) return html
+
+  const $ = cheerio.load(html)
+
+  let progressed = true
+  while (progressed) {
+    progressed = false
+    const leaves = $(MACRO_SELECTOR).filter((_, el) => $(el).find(MACRO_SELECTOR).length === 0)
+    if (leaves.length === 0) break
+
+    leaves.each((_, el) => {
+      const $el = $(el)
+      if ($el.hasClass('confluence-information-macro')) {
+        const type = ($el.attr('class') ?? '')
+          .match(/confluence-information-macro-(\w+)/)?.[1]
+          ?.toLowerCase()
+        const label = (type && CALLOUT_LABELS[type]) || CALLOUT_LABELS.information
+        const macroBody = $el.find('.confluence-information-macro-body').first()
+        const body = extractBlockJoinedText($, macroBody.length > 0 ? macroBody : $el)
+        $el.replaceWith($('<p></p>').text(`${label} ${body}`))
+      } else {
+        const headerText = extractBlockJoinedText($, $el.find('.panelHeader').first())
+        const panelContent = $el.find('.panelContent').first()
+        const bodyText = extractBlockJoinedText($, panelContent.length > 0 ? panelContent : $el)
+        const label = headerText ? `[CALLOUT: ${headerText}]` : '[CALLOUT]'
+        $el.replaceWith($('<p></p>').text(`${label} ${bodyText}`))
+      }
+      progressed = true
+    })
+  }
+
+  return $.html()
+}
+
 /**
  * Escapes a value for use inside CQL double-quoted strings.
  */
 export function escapeCql(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+/**
+ * Keeps only content that is still current in Confluence. The v2
+ * `/spaces/{id}/pages` endpoint includes `archived` pages by default and CQL has
+ * no status filter, so without this guard archived pages stay in every listing,
+ * keep getting upserted, and never fall out via deletion reconciliation (which
+ * removes only documents absent from the listing). Items with no status field
+ * are kept — only an explicit non-current status excludes a result.
+ */
+export function isCurrentContent(item: Record<string, unknown>): boolean {
+  return item.status == null || item.status === 'current'
 }
 
 /**
@@ -28,67 +190,32 @@ function buildSpaceClause(spaceKeys: string[]): string {
 }
 
 /**
- * Fetches labels for a batch of page IDs using the v2 labels endpoint.
+ * Reads the `labels` field returned by the v2 single-content GET when
+ * `include-labels=true` is set, which removes the need for a second round trip
+ * to `/{type}/{id}/labels`. That embedded list is capped at 50 labels (the
+ * dedicated endpoint defaulted to 25), so this widens rather than narrows what
+ * a page can report; labels beyond the cap are paginated behind
+ * `labels._links` and are deliberately not followed.
  */
-const LABEL_FETCH_CONCURRENCY = 5
+export function readIncludedLabels(page: Record<string, unknown>): string[] {
+  const wrapper = page.labels as Record<string, unknown> | undefined
+  const results = (wrapper?.results as Record<string, unknown>[] | undefined) ?? []
+  return results.map((label) => String(label.name ?? '')).filter(Boolean)
+}
 
-async function fetchLabelsForPages(
-  cloudId: string,
-  accessToken: string,
-  pageIds: string[]
-): Promise<Map<string, string[]>> {
-  const labelsByPageId = new Map<string, string[]>()
-
-  for (let i = 0; i < pageIds.length; i += LABEL_FETCH_CONCURRENCY) {
-    const batch = pageIds.slice(i, i + LABEL_FETCH_CONCURRENCY)
-    const results = await Promise.all(
-      batch.map(async (pageId) => {
-        try {
-          let data: Record<string, unknown> | null = null
-          for (const contentType of ['pages', 'blogposts']) {
-            const url = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki/api/v2/${contentType}/${pageId}/labels`
-            const response = await fetchWithRetry(url, {
-              method: 'GET',
-              headers: {
-                Accept: 'application/json',
-                Authorization: `Bearer ${accessToken}`,
-              },
-            })
-
-            if (response.ok) {
-              data = await response.json()
-              break
-            }
-            if (response.status !== 404) {
-              logger.warn(`Failed to fetch labels for ${contentType} ${pageId}`, {
-                status: response.status,
-              })
-            }
-          }
-
-          if (!data) {
-            return { pageId, labels: [] as string[] }
-          }
-
-          const labels = ((data.results as Record<string, unknown>[]) || []).map(
-            (label) => label.name as string
-          )
-          return { pageId, labels }
-        } catch (error) {
-          logger.warn(`Error fetching labels for page ${pageId}`, {
-            error: toError(error).message,
-          })
-          return { pageId, labels: [] as string[] }
-        }
-      })
-    )
-
-    for (const { pageId, labels } of results) {
-      labelsByPageId.set(pageId, labels)
-    }
+/**
+ * Extracts the `cursor` query value from a relative `_links.next` URL. Both the
+ * v2 endpoints and the v1 CQL search return the next page as a relative path
+ * carrying an opaque cursor, so the value has to be parsed back out rather than
+ * derived.
+ */
+export function extractCursor(nextLink: unknown): string | undefined {
+  if (typeof nextLink !== 'string' || !nextLink) return undefined
+  try {
+    return new URL(nextLink, 'https://placeholder').searchParams.get('cursor') || undefined
+  } catch {
+    return undefined
   }
-
-  return labelsByPageId
 }
 
 /**
@@ -96,10 +223,12 @@ async function fetchLabelsForPages(
  * invalidates every previously-synced Confluence document so a one-time
  * re-hydration picks up content newly reachable by the current extraction
  * (e.g. the switch from `storage` to rendered `view`, which expands Include
- * Page / Excerpt macros). Without it, already-indexed pages whose version is
- * unchanged classify as `unchanged` and keep their stale (empty) content.
+ * Page / Excerpt macros; or `preserveConfluenceCallouts`, which stops
+ * flattening panel/info/note/warning/tip macros into indistinguishable plain
+ * text). Without it, already-indexed pages whose version is unchanged
+ * classify as `unchanged` and keep their stale (pre-fix) content.
  */
-const CONTENT_REPRESENTATION = 'view'
+const CONTENT_REPRESENTATION = 'view-callouts'
 
 /**
  * Produces a canonical metadata stub with a deterministic contentHash that
@@ -254,7 +383,7 @@ export const confluenceConnector: ConnectorConfig = {
      */
     let page: Record<string, unknown> | null = null
     for (const endpoint of ['pages', 'blogposts']) {
-      const url = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki/api/v2/${endpoint}/${externalId}?body-format=view`
+      const url = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki/api/v2/${endpoint}/${encodeURIComponent(externalId)}?body-format=view&include-labels=true`
       const response = await fetchWithRetry(url, {
         method: 'GET',
         headers: {
@@ -272,19 +401,16 @@ export const confluenceConnector: ConnectorConfig = {
       }
     }
 
-    if (!page) return null
+    if (!page || !isCurrentContent(page)) return null
     const body = page.body as Record<string, unknown> | undefined
     const view = body?.view as Record<string, unknown> | undefined
     const rawContent = (view?.value as string) || ''
-    const plainText = htmlToPlainText(rawContent)
-
-    const labelMap = await fetchLabelsForPages(cloudId, accessToken, [String(page.id)])
-    const labels = labelMap.get(String(page.id)) ?? []
+    const plainText = htmlToPlainText(preserveConfluenceCallouts(rawContent))
 
     const links = page._links as Record<string, unknown> | undefined
     const stub = pageToStub(page, {
       spaceId: page.spaceId,
-      labels,
+      labels: readIncludedLabels(page),
       sourceUrl: links?.webui ? `https://${domain}/wiki${links.webui}` : undefined,
     })
 
@@ -381,6 +507,12 @@ async function listDocumentsV2(
 ): Promise<ExternalDocumentList> {
   const queryParams = new URLSearchParams()
   queryParams.append('limit', '250')
+  /**
+   * Restrict to current content: the pages endpoint defaults to
+   * `current,archived`, so archived pages would otherwise stay in the listing
+   * forever and never be purged by deletion reconciliation.
+   */
+  queryParams.append('status', 'current')
   if (cursor) {
     queryParams.append('cursor', cursor)
   }
@@ -410,28 +542,28 @@ async function listDocumentsV2(
   const data = await response.json()
   const results = data.results || []
 
-  const documents: ExternalDocument[] = results.map((page: Record<string, unknown>) => {
-    const links = page._links as Record<string, string> | undefined
-    return pageToStub(page, {
-      spaceId: page.spaceId,
-      sourceUrl: links?.webui ? `https://${domain}/wiki${links.webui}` : undefined,
+  const documents: ExternalDocument[] = (results as Record<string, unknown>[])
+    .filter(isCurrentContent)
+    .map((page) => {
+      const links = page._links as Record<string, string> | undefined
+      return pageToStub(page, {
+        spaceId: page.spaceId,
+        sourceUrl: links?.webui ? `https://${domain}/wiki${links.webui}` : undefined,
+      })
     })
-  })
 
-  let nextCursor: string | undefined
-  const nextLink = (data._links as Record<string, string>)?.next
-  if (nextLink) {
-    try {
-      nextCursor = new URL(nextLink, 'https://placeholder').searchParams.get('cursor') || undefined
-    } catch {
-      // Ignore malformed URLs
-    }
-  }
+  const nextCursor = extractCursor((data._links as Record<string, unknown> | undefined)?.next)
 
   const totalFetched = ((syncContext?.totalDocsFetched as number) ?? 0) + documents.length
   if (syncContext) syncContext.totalDocsFetched = totalFetched
   const hitLimit = maxPages > 0 && totalFetched >= maxPages
-  if (hitLimit && syncContext) syncContext.listingCapped = true
+  /**
+   * Only a cap that actually truncates a listing may suppress deletion
+   * reconciliation. When the source is exhausted (no next cursor) the listing is
+   * complete even though the count reached `maxPages`, and flagging it would
+   * permanently strand documents deleted upstream.
+   */
+  if (hitLimit && nextCursor && syncContext) syncContext.listingCapped = true
 
   return {
     documents,
@@ -526,6 +658,13 @@ async function listAllContentTypes(
 }
 
 /**
+ * Page size for CQL search. The endpoint defaults to 25 and documents no hard
+ * maximum, so this stays conservatively below the fixed system limits it warns
+ * about rather than mirroring the v2 endpoints' 250.
+ */
+const CQL_PAGE_SIZE = 50
+
+/**
  * Lists documents using CQL search via the v1 API (used when label filtering is enabled).
  */
 async function listDocumentsViaCql(
@@ -549,10 +688,17 @@ async function listDocumentsViaCql(
 
   if (contentType === 'blogpost') {
     cql += ' AND type="blogpost"'
-  } else if (contentType === 'page' || !contentType) {
+  } else if (contentType === 'all') {
+    /**
+     * An unconstrained CQL search matches every content type the index holds —
+     * attachments, comments, space descriptions and user profiles included — none
+     * of which `getDocument` can resolve through the page/blogpost endpoints. "All
+     * content" means both indexable content types, not literally everything.
+     */
+    cql += ' AND type in ("page","blogpost")'
+  } else {
     cql += ' AND type="page"'
   }
-  // contentType === 'all' — no type filter
 
   if (labels.length === 1) {
     cql += ` AND label="${escapeCql(labels[0])}"`
@@ -561,18 +707,33 @@ async function listDocumentsViaCql(
     cql += ` AND label in (${labelList})`
   }
 
-  const limit = maxPages > 0 ? Math.min(maxPages, 50) : 50
-  const start = cursor ? Number(cursor) : 0
+  const fetchedSoFar = (syncContext?.totalDocsFetched as number) ?? 0
+  const remaining = maxPages > 0 ? maxPages - fetchedSoFar : Number.POSITIVE_INFINITY
 
+  /**
+   * The page size stays constant for every request of a run. This endpoint
+   * paginates by opaque cursor, and Atlassian does not document that a cursor
+   * issued against one `limit` stays valid when the following request asks for a
+   * different one, so narrowing `limit` to the remaining budget risks skipping or
+   * repeating results. The cap is applied by trimming the returned page instead.
+   */
   const queryParams = new URLSearchParams()
   queryParams.append('cql', cql)
-  queryParams.append('limit', String(limit))
-  queryParams.append('start', String(start))
+  queryParams.append('limit', String(CQL_PAGE_SIZE))
   queryParams.append('expand', 'version,metadata.labels')
+  /**
+   * `/wiki/rest/api/content/search` paginates by opaque cursor only — it has no
+   * `start` parameter, and its response carries no total count. The next page is
+   * reachable solely through the cursor embedded in `_links.next`.
+   */
+  if (cursor) queryParams.append('cursor', cursor)
 
   const url = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki/rest/api/content/search?${queryParams.toString()}`
 
-  logger.info(`Searching Confluence via CQL: ${cql}`, { start, limit })
+  logger.info(`Searching Confluence via CQL: ${cql}`, {
+    limit: CQL_PAGE_SIZE,
+    hasCursor: Boolean(cursor),
+  })
 
   const response = await fetchWithRetry(url, {
     method: 'GET',
@@ -594,22 +755,36 @@ async function listDocumentsViaCql(
   const data = await response.json()
   const results = data.results || []
 
-  const documents: ExternalDocument[] = results.map((item: Record<string, unknown>) =>
-    cqlResultToStub(item, domain)
-  )
+  const allDocuments: ExternalDocument[] = (results as Record<string, unknown>[])
+    .filter(isCurrentContent)
+    .map((item) => cqlResultToStub(item, domain))
 
-  const totalFetched = ((syncContext?.totalDocsFetched as number) ?? 0) + documents.length
+  /**
+   * Trim to the remaining budget. Trimming stops the walk (`hitLimit` below is
+   * then true), so the discarded tail is never skipped over — the run simply
+   * ends here.
+   */
+  const documents =
+    allDocuments.length > remaining ? allDocuments.slice(0, remaining) : allDocuments
+  const trimmedByCap = documents.length < allDocuments.length
+
+  const nextCursor = extractCursor((data._links as Record<string, unknown> | undefined)?.next)
+
+  const totalFetched = fetchedSoFar + documents.length
   if (syncContext) syncContext.totalDocsFetched = totalFetched
   const hitLimit = maxPages > 0 && totalFetched >= maxPages
-  if (hitLimit && syncContext) syncContext.listingCapped = true
+  /**
+   * Both truncation shapes count: pages this run trimmed off, and a page left
+   * unread behind a live cursor. A cap that lands exactly on source exhaustion
+   * is a complete listing and must still reconcile deletions.
+   */
+  if (hitLimit && (trimmedByCap || nextCursor) && syncContext) syncContext.listingCapped = true
 
-  const totalSize = (data.totalSize as number) ?? 0
-  const nextStart = start + results.length
-  const hasMore = !hitLimit && nextStart < totalSize
+  const hasMore = !hitLimit && Boolean(nextCursor)
 
   return {
     documents,
-    nextCursor: hasMore ? String(nextStart) : undefined,
+    nextCursor: hasMore ? nextCursor : undefined,
     hasMore,
   }
 }

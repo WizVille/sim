@@ -1,3 +1,4 @@
+import type { BlockFactoryOptions } from '@sim/testing'
 import {
   createAgentBlock,
   createBlock,
@@ -5,9 +6,12 @@ import {
   createLoopBlock,
   createStarterBlock,
 } from '@sim/testing'
-import { describe, expect, it } from 'vitest'
+import type { Edge } from 'reactflow'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { getBlock } from '@/blocks/registry'
 import { normalizeName } from '@/executor/constants'
-import { getUniqueBlockName, regenerateBlockIds } from './utils'
+import { prepareBlockState } from './prepare-block-state'
+import { filterNewEdges, getUniqueBlockName, regenerateBlockIds } from './utils'
 
 describe('normalizeName', () => {
   it.concurrent('should convert to lowercase', () => {
@@ -105,6 +109,43 @@ describe('normalizeName', () => {
   })
 })
 
+describe('filterNewEdges', () => {
+  const makeEdge = (id: string, sourceHandle: string, targetHandle: string): Edge => ({
+    id,
+    source: 'source',
+    target: 'target',
+    sourceHandle,
+    targetHandle,
+  })
+
+  it('treats every side-anchored handle as the same logical connection', () => {
+    const currentEdges = [makeEdge('canonical', 'source', 'target')]
+    const candidates = [
+      makeEdge('side-anchored', 'source-right', 'target-left'),
+      makeEdge('other-side', 'source-left', 'target-right'),
+      makeEdge('legacy-vertical', 'source-bottom', 'target-top'),
+    ]
+
+    expect(filterNewEdges(candidates, currentEdges)).toEqual([])
+  })
+
+  it('collapses side-anchored candidates against each other within one batch', () => {
+    const candidates = [
+      makeEdge('first', 'source-right', 'target-left'),
+      makeEdge('second', 'source', 'target'),
+    ]
+
+    expect(filterNewEdges(candidates, [])).toEqual([candidates[0]])
+  })
+
+  it('keeps semantic routing handles distinct', () => {
+    const currentEdges = [makeEdge('true-route', 'condition-true', 'target-left')]
+    const candidates = [makeEdge('false-route', 'condition-false', 'target-left')]
+
+    expect(filterNewEdges(candidates, currentEdges)).toEqual(candidates)
+  })
+})
+
 describe('getUniqueBlockName', () => {
   it('should return "Start" for starter blocks', () => {
     expect(getUniqueBlockName('Start', {})).toBe('Start')
@@ -112,10 +153,11 @@ describe('getUniqueBlockName', () => {
     expect(getUniqueBlockName('start', {})).toBe('Start')
   })
 
-  it('should return name with number 1 when no existing blocks', () => {
-    expect(getUniqueBlockName('Agent', {})).toBe('Agent 1')
-    expect(getUniqueBlockName('Function', {})).toBe('Function 1')
-    expect(getUniqueBlockName('Loop', {})).toBe('Loop 1')
+  it('should return the bare name when no existing blocks', () => {
+    /* The first of a kind reads as itself; only the second needs telling apart. */
+    expect(getUniqueBlockName('Agent', {})).toBe('Agent')
+    expect(getUniqueBlockName('Function', {})).toBe('Function')
+    expect(getUniqueBlockName('Loop', {})).toBe('Loop')
   })
 
   it('should increment number when existing blocks have same base name', () => {
@@ -166,15 +208,27 @@ describe('getUniqueBlockName', () => {
     expect(getUniqueBlockName('Agent', existingBlocks)).toBe('Agent 2')
     expect(getUniqueBlockName('Function', existingBlocks)).toBe('Function 2')
     expect(getUniqueBlockName('Loop', existingBlocks)).toBe('Loop 2')
-    expect(getUniqueBlockName('Router', existingBlocks)).toBe('Router 1')
+    expect(getUniqueBlockName('Router', existingBlocks)).toBe('Router')
   })
 
-  it('should handle blocks without numbers as having number 0', () => {
+  it('should treat a bare existing name as the first of its series', () => {
+    /* `Custom` is the first, so the next is `Custom 2` — not a second `Custom 1`. */
     const existingBlocks = {
       'block-1': createBlock({ id: 'block-1', name: 'Custom' }),
     }
 
-    expect(getUniqueBlockName('Custom', existingBlocks)).toBe('Custom 1')
+    expect(getUniqueBlockName('Custom', existingBlocks)).toBe('Custom 2')
+  })
+
+  it('should continue a legacy series that starts at 1', () => {
+    /* Workflows created before bare-first naming still number from 1; adding to
+       one of those must not collide with its existing `Gmail 1`. */
+    const existingBlocks = {
+      'block-1': createBlock({ id: 'block-1', name: 'Gmail 1' }),
+      'block-2': createBlock({ id: 'block-2', name: 'Gmail 2' }),
+    }
+
+    expect(getUniqueBlockName('Gmail', existingBlocks)).toBe('Gmail 3')
   })
 
   it('should handle multi-word base names', () => {
@@ -195,12 +249,14 @@ describe('getUniqueBlockName', () => {
     expect(getUniqueBlockName('Starter', existingBlocks)).toBe('Start')
   })
 
-  it('should handle empty string base name', () => {
+  it('should not throw on an empty base name', () => {
+    /* Degenerate: every real caller passes a block's registry name or a default
+       trigger name, so the prefix is never empty. Pinned so it stays total. */
     const existingBlocks = {
       'block-1': createBlock({ id: 'block-1', name: ' 1' }),
     }
 
-    expect(getUniqueBlockName('', existingBlocks)).toBe(' 1')
+    expect(getUniqueBlockName('', existingBlocks)).toBe('')
   })
 
   it('should handle complex real-world scenarios', () => {
@@ -215,7 +271,7 @@ describe('getUniqueBlockName', () => {
     expect(getUniqueBlockName('Agent', existingBlocks)).toBe('Agent 3')
     expect(getUniqueBlockName('Function', existingBlocks)).toBe('Function 2')
     expect(getUniqueBlockName('Start', existingBlocks)).toBe('Start')
-    expect(getUniqueBlockName('Condition', existingBlocks)).toBe('Condition 1')
+    expect(getUniqueBlockName('Condition', existingBlocks)).toBe('Condition')
   })
 
   it('should preserve original base name casing in result', () => {
@@ -436,6 +492,67 @@ describe('regenerateBlockIds', () => {
     const duplicatedBlock = Object.values(result.blocks)[0]
     expect(duplicatedBlock.position).toEqual({ x: 280, y: 70 })
     expect(duplicatedBlock.data?.parentId).toBe(loopId)
+  })
+
+  /**
+   * Regression: a fallback writer stamped a condition block's `conditions`
+   * subblock `short-input`. The id remap must key on block type + subblock key
+   * (not the drifted stored type) so the condition row ids and the outgoing
+   * edge's sourceHandle move together — previously the handle remapped while
+   * the row ids stayed stale, orphaning the edge.
+   */
+  it('keeps condition row ids and edge handles consistent when the stored subblock type drifted', () => {
+    const conditionId = 'condition-1'
+    const targetId = 'target-1'
+
+    const blocksToCopy = {
+      [conditionId]: createBlock({
+        id: conditionId,
+        type: 'condition',
+        name: 'botFilter',
+        subBlocks: {
+          conditions: {
+            id: 'conditions',
+            type: 'short-input',
+            value: JSON.stringify([
+              { id: `${conditionId}-if`, title: 'if', value: '<a.b>' },
+              { id: `${conditionId}-else`, title: 'else', value: '' },
+            ]),
+          },
+        },
+      }),
+      [targetId]: createAgentBlock({ id: targetId, name: 'Agent 1' }),
+    }
+
+    const edges = [
+      {
+        id: 'edge-1',
+        source: conditionId,
+        sourceHandle: `condition-${conditionId}-else`,
+        target: targetId,
+        targetHandle: 'target',
+      },
+    ] as Edge[]
+
+    const result = regenerateBlockIds(
+      blocksToCopy,
+      edges,
+      {},
+      {},
+      {},
+      positionOffset,
+      {},
+      getUniqueBlockName
+    )
+
+    const newCondition = Object.values(result.blocks).find((b) => b.type === 'condition')!
+    const newEdge = result.edges[0]
+    const rowIds = JSON.parse(newCondition.subBlocks.conditions.value as string).map(
+      (row: { id: string }) => row.id
+    )
+
+    expect(rowIds).toEqual([`${newCondition.id}-if`, `${newCondition.id}-else`])
+    expect(newEdge.sourceHandle).toBe(`condition-${newCondition.id}-else`)
   })
 
   it('should unlock pasted block when source is locked', () => {
@@ -793,5 +910,257 @@ describe('regenerateBlockIds', () => {
     expect(new Set(names).size).toBe(2)
     expect(names).toContain('Agent 1')
     expect(names).toContain('Agent 2')
+  })
+})
+
+describe('regenerateBlockIds — cloned webhook path', () => {
+  const positionOffset = { x: 50, y: 50 }
+  const sourceId = 'webhook-source'
+  const deployedPath = 'webhook-source'
+
+  function pasteOne(block: Partial<BlockFactoryOptions>, values?: Record<string, unknown>) {
+    const blocks = { [sourceId]: createBlock({ id: sourceId, ...block }) }
+    const result = regenerateBlockIds(
+      blocks,
+      [],
+      {},
+      {},
+      values ? { [sourceId]: values } : {},
+      positionOffset,
+      {},
+      getUniqueBlockName
+    )
+    return { newId: Object.keys(result.blocks)[0], result }
+  }
+
+  /**
+   * The reported bug. A Webhook Trigger added from the toolbar carries `triggerMode: true`
+   * (confirmed against production rows), and after a deploy its `triggerPath` holds the registered
+   * path — its own block id. A clone that copies that value renders the SOURCE's URL.
+   */
+  it('clears triggerPath on a pasted webhook trigger (triggerMode true)', () => {
+    const { newId, result } = pasteOne(
+      {
+        type: 'generic_webhook',
+        name: 'Webhook 1',
+        triggerMode: true,
+        subBlocks: {
+          triggerPath: { id: 'triggerPath', type: 'short-input', value: deployedPath },
+        },
+      },
+      { triggerPath: deployedPath }
+    )
+
+    expect(newId).not.toBe(sourceId)
+    // Both sources must be cleared: the value map overrides the structure in mergeSubblockState.
+    expect(result.blocks[newId].subBlocks.triggerPath?.value).toBeNull()
+    expect(result.subBlockValues[newId].triggerPath).toBeNull()
+  })
+
+  /** Rows written by the API/import path can carry `triggerMode: false`; same requirement. */
+  it('clears triggerPath on a pasted webhook trigger (triggerMode false)', () => {
+    const { newId, result } = pasteOne(
+      {
+        type: 'generic_webhook',
+        name: 'Webhook 1',
+        triggerMode: false,
+        subBlocks: {
+          triggerPath: { id: 'triggerPath', type: 'short-input', value: deployedPath },
+        },
+      },
+      { triggerPath: deployedPath }
+    )
+
+    expect(result.blocks[newId].subBlocks.triggerPath?.value).toBeNull()
+    expect(result.subBlockValues[newId].triggerPath).toBeNull()
+  })
+
+  it('clears it when the path lives only in the value map', () => {
+    const { newId, result } = pasteOne(
+      { type: 'generic_webhook', name: 'Webhook 1', triggerMode: true, subBlocks: {} },
+      { triggerPath: deployedPath }
+    )
+
+    expect(result.subBlockValues[newId].triggerPath).toBeNull()
+  })
+
+  it('clears it when the block has no value-map entry at all', () => {
+    const { newId, result } = pasteOne({
+      type: 'generic_webhook',
+      name: 'Webhook 1',
+      triggerMode: true,
+      subBlocks: {
+        triggerPath: { id: 'triggerPath', type: 'short-input', value: deployedPath },
+      },
+    })
+
+    expect(result.blocks[newId].subBlocks.triggerPath?.value).toBeNull()
+  })
+
+  /**
+   * `webhookId` is a user-entered action field on Attio, Vercel, and Discord — and Attio/Vercel are
+   * trigger-capable, so any predicate keyed on trigger-ness would wipe it in trigger mode. It is
+   * deliberately NOT cleared: nothing reads it as trigger state.
+   */
+  it('preserves a user-entered webhookId on a trigger-capable block in trigger mode', () => {
+    const { newId, result } = pasteOne(
+      {
+        type: 'attio',
+        name: 'Attio 1',
+        triggerMode: true,
+        subBlocks: {
+          webhookId: { id: 'webhookId', type: 'short-input', value: 'attio-wh-42' },
+        },
+      },
+      { webhookId: 'attio-wh-42' }
+    )
+
+    expect(result.blocks[newId].subBlocks.webhookId?.value).toBe('attio-wh-42')
+    expect(result.subBlockValues[newId].webhookId).toBe('attio-wh-42')
+  })
+
+  it('preserves a user-entered webhookId on an action block', () => {
+    const { newId, result } = pasteOne(
+      {
+        type: 'discord',
+        name: 'Discord 1',
+        triggerMode: false,
+        subBlocks: {
+          webhookId: { id: 'webhookId', type: 'short-input', value: '1234567890' },
+          webhookToken: { id: 'webhookToken', type: 'short-input', value: 'tok_abc' },
+        },
+      },
+      { webhookId: '1234567890', webhookToken: 'tok_abc' }
+    )
+
+    expect(result.subBlockValues[newId].webhookId).toBe('1234567890')
+    expect(result.subBlockValues[newId].webhookToken).toBe('tok_abc')
+  })
+
+  /** Trigger configuration is user setup and must survive the copy. */
+  it('preserves trigger configuration on a cloned trigger block', () => {
+    const { newId, result } = pasteOne(
+      {
+        type: 'generic_webhook',
+        name: 'Webhook 1',
+        triggerMode: true,
+        subBlocks: {
+          triggerPath: { id: 'triggerPath', type: 'short-input', value: deployedPath },
+          triggerConfig: { id: 'triggerConfig', type: 'short-input', value: { labelIds: ['a'] } },
+          triggerId: { id: 'triggerId', type: 'short-input', value: 'generic_webhook' },
+          token: { id: 'token', type: 'short-input', value: 'user-secret' },
+        },
+      },
+      {
+        triggerPath: deployedPath,
+        triggerConfig: { labelIds: ['a'] },
+        triggerId: 'generic_webhook',
+        token: 'user-secret',
+      }
+    )
+
+    expect(result.subBlockValues[newId].triggerPath).toBeNull()
+    expect(result.subBlockValues[newId].triggerConfig).toEqual({ labelIds: ['a'] })
+    expect(result.subBlockValues[newId].triggerId).toBe('generic_webhook')
+    expect(result.subBlockValues[newId].token).toBe('user-secret')
+  })
+})
+
+describe('prepareBlockState — permission-group seed veto', () => {
+  const blockWithDefaults = {
+    name: 'Mock Block',
+    description: '',
+    icon: () => null,
+    outputs: {},
+    tools: { access: ['slack_message'] },
+    subBlocks: [
+      { id: 'operation', type: 'dropdown', defaultValue: 'send' },
+      { id: 'model', type: 'combobox', defaultValue: 'claude-sonnet-5' },
+      { id: 'channel', type: 'short-input', defaultValue: '#general' },
+      { id: 'blank', type: 'short-input', defaultValue: '' },
+      { id: 'headers', type: 'table', defaultValue: [] },
+    ],
+  }
+
+  const seededValues = (isSeededValueAllowed?: (subBlockId: string, value: string) => boolean) => {
+    vi.mocked(getBlock).mockReturnValueOnce(blockWithDefaults as never)
+    const block = prepareBlockState({
+      id: 'b1',
+      type: 'slack',
+      name: 'Slack',
+      position: { x: 0, y: 0 },
+      isSeededValueAllowed,
+    })
+    return Object.fromEntries(
+      Object.entries(block.subBlocks).map(([id, subBlock]) => [id, subBlock.value])
+    )
+  }
+
+  afterEach(() => {
+    vi.mocked(getBlock).mockReset()
+  })
+
+  it('seeds every declared default when no gate is supplied', () => {
+    expect(seededValues()).toEqual({
+      operation: 'send',
+      model: 'claude-sonnet-5',
+      channel: '#general',
+      blank: '',
+      headers: [],
+    })
+  })
+
+  it('seeds every declared default when the gate allows them', () => {
+    expect(seededValues(() => true)).toEqual({
+      operation: 'send',
+      model: 'claude-sonnet-5',
+      channel: '#general',
+      blank: '',
+      headers: [],
+    })
+  })
+
+  it('never consults the gate for an empty or non-string default', () => {
+    /* Both are "nothing was declared" rather than a value to authorize, and a
+       gate that saw them would veto every unfilled field. */
+    const seen: string[] = []
+    seededValues((subBlockId) => {
+      seen.push(subBlockId)
+      return true
+    })
+    expect(seen).not.toContain('blank')
+    expect(seen).not.toContain('headers')
+  })
+
+  it('keeps an empty or non-string default even when the gate rejects everything', () => {
+    const values = seededValues(() => false)
+    expect(values.blank).toBe('')
+    expect(values.headers).toEqual([])
+  })
+
+  it('leaves a denied operation unseeded rather than substituting one', () => {
+    const values = seededValues((subBlockId) => subBlockId !== 'operation')
+    expect(values.operation).toBeNull()
+    expect(values.model).toBe('claude-sonnet-5')
+    expect(values.channel).toBe('#general')
+  })
+
+  it('leaves a denied model unseeded', () => {
+    const values = seededValues((subBlockId) => subBlockId !== 'model')
+    expect(values.model).toBeNull()
+    expect(values.operation).toBe('send')
+  })
+
+  it('passes the seeded value to the gate, not just the field id', () => {
+    const seen: Array<[string, string]> = []
+    seededValues((subBlockId, value) => {
+      seen.push([subBlockId, value])
+      return true
+    })
+    expect(seen).toEqual([
+      ['operation', 'send'],
+      ['model', 'claude-sonnet-5'],
+      ['channel', '#general'],
+    ])
   })
 })

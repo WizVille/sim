@@ -1,13 +1,21 @@
 import { z } from 'zod'
 import { scheduleContextSchema } from '@/lib/api/contracts/schedules'
+import {
+  mountedSecretNamesSchema,
+  secretMountScopeSchema,
+} from '@/lib/api/contracts/secret-mount-policy'
 import { defineRouteContract } from '@/lib/api/contracts/types'
 
 const dateStringSchema = z.string().refine((value) => !Number.isNaN(Date.parse(value)), {
   message: 'Expected a valid date string',
 })
 
+export const mothershipChatScopeSchema = z.enum(['active', 'archived'])
+export type MothershipChatScope = z.output<typeof mothershipChatScopeSchema>
+
 export const listMothershipChatsQuerySchema = z.object({
   workspaceId: z.string().min(1),
+  scope: mothershipChatScopeSchema.default('active'),
 })
 
 export const mothershipChatParamsSchema = z.object({
@@ -108,13 +116,15 @@ export const mothershipExecuteBodySchema = z.object({
   fileAttachments: z.array(mothershipExecuteFileAttachmentSchema).optional(),
   /**
    * `@`-mentioned resources / `/`-invoked skills to resolve into the agent run,
-   * mirroring the interactive chat path. Used by scheduled tasks, whose
-   * captured contexts must reach the run without a live client.
+   * mirroring the interactive chat path. Headless executions use this to pass
+   * captured contexts into the run without a live client.
    */
   contexts: z.array(scheduleContextSchema).optional(),
   mcpTools: z.array(mothershipExecuteMcpToolSchema).optional(),
   workflowId: z.string().optional(),
   executionId: z.string().optional(),
+  secretScope: secretMountScopeSchema.optional(),
+  mountedSecrets: mountedSecretNamesSchema.optional(),
   userMetadata: z
     .object({
       name: z.string().optional(),
@@ -244,6 +254,25 @@ export const removeMothershipChatResourceContract = defineRouteContract({
   },
 })
 
+export const stageLocalFileUploadContract = defineRouteContract({
+  method: 'POST',
+  path: '/api/mothership/local-files/stage',
+  body: z.object({
+    workspaceId: z.string().min(1),
+    chatId: z.string().min(1),
+    key: z.string().min(1).max(2048),
+  }),
+  response: {
+    mode: 'json',
+    schema: z.object({
+      success: z.literal(true),
+      displayName: z.string(),
+      fileName: z.string(),
+      uploadPath: z.string(),
+    }),
+  },
+})
+
 export const mothershipChatSchema = z.object({
   id: z.string(),
   title: z.string().nullable(),
@@ -251,6 +280,7 @@ export const mothershipChatSchema = z.object({
   activeStreamId: z.string().nullable(),
   lastSeenAt: dateStringSchema.nullable(),
   pinned: z.boolean(),
+  deletedAt: dateStringSchema.nullable(),
 })
 
 export const listMothershipChatsContract = defineRouteContract({
@@ -282,6 +312,18 @@ export const updateMothershipChatContract = defineRouteContract({
 export const deleteMothershipChatContract = defineRouteContract({
   method: 'DELETE',
   path: '/api/mothership/chats/[chatId]',
+  params: mothershipChatParamsSchema,
+  response: {
+    mode: 'json',
+    schema: z.object({
+      success: z.literal(true),
+    }),
+  },
+})
+
+export const restoreMothershipChatContract = defineRouteContract({
+  method: 'POST',
+  path: '/api/mothership/chats/[chatId]/restore',
   params: mothershipChatParamsSchema,
   response: {
     mode: 'json',

@@ -7,32 +7,28 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
-  DirectUploadErrorMock,
   executionStoreState,
+  mockCancel,
   mockExecute,
+  mockExecuteFromBlock,
   mockFetch,
-  mockRunUploadStrategy,
+  mockHandleExecutionCancelledConsole,
+  mockHandleExecutionErrorConsole,
+  mockRequestJson,
+  mockResolveStartCandidates,
+  mockSelectBestTrigger,
+  mockUploadInternalFileSession,
   terminalStoreState,
   workflowBlocks,
   workflowStoreState,
 } = vi.hoisted(() => {
-  class DirectUploadErrorMock extends Error {
-    constructor(
-      message: string,
-      public code: string
-    ) {
-      super(message)
-      this.name = 'DirectUploadError'
-    }
-  }
-
   const workflowBlocks = {
     start: {
       id: 'start',
       type: 'starter',
       name: 'Start',
       enabled: true,
-      subBlocks: {},
+      subBlocks: { inputFormat: { value: 'persisted-state' } },
     },
   }
   const idleExecution = {
@@ -50,7 +46,7 @@ const {
   const executionStoreState = {
     workflowExecutions: new Map([['workflow-1', idleExecution]]),
     getWorkflowExecution: vi.fn(() => idleExecution),
-    getCurrentExecutionId: vi.fn(() => null),
+    getCurrentExecutionId: vi.fn<() => string | null>(() => null),
     getLastExecutionSnapshot: vi.fn(() => null),
     setCurrentExecutionId: vi.fn(),
     setIsExecuting: vi.fn(),
@@ -73,23 +69,30 @@ const {
     finishRunningEntries: vi.fn(),
     clearExecutionEntries: vi.fn(),
   }
+  const workflowEdges: Array<{ source: string; target: string }> = []
   const workflowStoreState = {
     blocks: workflowBlocks,
-    edges: [],
+    edges: workflowEdges,
     getWorkflowState: vi.fn(() => ({
       blocks: workflowBlocks,
-      edges: [],
+      edges: workflowEdges,
       loops: {},
       parallels: {},
     })),
   }
 
   return {
-    DirectUploadErrorMock,
     executionStoreState,
+    mockCancel: vi.fn(),
     mockExecute: vi.fn(),
+    mockExecuteFromBlock: vi.fn(),
     mockFetch: vi.fn(),
-    mockRunUploadStrategy: vi.fn(),
+    mockHandleExecutionCancelledConsole: vi.fn(),
+    mockHandleExecutionErrorConsole: vi.fn(),
+    mockRequestJson: vi.fn(),
+    mockResolveStartCandidates: vi.fn(),
+    mockSelectBestTrigger: vi.fn(),
+    mockUploadInternalFileSession: vi.fn(),
     terminalStoreState,
     workflowBlocks,
     workflowStoreState,
@@ -105,12 +108,13 @@ vi.mock('next/navigation', () => ({
 }))
 
 vi.mock('@/lib/api/client/request', () => ({
-  requestJson: vi.fn(),
+  requestJson: mockRequestJson,
 }))
 
 vi.mock('@/lib/api/contracts/workflows', () => ({
   cancelWorkflowExecutionContract: {},
   workflowLogContract: {},
+  workflowStateSchema: { parse: (value: unknown) => value },
 }))
 
 vi.mock('@/lib/logs/execution/trace-spans/trace-spans', () => ({
@@ -121,9 +125,8 @@ vi.mock('@/lib/tokenization', () => ({
   processStreamingBlockLogs: () => 0,
 }))
 
-vi.mock('@/lib/uploads/client/direct-upload', () => ({
-  DirectUploadError: DirectUploadErrorMock,
-  runUploadStrategy: mockRunUploadStrategy,
+vi.mock('@/lib/uploads/client/session-upload', () => ({
+  uploadInternalFileSession: mockUploadInternalFileSession,
 }))
 
 vi.mock('@/lib/workflows/input-format', () => ({
@@ -133,12 +136,12 @@ vi.mock('@/lib/workflows/input-format', () => ({
 
 vi.mock('@/lib/workflows/triggers/trigger-utils', () => ({
   extractTriggerMockPayload: () => ({}),
-  selectBestTrigger: () => [],
+  selectBestTrigger: mockSelectBestTrigger,
   triggerNeedsMockPayload: () => false,
 }))
 
 vi.mock('@/lib/workflows/triggers/triggers', () => ({
-  resolveStartCandidates: () => [],
+  resolveStartCandidates: mockResolveStartCandidates,
   StartBlockPath: {
     SPLIT_API: 'split-api',
     SPLIT_INPUT: 'split-input',
@@ -172,8 +175,8 @@ vi.mock('@/app/workspace/[workspaceId]/w/[workflowId]/utils/workflow-execution-u
   }),
   reconcileFinalBlockLogs: vi.fn(),
   addExecutionErrorConsoleEntry: vi.fn(),
-  handleExecutionCancelledConsole: vi.fn(),
-  handleExecutionErrorConsole: vi.fn(),
+  handleExecutionCancelledConsole: mockHandleExecutionCancelledConsole,
+  handleExecutionErrorConsole: mockHandleExecutionErrorConsole,
 }))
 
 vi.mock('@/blocks', () => ({
@@ -186,10 +189,6 @@ vi.mock('@/executor/utils/errors', () => ({
 
 vi.mock('@/executor/utils/start-block', () => ({
   coerceValue: (_type: string, value: unknown) => value,
-}))
-
-vi.mock('@/hooks/queries/subscription', () => ({
-  subscriptionKeys: { users: () => ['subscription', 'users'] },
 }))
 
 vi.mock('@/hooks/queries/utils/workflow-cache', () => ({
@@ -206,9 +205,9 @@ vi.mock('@/hooks/use-execution-stream', () => {
     SSEStreamInterruptedError,
     useExecutionStream: () => ({
       execute: mockExecute,
-      executeFromBlock: vi.fn(),
+      executeFromBlock: mockExecuteFromBlock,
       reconnect: vi.fn(),
-      cancel: vi.fn(),
+      cancel: mockCancel,
       cancelExecute: vi.fn(),
       cancelReconnect: vi.fn(),
     }),
@@ -277,7 +276,7 @@ vi.mock('@/stores/workflows/registry/store', () => ({
 }))
 
 vi.mock('@/stores/workflows/utils', () => ({
-  mergeSubblockState: () => workflowBlocks,
+  mergeSubblockState: (blocks: Record<string, unknown>) => blocks,
 }))
 
 vi.mock('@/stores/workflows/workflow/store', () => ({
@@ -341,12 +340,74 @@ async function drainStream(value: unknown): Promise<void> {
   while (!(await reader.read()).done) {}
 }
 
+describe('useWorkflowExecution cancellation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    executionStoreState.getCurrentExecutionId.mockReturnValue('execution-1')
+    mockRequestJson.mockResolvedValue({ success: true })
+  })
+
+  afterEach(() => {
+    executionStoreState.getCurrentExecutionId.mockReturnValue(null)
+  })
+
+  it('leaves the run intact until the server confirms, when there is one to cancel', () => {
+    /*
+     * The server's terminal event owns teardown. Tearing down here instead
+     * would (a) show the run as stopped even when the cancel request fails,
+     * while it keeps executing and billing server-side, with the execution id
+     * already discarded so it cannot be retried, and (b) abort the stream
+     * before `onExecutionCancelled` can settle the agent-stream chrome, so a
+     * pending thinking-flush revives a console entry nothing will settle again.
+     */
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    act(() => {
+      result().handleCancelExecution()
+    })
+
+    expect(mockRequestJson).toHaveBeenCalledWith(
+      {},
+      expect.objectContaining({
+        params: { id: 'workflow-1', executionId: 'execution-1' },
+      })
+    )
+    expect(mockCancel).not.toHaveBeenCalled()
+    expect(executionStoreState.setCurrentExecutionId).not.toHaveBeenCalled()
+    expect(executionStoreState.setIsExecuting).not.toHaveBeenCalled()
+    expect(executionStoreState.setActiveBlocks).not.toHaveBeenCalled()
+    expect(mockHandleExecutionCancelledConsole).not.toHaveBeenCalled()
+
+    unmount()
+  })
+
+  it('tears down locally when there is no server execution to cancel', () => {
+    executionStoreState.getCurrentExecutionId.mockReturnValue(null)
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    act(() => {
+      result().handleCancelExecution()
+    })
+
+    expect(mockRequestJson).not.toHaveBeenCalled()
+    expect(mockCancel).toHaveBeenCalledWith('workflow-1')
+    expect(executionStoreState.setIsExecuting).toHaveBeenCalledWith('workflow-1', false)
+    expect(executionStoreState.setIsDebugging).toHaveBeenCalledWith('workflow-1', false)
+    expect(executionStoreState.setActiveBlocks).toHaveBeenCalledWith('workflow-1', expect.any(Set))
+
+    unmount()
+  })
+})
+
 describe('useWorkflowExecution attachment uploads', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    executionStoreState.getCurrentExecutionId.mockReturnValue(null)
+    mockResolveStartCandidates.mockReturnValue([])
+    mockSelectBestTrigger.mockReturnValue([])
     vi.stubGlobal('fetch', mockFetch)
-    mockRunUploadStrategy.mockRejectedValue(
-      new DirectUploadErrorMock('Server signaled fallback to API upload', 'FALLBACK_REQUIRED')
+    mockUploadInternalFileSession.mockRejectedValue(
+      new Error('Workspace file storage limit exceeded')
     )
     mockFetch.mockResolvedValue(
       new Response(JSON.stringify({ error: 'Workspace file storage limit exceeded' }), {
@@ -355,6 +416,8 @@ describe('useWorkflowExecution attachment uploads', () => {
       })
     )
     mockExecute.mockResolvedValue(undefined)
+    mockExecuteFromBlock.mockResolvedValue(undefined)
+    workflowStoreState.edges.length = 0
   })
 
   afterEach(() => {
@@ -367,12 +430,14 @@ describe('useWorkflowExecution attachment uploads', () => {
     const file = new File(['report'], 'report.pdf', { type: 'application/pdf' })
     let uploadError: unknown
 
-    mockRunUploadStrategy.mockResolvedValueOnce({
+    mockUploadInternalFileSession.mockResolvedValueOnce({
+      id: 'attachment-context',
       key: 'executions/context.txt',
-      path: '/uploads/context.txt',
+      url: '/uploads/context.txt',
       name: contextFile.name,
       size: contextFile.size,
-      contentType: contextFile.type,
+      type: contextFile.type,
+      context: 'execution',
     })
 
     await act(async () => {
@@ -426,12 +491,14 @@ describe('useWorkflowExecution attachment uploads', () => {
     }
     let runResult: unknown
 
-    mockRunUploadStrategy.mockResolvedValueOnce({
+    mockUploadInternalFileSession.mockResolvedValueOnce({
+      id: 'attachment-diagram',
       key: 'execution/diagram.png',
-      path: '/api/files/serve/execution%2Fdiagram.png',
+      url: '/api/files/serve/execution%2Fdiagram.png',
       name: file.name,
       size: file.size,
-      contentType: file.type,
+      type: file.type,
+      context: 'execution',
     })
 
     await act(async () => {
@@ -465,6 +532,337 @@ describe('useWorkflowExecution attachment uploads', () => {
             }),
           ],
         }),
+      })
+    )
+
+    unmount()
+  })
+
+  it('uses only projected live thinking without changing normal settle behavior', async () => {
+    mockExecute.mockImplementationOnce(async (options) => {
+      options.onExecutionId?.('execution-1')
+      await options.callbacks?.onStreamThinking?.({
+        blockId: 'agent-1',
+        text: 'sk-resolved-secret',
+        display: { text: '{{OPENAI_API_KEY}}' },
+      })
+      await options.callbacks?.onStreamDone?.({ blockId: 'agent-1' })
+      await options.callbacks?.onBlockCompleted?.({
+        blockId: 'agent-1',
+        blockName: 'Agent 1',
+        blockType: 'agent',
+        executionOrder: 1,
+        output: { content: 'sk-resolved-secret' },
+        display: { output: { content: '{{OPENAI_API_KEY}}' } },
+        durationMs: 10,
+        startedAt: '2026-07-31T00:00:00.000Z',
+        endedAt: '2026-07-31T00:00:00.010Z',
+      })
+    })
+
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    await act(async () => {
+      const runResult = await result().handleRunWorkflow({ input: 'chat input' })
+      await drainStream(runResult)
+    })
+
+    expect(terminalStoreState.updateConsole).toHaveBeenCalledWith(
+      'agent-1',
+      expect.objectContaining({ agentStreamThinking: '{{OPENAI_API_KEY}}' }),
+      'execution-1'
+    )
+    expect(terminalStoreState.updateConsole).not.toHaveBeenCalledWith(
+      'agent-1',
+      expect.objectContaining({ clearAgentStreamThinking: true }),
+      'execution-1'
+    )
+    expect(JSON.stringify(terminalStoreState.updateConsole.mock.calls)).not.toContain(
+      'sk-resolved-secret'
+    )
+
+    unmount()
+  })
+
+  it('preserves legacy live thinking when no display projection field is sent', async () => {
+    mockExecute.mockImplementationOnce(async (options) => {
+      options.onExecutionId?.('execution-1')
+      await options.callbacks?.onStreamThinking?.({
+        blockId: 'agent-1',
+        text: 'sk-resolved-secret',
+      })
+      await options.callbacks?.onStreamDone?.({ blockId: 'agent-1' })
+    })
+
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    await act(async () => {
+      const runResult = await result().handleRunWorkflow({ input: 'chat input' })
+      await drainStream(runResult)
+    })
+
+    expect(terminalStoreState.updateConsole).toHaveBeenCalledWith(
+      'agent-1',
+      expect.objectContaining({ agentStreamThinking: 'sk-resolved-secret' }),
+      'execution-1'
+    )
+
+    unmount()
+  })
+
+  it('clears live thinking when the server sends an empty display projection', async () => {
+    mockExecute.mockImplementationOnce(async (options) => {
+      options.onExecutionId?.('execution-1')
+      await options.callbacks?.onStreamThinking?.({
+        blockId: 'agent-1',
+        text: 'sk-resolved-secret',
+        display: {},
+      })
+    })
+
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    await act(async () => {
+      const runResult = await result().handleRunWorkflow({ input: 'chat input' })
+      await drainStream(runResult)
+    })
+
+    expect(terminalStoreState.updateConsole).toHaveBeenCalledWith(
+      'agent-1',
+      { clearAgentStreamThinking: true },
+      'execution-1'
+    )
+    expect(JSON.stringify(terminalStoreState.updateConsole.mock.calls)).not.toContain(
+      'sk-resolved-secret'
+    )
+
+    unmount()
+  })
+
+  it('keeps the trusted execution ID when storing a run-until-block snapshot', async () => {
+    const startCandidate = {
+      blockId: 'start',
+      block: workflowBlocks.start,
+      path: 'legacy-starter',
+    }
+    mockResolveStartCandidates.mockReturnValue([startCandidate])
+    mockSelectBestTrigger.mockReturnValue([startCandidate])
+    mockExecute.mockImplementationOnce(async (options) => {
+      const executionId = options.executionId as string
+      executionStoreState.getCurrentExecutionId.mockReturnValue(executionId)
+      options.onExecutionId?.(executionId)
+      await options.callbacks?.onExecutionCompleted?.({
+        success: true,
+        output: {},
+        duration: 10,
+        startTime: '2026-07-31T00:00:00.000Z',
+        endTime: '2026-07-31T00:00:00.010Z',
+        finalBlockLogs: [],
+      })
+    })
+
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    await act(async () => {
+      await result().handleRunUntilBlock('function-1', 'workflow-1')
+    })
+
+    const executionId = mockExecute.mock.calls[0]?.[0]?.executionId
+    expect(executionId).toEqual(expect.any(String))
+    expect(executionStoreState.setLastExecutionSnapshot).toHaveBeenCalledWith(
+      'workflow-1',
+      expect.objectContaining({ sourceExecutionId: executionId })
+    )
+
+    unmount()
+  })
+
+  it('sends the snapshot as a fallback with a trusted run-from-block execution ID', async () => {
+    const sourceSnapshot = {
+      blockStates: { start: { output: { value: 'ready' } } },
+      executedBlocks: ['start'],
+      blockLogs: [],
+      decisions: { router: {}, condition: {} },
+      completedLoops: [],
+      activeExecutionPath: ['start'],
+      sourceExecutionId: 'source-execution-1',
+    }
+    executionStoreState.getLastExecutionSnapshot.mockReturnValueOnce(sourceSnapshot)
+    workflowStoreState.edges.push({ source: 'start', target: 'function-1' } as never)
+    const currentBlocks = {
+      ...workflowBlocks,
+      'function-1': {
+        id: 'function-1',
+        type: 'function',
+        name: 'Function 1',
+        enabled: true,
+        subBlocks: { code: { value: 'return "current editor state"' } },
+      },
+    }
+    workflowStoreState.getWorkflowState.mockReturnValueOnce({
+      blocks: currentBlocks,
+      edges: workflowStoreState.edges,
+      loops: {},
+      parallels: {},
+    })
+
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    await act(async () => {
+      await result().handleRunFromBlock('function-1', 'workflow-1')
+    })
+
+    expect(mockExecuteFromBlock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowId: 'workflow-1',
+        startBlockId: 'function-1',
+        sourceExecutionId: 'source-execution-1',
+        sourceSnapshot,
+        useDraftState: true,
+        isClientSession: true,
+        workflowStateOverride: {
+          blocks: currentBlocks,
+          edges: workflowStoreState.edges,
+          loops: {},
+          parallels: {},
+        },
+      })
+    )
+
+    unmount()
+  })
+
+  it('uses fresh execution for trigger block runs and stores their snapshot', async () => {
+    const currentBlocks = {
+      ...workflowBlocks,
+      start: {
+        ...workflowBlocks.start,
+        subBlocks: { inputFormat: { value: 'current-editor-state' } },
+      },
+    }
+    workflowStoreState.getWorkflowState.mockReturnValueOnce({
+      blocks: currentBlocks,
+      edges: [],
+      loops: {},
+      parallels: {},
+    })
+    mockExecute.mockImplementationOnce(async (options) => {
+      executionStoreState.getCurrentExecutionId.mockReturnValue('execution-1')
+      options.onExecutionId?.('execution-1')
+      await options.callbacks?.onExecutionCompleted?.({
+        success: true,
+        output: {},
+        duration: 10,
+        startTime: '2026-08-04T00:00:00.000Z',
+        endTime: '2026-08-04T00:00:00.010Z',
+        finalBlockLogs: [],
+      })
+    })
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    await act(async () => {
+      await result().handleRunFromBlock('start', 'workflow-1')
+    })
+
+    expect(mockExecute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowId: 'workflow-1',
+        startBlockId: 'start',
+        triggerType: 'manual',
+        useDraftState: true,
+        isClientSession: true,
+        workflowStateOverride: {
+          blocks: currentBlocks,
+          edges: [],
+          loops: {},
+          parallels: {},
+        },
+      })
+    )
+    expect(mockExecute.mock.calls[0]?.[0]).not.toHaveProperty('sourceSnapshot')
+    expect(mockExecuteFromBlock).not.toHaveBeenCalled()
+    expect(executionStoreState.setLastExecutionSnapshot).toHaveBeenCalledWith(
+      'workflow-1',
+      expect.objectContaining({
+        sourceExecutionId: 'execution-1',
+        executedBlocks: ['start'],
+      })
+    )
+
+    unmount()
+  })
+
+  it('fails closed when a legacy run-from-block error has no display projection', async () => {
+    mockExecute.mockImplementationOnce(async (options) => {
+      executionStoreState.getCurrentExecutionId.mockReturnValue('execution-1')
+      options.onExecutionId?.('execution-1')
+      await options.callbacks?.onExecutionError?.({
+        error: 'raw-secret-value caused the failure',
+        duration: 8,
+        finalBlockLogs: [],
+      })
+    })
+
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    await act(async () => {
+      await result().handleRunFromBlock('start', 'workflow-1')
+    })
+
+    expect(mockHandleExecutionErrorConsole).toHaveBeenCalledWith(
+      expect.objectContaining({
+        addConsole: terminalStoreState.addConsole,
+      }),
+      expect.objectContaining({
+        workflowId: 'workflow-1',
+        executionId: 'execution-1',
+        error: 'raw-secret-value caused the failure',
+        hasDisplayProjection: true,
+        durationMs: 8,
+      })
+    )
+    expect(mockHandleExecutionErrorConsole.mock.calls[0]?.[1]).not.toHaveProperty('displayError')
+
+    unmount()
+  })
+
+  it('shows one safe error when run-from-block fails before receiving an execution ID', async () => {
+    const sourceSnapshot = {
+      blockStates: { start: { output: { value: 'ready' } } },
+      executedBlocks: ['start'],
+      blockLogs: [],
+      decisions: { router: {}, condition: {} },
+      completedLoops: [],
+      activeExecutionPath: ['start'],
+      sourceExecutionId: 'source-execution-1',
+    }
+    executionStoreState.getLastExecutionSnapshot.mockReturnValueOnce(sourceSnapshot)
+    workflowStoreState.edges.push({ source: 'start', target: 'function-1' } as never)
+    mockExecuteFromBlock.mockImplementationOnce(async (options) => {
+      await options.callbacks?.onExecutionError?.({
+        error: 'raw pre-execution failure',
+        duration: 0,
+      })
+      throw new Error('raw pre-execution failure')
+    })
+
+    const { result, unmount } = renderWorkflowExecutionHook()
+
+    await act(async () => {
+      await result().handleRunFromBlock('function-1', 'workflow-1')
+    })
+
+    expect(mockHandleExecutionErrorConsole).toHaveBeenCalledTimes(1)
+    expect(mockHandleExecutionErrorConsole).toHaveBeenCalledWith(
+      expect.objectContaining({
+        addConsole: terminalStoreState.addConsole,
+      }),
+      expect.objectContaining({
+        workflowId: 'workflow-1',
+        error: 'raw pre-execution failure',
+        hasDisplayProjection: true,
+        durationMs: 0,
+        blockLogs: [],
       })
     )
 

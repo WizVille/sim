@@ -1,10 +1,8 @@
 import { execSync } from 'node:child_process'
-import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { createLogger } from '@sim/logger'
-import ffmpegStatic from 'ffmpeg-static'
 import ffmpeg from 'fluent-ffmpeg'
 import type {
   AudioExtractionOptions,
@@ -31,19 +29,6 @@ function ensureFfmpeg(): void {
   }
 
   ffmpegInitialized = true
-
-  // Try ffmpeg-static binary
-  if (ffmpegStatic && typeof ffmpegStatic === 'string') {
-    try {
-      fsSync.accessSync(ffmpegStatic, fsSync.constants.X_OK)
-      ffmpegPath = ffmpegStatic
-      ffmpeg.setFfmpegPath(ffmpegPath)
-      logger.info('[FFmpeg] Using ffmpeg-static:', ffmpegPath)
-      return
-    } catch {
-      // Binary doesn't exist or not executable
-    }
-  }
 
   // Try system ffmpeg (cross-platform)
   try {
@@ -287,43 +272,4 @@ export function isVideoFile(mimeType: string): boolean {
  */
 export function isAudioFile(mimeType: string): boolean {
   return mimeType.startsWith('audio/')
-}
-
-/**
- * Get optimal audio format for STT provider
- */
-export function getOptimalFormat(provider: 'whisper' | 'deepgram' | 'elevenlabs'): {
-  format: 'mp3' | 'wav' | 'flac'
-  sampleRate: number
-  channels: 1 | 2
-} {
-  switch (provider) {
-    case 'whisper':
-      // Whisper prefers 16kHz mono
-      return {
-        format: 'mp3',
-        sampleRate: 16000,
-        channels: 1,
-      }
-    case 'deepgram':
-      // Deepgram works well with various formats
-      return {
-        format: 'mp3',
-        sampleRate: 16000,
-        channels: 1,
-      }
-    case 'elevenlabs':
-      // ElevenLabs format preferences
-      return {
-        format: 'mp3',
-        sampleRate: 16000,
-        channels: 1,
-      }
-    default:
-      return {
-        format: 'mp3',
-        sampleRate: 16000,
-        channels: 1,
-      }
-  }
 }

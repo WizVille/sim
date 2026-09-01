@@ -1,3 +1,4 @@
+import { omit } from '@sim/utils/object'
 import { GrainIcon } from '@/components/icons'
 import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
@@ -27,6 +28,7 @@ export const GrainBlock: BlockConfig = {
   // Superseded by grain_v2 (Grain API v1 sunsets 2026-09-07); existing blocks
   // keep rendering, new blocks come from the v2 entry.
   hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'grain_v2' },
   longDescription:
     'Integrate Grain into your workflow. Access meeting recordings, transcripts, highlights, and AI-generated summaries. Can also trigger workflows based on Grain webhook events.',
   category: 'tools',
@@ -34,6 +36,46 @@ export const GrainBlock: BlockConfig = {
   docsLink: 'https://docs.sim.ai/integrations/grain',
   icon: GrainIcon,
   bgColor: '#F6FAF9',
+  canvasPresentation: {
+    defaultTitle: 'Grain',
+    /*
+     * Every trigger here subscribes through a view, and the view's own type is
+     * what decides whether recordings, highlights or stories fire — so it is
+     * the scope worth naming next to the event. One declaration covers all of
+     * them: each trigger's `viewId` is gated on the picker, so the clause
+     * resolves to whichever one is selected.
+     */
+    triggerSentences: {
+      default: [
+        'Run on',
+        { field: 'selectedTriggerId', core: true },
+        { text: 'in view', field: 'viewId' },
+      ],
+    },
+    sentences: {
+      byOperation: {
+        grain_list_recordings: [
+          'List meeting recordings',
+          { text: ', titled like', field: 'titleSearch' },
+          { text: ', after', field: 'afterDatetime' },
+          { text: ', before', field: 'beforeDatetime' },
+        ],
+        grain_get_recording: [{ text: 'Read recording', field: 'recordingId', core: true }],
+        grain_get_transcript: [
+          { text: 'Read the transcript of recording', field: 'recordingId', core: true },
+        ],
+        grain_list_views: ['List views'],
+        grain_list_teams: ['List teams'],
+        grain_list_meeting_types: ['List meeting types'],
+        grain_create_hook: [
+          { text: 'Create a webhook posting to', field: 'hookUrl', core: true },
+          { text: ', for view', field: 'viewId' },
+        ],
+        grain_list_hooks: ['List webhooks'],
+        grain_delete_hook: [{ text: 'Delete webhook', field: 'hookId', core: true }],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -293,6 +335,7 @@ Return ONLY the search term - no explanations, no quotes, no extra text.`,
     {
       id: 'selectedTriggerId',
       title: 'Trigger Type',
+      canvasNoun: 'an event',
       type: 'dropdown',
       mode: 'trigger',
       options: grainTriggerOptions,
@@ -501,8 +544,38 @@ Return ONLY the search term - no explanations, no quotes, no extra text.`,
  */
 export const GrainV2Block: BlockConfig = {
   ...GrainBlock,
+  sunset: undefined,
   type: 'grain_v2',
   hideFromToolbar: false,
+  canvasPresentation: {
+    defaultTitle: 'Grain',
+    sentences: {
+      byOperation: {
+        grain_list_recordings: [
+          'List meeting recordings',
+          { text: ', titled like', field: 'titleSearch' },
+          { text: ', after', field: 'afterDatetime' },
+          { text: ', before', field: 'beforeDatetime' },
+        ],
+        grain_get_recording: [{ text: 'Read recording', field: 'recordingId', core: true }],
+        grain_get_transcript: [
+          { text: 'Read the transcript of recording', field: 'recordingId', core: true },
+        ],
+        grain_list_teams: ['List teams'],
+        grain_list_meeting_types: ['List meeting types'],
+        grain_create_hook_v2: [
+          { text: 'Create a webhook posting to', field: 'hookUrl', core: true },
+          { text: ', on event', field: 'hookType' },
+        ],
+        grain_list_hooks_v2: [
+          'List webhooks',
+          { text: ', for event', field: 'hookTypeFilter' },
+          { text: ', in state', field: 'hookState' },
+        ],
+        grain_delete_hook_v2: [{ text: 'Delete webhook', field: 'hookId', core: true }],
+      },
+    },
+  },
   subBlocks: [
     ...GrainBlock.subBlocks.flatMap((sb) => {
       // Drop v1 trigger subblocks (matched per source trigger), the v1
@@ -686,7 +759,7 @@ export const GrainV2Block: BlockConfig = {
     },
   },
   inputs: {
-    ...Object.fromEntries(Object.entries(GrainBlock.inputs).filter(([key]) => key !== 'viewId')),
+    ...omit(GrainBlock.inputs, ['viewId']),
     apiKey: { type: 'string', description: 'Grain API key (Personal or Workspace Access Token)' },
     hookType: { type: 'string', description: 'Grain event type for the webhook' },
     hookInclude: {

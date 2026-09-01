@@ -1,7 +1,8 @@
 /**
  * @vitest-environment node
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { resetEnvMock, setEnv } from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { mockParseWebhookBody, mockFindWebhooksByRoutingKey, mockDispatchResolvedWebhookTarget } =
   vi.hoisted(() => ({
@@ -13,10 +14,6 @@ const { mockParseWebhookBody, mockFindWebhooksByRoutingKey, mockDispatchResolved
 vi.mock('@/lib/core/admission/gate', () => ({
   tryAdmit: () => ({ release: vi.fn() }),
   admissionRejectedResponse: () => new Response(null, { status: 503 }),
-}))
-
-vi.mock('@/lib/core/config/env', () => ({
-  env: { SLACK_SIGNING_SECRET: 'test-secret' },
 }))
 
 vi.mock('@/lib/webhooks/processor', () => ({
@@ -46,7 +43,7 @@ function webhook(id: string) {
 
 async function run(body: Record<string, unknown>) {
   mockParseWebhookBody.mockResolvedValue({ body, rawBody: JSON.stringify(body) })
-  await POST(makeRequest())
+  return POST(makeRequest())
 }
 
 const messageBody = {
@@ -56,8 +53,13 @@ const messageBody = {
 }
 
 describe('Slack app webhook route', () => {
+  afterAll(() => {
+    resetEnvMock()
+  })
+
   beforeEach(() => {
     vi.clearAllMocks()
+    setEnv({ SLACK_SIGNING_SECRET: 'test-secret' })
     mockFindWebhooksByRoutingKey.mockResolvedValue([webhook('wh1')])
     mockDispatchResolvedWebhookTarget.mockResolvedValue({
       outcome: 'queued',
@@ -79,6 +81,18 @@ describe('Slack app webhook route', () => {
     })
     await run(messageBody)
     expect(mockDispatchResolvedWebhookTarget).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns a retryable failure when no target queues', async () => {
+    mockDispatchResolvedWebhookTarget.mockResolvedValue({
+      outcome: 'failed',
+      response: new Response(null, { status: 500 }),
+      reason: 'queue-failed',
+    })
+
+    const response = await run(messageBody)
+
+    expect(response.status).toBe(500)
   })
 
   it('routes via Slack Connect authorizations and dedups overlapping webhooks', async () => {

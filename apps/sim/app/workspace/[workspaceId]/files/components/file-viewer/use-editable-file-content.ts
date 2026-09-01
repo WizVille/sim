@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react'
 import { toast } from '@sim/emcn'
 import type { WorkspaceFileRecord } from '@/lib/uploads/contexts/workspace'
+import { GENERATED_DOCUMENT_SOURCE_TYPES } from '@/lib/uploads/utils/file-utils'
 import {
   useUpdateWorkspaceFileContent,
   useWorkspaceFileContent,
@@ -20,13 +21,7 @@ import {
  * editable text is the source program, not the compiled artifact. The serve route
  * returns that source only when asked for the raw representation.
  */
-const GENERATED_SOURCE_FILE_TYPES = new Set([
-  'text/x-pptxgenjs',
-  'text/x-docxjs',
-  'text/x-pdflibjs',
-  'text/x-python-pdf',
-  'text/x-python-xlsx',
-])
+const GENERATED_SOURCE_FILE_TYPES = GENERATED_DOCUMENT_SOURCE_TYPES
 
 /**
  * Poll cadence for the content query while the post-stream reconcile waits for a fetch showing the
@@ -66,6 +61,13 @@ interface UseEditableFileContentOptions {
    * the at-rest baseline, never while an agent stream is in flight. Stable reference required.
    */
   normalizeBaseline?: (raw: string) => string
+  /**
+   * Extra gate on autosave (and draft persistence). When `false`, saving is
+   * suppressed even when otherwise eligible — the collaborative editor uses it to
+   * hold saves until the shared document is synced AND seeded, so an empty or
+   * partially-synced doc can never overwrite the real file. Defaults to `true`.
+   */
+  canAutosave?: boolean
 }
 
 interface EditableFileContent {
@@ -141,6 +143,7 @@ export function useEditableFileContent({
   saveRef,
   discardRef,
   normalizeBaseline,
+  canAutosave = true,
 }: UseEditableFileContentOptions): EditableFileContent {
   const onDirtyChangeRef = useRef(onDirtyChange)
   const onSaveStatusChangeRef = useRef(onSaveStatusChange)
@@ -175,7 +178,15 @@ export function useEditableFileContent({
     file.id,
     file.key,
     GENERATED_SOURCE_FILE_TYPES.has(file.type),
-    { refetchInterval: reconcileRefetchInterval }
+    {
+      refetchInterval: reconcileRefetchInterval,
+      // `canAutosave: false` on this surface means a server-side owner holds durability — the
+      // collaborative relay, which projects the live document to markdown itself and merges
+      // external writes INTO that document. There is nothing a focus refetch of the durable bytes
+      // can teach the editor that the shared document does not already have; all it does is
+      // re-read a storage key the relay's last save has already rotated away from.
+      refetchOnWindowFocus: canAutosave,
+    }
   )
 
   /**
@@ -239,7 +250,7 @@ export function useEditableFileContent({
     [workspaceId, file.id, markSavedContent]
   )
 
-  const autosaveEnabled = canEdit && isInitialized && !isStreamInteractionLocked
+  const autosaveEnabled = canEdit && isInitialized && !isStreamInteractionLocked && canAutosave
 
   const { saveStatus, saveImmediately, isDirty, discard } = useAutosave({
     content,
@@ -254,9 +265,16 @@ export function useEditableFileContent({
       ),
   })
 
+  // When the client can't autosave it isn't the durability owner: the collaborative editor holds
+  // `canAutosave` permanently false because the relay persists the doc server-side (debounced + on
+  // last-disconnect), so `savedContent` never advances and raw `isDirty` would latch true after any
+  // local OR remote keystroke — surfacing a spurious "Unsaved changes" navigation prompt whose
+  // "Discard" discards nothing real. With nothing the user can save, there is nothing to warn about.
+  const isDirtyForCaller = canAutosave && isDirty
+
   useEffect(() => {
-    onDirtyChangeRef.current?.(isDirty)
-  }, [isDirty])
+    onDirtyChangeRef.current?.(isDirtyForCaller)
+  }, [isDirtyForCaller])
 
   useEffect(() => {
     onSaveStatusChangeRef.current?.(
@@ -304,6 +322,6 @@ export function useEditableFileContent({
     hasContentError: streamingContent === undefined && Boolean(error) && !isInitialized,
     saveStatus,
     saveImmediately,
-    isDirty,
+    isDirty: isDirtyForCaller,
   }
 }

@@ -9,7 +9,7 @@ import type { TriggerConfig } from '@/triggers/types'
 
 /**
  * Primary TikTok trigger — includes the trigger-type dropdown.
- * Fires when Content Posting completes (direct post or inbox draft published).
+ * Fires when Content Posting completes (inbox draft published in TikTok).
  */
 export const tiktokPostPublishCompleteTrigger: TriggerConfig = {
   id: 'tiktok_post_publish_complete',
@@ -23,6 +23,7 @@ export const tiktokPostPublishCompleteTrigger: TriggerConfig = {
     {
       id: 'selectedTriggerId',
       title: 'Trigger Type',
+      canvasNoun: 'an event',
       type: 'dropdown',
       mode: 'trigger',
       options: tiktokTriggerOptions,

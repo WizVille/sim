@@ -6,6 +6,7 @@ import { v1ListFilesContract, v1UploadFileFormFieldsSchema } from '@/lib/api/con
 import { getValidationErrorMessage, parseRequest } from '@/lib/api/server'
 import { generateRequestId } from '@/lib/core/utils/request'
 import {
+  isMultipartFieldValidationError,
   isPayloadSizeLimitError,
   MAX_MULTIPART_OVERHEAD_BYTES,
   readFileToBufferWithLimit,
@@ -18,10 +19,12 @@ import {
   listWorkspaceFiles,
   uploadWorkspaceFile,
 } from '@/lib/uploads/contexts/workspace'
+import { EXACT_EMPTY_WORKSPACE_FILE_SECRET_PROVENANCE } from '@/lib/uploads/contexts/workspace/workspace-file-secret-provenance'
 import {
   checkRateLimit,
   checkWorkspaceScope,
   createRateLimitResponse,
+  v1ValidationErrorResponse,
   validateWorkspaceAccess,
 } from '@/app/api/v1/middleware'
 
@@ -43,7 +46,14 @@ export const GET = withRouteHandler(async (request: NextRequest) => {
     }
 
     const userId = rateLimit.userId!
-    const parsed = await parseRequest(v1ListFilesContract, request, {})
+    const parsed = await parseRequest(
+      v1ListFilesContract,
+      request,
+      {},
+      {
+        validationErrorResponse: v1ValidationErrorResponse,
+      }
+    )
     if (!parsed.success) return parsed.response
 
     const { workspaceId } = parsed.data.query
@@ -97,6 +107,9 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
       if (isPayloadSizeLimitError(error)) {
         return NextResponse.json({ error: error.message }, { status: 413 })
       }
+      if (isMultipartFieldValidationError(error)) {
+        return NextResponse.json({ error: error.message }, { status: 400 })
+      }
       return NextResponse.json(
         { error: 'Request body must be valid multipart form data' },
         { status: 400 }
@@ -146,7 +159,8 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
       userId,
       buffer,
       file.name,
-      file.type || 'application/octet-stream'
+      file.type || 'application/octet-stream',
+      { secretProvenance: EXACT_EMPTY_WORKSPACE_FILE_SECRET_PROVENANCE }
     )
 
     logger.info(`[${requestId}] Uploaded file: ${file.name} to workspace ${workspaceId}`)

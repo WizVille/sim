@@ -14,10 +14,9 @@ import {
   Tooltip,
   Trash,
 } from '@sim/emcn'
-import { Download } from '@sim/emcn/icons'
+import { ArrowUp, CircleAlert, Download, MoreVertical, Paperclip, Square, X } from '@sim/emcn/icons'
 import { createLogger } from '@sim/logger'
 import { generateId } from '@sim/utils/id'
-import { AlertCircle, ArrowUp, MoreVertical, Paperclip, Square, X } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useSession } from '@/lib/auth/auth-client'
 import {
@@ -238,6 +237,7 @@ export function Chat() {
     selectedWorkflowOutputs,
     setSelectedWorkflowOutput,
     appendMessageContent,
+    setMessageContent,
     finalizeMessageStream,
     getConversationId,
     clearChat,
@@ -256,6 +256,7 @@ export function Chat() {
       selectedWorkflowOutputs: s.selectedWorkflowOutputs,
       setSelectedWorkflowOutput: s.setSelectedWorkflowOutput,
       appendMessageContent: s.appendMessageContent,
+      setMessageContent: s.setMessageContent,
       finalizeMessageStream: s.finalizeMessageStream,
       getConversationId: s.getConversationId,
       clearChat: s.clearChat,
@@ -495,10 +496,21 @@ export function Chat() {
     async (stream: ReadableStream<Uint8Array>, responseMessageId: string) => {
       const reader = stream.getReader()
       streamReaderRef.current = reader
+
+      /**
+       * Answer text tracked per block so a `chunk_reset` frame (a live-streamed
+       * turn resolved to tool calls) can drop one block's contribution. Each
+       * flush replaces the message content with the joined segments.
+       */
+      const blockOrder: string[] = []
+      const blockSegments = new Map<string, string>()
       let accumulatedContent = ''
+      const recomputeContent = () => {
+        accumulatedContent = blockOrder.map((id) => blockSegments.get(id) ?? '').join('')
+      }
 
       const BATCH_MAX_MS = 50
-      let pendingChunks = ''
+      let contentDirty = false
       let batchRAF: number | null = null
       let batchTimer: ReturnType<typeof setTimeout> | null = null
       let lastFlush = 0
@@ -512,9 +524,9 @@ export function Chat() {
           clearTimeout(batchTimer)
           batchTimer = null
         }
-        if (pendingChunks) {
-          appendMessageContent(responseMessageId, pendingChunks)
-          pendingChunks = ''
+        if (contentDirty) {
+          setMessageContent(responseMessageId, accumulatedContent)
+          contentDirty = false
         }
         lastFlush = performance.now()
       }
@@ -534,12 +546,17 @@ export function Chat() {
 
       let finalError: string | null = null
       try {
-        await readSSEEvents<{ event?: string; data?: ExecutionResult; chunk?: string }>(reader, {
+        await readSSEEvents<{
+          event?: string
+          data?: ExecutionResult
+          chunk?: string
+          blockId?: string
+        }>(reader, {
           onParseError: (_data, e) => {
             logger.error('Error parsing stream data:', e)
           },
           onEvent: (json) => {
-            const { event, data: eventData, chunk: contentChunk } = json
+            const { event, data: eventData, chunk: contentChunk, blockId } = json
 
             if (event === 'final' && eventData) {
               if ('success' in eventData && !eventData.success) {
@@ -548,9 +565,32 @@ export function Chat() {
               return true
             }
 
+            if (event === 'chunk_reset' && blockId) {
+              // Drop the block's provisional text and its order slot — the
+              // final turn re-registers at the end, keeping render order =
+              // arrival order (separators are recomputed on re-stream).
+              if (blockSegments.has(blockId)) {
+                blockSegments.delete(blockId)
+                const orderIndex = blockOrder.indexOf(blockId)
+                if (orderIndex !== -1) {
+                  blockOrder.splice(orderIndex, 1)
+                }
+                recomputeContent()
+                contentDirty = true
+                scheduleFlush()
+              }
+              return
+            }
+
             if (contentChunk) {
-              accumulatedContent += contentChunk
-              pendingChunks += contentChunk
+              const segmentKey = blockId ?? ''
+              if (!blockSegments.has(segmentKey)) {
+                blockOrder.push(segmentKey)
+                blockSegments.set(segmentKey, '')
+              }
+              blockSegments.set(segmentKey, blockSegments.get(segmentKey)! + contentChunk)
+              recomputeContent()
+              contentDirty = true
               scheduleFlush()
             }
           },
@@ -578,7 +618,14 @@ export function Chat() {
         focusInput(100)
       }
     },
-    [appendMessageContent, finalizeMessageStream, focusInput, selectedOutputs, activeWorkflowId]
+    [
+      appendMessageContent,
+      setMessageContent,
+      finalizeMessageStream,
+      focusInput,
+      selectedOutputs,
+      activeWorkflowId,
+    ]
   )
 
   /**
@@ -865,9 +912,7 @@ export function Chat() {
         className='flex h-[32px] flex-shrink-0 cursor-grab items-center justify-between gap-2.5 bg-[var(--surface-1)] p-0 active:cursor-grabbing'
         onMouseDown={handleMouseDown}
       >
-        <span className='flex-shrink-0 pr-0.5 font-medium text-[var(--text-primary)] text-sm'>
-          Chat
-        </span>
+        <span className='flex-shrink-0 pr-0.5 text-[var(--text-primary)] text-sm'>Chat</span>
 
         {/* Start inputs button and output selector - with max-width to prevent overflow */}
         <div
@@ -877,7 +922,7 @@ export function Chat() {
           {shouldShowConfigureStartInputsButton && (
             <button
               type='button'
-              className='flex flex-none cursor-pointer items-center whitespace-nowrap rounded-md border border-[var(--border-1)] bg-[var(--surface-5)] px-2.5 py-0.5 font-medium font-sans text-[var(--text-primary)] text-caption hover-hover:bg-[var(--surface-active)]'
+              className='flex flex-none cursor-pointer items-center whitespace-nowrap rounded-md border border-[var(--border-1)] bg-[var(--surface-5)] px-2.5 py-0.5 font-sans text-[var(--text-primary)] text-caption hover-hover:bg-[var(--surface-active)]'
               title='Add chat inputs to Start block'
               onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => {
@@ -902,14 +947,14 @@ export function Chat() {
 
         <div className='flex flex-shrink-0 items-center gap-2'>
           {/* More menu with actions */}
-          <Popover variant='default' size='sm' open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
+          <Popover size='sm' open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
             <PopoverTrigger asChild>
               <Button
                 variant='ghost'
                 className='!p-1.5 -m-1.5'
                 onClick={(e) => e.stopPropagation()}
               >
-                <MoreVertical className='size-[14px]' strokeWidth={2} />
+                <MoreVertical className='size-[14px]' />
               </Button>
             </PopoverTrigger>
             <PopoverContent
@@ -983,9 +1028,9 @@ export function Chat() {
             <div>
               <div className='rounded-lg border border-[var(--terminal-status-error-border)] bg-[var(--terminal-status-error-bg)]'>
                 <div className='flex items-start gap-2'>
-                  <AlertCircle className='mt-0.5 size-3 shrink-0 text-[var(--text-error)]' />
+                  <CircleAlert className='mt-0.5 size-3 shrink-0 text-[var(--text-error)]' />
                   <div className='flex-1'>
-                    <div className='mb-1 font-medium text-[var(--text-error)] text-caption'>
+                    <div className='mb-1 text-[var(--text-error)] text-caption'>
                       File upload error
                     </div>
                     <div className='space-y-1'>
@@ -1074,10 +1119,7 @@ export function Chat() {
                         : 'bg-[#808080] dark:bg-[#808080]'
                     )}
                   >
-                    <ArrowUp
-                      className='h-3.5 w-3.5 text-white dark:text-black'
-                      strokeWidth={2.25}
-                    />
+                    <ArrowUp className='size-3.5 text-white dark:text-black' />
                   </Button>
                 )}
               </div>

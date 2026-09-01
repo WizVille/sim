@@ -7,35 +7,31 @@
 
 import type {
   auditLog,
+  folder as folderTable,
   member,
   organization,
   subscription,
   user,
   userStats,
   workflow,
-  workflowFolder,
   workspace,
 } from '@sim/db/schema'
 import type { InferSelectModel } from 'drizzle-orm'
 import type { Edge } from 'reactflow'
 import type { BlockState, Loop, Parallel } from '@/stores/workflows/workflow/types'
 
-// =============================================================================
 // Database Model Types (inferred from schema)
-// =============================================================================
 
 export type DbUser = InferSelectModel<typeof user>
 export type DbWorkspace = InferSelectModel<typeof workspace>
 export type DbWorkflow = InferSelectModel<typeof workflow>
-export type DbWorkflowFolder = InferSelectModel<typeof workflowFolder>
+export type DbWorkflowFolder = InferSelectModel<typeof folderTable>
 export type DbOrganization = InferSelectModel<typeof organization>
 export type DbSubscription = InferSelectModel<typeof subscription>
 export type DbMember = InferSelectModel<typeof member>
 export type DbUserStats = InferSelectModel<typeof userStats>
 
-// =============================================================================
 // Pagination
-// =============================================================================
 
 export interface PaginationParams {
   limit: number
@@ -52,19 +48,6 @@ export interface PaginationMeta {
 export const DEFAULT_LIMIT = 50
 export const MAX_LIMIT = 250
 
-export function parsePaginationParams(url: URL): PaginationParams {
-  return {
-    limit: parsePaginationNumber(url.searchParams.get('limit'), DEFAULT_LIMIT, MAX_LIMIT),
-    offset: parsePaginationNumber(url.searchParams.get('offset'), 0),
-  }
-}
-
-function parsePaginationNumber(value: string | null, fallback: number, max?: number): number {
-  const parsed = value ? Number.parseInt(value, 10) : fallback
-  if (!Number.isInteger(parsed) || parsed < 1) return fallback
-  return max === undefined ? parsed : Math.min(parsed, max)
-}
-
 export function createPaginationMeta(total: number, limit: number, offset: number): PaginationMeta {
   return {
     total,
@@ -74,9 +57,7 @@ export function createPaginationMeta(total: number, limit: number, offset: numbe
   }
 }
 
-// =============================================================================
 // API Response Types
-// =============================================================================
 
 export interface AdminListResponse<T> {
   data: T[]
@@ -95,9 +76,7 @@ export interface AdminErrorResponse {
   }
 }
 
-// =============================================================================
 // User Types
-// =============================================================================
 
 export interface AdminUser {
   id: string
@@ -121,9 +100,7 @@ export function toAdminUser(dbUser: DbUser): AdminUser {
   }
 }
 
-// =============================================================================
 // Workspace Types
-// =============================================================================
 
 export interface AdminWorkspace {
   id: string
@@ -148,14 +125,17 @@ export function toAdminWorkspace(dbWorkspace: DbWorkspace): AdminWorkspace {
   }
 }
 
-// =============================================================================
 // Folder Types
-// =============================================================================
 
 export interface AdminFolder {
   id: string
   name: string
   parentId: string | null
+  /**
+   * Always `null` since folders moved to the generic `folder` table, which has no `color`
+   * column (it had no consumer). Retained so the v1 admin response shape stays stable for
+   * existing API clients rather than silently dropping a documented field.
+   */
   color: string | null
   sortOrder: number
   createdAt: string
@@ -167,16 +147,14 @@ export function toAdminFolder(dbFolder: DbWorkflowFolder): AdminFolder {
     id: dbFolder.id,
     name: dbFolder.name,
     parentId: dbFolder.parentId,
-    color: dbFolder.color,
+    color: null,
     sortOrder: dbFolder.sortOrder,
     createdAt: dbFolder.createdAt.toISOString(),
     updatedAt: dbFolder.updatedAt.toISOString(),
   }
 }
 
-// =============================================================================
 // Workflow Types
-// =============================================================================
 
 export interface AdminWorkflow {
   id: string
@@ -228,9 +206,7 @@ export function toAdminWorkflow(dbWorkflow: AdminWorkflowSource): AdminWorkflow 
   }
 }
 
-// =============================================================================
 // Workflow Variable Types
-// =============================================================================
 
 export type VariableType = 'string' | 'number' | 'boolean' | 'object' | 'array' | 'plain'
 
@@ -241,9 +217,7 @@ export interface WorkflowVariable {
   value: unknown
 }
 
-// =============================================================================
 // Export/Import Types
-// =============================================================================
 
 export interface WorkflowExportState {
   blocks: Record<string, BlockState>
@@ -291,9 +265,7 @@ export interface WorkspaceExportPayload {
   folders: FolderExportPayload[]
 }
 
-// =============================================================================
 // Import Types
-// =============================================================================
 
 export interface WorkflowImportRequest {
   workspaceId: string
@@ -323,56 +295,7 @@ export interface WorkspaceImportResponse {
   results: ImportResult[]
 }
 
-// =============================================================================
 // Utility Functions
-// =============================================================================
-
-/**
- * Parse workflow variables from database JSON format to Record format.
- * Handles both legacy Array and current Record<string, Variable> formats.
- */
-export function parseWorkflowVariables(
-  dbVariables: DbWorkflow['variables']
-): Record<string, WorkflowVariable> | undefined {
-  if (!dbVariables) return undefined
-
-  try {
-    const varsObj = typeof dbVariables === 'string' ? JSON.parse(dbVariables) : dbVariables
-
-    // Handle legacy Array format by converting to Record
-    if (Array.isArray(varsObj)) {
-      const result: Record<string, WorkflowVariable> = {}
-      for (const v of varsObj) {
-        result[v.id] = {
-          id: v.id,
-          name: v.name,
-          type: v.type,
-          value: v.value,
-        }
-      }
-      return result
-    }
-
-    // Already Record format - normalize and return
-    if (typeof varsObj === 'object' && varsObj !== null) {
-      const result: Record<string, WorkflowVariable> = {}
-      for (const [key, v] of Object.entries(varsObj)) {
-        const variable = v as { id: string; name: string; type: VariableType; value: unknown }
-        result[key] = {
-          id: variable.id,
-          name: variable.name,
-          type: variable.type,
-          value: variable.value,
-        }
-      }
-      return result
-    }
-  } catch {
-    // pass
-  }
-
-  return undefined
-}
 
 /**
  * Extract workflow metadata from various export formats.
@@ -426,9 +349,7 @@ function getNestedString(obj: Record<string, unknown>, path: string): string | u
   return typeof current === 'string' ? current : undefined
 }
 
-// =============================================================================
 // Organization Types
-// =============================================================================
 
 export interface AdminOrganization {
   id: string
@@ -437,7 +358,6 @@ export interface AdminOrganization {
   logo: string | null
   orgUsageLimit: string | null
   storageUsedBytes: number
-  departedMemberUsage: string
   createdAt: string
   updatedAt: string
 }
@@ -449,15 +369,7 @@ export interface AdminOrganizationDetail extends AdminOrganization {
 
 export type AdminOrganizationSource = Pick<
   DbOrganization,
-  | 'id'
-  | 'name'
-  | 'slug'
-  | 'logo'
-  | 'orgUsageLimit'
-  | 'storageUsedBytes'
-  | 'departedMemberUsage'
-  | 'createdAt'
-  | 'updatedAt'
+  'id' | 'name' | 'slug' | 'logo' | 'orgUsageLimit' | 'storageUsedBytes' | 'createdAt' | 'updatedAt'
 >
 
 export function toAdminOrganization(dbOrg: AdminOrganizationSource): AdminOrganization {
@@ -468,15 +380,12 @@ export function toAdminOrganization(dbOrg: AdminOrganizationSource): AdminOrgani
     logo: dbOrg.logo,
     orgUsageLimit: dbOrg.orgUsageLimit,
     storageUsedBytes: dbOrg.storageUsedBytes,
-    departedMemberUsage: dbOrg.departedMemberUsage,
     createdAt: dbOrg.createdAt.toISOString(),
     updatedAt: dbOrg.updatedAt.toISOString(),
   }
 }
 
-// =============================================================================
 // Subscription Types
-// =============================================================================
 
 export interface AdminSubscription {
   id: string
@@ -512,9 +421,7 @@ export function toAdminSubscription(dbSub: DbSubscription): AdminSubscription {
   }
 }
 
-// =============================================================================
 // Member Types
-// =============================================================================
 
 export interface AdminMember {
   id: string
@@ -534,9 +441,7 @@ export interface AdminMemberDetail extends AdminMember {
   billingBlocked: boolean
 }
 
-// =============================================================================
 // Workspace Member Types
-// =============================================================================
 
 export interface AdminWorkspaceMember {
   id: string
@@ -550,9 +455,7 @@ export interface AdminWorkspaceMember {
   userImage: string | null
 }
 
-// =============================================================================
 // User Billing Types
-// =============================================================================
 
 interface AdminUserBilling {
   userId: string
@@ -567,8 +470,7 @@ interface AdminUserBilling {
   billedOverageThisPeriod: string
   storageUsedBytes: number
   billingBlocked: boolean
-  // Copilot usage (active per-period baselines)
-  currentPeriodCopilotCost: string
+  // Copilot usage
   lastPeriodCopilotCost: string | null
 }
 
@@ -581,9 +483,7 @@ export interface AdminUserBillingWithSubscription extends AdminUserBilling {
   }>
 }
 
-// =============================================================================
 // Organization Billing Summary Types
-// =============================================================================
 
 export interface AdminOrganizationBillingSummary {
   organizationId: string
@@ -629,9 +529,7 @@ export interface AdminDeploymentVersion {
   deployedByName: string | null
 }
 
-// =============================================================================
 // Audit Log Types
-// =============================================================================
 
 export type DbAuditLog = InferSelectModel<typeof auditLog>
 

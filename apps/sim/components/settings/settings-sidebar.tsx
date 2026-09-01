@@ -1,11 +1,34 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { ChipConfirmModal, chipVariants, cn, Tooltip } from '@sim/emcn'
-import { ChevronDown } from '@sim/emcn/icons'
+import {
+  ChipConfirmModal,
+  chipIconSlotClass,
+  chipVariants,
+  cn,
+  OverflowText,
+  Tooltip,
+} from '@sim/emcn'
+import { ChevronLeft } from '@sim/emcn/icons'
 import { useRouter } from 'next/navigation'
-import type { SettingsNavigationItem, SettingsSection } from '@/components/settings/navigation'
+import {
+  SETTINGS_PLANE_CHROME,
+  type SettingsNavigationItem,
+  type SettingsSection,
+  type StandaloneSettingsPlane,
+} from '@/components/settings/navigation'
+import { SettingsIntentLink } from '@/components/settings/settings-intent-link'
+import { SimWordmark } from '@/app/(landing)/components/navbar/components'
 import { useSettingsDirtyStore } from '@/stores/settings/dirty/store'
+
+/**
+ * The marketing landing page. `?home` is required: the proxy bounces a
+ * signed-in user off `/` to `/workspace` unless the param is present.
+ */
+const LANDING_HREF = '/?home'
+
+/** Where the Back chip goes on planes that don't show the wordmark. */
+const WORKSPACE_HREF = '/workspace'
 
 interface SettingsNavigationGroup {
   key: string
@@ -19,7 +42,7 @@ interface SidebarSettingsItem<Section extends SettingsSection>
 
 interface SettingsSidebarProps<Section extends SettingsSection> {
   activeSection: string
-  backHref: string
+  plane: StandaloneSettingsPlane
   groups: readonly SettingsNavigationGroup[]
   hrefForSection: (section: Section) => string
   items: readonly SidebarSettingsItem<Section>[]
@@ -47,7 +70,7 @@ function SidebarTooltip({
 
 export function SettingsSidebar<Section extends SettingsSection>({
   activeSection,
-  backHref,
+  plane,
   groups,
   hrefForSection,
   items,
@@ -82,24 +105,37 @@ export function SettingsSidebar<Section extends SettingsSection>({
   return (
     <>
       <div className='flex flex-shrink-0 flex-col gap-0.5 px-2 pb-1.5'>
-        <SidebarTooltip label='Back' enabled={showCollapsedTooltips}>
+        {/* Both stay buttons, not Links: leaving settings must run the unsaved-changes guard. */}
+        {SETTINGS_PLANE_CHROME[plane].showWordmark ? (
           <button
             type='button'
-            onClick={() => requestLeave(() => router.push(backHref))}
-            className={chipVariants({ fullWidth: true })}
+            aria-label='Sim home'
+            onClick={() => requestLeave(() => router.push(LANDING_HREF))}
+            className='flex h-[30px] flex-shrink-0 items-center px-2 transition-opacity hover:opacity-70'
           >
-            <div className='flex size-[16px] flex-shrink-0 items-center justify-center text-[var(--text-icon)]'>
-              <ChevronDown className='size-[10px] rotate-90' />
-            </div>
-            <span className='sidebar-collapse-hide truncate text-[var(--text-body)]'>Back</span>
+            <SimWordmark />
           </button>
-        </SidebarTooltip>
+        ) : (
+          <SidebarTooltip label='Back' enabled={showCollapsedTooltips}>
+            <button
+              type='button'
+              onClick={() => requestLeave(() => router.push(WORKSPACE_HREF))}
+              className={chipVariants({ fullWidth: true })}
+            >
+              {/* The 16px slot every settings row gives its icon, so Back's label starts on their baseline. */}
+              <span aria-hidden className={cn(chipIconSlotClass, 'text-[var(--text-icon)]')}>
+                <ChevronLeft className='size-[14px]' />
+              </span>
+              <span className='sidebar-collapse-hide text-[var(--text-body)]'>Back</span>
+            </button>
+          </SidebarTooltip>
+        )}
       </div>
 
       <div
         ref={isCollapsed ? undefined : scrollContainerRef}
         className={cn(
-          'flex flex-1 flex-col overflow-y-auto overflow-x-hidden border-t pt-1.5 transition-colors duration-150',
+          'flex flex-1 flex-col overflow-y-auto overflow-x-hidden border-t pt-1.5 pb-2 transition-colors duration-150',
           !hasOverflowTop && 'border-transparent'
         )}
       >
@@ -122,32 +158,40 @@ export function SettingsSidebar<Section extends SettingsSection>({
                   {group.items.map((item) => {
                     const Icon = item.icon
                     const active = activeSection === item.id
+                    const href = hrefForSection(item.id)
                     return (
                       <SidebarTooltip
                         key={item.id}
                         label={item.label}
                         enabled={showCollapsedTooltips}
                       >
-                        <button
-                          type='button'
+                        <SettingsIntentLink
+                          href={href}
+                          replace
+                          scroll={false}
+                          aria-current={active ? 'page' : undefined}
                           className={chipVariants({ active, fullWidth: true })}
-                          onClick={() => {
-                            if (active) return
-                            requestLeave(() => {
-                              router.replace(hrefForSection(item.id), { scroll: false })
-                            })
+                          onNavigate={(event) => {
+                            if (active) {
+                              event.preventDefault()
+                              return
+                            }
+                            if (!useSettingsDirtyStore.getState().isDirty) return
+                            event.preventDefault()
+                            requestLeave(() => router.replace(href, { scroll: false }))
                           }}
                         >
                           <Icon className='size-[16px] flex-shrink-0 text-[var(--text-icon)]' />
-                          <span className='sidebar-collapse-hide min-w-0 truncate text-[var(--text-body)]'>
-                            {item.label}
-                          </span>
+                          <OverflowText
+                            label={item.label}
+                            className='sidebar-collapse-hide text-[var(--text-body)]'
+                          />
                           {item.locked && (
                             <span className='sidebar-collapse-hide ml-auto shrink-0 rounded-[3px] bg-[var(--surface-5)] px-1 py-[1px] font-medium text-[var(--text-icon)] text-micro uppercase tracking-wide'>
                               Plan
                             </span>
                           )}
-                        </button>
+                        </SettingsIntentLink>
                       </SidebarTooltip>
                     )
                   })}

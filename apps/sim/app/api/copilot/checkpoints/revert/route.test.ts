@@ -3,91 +3,66 @@
  *
  * @vitest-environment node
  */
-import { authMockFns, workflowAuthzMockFns, workflowsUtilsMock } from '@sim/testing'
+import {
+  authMockFns,
+  dbChainMockFns,
+  queueTableRows,
+  resetDbChainMock,
+  resetEnvMock,
+  schemaMock,
+  setEnv,
+  workflowAuthzMockFns,
+  workflowsUtilsMock,
+} from '@sim/testing'
 import { NextRequest } from 'next/server'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
-  mockSelect,
-  mockFrom,
-  mockWhere,
-  mockThen,
-  mockDelete,
-  mockDeleteWhere,
   mockGetAccessibleCopilotChat,
+  mockParseWorkflowStateForPersistence,
+  mockSaveWorkflowNormalizedState,
 } = vi.hoisted(() => ({
-  mockSelect: vi.fn(),
-  mockFrom: vi.fn(),
-  mockWhere: vi.fn(),
-  mockThen: vi.fn(),
-  mockDelete: vi.fn(),
-  mockDeleteWhere: vi.fn(),
   mockGetAccessibleCopilotChat: vi.fn(),
-}))
-
-vi.mock('@/lib/core/utils/urls', () => ({
-  getBaseUrl: vi.fn(() => 'http://localhost:3000'),
-  getInternalApiBaseUrl: vi.fn(() => 'http://localhost:3000'),
-  getBaseDomain: vi.fn(() => 'localhost:3000'),
-  getEmailDomain: vi.fn(() => 'localhost:3000'),
+  mockParseWorkflowStateForPersistence: vi.fn(),
+  mockSaveWorkflowNormalizedState: vi.fn(),
 }))
 
 vi.mock('@/lib/workflows/utils', () => workflowsUtilsMock)
+
+vi.mock('@/lib/workflows/persistence/save-normalized-state', () => ({
+  parseWorkflowStateForPersistence: mockParseWorkflowStateForPersistence,
+  saveWorkflowNormalizedState: mockSaveWorkflowNormalizedState,
+}))
 
 vi.mock('@/lib/copilot/chat/lifecycle', () => ({
   getAccessibleCopilotChat: mockGetAccessibleCopilotChat,
   getAccessibleCopilotChatAuth: mockGetAccessibleCopilotChat,
 }))
 
-vi.mock('@sim/db', () => ({
-  db: {
-    select: mockSelect,
-    delete: mockDelete,
-  },
-}))
-
-vi.mock('drizzle-orm', () => ({
-  and: vi.fn((...conditions: unknown[]) => ({ conditions, type: 'and' })),
-  eq: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'eq' })),
-}))
-
 import { POST } from '@/app/api/copilot/checkpoints/revert/route'
 
 describe('Copilot Checkpoints Revert API Route', () => {
-  /** Queued results for successive `.then()` calls in the db select chain */
-  let thenResults: unknown[]
-
   beforeEach(() => {
     vi.clearAllMocks()
-
-    thenResults = []
+    resetDbChainMock()
+    setEnv({ NEXT_PUBLIC_APP_URL: 'http://localhost:3000' })
 
     authMockFns.mockGetSession.mockResolvedValue(null)
 
+    /** Authorization is the route's workflow read, so an allowed result always carries one. */
     workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValue({
       allowed: true,
       status: 200,
+      workflow: { id: 'b2c3d4e5-f6a7-4b89-a0d1-e2f3a4b5c6d7', workspaceId: 'ws-123' },
     })
 
-    mockSelect.mockReturnValue({ from: mockFrom })
-    mockFrom.mockReturnValue({ where: mockWhere })
-    mockWhere.mockReturnValue({ then: mockThen })
-
-    // Drizzle's .then() is a thenable: it receives a callback like (rows) => rows[0].
-    // We invoke the callback with our mock rows array so the route gets the expected value.
-    mockThen.mockImplementation((callback: (rows: unknown[]) => unknown) => {
-      const result = thenResults.shift()
-      if (result instanceof Error) {
-        return Promise.reject(result)
-      }
-      const rows = result === undefined ? [] : [result]
-      return Promise.resolve(callback(rows))
-    })
-
-    // Mock delete chain
-    mockDelete.mockReturnValue({ where: mockDeleteWhere })
-    mockDeleteWhere.mockResolvedValue(undefined)
     mockGetAccessibleCopilotChat.mockResolvedValue({ id: 'chat-123', userId: 'user-123' })
+
+    mockParseWorkflowStateForPersistence.mockImplementation((value: unknown) => ({
+      success: true,
+      data: value,
+    }))
+    mockSaveWorkflowNormalizedState.mockResolvedValue({ success: true, warnings: [] })
 
     global.fetch = vi.fn()
 
@@ -114,8 +89,12 @@ describe('Copilot Checkpoints Revert API Route', () => {
   })
 
   afterEach(() => {
-    vi.clearAllMocks()
     vi.restoreAllMocks()
+  })
+
+  afterAll(() => {
+    resetDbChainMock()
+    resetEnvMock()
   })
 
   /** Helper to set authenticated state */
@@ -180,8 +159,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     it('should return 404 when checkpoint is not found', async () => {
       setAuthenticated()
 
-      // Mock checkpoint not found
-      thenResults.push(undefined)
+      queueTableRows(schemaMock.workflowCheckpoints, [])
 
       const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
         method: 'POST',
@@ -199,8 +177,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     it('should return 404 when checkpoint belongs to different user', async () => {
       setAuthenticated()
 
-      // Mock checkpoint not found (due to user mismatch in query)
-      thenResults.push(undefined)
+      queueTableRows(schemaMock.workflowCheckpoints, [])
 
       const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
         method: 'POST',
@@ -225,8 +202,13 @@ describe('Copilot Checkpoints Revert API Route', () => {
         workflowState: { blocks: {}, edges: [] },
       }
 
-      thenResults.push(mockCheckpoint) // Checkpoint found
-      thenResults.push(undefined) // Workflow not found
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      /** Authorization performs the workflow read, so a missing workflow surfaces through it. */
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: false,
+        status: 404,
+        workflow: null,
+      })
 
       const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
         method: 'POST',
@@ -239,6 +221,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
       expect(response.status).toBe(404)
       const responseData = await response.json()
       expect(responseData.error).toBe('Workflow not found')
+      expect(mockSaveWorkflowNormalizedState).not.toHaveBeenCalled()
     })
 
     it('should return 401 when workflow belongs to different user', async () => {
@@ -256,12 +239,13 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'different-user',
       }
 
-      thenResults.push(mockCheckpoint) // Checkpoint found
-      thenResults.push(mockWorkflow) // Workflow found but different user
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
       workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
         allowed: false,
         status: 403,
+        workflow: { id: 'b2c3d4e5-f6a7-4b89-a0d1-e2f3a4b5c6d7', workspaceId: 'ws-123' },
       })
 
       const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
@@ -298,8 +282,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      thenResults.push(mockCheckpoint) // Checkpoint found
-      thenResults.push(mockWorkflow) // Workflow found
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
@@ -339,24 +323,19 @@ describe('Copilot Checkpoints Revert API Route', () => {
         },
       })
 
-      // Verify fetch was called with correct parameters
-      expect(global.fetch).toHaveBeenCalledWith(
-        'http://localhost:3000/api/workflows/c3d4e5f6-a7b8-4c09-a1e2-f3a4b5c6d7e8/state',
-        {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Cookie: 'session=test-session',
-          },
-          body: JSON.stringify({
+      expect(mockSaveWorkflowNormalizedState).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workflowId: 'c3d4e5f6-a7b8-4c09-a1e2-f3a4b5c6d7e8',
+          userId: 'user-123',
+          state: {
             blocks: { block1: { type: 'start' } },
             edges: [{ from: 'block1', to: 'block2' }],
             loops: {},
             parallels: {},
             isDeployed: true,
             lastSaved: 1640995200000,
-          }),
-        }
+          },
+        })
       )
     })
 
@@ -380,8 +359,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      thenResults.push(mockCheckpoint)
-      thenResults.push(mockWorkflow)
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
@@ -422,8 +401,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      thenResults.push(mockCheckpoint)
-      thenResults.push(mockWorkflow)
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
@@ -464,8 +443,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      thenResults.push(mockCheckpoint)
-      thenResults.push(mockWorkflow)
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
@@ -494,7 +473,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
       })
     })
 
-    it('should return 500 when state API call fails', async () => {
+    it('should return 500 when the state write fails', async () => {
       setAuthenticated()
 
       const mockCheckpoint = {
@@ -509,12 +488,13 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      thenResults.push(mockCheckpoint)
-      thenResults.push(mockWorkflow)
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
-      ;(global.fetch as any).mockResolvedValue({
-        ok: false,
-        text: () => Promise.resolve('State validation failed'),
+      mockSaveWorkflowNormalizedState.mockResolvedValueOnce({
+        success: false,
+        status: 500,
+        error: 'Failed to save workflow state',
       })
 
       const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
@@ -530,11 +510,42 @@ describe('Copilot Checkpoints Revert API Route', () => {
       expect(responseData.error).toBe('Failed to revert workflow to checkpoint')
     })
 
+    it('should return 500 when the checkpoint state fails validation', async () => {
+      setAuthenticated()
+
+      const mockCheckpoint = {
+        id: 'checkpoint-123',
+        workflowId: 'a7b8c9d0-e1f2-4a34-b5c6-d7e8f9a0b1c2',
+        userId: 'user-123',
+        workflowState: { blocks: {}, edges: [] },
+      }
+
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [{ id: mockCheckpoint.workflowId, userId: 'user-123' }])
+
+      mockParseWorkflowStateForPersistence.mockReturnValueOnce({
+        success: false,
+        error: { issues: [{ message: 'blocks: invalid' }] },
+      })
+
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-123' }),
+      })
+
+      const response = await POST(req)
+
+      expect(response.status).toBe(500)
+      expect(mockSaveWorkflowNormalizedState).not.toHaveBeenCalled()
+    })
+
     it('should handle database errors during checkpoint lookup', async () => {
       setAuthenticated()
 
-      // Mock database error
-      thenResults.push(new Error('Database connection failed'))
+      dbChainMockFns.where.mockReturnValueOnce(
+        Promise.reject(new Error('Database connection failed'))
+      )
 
       const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
         method: 'POST',
@@ -559,8 +570,11 @@ describe('Copilot Checkpoints Revert API Route', () => {
         workflowState: { blocks: {}, edges: [] },
       }
 
-      thenResults.push(mockCheckpoint) // Checkpoint found
-      thenResults.push(new Error('Database error during workflow lookup')) // Workflow lookup fails
+      dbChainMockFns.where.mockReturnValueOnce(Promise.resolve([mockCheckpoint]))
+      /** Authorization performs the workflow read, so a failed lookup surfaces through it. */
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockRejectedValueOnce(
+        new Error('Database error during workflow lookup')
+      )
 
       const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
         method: 'POST',
@@ -575,7 +589,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
       expect(responseData.error).toBe('Failed to revert to checkpoint')
     })
 
-    it('should handle fetch network errors', async () => {
+    it('should handle unexpected errors from the state write', async () => {
       setAuthenticated()
 
       const mockCheckpoint = {
@@ -590,10 +604,10 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      thenResults.push(mockCheckpoint)
-      thenResults.push(mockWorkflow)
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
-      ;(global.fetch as any).mockRejectedValue(new Error('Network error'))
+      mockSaveWorkflowNormalizedState.mockRejectedValueOnce(new Error('Network error'))
 
       const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
         method: 'POST',
@@ -626,7 +640,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
       expect(responseData.error).toBe('Failed to revert to checkpoint')
     })
 
-    it('should forward cookies to state API call', async () => {
+    it('should apply the state in-process instead of re-authenticating over HTTP', async () => {
       setAuthenticated()
 
       const mockCheckpoint = {
@@ -641,8 +655,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      thenResults.push(mockCheckpoint)
-      thenResults.push(mockWorkflow)
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
@@ -662,17 +676,15 @@ describe('Copilot Checkpoints Revert API Route', () => {
 
       await POST(req)
 
-      expect(global.fetch).toHaveBeenCalledWith(
-        'http://localhost:3000/api/workflows/d0e1f2a3-b4c5-4d67-a8f9-a0b1c2d3e4f5/state',
-        {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Cookie: 'session=test-session; auth=token123',
-          },
-          body: expect.any(String),
-        }
+      expect(mockSaveWorkflowNormalizedState).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workflowId: 'd0e1f2a3-b4c5-4d67-a8f9-a0b1c2d3e4f5',
+          userId: 'user-123',
+        })
       )
+      for (const call of (global.fetch as any).mock.calls) {
+        expect(String(call[0])).not.toContain('/state')
+      }
     })
 
     it('should handle missing cookies gracefully', async () => {
@@ -690,8 +702,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      thenResults.push(mockCheckpoint)
-      thenResults.push(mockWorkflow)
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
@@ -712,16 +724,11 @@ describe('Copilot Checkpoints Revert API Route', () => {
       const response = await POST(req)
 
       expect(response.status).toBe(200)
-      expect(global.fetch).toHaveBeenCalledWith(
-        'http://localhost:3000/api/workflows/e1f2a3b4-c5d6-4e78-a9a0-b1c2d3e4f5a6/state',
-        {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Cookie: '', // Empty string when no cookies
-          },
-          body: expect.any(String),
-        }
+      expect(mockSaveWorkflowNormalizedState).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workflowId: 'e1f2a3b4-c5d6-4e78-a9a0-b1c2d3e4f5a6',
+          userId: 'user-123',
+        })
       )
     })
 
@@ -758,8 +765,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      thenResults.push(mockCheckpoint)
-      thenResults.push(mockWorkflow)
+      queueTableRows(schemaMock.workflowCheckpoints, [mockCheckpoint])
+      queueTableRows(schemaMock.workflow, [mockWorkflow])
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,

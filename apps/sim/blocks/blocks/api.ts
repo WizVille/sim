@@ -17,6 +17,16 @@ export const ApiBlock: BlockConfig<RequestResponse> = {
   integrationType: IntegrationType.DevOps,
   bgColor: '#2F55FF',
   icon: ApiIcon,
+  canvasPresentation: {
+    defaultTitle: 'API',
+    sentences: {
+      default: [
+        { text: 'Send', field: 'method', after: 'request to', core: true },
+        { field: 'url', core: true },
+        { text: ', with body', field: 'body' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'url',
@@ -56,6 +66,7 @@ export const ApiBlock: BlockConfig<RequestResponse> = {
       id: 'body',
       title: 'Body',
       type: 'code',
+      language: 'json',
       placeholder: 'Enter JSON...',
       wandConfig: {
         enabled: true,
@@ -123,6 +134,31 @@ Example:
       description: 'Allow retries for POST/PATCH requests (may create duplicate requests)',
       mode: 'advanced',
     },
+    {
+      id: 'redirectPolicyVersion',
+      title: 'Redirect policy version',
+      type: 'short-input',
+      defaultValue: 'standard-v1',
+      hidden: true,
+    },
+    {
+      id: 'sendCredentialsOnCrossOriginRedirect',
+      title: 'Send credentials on cross-origin redirects',
+      type: 'switch',
+      defaultValue: true,
+      description:
+        'Forward credential-bearing headers when a redirect changes scheme, host, or port. Enabled by default for compatibility; disable it when redirected destinations should not receive the same credentials.',
+      mode: 'advanced',
+    },
+    {
+      id: 'proxyUrl',
+      title: 'Proxy URL',
+      type: 'short-input',
+      placeholder: 'http://user:pass@proxy.host:port or {{PROXY_URL}}',
+      description:
+        'Optional. Route this request through an http:// proxy (e.g. a residential proxy). Must be http://; the proxy host must be publicly reachable. Keep credentials in an environment variable and reference it like {{PROXY_URL}}.',
+      mode: 'advanced',
+    },
   ],
   tools: {
     access: ['http_request'],
@@ -143,6 +179,18 @@ Example:
     retryNonIdempotent: {
       type: 'boolean',
       description: 'Allow retries for non-idempotent methods like POST/PATCH',
+    },
+    redirectPolicyVersion: {
+      type: 'string',
+      description: 'Persisted redirect-policy compatibility version',
+    },
+    sendCredentialsOnCrossOriginRedirect: {
+      type: 'boolean',
+      description: 'Send credential-bearing headers on redirects to a different origin',
+    },
+    proxyUrl: {
+      type: 'string',
+      description: 'Optional http:// proxy URL to route the request through',
     },
   },
   outputs: {

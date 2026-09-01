@@ -16,6 +16,15 @@ export const SmtpBlock: BlockConfig<SmtpSendMailResult> = {
   bgColor: '#2D3748',
   icon: SmtpIcon,
   authMode: AuthMode.ApiKey,
+  canvasPresentation: {
+    defaultTitle: 'SMTP',
+    sentences: {
+      default: [
+        { text: 'Send', field: 'subject', core: true },
+        { text: 'to', field: 'to', core: true },
+      ],
+    },
+  },
 
   subBlocks: [
     {
@@ -71,6 +80,7 @@ export const SmtpBlock: BlockConfig<SmtpSendMailResult> = {
     {
       id: 'to',
       title: 'To',
+      canvasNoun: 'a recipient',
       type: 'short-input',
       placeholder: 'recipient@example.com',
       required: true,
@@ -215,7 +225,7 @@ export const SmtpBlockMeta = {
   templates: [
     {
       icon: SmtpIcon,
-      title: 'Scheduled daily digest email',
+      title: 'SMTP daily digest email',
       prompt:
         'Build a scheduled workflow that gathers the day’s key updates, has an agent write a clean HTML summary, and sends it as a daily digest email to the team over SMTP.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -224,7 +234,7 @@ export const SmtpBlockMeta = {
     },
     {
       icon: SmtpIcon,
-      title: 'Alert email when a condition is met',
+      title: 'SMTP alert email on threshold',
       prompt:
         'Create a workflow that checks a metric or status, and when it crosses a threshold, sends an alert email over SMTP with the details and a clear subject so the on-call person notices immediately.',
       modules: ['agent', 'workflows'],
@@ -233,7 +243,7 @@ export const SmtpBlockMeta = {
     },
     {
       icon: SmtpIcon,
-      title: 'Email a generated report as an attachment',
+      title: 'SMTP report as attachment',
       prompt:
         'Build a workflow that generates a report file, then sends it as an email attachment over SMTP to the requested recipients with a short summary in the body.',
       modules: ['files', 'agent', 'workflows'],
@@ -242,7 +252,7 @@ export const SmtpBlockMeta = {
     },
     {
       icon: SmtpIcon,
-      title: 'Personalized outreach from a recipient table',
+      title: 'SMTP outreach from a table',
       prompt:
         'Create a workflow that reads a table of recipients, has an agent draft a personalized message for each row, and sends an individual email to every contact over SMTP with their name and details filled in.',
       modules: ['tables', 'agent', 'workflows'],
@@ -251,7 +261,7 @@ export const SmtpBlockMeta = {
     },
     {
       icon: SmtpIcon,
-      title: 'Form-submission auto-reply',
+      title: 'SMTP form-submission auto-reply',
       prompt:
         'Build a workflow that triggers on a new form submission and sends an automatic confirmation email over SMTP to the submitter, using their address as the recipient and a friendly reply-to.',
       modules: ['agent', 'workflows'],
@@ -260,7 +270,7 @@ export const SmtpBlockMeta = {
     },
     {
       icon: SmtpIcon,
-      title: 'Incident notification email',
+      title: 'SMTP incident notification',
       prompt:
         'Create a workflow that, when an incident is detected, sends a notification email over SMTP to a distribution list with the severity, impact, and next steps, cc’ing the stakeholders who need to be looped in.',
       modules: ['agent', 'workflows'],
@@ -269,7 +279,7 @@ export const SmtpBlockMeta = {
     },
     {
       icon: SmtpIcon,
-      title: 'Weekly summary email',
+      title: 'SMTP weekly summary email',
       prompt:
         'Build a scheduled workflow that compiles the week’s results into an HTML summary with an agent and emails it over SMTP to the team every Friday, with a link-friendly reply-to for follow-ups.',
       modules: ['scheduled', 'agent', 'workflows'],

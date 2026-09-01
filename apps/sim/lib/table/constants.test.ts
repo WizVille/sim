@@ -24,7 +24,24 @@ vi.mock('@/lib/core/config/env', () => ({
   },
 }))
 
-import { getBillingDisabledTableLimits } from '@/lib/table/constants'
+/**
+ * Query-suffixed import gives this file a private instance of the module under
+ * test. Under `isolate: false` the worker's module graph is shared across test
+ * files, so the plain specifier may already be cached with the real env binding
+ * (mocks never reach an already-evaluated module) — and evaluating it here
+ * under this file's mocks would poison it for later files. The suffixed id is
+ * unique to this file, so it always evaluates fresh with the mock above.
+ */
+declare module '@/lib/table/constants?constants-test' {
+  // biome-ignore lint/suspicious/noExportsInTest: ambient type re-declaration for the query-suffixed specifier, not a runtime export
+  export * from '@/lib/table/constants'
+}
+
+import {
+  getBillingDisabledTableLimits,
+  getMaxPageBytes,
+  TABLE_LIMITS,
+} from '@/lib/table/constants?constants-test'
 
 describe('getBillingDisabledTableLimits', () => {
   beforeEach(() => {
@@ -51,5 +68,21 @@ describe('getBillingDisabledTableLimits', () => {
       maxTables: 7,
       maxRowsPerTable: 2500,
     })
+  })
+})
+
+describe('getMaxPageBytes', () => {
+  beforeEach(() => {
+    for (const key of Object.keys(mockEnv)) delete mockEnv[key]
+  })
+
+  it('defaults bounded pages to the 5MB query-result budget', () => {
+    expect(getMaxPageBytes()).toBe(TABLE_LIMITS.MAX_QUERY_RESULT_BYTES)
+  })
+
+  it('allows a positive integer environment override', () => {
+    mockEnv.TABLE_MAX_PAGE_BYTES = String(2 * 1024 * 1024)
+
+    expect(getMaxPageBytes()).toBe(2 * 1024 * 1024)
   })
 })

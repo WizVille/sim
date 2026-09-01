@@ -1,7 +1,7 @@
 'use client'
 
 import { Chip, ChipInput } from '@sim/emcn'
-import { Plus, Trash2 } from 'lucide-react'
+import { Plus, Trash } from '@sim/emcn/icons'
 import type { CustomPiiPattern } from '@/lib/guardrails/pii-entities'
 import { validateRegexPattern } from '@/lib/guardrails/validate_regex'
 
@@ -15,9 +15,13 @@ interface CustomPatternsEditorProps {
 
 /**
  * Editor for user-supplied custom regex patterns. Each row is a name label, the
- * regex (validated inline for syntax + catastrophic-backtracking safety), and the
- * verbatim replacement token that matches are redacted to. Shared by the Data
- * Retention settings and any other PII-policy surface.
+ * regex (validated inline for syntax only), and the verbatim replacement token
+ * that matches are redacted to. Shared by the Data Retention settings and any
+ * other PII-policy surface.
+ *
+ * Syntax is the only check because these patterns execute in Presidio, not in
+ * this process — see `validateRegexPattern` for why a backtracking screen here
+ * was removed rather than kept.
  */
 export function CustomPatternsEditor({ patterns, onChange }: CustomPatternsEditorProps) {
   function updateRow(index: number, patch: Partial<CustomPiiPattern>) {
@@ -56,7 +60,7 @@ export function CustomPatternsEditor({ patterns, onChange }: CustomPatternsEdito
                 className='flex-1'
               />
               <ChipInput
-                placeholder='EMPLOYEE_ID'
+                placeholder='SUBSTITUTION_TEXT'
                 value={pattern.replacement}
                 onChange={(e) => updateRow(index, { replacement: e.target.value })}
                 className='w-[26%]'
@@ -67,7 +71,7 @@ export function CustomPatternsEditor({ patterns, onChange }: CustomPatternsEdito
                 onClick={() => removeRow(index)}
                 className='flex size-[30px] flex-shrink-0 items-center justify-center rounded-md text-[var(--text-icon)] transition-colors hover-hover:bg-[var(--surface-active)] hover-hover:text-[var(--text-error)]'
               >
-                <Trash2 className='size-[14px]' />
+                <Trash className='size-[14px]' />
               </button>
             </div>
             {error && <span className='text-[var(--text-error)] text-small'>{error}</span>}

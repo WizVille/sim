@@ -44,34 +44,28 @@ export function NoOrganizationView({
     return (
       <div>
         <div className='flex flex-col gap-5'>
-          {/* Header - matching settings page style */}
           <div>
-            <h4 className='font-medium text-[var(--text-primary)] text-base'>
-              Create Your Team Workspace
-            </h4>
+            <h4 className='text-[var(--text-primary)] text-base'>Create Your Team Workspace</h4>
             <p className='mt-1 text-[var(--text-muted)] text-small'>
               You're subscribed to a {hasEnterprisePlan ? 'enterprise' : 'team'} plan. Create your
               workspace to start collaborating with your team.
             </p>
           </div>
 
-          {/* Form fields - clean layout without card */}
           <div className='flex flex-col gap-4.5'>
-            {/* Hidden decoy field to prevent browser autofill */}
+            {/* Decoy field: absorbs browser autofill so it can't target the real inputs. */}
             <input
               type='text'
               name='fakeusernameremembered'
               autoComplete='username'
-              style={{ position: 'absolute', left: '-9999px', opacity: 0, pointerEvents: 'none' }}
+              className='-left-[9999px] pointer-events-none absolute opacity-0'
               tabIndex={-1}
               readOnly
               aria-hidden='true'
               aria-label='Ignore this field'
             />
             <div>
-              <Label htmlFor='team-name-field' className='font-medium text-small'>
-                Team Name
-              </Label>
+              <Label htmlFor='team-name-field'>Team Name</Label>
               <ChipInput
                 id='team-name-field'
                 value={orgName}
@@ -88,9 +82,7 @@ export function NoOrganizationView({
             </div>
 
             <div>
-              <Label htmlFor='orgSlug' className='font-medium text-small'>
-                Team URL
-              </Label>
+              <Label htmlFor='orgSlug'>Team URL</Label>
               <div className='mt-1 flex items-center'>
                 <div className='rounded-l-[6px] border border-[var(--border-1)] border-r-0 bg-[var(--surface-4)] px-3 py-1.5 text-[var(--text-muted)] text-small'>
                   sim.ai/team/
@@ -131,12 +123,12 @@ export function NoOrganizationView({
             Create Team Organization
           </ChipModalHeader>
           <ChipModalBody>
-            {/* Hidden decoy field to prevent browser autofill */}
+            {/* Decoy field: absorbs browser autofill so it can't target the real inputs. */}
             <input
               type='text'
               name='fakeusernameremembered'
               autoComplete='username'
-              style={{ position: 'absolute', left: '-9999px', opacity: 0, pointerEvents: 'none' }}
+              className='-left-[9999px] pointer-events-none absolute opacity-0'
               tabIndex={-1}
               readOnly
               aria-hidden='true'
@@ -182,7 +174,7 @@ export function NoOrganizationView({
   return (
     <div className='flex flex-col gap-5'>
       <div className='flex flex-col gap-2'>
-        <h3 className='font-medium text-[var(--text-primary)] text-base'>No Team Workspace</h3>
+        <h3 className='text-[var(--text-primary)] text-base'>No Team Workspace</h3>
         <p className='text-[var(--text-secondary)] text-small'>
           You don't have a team workspace yet. To collaborate with others, first upgrade to a team
           or enterprise plan.

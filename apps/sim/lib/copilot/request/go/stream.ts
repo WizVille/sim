@@ -1,6 +1,7 @@
 import { type Context, SpanStatusCode } from '@opentelemetry/api'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
 import { ORCHESTRATION_TIMEOUT_MS } from '@/lib/copilot/constants'
 import {
   MothershipStreamV1EventType,
@@ -57,9 +58,7 @@ type SubagentSpanData = {
 }
 
 function asJsonRecord(value: unknown): JsonRecord | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as JsonRecord)
-    : undefined
+  return isRecordLike(value) ? (value as JsonRecord) : undefined
 }
 
 function parseSubagentSpanData(value: unknown): SubagentSpanData | undefined {
@@ -93,6 +92,31 @@ export class BillingLimitError extends Error {
   constructor(public readonly userId: string) {
     super('Usage limit reached')
     this.name = 'BillingLimitError'
+  }
+}
+
+/**
+ * Shown to the user when a leg ends early. It must not promise that retrying
+ * helps: the backend has already produced its outcome for this leg, and the
+ * turn's completed work is persisted by the finalizer.
+ */
+export const STREAM_ENDED_WITHOUT_TERMINAL_MESSAGE =
+  'The assistant stopped before finishing this turn. The work it already completed has been saved — send a message to continue from there.'
+
+/**
+ * The SSE body closed after a `200` response without a terminal event: the
+ * backend accepted the leg, ran it, and ended it on whatever outcome it reached
+ * in-band. Distinct from {@link CopilotBackendError} because there is no HTTP
+ * failure here — the leg is already claimed on the backend, so the outcome is
+ * deterministic and re-posting it cannot change anything.
+ */
+export class StreamEndedWithoutTerminalError extends Error {
+  readonly path: string
+
+  constructor(path: string) {
+    super(STREAM_ENDED_WITHOUT_TERMINAL_MESSAGE)
+    this.name = 'StreamEndedWithoutTerminalError'
+    this.path = path
   }
 }
 
@@ -343,16 +367,28 @@ export async function runStreamLoop(
           return
         }
 
-        await processFilePreviewStreamEvent({
-          streamId: envelope.stream.streamId,
-          streamEvent,
-          context,
-          execContext,
-          options,
-          state: filePreviewAdapterState,
-        })
+        // Presentation only. A throw here abandons the rest of the event, so
+        // the tool-call frame never registers its arguments and the call is
+        // later dispatched with an empty payload.
+        try {
+          await processFilePreviewStreamEvent({
+            streamId: envelope.stream.streamId,
+            streamEvent,
+            context,
+            execContext,
+            options,
+            state: filePreviewAdapterState,
+          })
+        } catch (error) {
+          logger.warn('Failed to process file preview stream event', {
+            type: streamEvent.type,
+            requestId: context.requestId,
+            messageId: context.messageId,
+            error: getErrorMessage(error),
+          })
+        }
 
-        await prePersistClientExecutableToolCall(streamEvent, context)
+        await prePersistClientExecutableToolCall(streamEvent, context, options, execContext)
 
         try {
           await options.onEvent?.(streamEvent)
@@ -396,17 +432,36 @@ export async function runStreamLoop(
               context.subAgentToolCalls[toolCallId] ??= []
             }
             if (toolCallId && subagentName) {
+              const payloadData = streamEvent.payload.data
+              const rawName =
+                payloadData && typeof payloadData === 'object' && !Array.isArray(payloadData)
+                  ? (payloadData as Record<string, unknown>).name
+                  : undefined
+              const displayName = typeof rawName === 'string' && rawName ? rawName : undefined
               const openParents = (context.openSubagentParents ??= new Set<string>())
               if (!openParents.has(toolCallId)) {
                 openParents.add(toolCallId)
                 context.contentBlocks.push({
                   type: 'subagent',
                   content: subagentName,
+                  ...(displayName ? { subagentName: displayName } : {}),
                   parentToolCallId: toolCallId,
                   ...(spanId ? { spanId } : {}),
                   ...(parentSpanId ? { parentSpanId } : {}),
                   timestamp: Date.now(),
                 })
+              } else if (displayName) {
+                // The lane was opened by the dispatch-time start, which fires
+                // before the trigger args (and therefore the name) exist. The
+                // phase-3 start re-announces the lane WITH the name; backfill
+                // it instead of dropping the duplicate wholesale.
+                for (let i = context.contentBlocks.length - 1; i >= 0; i--) {
+                  const b = context.contentBlocks[i]
+                  if (b.type === 'subagent' && b.parentToolCallId === toolCallId) {
+                    if (!b.subagentName) b.subagentName = displayName
+                    break
+                  }
+                }
               }
             } else {
               logger.warn('subagent start missing toolCallId or agent name', {
@@ -486,15 +541,14 @@ export async function runStreamLoop(
         endedOn = CopilotSseCloseReason.Aborted
       } else {
         const streamPath = new URL(fetchUrl).pathname
-        const message = `Copilot backend stream ended before a terminal event on ${streamPath}`
-        context.errors.push(message)
+        context.errors.push(STREAM_ENDED_WITHOUT_TERMINAL_MESSAGE)
         logger.error('Copilot backend stream ended before a terminal event', {
           path: streamPath,
           requestId: context.requestId,
           messageId: context.messageId,
         })
         endedOn = CopilotSseCloseReason.ClosedNoTerminal
-        throw new CopilotBackendError(message, { status: 503 })
+        throw new StreamEndedWithoutTerminalError(streamPath)
       }
     }
   } catch (error) {

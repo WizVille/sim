@@ -24,15 +24,15 @@ import {
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
 import { truncate } from '@sim/utils/string'
-import { CSV_ASYNC_IMPORT_THRESHOLD_BYTES } from '@/lib/table/constants'
-import { buildAutoMapping, parseCsvBuffer } from '@/lib/table/import'
-import type { TableDefinition } from '@/lib/table/types'
 import {
-  type CsvImportMode,
-  cancelTableJob,
-  useImportCsvIntoTable,
-  useImportCsvIntoTableAsync,
-} from '@/hooks/queries/tables'
+  buildAutoMapping,
+  CSV_DELIMITER_SNIFF_BYTES,
+  type CsvDelimiter,
+  detectCsvDelimiter,
+  parseCsvBuffer,
+} from '@/lib/table/import'
+import type { TableDefinition } from '@/lib/table/types'
+import { type CsvImportMode, useImportCsvIntoTable } from '@/hooks/queries/tables'
 import { useImportTrayStore } from '@/stores/table/import-tray/store'
 
 const logger = createLogger('ImportCsvDialog')
@@ -47,7 +47,7 @@ const CSV_PREVIEW_BYTES = 512 * 1024
 /**
  * Sentinel value for the "Do not import" option in the mapping combobox. The
  * whitespace is intentional: valid column names must match `NAME_PATTERN`
- * (`/^[a-z_][a-z0-9_]*$/i`), so no real column can share this value.
+ * (`/^[A-Za-z_][A-Za-z0-9_]*$/`), so no real column can share this value.
  */
 const SKIP_VALUE = '__ skip __'
 /**
@@ -107,8 +107,13 @@ interface ParsedCsv {
   sampleRows: Record<string, unknown>[]
 }
 
-/** Parses the head of a CSV/TSV for the mapping + sample, dropping any truncated final line. */
-async function parseCsvPreview(file: File, delimiter: ',' | '\t') {
+/**
+ * Parses the head of a CSV/TSV for the mapping + sample, dropping any truncated final line.
+ *
+ * The separator is sniffed from the same leading bytes the server sniffs, so the mapping shown
+ * here always matches the columns the import will actually produce.
+ */
+async function parseCsvPreview(file: File, fallbackDelimiter: CsvDelimiter) {
   const sliced = file.size > CSV_PREVIEW_BYTES
   const blob = sliced ? file.slice(0, CSV_PREVIEW_BYTES) : file
   let bytes = new Uint8Array(await blob.arrayBuffer())
@@ -116,6 +121,13 @@ async function parseCsvPreview(file: File, delimiter: ',' | '\t') {
     const lastNewline = bytes.lastIndexOf(0x0a)
     if (lastNewline > 0) bytes = bytes.subarray(0, lastNewline + 1)
   }
+  // The sniff sample is the whole file only when nothing was sliced off and it fits the window;
+  // otherwise it's a truncated prefix whose last line may be partial.
+  const delimiter = await detectCsvDelimiter(
+    bytes.subarray(0, CSV_DELIMITER_SNIFF_BYTES),
+    fallbackDelimiter,
+    { complete: !sliced && bytes.length <= CSV_DELIMITER_SNIFF_BYTES }
+  )
   return parseCsvBuffer(bytes, delimiter)
 }
 
@@ -134,7 +146,6 @@ export function ImportCsvDialog({
   const [createHeaders, setCreateHeaders] = useState<Set<string>>(new Set())
   const [mode, setMode] = useState<CsvImportMode>('append')
   const importMutation = useImportCsvIntoTable()
-  const importAsyncMutation = useImportCsvIntoTableAsync()
 
   function resetState() {
     setParsed(null)
@@ -157,10 +168,16 @@ export function ImportCsvDialog({
     resetState()
   }
 
+  // Replace deletes every existing row and creating columns is a schema change,
+  // so each needs its own lock clear. Withholding them here keeps the dialog
+  // from offering a configuration the server can only answer with a 423.
+  const canReplace = !table.locks?.deleteLocked
+  const canCreateColumns = !table.locks?.schemaLocked
+
   const columnOptions: ComboboxOption[] = useMemo(() => {
     const options: ComboboxOption[] = [
       { label: 'Do not import', value: SKIP_VALUE },
-      { label: '+ Create new column', value: CREATE_VALUE },
+      ...(canCreateColumns ? [{ label: '+ Create new column', value: CREATE_VALUE }] : []),
     ]
     for (const col of table.schema.columns) {
       options.push({
@@ -169,7 +186,7 @@ export function ImportCsvDialog({
       })
     }
     return options
-  }, [table.schema.columns])
+  }, [table.schema.columns, canCreateColumns])
 
   async function handleFileSelected(file: File) {
     const ext = file.name.split('.').pop()?.toLowerCase()
@@ -180,8 +197,7 @@ export function ImportCsvDialog({
     setParsing(true)
     setParseError(null)
     try {
-      const delimiter: ',' | '\t' = ext === 'tsv' ? '\t' : ','
-      const { headers, rows } = await parseCsvPreview(file, delimiter)
+      const { headers, rows } = await parseCsvPreview(file, ext === 'tsv' ? '\t' : ',')
       const autoMapping = buildAutoMapping(headers, table.schema)
       setParsed({
         file,
@@ -240,6 +256,7 @@ export function ImportCsvDialog({
 
   function handleModeChange(value: string) {
     setSubmitError(null)
+    if (value === 'replace' && !canReplace) return
     setMode(value as CsvImportMode)
   }
 
@@ -282,7 +299,6 @@ export function ImportCsvDialog({
   const canSubmit =
     parsed !== null &&
     !importMutation.isPending &&
-    !importAsyncMutation.isPending &&
     missingRequired.length === 0 &&
     duplicateTargets.length === 0 &&
     mappedCount + createCount > 0
@@ -290,78 +306,50 @@ export function ImportCsvDialog({
   async function handleSubmit() {
     if (!parsed || !canSubmit) return
     setSubmitError(null)
-    const createColumns = createHeaders.size > 0 ? [...createHeaders] : undefined
+    // Hiding the Replace control doesn't clear an already-selected `mode`, so a
+    // delete lock landing while the dialog is open would still submit replace.
+    const effectiveMode: CsvImportMode = canReplace ? mode : 'append'
+    const createColumns =
+      canCreateColumns && createHeaders.size > 0 ? [...createHeaders] : undefined
 
-    // Large files can't be POSTed through the server (request-body cap) — upload them
-    // straight to storage and import in the background instead. Seed the header tray and
-    // close the dialog immediately so the indicator is visible during the upload, then run
-    // the upload + kickoff in the background (don't block the dialog on it).
-    if (parsed.file.size >= CSV_ASYNC_IMPORT_THRESHOLD_BYTES) {
-      useImportTrayStore.getState().startUpload({
-        uploadId: table.id,
-        workspaceId,
-        title: parsed.file.name,
-      })
-      onOpenChange(false)
-      toast.success(`Importing "${parsed.file.name}" into "${table.name}" in the background`)
-      importAsyncMutation.mutate(
-        {
-          workspaceId,
-          tableId: table.id,
-          file: parsed.file,
-          mode,
-          mapping,
-          createColumns,
-          onProgress: (percent) => {
-            useImportTrayStore.getState().setUploadPercent(table.id, percent)
-          },
-        },
-        {
-          onSuccess: (data) => {
-            useImportTrayStore.getState().endUpload(table.id)
-            // The server row drives the tray once the list refetches. If canceled mid-upload, flag
-            // the id so it's not shown and cancel the worker server-side.
-            if (useImportTrayStore.getState().consumeCanceled(table.id) && data?.importId) {
-              useImportTrayStore.getState().cancel(table.id)
-              void cancelTableJob(workspaceId, table.id, data.importId).catch(() => {})
-            }
-          },
-          onError: () => {
-            // The hook's onError surfaces the toast; just clear the tray indicator here.
-            useImportTrayStore.getState().endUpload(table.id)
-          },
-        }
-      )
-      return
-    }
-
-    try {
-      const result = await importMutation.mutateAsync({
+    let importId: string | null = null
+    onOpenChange(false)
+    toast.success(`Importing "${parsed.file.name}" into "${table.name}" in the background`)
+    importMutation.mutate(
+      {
         workspaceId,
         tableId: table.id,
         file: parsed.file,
-        mode,
+        mode: effectiveMode,
         mapping,
         createColumns,
-      })
-      const data = result.data
-      if (mode === 'append') {
-        toast.success(`Imported ${data?.insertedCount ?? 0} rows into "${table.name}"`)
-      } else {
-        toast.success(
-          `Replaced rows in "${table.name}": deleted ${data?.deletedCount ?? 0}, inserted ${data?.insertedCount ?? 0}`
-        )
+        onCreated: (createdImportId) => {
+          importId = createdImportId
+          useImportTrayStore.getState().startUpload({
+            uploadId: createdImportId,
+            tableId: table.id,
+            workspaceId,
+            title: parsed.file.name,
+          })
+        },
+        onProgress: (percent) => {
+          if (importId) useImportTrayStore.getState().setUploadPercent(importId, percent)
+        },
+      },
+      {
+        onSuccess: () => {
+          if (importId) {
+            useImportTrayStore.getState().endUpload(importId)
+            useImportTrayStore.getState().consumeCanceled(importId)
+          }
+          onImported?.({})
+        },
+        onError: (error) => {
+          if (importId) useImportTrayStore.getState().endUpload(importId)
+          setSubmitError(summarizeImportError(error.message))
+        },
       }
-      onImported?.({
-        insertedCount: data?.insertedCount,
-        deletedCount: data?.deletedCount,
-      })
-      onOpenChange(false)
-    } catch (err) {
-      const message = getErrorMessage(err, 'Failed to import CSV')
-      setSubmitError(summarizeImportError(message))
-      logger.error('CSV import into existing table failed', err)
-    }
+    )
   }
 
   const hasWarning = missingRequired.length > 0 || duplicateTargets.length > 0
@@ -409,14 +397,19 @@ export function ImportCsvDialog({
             <ChipModalField type='custom' title='Mode'>
               <ButtonGroup value={mode} onValueChange={handleModeChange}>
                 <ButtonGroupItem value='append'>Append</ButtonGroupItem>
-                <ButtonGroupItem value='replace'>Replace all rows</ButtonGroupItem>
+                {canReplace && <ButtonGroupItem value='replace'>Replace all rows</ButtonGroupItem>}
               </ButtonGroup>
             </ChipModalField>
 
             <ChipModalField type='custom' title='Column mapping'>
               {skipCount > 0 && (
                 <div className='flex justify-end'>
-                  <Button variant='ghost' size='sm' onClick={handleCreateAllUnmapped}>
+                  <Button
+                    variant='ghost'
+                    size='sm'
+                    disabled={!canCreateColumns}
+                    onClick={handleCreateAllUnmapped}
+                  >
                     Create columns for {skipCount} unmapped
                   </Button>
                 </div>
@@ -507,6 +500,7 @@ export function ImportCsvDialog({
       <ChipModalFooter
         onCancel={() => onOpenChange(false)}
         cancelDisabled={importMutation.isPending}
+        defaultAction={mode === 'replace' ? 'none' : 'primary'}
         primaryAction={{
           label: importMutation.isPending
             ? mode === 'replace'

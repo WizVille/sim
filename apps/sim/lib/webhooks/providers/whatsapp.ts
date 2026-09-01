@@ -4,6 +4,7 @@ import { createLogger } from '@sim/logger'
 import { safeCompare } from '@sim/security/compare'
 import { sha256Hex } from '@sim/security/hash'
 import { hmacSha256Hex } from '@sim/security/hmac'
+import { isRecordLike } from '@sim/utils/object'
 import { and, eq, isNull, or } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
 import type {
@@ -14,26 +15,22 @@ import type {
 
 const logger = createLogger('WebhookProvider:WhatsApp')
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
-}
-
 function getWhatsAppChanges(
   body: unknown
 ): Array<{ field?: string; value: Record<string, unknown> }> {
-  if (!isRecord(body) || !Array.isArray(body.entry)) {
+  if (!isRecordLike(body) || !Array.isArray(body.entry)) {
     return []
   }
 
   const changes: Array<{ field?: string; value: Record<string, unknown> }> = []
 
   for (const entry of body.entry) {
-    if (!isRecord(entry) || !Array.isArray(entry.changes)) {
+    if (!isRecordLike(entry) || !Array.isArray(entry.changes)) {
       continue
     }
 
     for (const change of entry.changes) {
-      if (!isRecord(change) || !isRecord(change.value)) {
+      if (!isRecordLike(change) || !isRecordLike(change.value)) {
         continue
       }
 
@@ -48,7 +45,7 @@ function getWhatsAppChanges(
 }
 
 function normalizeWhatsAppContact(contact: Record<string, unknown>) {
-  const profile = isRecord(contact.profile) ? contact.profile : undefined
+  const profile = isRecordLike(contact.profile) ? contact.profile : undefined
 
   return {
     wa_id: typeof contact.wa_id === 'string' ? contact.wa_id : undefined,
@@ -60,11 +57,41 @@ function normalizeWhatsAppContact(contact: Record<string, unknown>) {
   }
 }
 
+/** Message types whose payload carries a downloadable media asset. */
+const WHATSAPP_MEDIA_TYPES = new Set(['image', 'audio', 'video', 'document', 'sticker'])
+
+/**
+ * Pull the media asset off a typed media message. WhatsApp nests it under a key
+ * matching the message `type` — `{ type: 'image', image: { id, mime_type, ... } }`.
+ * Note `media.id` is the media asset ID passed to Download Media, which is a
+ * different value from `message.id` (the `wamid.` message identifier).
+ */
+function extractWhatsAppMedia(message: Record<string, unknown>) {
+  const type = typeof message.type === 'string' ? message.type : undefined
+  if (!type || !WHATSAPP_MEDIA_TYPES.has(type)) {
+    return undefined
+  }
+
+  const media = isRecordLike(message[type]) ? (message[type] as Record<string, unknown>) : undefined
+  if (!media) {
+    return undefined
+  }
+
+  return {
+    mediaId: typeof media.id === 'string' ? media.id : undefined,
+    mediaMimeType: typeof media.mime_type === 'string' ? media.mime_type : undefined,
+    mediaSha256: typeof media.sha256 === 'string' ? media.sha256 : undefined,
+    mediaFilename: typeof media.filename === 'string' ? media.filename : undefined,
+    caption: typeof media.caption === 'string' ? media.caption : undefined,
+  }
+}
+
 function normalizeWhatsAppMessage(
   message: Record<string, unknown>,
   metadata?: Record<string, unknown>
 ) {
-  const text = isRecord(message.text) ? message.text : undefined
+  const text = isRecordLike(message.text) ? message.text : undefined
+  const media = extractWhatsAppMedia(message)
 
   return {
     messageId: typeof message.id === 'string' ? message.id : undefined,
@@ -78,6 +105,11 @@ function normalizeWhatsAppMessage(
     text: typeof text?.body === 'string' ? text.body : undefined,
     timestamp: typeof message.timestamp === 'string' ? message.timestamp : undefined,
     messageType: typeof message.type === 'string' ? message.type : undefined,
+    mediaId: media?.mediaId,
+    mediaMimeType: media?.mediaMimeType,
+    mediaSha256: media?.mediaSha256,
+    mediaFilename: media?.mediaFilename,
+    caption: media?.caption,
     raw: message,
   }
 }
@@ -97,8 +129,8 @@ function normalizeWhatsAppStatus(
         : undefined,
     status: typeof status.status === 'string' ? status.status : undefined,
     timestamp: typeof status.timestamp === 'string' ? status.timestamp : undefined,
-    conversation: isRecord(status.conversation) ? status.conversation : undefined,
-    pricing: isRecord(status.pricing) ? status.pricing : undefined,
+    conversation: isRecordLike(status.conversation) ? status.conversation : undefined,
+    pricing: isRecordLike(status.pricing) ? status.pricing : undefined,
     raw: status,
   }
 }
@@ -170,6 +202,8 @@ async function handleWhatsAppVerification(
         )
       )
 
+    let candidates = 0
+
     for (const row of webhooks) {
       const wh = row.webhook
       const providerConfig = (wh.providerConfig as Record<string, unknown>) || {}
@@ -178,6 +212,8 @@ async function handleWhatsAppVerification(
       if (!verificationToken) {
         continue
       }
+
+      candidates++
 
       if (safeCompare(token, verificationToken as string)) {
         logger.info(`[${requestId}] WhatsApp verification successful for webhook ${wh.id}`)
@@ -190,6 +226,15 @@ async function handleWhatsAppVerification(
       }
     }
 
+    /**
+     * A path with no WhatsApp webhook expecting a token is not a failed verification: the
+     * `hub.*` parameters belong to whoever owns that path. Fall through so the delivery is
+     * routed normally instead of answering 403 for someone else's query parameters.
+     */
+    if (candidates === 0) {
+      return null
+    }
+
     logger.warn(`[${requestId}] No matching WhatsApp verification token found`)
     return new NextResponse('Verification failed', { status: 403 })
   }
@@ -198,6 +243,12 @@ async function handleWhatsAppVerification(
 }
 
 export const whatsappHandler: WebhookProviderHandler = {
+  /**
+   * Meta sends the WhatsApp verification handshake as a `GET` with `hub.*` query parameters, so
+   * this is the one challenge handler that must answer outside `POST`.
+   */
+  challengeMethods: ['GET', 'POST'],
+
   verifyAuth({ request, rawBody, requestId, providerConfig }) {
     const appSecret = providerConfig.appSecret as string | undefined
     if (!appSecret) {
@@ -235,7 +286,7 @@ export const whatsappHandler: WebhookProviderHandler = {
     for (const { field, value } of getWhatsAppChanges(body)) {
       if (Array.isArray(value.messages)) {
         for (const message of value.messages) {
-          if (!isRecord(message) || typeof message.id !== 'string') {
+          if (!isRecordLike(message) || typeof message.id !== 'string') {
             continue
           }
 
@@ -245,7 +296,7 @@ export const whatsappHandler: WebhookProviderHandler = {
 
       if (Array.isArray(value.statuses)) {
         for (const status of value.statuses) {
-          if (!isRecord(status) || typeof status.id !== 'string') {
+          if (!isRecordLike(status) || typeof status.id !== 'string') {
             continue
           }
 
@@ -257,7 +308,7 @@ export const whatsappHandler: WebhookProviderHandler = {
 
       if (Array.isArray(value.groups)) {
         for (const group of value.groups) {
-          if (!isRecord(group) || typeof group.request_id !== 'string') {
+          if (!isRecordLike(group) || typeof group.request_id !== 'string') {
             continue
           }
 
@@ -274,7 +325,7 @@ export const whatsappHandler: WebhookProviderHandler = {
   },
 
   async formatInput({ body }: FormatInputContext): Promise<FormatInputResult> {
-    const payload = isRecord(body) ? body : undefined
+    const payload = isRecordLike(body) ? body : undefined
     const contacts: Array<{ wa_id?: string; profile?: { name?: string } }> = []
     const messages: Array<{
       messageId?: string
@@ -284,6 +335,11 @@ export const whatsappHandler: WebhookProviderHandler = {
       text?: string
       timestamp?: string
       messageType?: string
+      mediaId?: string
+      mediaMimeType?: string
+      mediaSha256?: string
+      mediaFilename?: string
+      caption?: string
       raw: Record<string, unknown>
     }> = []
     const statuses: Array<{
@@ -299,11 +355,11 @@ export const whatsappHandler: WebhookProviderHandler = {
     }> = []
 
     for (const { value } of getWhatsAppChanges(body)) {
-      const metadata = isRecord(value.metadata) ? value.metadata : undefined
+      const metadata = isRecordLike(value.metadata) ? value.metadata : undefined
 
       if (Array.isArray(value.contacts)) {
         for (const contact of value.contacts) {
-          if (!isRecord(contact)) {
+          if (!isRecordLike(contact)) {
             continue
           }
 
@@ -313,7 +369,7 @@ export const whatsappHandler: WebhookProviderHandler = {
 
       if (Array.isArray(value.messages)) {
         for (const message of value.messages) {
-          if (!isRecord(message)) {
+          if (!isRecordLike(message)) {
             continue
           }
 
@@ -323,7 +379,7 @@ export const whatsappHandler: WebhookProviderHandler = {
 
       if (Array.isArray(value.statuses)) {
         for (const status of value.statuses) {
-          if (!isRecord(status)) {
+          if (!isRecordLike(status)) {
             continue
           }
 
@@ -355,6 +411,9 @@ export const whatsappHandler: WebhookProviderHandler = {
         text: firstMessage?.text,
         timestamp: firstMessage?.timestamp ?? firstStatus?.timestamp,
         messageType: firstMessage?.messageType,
+        mediaId: firstMessage?.mediaId,
+        mediaMimeType: firstMessage?.mediaMimeType,
+        caption: firstMessage?.caption,
         status: firstStatus?.status,
         contact: contacts[0],
         webhookContacts: contacts,

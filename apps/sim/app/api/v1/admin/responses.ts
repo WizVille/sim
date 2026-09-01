@@ -51,9 +51,7 @@ export function errorResponse(
   return NextResponse.json(body, { status })
 }
 
-// =============================================================================
 // Common Error Responses
-// =============================================================================
 
 export function unauthorizedResponse(message = 'Authentication required'): NextResponse {
   return errorResponse('UNAUTHORIZED', message, 401)
@@ -69,6 +67,11 @@ export function notFoundResponse(resource: string): NextResponse {
 
 export function badRequestResponse(message: string, details?: unknown): NextResponse {
   return errorResponse('BAD_REQUEST', message, 400, details)
+}
+
+/** The request is well-formed but conflicts with the resource's current state. */
+export function conflictResponse(message: string, details?: unknown): NextResponse {
+  return errorResponse('CONFLICT', message, 409, details)
 }
 
 export function adminValidationErrorResponse(error: z.ZodError): NextResponse {

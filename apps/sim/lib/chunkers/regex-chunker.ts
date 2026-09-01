@@ -1,15 +1,21 @@
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
+import { ChunkBudget } from '@/lib/chunkers/chunk-budget'
 import type { Chunk, RegexChunkerOptions } from '@/lib/chunkers/types'
 import {
   addOverlap,
   buildChunks,
   cleanText,
   estimateTokens,
+  iterateWordBoundaryChunks,
   resolveChunkerOptions,
-  splitAtWordBoundaries,
   tokensToChars,
 } from '@/lib/chunkers/utils'
+import {
+  compileLinearRegex,
+  compileLookaroundSplit,
+  type LinearRegex,
+} from '@/lib/core/security/linear-regex'
 
 const logger = createLogger('RegexChunker')
 
@@ -56,8 +62,9 @@ function toNonCapturing(pattern: string): string {
 export class RegexChunker {
   private readonly chunkSize: number
   private readonly chunkOverlap: number
-  private readonly regex: RegExp
+  private readonly regex: LinearRegex
   private readonly strictBoundaries: boolean
+  private readonly maxChunks?: number
 
   constructor(options: RegexChunkerOptions) {
     const resolved = resolveChunkerOptions(options)
@@ -65,9 +72,27 @@ export class RegexChunker {
     this.chunkOverlap = resolved.chunkOverlap
     this.regex = this.compilePattern(options.pattern)
     this.strictBoundaries = options.strictBoundaries ?? false
+    this.maxChunks = options.maxChunks
   }
 
-  private compilePattern(pattern: string): RegExp {
+  /**
+   * Compile the caller's split pattern on an engine that cannot backtrack.
+   *
+   * This previously screened for catastrophic backtracking by running the
+   * pattern against six probe strings — including `'a'.repeat(10000)` — and
+   * rejecting anything slower than 50ms. It measured the elapsed time *after*
+   * the match returned, so the screen was the denial of service it existed to
+   * prevent: `a*a*b` against that probe measured 213s on JSC. RE2 removes the
+   * failure mode outright, so the probe is gone rather than repaired.
+   *
+   * Keeping the delimiter — `(?=X)` before a chunk, `(?<=X)` after one — is the
+   * reason a split pattern reaches for lookaround, and `compileLookaroundSplit`
+   * runs both on RE2 without it. Anything else RE2 cannot represent is rejected
+   * rather than run on the built-in engine: no probe can tell a safe pattern
+   * from an unsafe one without running it, which is what made the old guard
+   * hang, so there is nothing to fall back *to*.
+   */
+  private compilePattern(pattern: string): LinearRegex {
     if (!pattern) {
       throw new Error('Regex pattern is required')
     }
@@ -77,34 +102,18 @@ export class RegexChunker {
     }
 
     try {
-      const regex = new RegExp(toNonCapturing(pattern), 'g')
-
-      const testStrings = [
-        'a'.repeat(10000),
-        ' '.repeat(10000),
-        'a '.repeat(5000),
-        'aB1 xY2\n'.repeat(1250),
-        `${'a'.repeat(30)}!`,
-        `${'a b '.repeat(25)}!`,
-      ]
-      for (const testStr of testStrings) {
-        regex.lastIndex = 0
-        const start = Date.now()
-        regex.test(testStr)
-        const elapsed = Date.now() - start
-        if (elapsed > 50) {
-          throw new Error('Regex pattern appears to have catastrophic backtracking')
-        }
-      }
-
-      regex.lastIndex = 0
-      return regex
+      new RegExp(pattern)
     } catch (error) {
-      if (error instanceof Error && error.message.includes('catastrophic')) {
-        throw error
-      }
       throw new Error(`Invalid regex pattern "${pattern}": ${toError(error).message}`)
     }
+
+    const source = toNonCapturing(pattern)
+    const compiled = compileLinearRegex(source) ?? compileLookaroundSplit(source)
+    if (compiled) return compiled
+
+    throw new Error(
+      `Regex pattern "${pattern}" uses syntax that cannot be evaluated safely. Unsupported: negative lookaround ("(?!...)", "(?<!...)"), backreferences, and repeat counts above 1000. Positive lookaround is supported — "(?=X)" splits before a delimiter, "(?<=X)" after one, and "(?<=X)Y(?=Z)" consumes Y between them.`
+    )
   }
 
   async chunk(content: string): Promise<Chunk[]> {
@@ -116,22 +125,41 @@ export class RegexChunker {
 
     if (!this.strictBoundaries && estimateTokens(cleaned) <= this.chunkSize) {
       logger.info('Content fits in single chunk')
-      return buildChunks([cleaned], 0)
+      const texts: string[] = []
+      new ChunkBudget(this.maxChunks).add(texts, cleaned)
+      return buildChunks(texts, 0)
     }
 
-    this.regex.lastIndex = 0
-    const segments = cleaned.split(this.regex).filter((s) => s.trim().length > 0)
-
-    if (segments.length <= 1) {
-      if (this.strictBoundaries) {
+    const segments = this.nonEmptySegments(cleaned)
+    if (this.strictBoundaries) {
+      const first = segments.next()
+      const second = segments.next()
+      if (first.done || second.done) {
+        const chunks: string[] = []
+        new ChunkBudget(this.maxChunks).add(chunks, cleaned.trim())
         logger.info('Regex pattern produced no splits in strict mode, returning single chunk')
-        return buildChunks([cleaned.trim()], 0)
+        return buildChunks(chunks, 0)
       }
+
+      const allSegments = this.prependSegments(first.value, second.value, segments)
+      const chunks = this.expandOversizedSegments(allSegments, new ChunkBudget(this.maxChunks))
+      logger.info(`Chunked into ${chunks.length} strict-boundary regex chunks`)
+      return buildChunks(chunks, 0)
+    }
+
+    const first = segments.next()
+    const second = segments.next()
+
+    if (first.done || second.done) {
       logger.warn(
         'Regex pattern did not produce any splits, falling back to word-boundary splitting'
       )
       const chunkSizeChars = tokensToChars(this.chunkSize)
-      let chunks = splitAtWordBoundaries(cleaned, chunkSizeChars)
+      const budget = new ChunkBudget(this.maxChunks)
+      let chunks: string[] = []
+      for (const chunk of iterateWordBoundaryChunks(cleaned, chunkSizeChars)) {
+        budget.add(chunks, chunk)
+      }
       if (this.chunkOverlap > 0) {
         const overlapChars = tokensToChars(this.chunkOverlap)
         chunks = addOverlap(chunks, overlapChars)
@@ -139,13 +167,9 @@ export class RegexChunker {
       return buildChunks(chunks, this.chunkOverlap)
     }
 
-    if (this.strictBoundaries) {
-      const chunks = this.expandOversizedSegments(segments)
-      logger.info(`Chunked into ${chunks.length} strict-boundary regex chunks`)
-      return buildChunks(chunks, 0)
-    }
-
-    const merged = this.mergeSegments(segments)
+    const allSegments = this.prependSegments(first.value, second.value, segments)
+    const budget = new ChunkBudget(this.maxChunks)
+    const merged = this.mergeSegments(allSegments, budget)
 
     let chunks = merged
     if (this.chunkOverlap > 0) {
@@ -157,12 +181,28 @@ export class RegexChunker {
     return buildChunks(chunks, this.chunkOverlap)
   }
 
+  private *nonEmptySegments(content: string): Generator<string> {
+    for (const segment of this.regex.iterateSplits(content)) {
+      if (segment.trim()) yield segment
+    }
+  }
+
+  private *prependSegments(
+    first: string,
+    second: string,
+    rest: Iterable<string>
+  ): Generator<string> {
+    yield first
+    yield second
+    yield* rest
+  }
+
   /**
    * In strict-boundary mode each segment becomes its own chunk. Segments that
    * exceed chunkSize are still split at word boundaries to preserve the token
    * limit invariant; this is a safety floor, not a merge.
    */
-  private expandOversizedSegments(segments: string[]): string[] {
+  private expandOversizedSegments(segments: Iterable<string>, budget: ChunkBudget): string[] {
     const result: string[] = []
     const chunkSizeChars = tokensToChars(this.chunkSize)
 
@@ -171,11 +211,10 @@ export class RegexChunker {
       if (!trimmed) continue
 
       if (estimateTokens(trimmed) <= this.chunkSize) {
-        result.push(trimmed)
+        budget.add(result, trimmed)
       } else {
-        const subChunks = splitAtWordBoundaries(trimmed, chunkSizeChars)
-        for (const sub of subChunks) {
-          if (sub.trim()) result.push(sub)
+        for (const sub of iterateWordBoundaryChunks(trimmed, chunkSizeChars)) {
+          if (sub.trim()) budget.add(result, sub)
         }
       }
     }
@@ -183,7 +222,7 @@ export class RegexChunker {
     return result
   }
 
-  private mergeSegments(segments: string[]): string[] {
+  private mergeSegments(segments: Iterable<string>, budget: ChunkBudget): string[] {
     const chunks: string[] = []
     let current = ''
 
@@ -194,14 +233,13 @@ export class RegexChunker {
         current = test
       } else {
         if (current.trim()) {
-          chunks.push(current.trim())
+          budget.add(chunks, current.trim())
         }
 
         if (estimateTokens(segment) > this.chunkSize) {
           const chunkSizeChars = tokensToChars(this.chunkSize)
-          const subChunks = splitAtWordBoundaries(segment, chunkSizeChars)
-          for (const sub of subChunks) {
-            chunks.push(sub)
+          for (const sub of iterateWordBoundaryChunks(segment, chunkSizeChars)) {
+            budget.add(chunks, sub)
           }
           current = ''
         } else {
@@ -211,7 +249,7 @@ export class RegexChunker {
     }
 
     if (current.trim()) {
-      chunks.push(current.trim())
+      budget.add(chunks, current.trim())
     }
 
     return chunks

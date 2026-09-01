@@ -57,15 +57,18 @@ describe('streaming resource titles', () => {
     ).toBe('Creating lookupWeather')
     expect(
       resolveStreamingToolDisplayTitle(
-        'manage_folder',
-        '{"operation":"rename","path":"workflows/Old%20Name","name":"New Name"}'
+        'mv',
+        '{"sources":["workflows/Old%20Name"],"destination":"workflows/New%20Name","toolTitle":"Old Name to New Name"}'
       )
     ).toBe('Renaming Old Name to New Name')
+    expect(resolveStreamingToolDisplayTitle('rm', '{"toolTitle":"Old Report.pdf"}')).toBe(
+      'Deleting Old Report.pdf'
+    )
   })
 })
 
 // A main-agent file delegation: trigger tool (main lane), subagent span, inner
-// workspace_file, span end, delegation result.
+// prepare_file_edit, span end, delegation result.
 function fileDelegationEvents(): PersistedStreamEventEnvelope[] {
   const sub: Scope = {
     lane: 'subagent',
@@ -86,13 +89,13 @@ function fileDelegationEvents(): PersistedStreamEventEnvelope[] {
     env(
       4,
       'tool',
-      { phase: 'call', toolCallId: 'wf-1', toolName: 'workspace_file' },
+      { phase: 'call', toolCallId: 'wf-1', toolName: 'prepare_file_edit' },
       { lane: 'subagent', spanId: 'S1' }
     ),
     env(
       5,
       'tool',
-      { phase: 'result', toolCallId: 'wf-1', toolName: 'workspace_file', success: true },
+      { phase: 'result', toolCallId: 'wf-1', toolName: 'prepare_file_edit', success: true },
       { lane: 'subagent', spanId: 'S1' }
     ),
     env(
@@ -121,7 +124,7 @@ describe('modelToContentBlocks', () => {
     expect(trigger?.toolCall?.status).toBe('success')
 
     const innerTool = blocksByType(blocks, 'tool_call').find(
-      (b) => b.toolCall?.name === 'workspace_file'
+      (b) => b.toolCall?.name === 'prepare_file_edit'
     )
     expect(innerTool?.spanId).toBe('S1')
     expect(innerTool?.toolCall?.calledBy).toBe('file')
@@ -217,7 +220,7 @@ describe('modelToContentBlocks', () => {
         env(
           4,
           'tool',
-          { phase: 'call', toolCallId: 'wf-1', toolName: 'workspace_file' },
+          { phase: 'call', toolCallId: 'wf-1', toolName: 'prepare_file_edit' },
           { lane: 'subagent', spanId: 'S1' }
         ),
         env(
@@ -230,7 +233,7 @@ describe('modelToContentBlocks', () => {
       ])
     )
     const types = blocks.map((b) => b.type)
-    const innerIdx = blocks.findIndex((b) => b.toolCall?.name === 'workspace_file')
+    const innerIdx = blocks.findIndex((b) => b.toolCall?.name === 'prepare_file_edit')
     const endIdx = types.indexOf('subagent_end')
     const afterIdx = blocks.findIndex((b) => b.type === 'text' && b.content === 'after')
     // subagent_end sits after the inner work and before the trailing main text — no sibling jumps.
@@ -272,7 +275,7 @@ describe('modelToContentBlocks', () => {
       env(
         3,
         'tool',
-        { phase: 'call', toolCallId: 'wf-1', toolName: 'workspace_file' },
+        { phase: 'call', toolCallId: 'wf-1', toolName: 'prepare_file_edit' },
         { lane: 'subagent', spanId: 'S1' }
       ),
     ])
@@ -306,7 +309,7 @@ describe('modelToContentBlocks', () => {
         env(1, 'tool', {
           phase: 'call',
           toolCallId: 'wf',
-          toolName: 'workspace_file',
+          toolName: 'prepare_file_edit',
           arguments: { operation: 'create', title: 'My Doc' },
         }),
       ])
@@ -319,7 +322,7 @@ describe('modelToContentBlocks', () => {
     const blocks = modelToContentBlocks(build(fileDelegationEvents()))
     const startIdx = blocks.findIndex((b) => b.type === 'subagent')
     const innerIdx = blocks.findIndex(
-      (b) => b.type === 'tool_call' && b.toolCall?.name === 'workspace_file'
+      (b) => b.type === 'tool_call' && b.toolCall?.name === 'prepare_file_edit'
     )
     const endIdx = blocks.findIndex((b) => b.type === 'subagent_end')
     expect(startIdx).toBeGreaterThanOrEqual(0)
@@ -422,7 +425,7 @@ describe('contentBlocksToModel round-trip', () => {
       env(
         3,
         'tool',
-        { phase: 'call', toolCallId: 'wf-1', toolName: 'workspace_file' },
+        { phase: 'call', toolCallId: 'wf-1', toolName: 'prepare_file_edit' },
         { lane: 'subagent', spanId: 'S1' }
       ),
     ])

@@ -1,27 +1,24 @@
 'use client'
 
 import type { ReactNode } from 'react'
-import { ToastProvider } from '@sim/emcn'
 import { usePathname } from 'next/navigation'
 import {
   ACCOUNT_SETTINGS_GROUPS,
   ACCOUNT_SETTINGS_ITEMS,
   ACCOUNT_SETTINGS_PATH_ALIASES,
   getAccountSettingsHref,
-  getOrganizationSettingsFeatures,
-  getOrganizationSettingsHref,
-  isOrganizationSettingsSectionAvailable,
-  ORGANIZATION_SETTINGS_GROUPS,
-  ORGANIZATION_SETTINGS_ITEMS,
-  ORGANIZATION_SETTINGS_PATH_ALIASES,
+  getSelfHostSettingsHref,
   parseSettingsPathSection,
-  resolveOrganizationSectionAccess,
+  SELFHOST_SETTINGS_GROUPS,
+  SELFHOST_SETTINGS_ITEMS,
+  SETTINGS_PLANE_CHROME,
 } from '@/components/settings/navigation'
 import { SettingsHeaderProvider, SettingsHeaderShell } from '@/components/settings/settings-header'
 import { SettingsSectionProvider } from '@/components/settings/settings-panel'
 import { SettingsSidebar } from '@/components/settings/settings-sidebar'
 import { useSettingsBeforeUnload } from '@/components/settings/use-settings-before-unload'
 import { isBillingEnabled, isHosted } from '@/lib/core/config/env-flags'
+import { SIDEBAR_WIDTH } from '@/stores/constants'
 
 interface StandaloneSettingsShellBaseProps {
   children: ReactNode
@@ -32,80 +29,79 @@ interface AccountSettingsShellProps extends StandaloneSettingsShellBaseProps {
   isSuperUser?: boolean
 }
 
-interface OrganizationSettingsShellProps extends StandaloneSettingsShellBaseProps {
-  plane: 'organization'
-  organizationId: string
-  hasEnterprisePlan: boolean
-  isOrganizationAdmin: boolean
+interface SelfHostSettingsShellProps extends StandaloneSettingsShellBaseProps {
+  plane: 'selfhost'
 }
 
-type StandaloneSettingsShellProps = AccountSettingsShellProps | OrganizationSettingsShellProps
+type StandaloneSettingsShellProps = AccountSettingsShellProps | SelfHostSettingsShellProps
 
 export function StandaloneSettingsShell(props: StandaloneSettingsShellProps) {
   const { children, plane } = props
   useSettingsBeforeUnload()
   const pathname = usePathname()
-  const hasEnterprisePlan = plane === 'organization' ? props.hasEnterprisePlan : false
-  const isOrganizationAdmin = plane === 'organization' ? props.isOrganizationAdmin : false
   const isSuperUser = plane === 'account' ? (props.isSuperUser ?? false) : false
 
-  const organizationFeatures = getOrganizationSettingsFeatures(hasEnterprisePlan)
   const accountItems = ACCOUNT_SETTINGS_ITEMS.filter((item) => {
     if (item.id === 'billing' && !isBillingEnabled) return false
-    if (item.id === 'copilot' && !isHosted) return false
     if ((item.id === 'admin' || item.id === 'mothership') && !isSuperUser) return false
     return true
   })
-  const organizationItems = ORGANIZATION_SETTINGS_ITEMS.filter(
-    (item) =>
-      resolveOrganizationSectionAccess({
-        section: item.id,
-        isTargetOrganizationMember: true,
-        isTargetOrganizationAdmin: isOrganizationAdmin,
-      }) !== 'unavailable' && isOrganizationSettingsSectionAvailable(item.id, organizationFeatures)
-  )
+  const selfHostItems = SELFHOST_SETTINGS_ITEMS.filter((item) => {
+    if (item.id === 'billing' && !isBillingEnabled) return false
+    // Chat keys are issued by the managed service, so there are none to list on
+    // a self-hosted deployment — useCopilotKeys is `enabled: isHosted` for the
+    // same reason. Self-hosters manage their keys on sim.ai.
+    if (item.id === 'chat-keys' && !isHosted) return false
+    return true
+  })
+  const selfHostSection = parseSettingsPathSection({
+    path: pathname,
+    items: SELFHOST_SETTINGS_ITEMS,
+    defaultSection: 'general',
+  })
   const accountSection = parseSettingsPathSection({
     path: pathname,
     items: ACCOUNT_SETTINGS_ITEMS,
     defaultSection: 'general',
     aliases: ACCOUNT_SETTINGS_PATH_ALIASES,
   })
-  const organizationSection = parseSettingsPathSection({
-    path: pathname,
-    items: ORGANIZATION_SETTINGS_ITEMS,
-    defaultSection: 'members',
-    aliases: ORGANIZATION_SETTINGS_PATH_ALIASES,
-  })
-  const activeSection = plane === 'account' ? accountSection : organizationSection
+  const activeSection = plane === 'account' ? accountSection : selfHostSection
   const sidebar =
     plane === 'account' ? (
       <SettingsSidebar
         activeSection={accountSection}
-        backHref='/workspace'
+        plane={plane}
         groups={ACCOUNT_SETTINGS_GROUPS}
         hrefForSection={getAccountSettingsHref}
         items={accountItems}
       />
     ) : (
       <SettingsSidebar
-        activeSection={organizationSection}
-        backHref='/workspace'
-        groups={ORGANIZATION_SETTINGS_GROUPS}
-        hrefForSection={(section) => getOrganizationSettingsHref(props.organizationId, section)}
-        items={organizationItems}
+        activeSection={selfHostSection}
+        plane={plane}
+        groups={SELFHOST_SETTINGS_GROUPS}
+        hrefForSection={getSelfHostSettingsHref}
+        items={selfHostItems}
       />
     )
 
   return (
-    <ToastProvider>
-      <div className='flex h-screen w-full overflow-hidden bg-[var(--surface-1)] p-2'>
-        <aside
-          className='mr-2 flex w-[248px] flex-shrink-0 flex-col rounded-[8px] border border-[var(--border)] bg-[var(--surface-1)] pt-3'
-          aria-label={`${plane === 'account' ? 'Account' : 'Organization'} settings navigation`}
-        >
-          {sidebar}
-        </aside>
-        <main className='min-w-0 flex-1 overflow-hidden rounded-[8px] border border-[var(--border)] bg-[var(--bg)]'>
+    <div className='flex h-screen w-full overflow-hidden bg-[var(--surface-1)]'>
+      {/*
+        Mirrors the in-workspace chrome (WorkspaceChrome): a flush, borderless
+        sidebar column against the app surface, and only the content pane
+        carrying the rounded border. Keep the two in step — a settings page
+        should look the same whether it is reached inside a workspace or not.
+      */}
+      <aside
+        style={{ width: SIDEBAR_WIDTH.DEFAULT }}
+        className='flex h-full flex-shrink-0 flex-col overflow-hidden bg-[var(--surface-1)] pt-3'
+        aria-label={`${SETTINGS_PLANE_CHROME[plane].label} settings navigation`}
+      >
+        {sidebar}
+      </aside>
+      <div className='flex min-w-0 flex-1 flex-col p-[8px] pl-0'>
+        <main className='flex-1 overflow-hidden rounded-[8px] border border-[var(--border)] bg-[var(--bg)]'>
           <SettingsHeaderProvider>
             <SettingsHeaderShell>
               <SettingsSectionProvider plane={plane} section={activeSection}>
@@ -115,6 +111,6 @@ export function StandaloneSettingsShell(props: StandaloneSettingsShellProps) {
           </SettingsHeaderProvider>
         </main>
       </div>
-    </ToastProvider>
+    </div>
   )
 }
