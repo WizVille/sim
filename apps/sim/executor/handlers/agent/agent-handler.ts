@@ -386,7 +386,8 @@ export class AgentBlockHandler implements BlockHandler {
         filteredInputs.tools || [],
         block.canonicalModes,
         toolIndexByRef,
-        projectedToolInputs
+        projectedToolInputs,
+        filteredInputs.apiKey
       )
 
       const skillInputs = filteredInputs.skills ?? []

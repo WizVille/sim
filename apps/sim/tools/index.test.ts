@@ -4882,6 +4882,81 @@ describe('Centralized Error Handling', () => {
   })
 })
 
+describe('Workflow variable passthrough headers', () => {
+  beforeEach(() => {
+    mockValidateUrlWithDNS.mockResolvedValue({ isValid: true, resolvedIP: '93.184.216.34' })
+    mockSecureFetchWithPinnedIP.mockResolvedValue(
+      toSecureFetchResponse(
+        new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+      )
+    )
+  })
+
+  function outboundHeaders(): Record<string, string> {
+    return mockSecureFetchWithPinnedIP.mock.calls.at(-1)?.[2]?.headers ?? {}
+  }
+
+  it("sends the run's HTTP_ variables on an outbound tool request", async () => {
+    const result = await executeTool(
+      'http_request',
+      { url: 'https://example.com/hook', method: 'GET' },
+      {
+        skipPostProcess: true,
+        executionContext: createToolExecutionContext({
+          workflowVariables: {
+            'var-1': { id: 'var-1', name: 'HTTP_CONTEXT_UUID', type: 'plain', value: 'ctx-123' },
+            'var-2': { id: 'var-2', name: 'apiToken', type: 'plain', value: 'secret-value' },
+          },
+        }),
+      }
+    )
+
+    expect(result.success, result.error).toBe(true)
+    // `Headers` lower-cases every name on its way to the transport.
+    expect(outboundHeaders()['context-uuid']).toBe('ctx-123')
+    expect(JSON.stringify(outboundHeaders())).not.toContain('secret-value')
+  })
+
+  it('never displaces a header the tool already set', async () => {
+    const result = await executeTool(
+      'http_request',
+      {
+        url: 'https://example.com/hook',
+        method: 'GET',
+        headers: { Trace: 'set-by-the-tool' },
+      },
+      {
+        skipPostProcess: true,
+        executionContext: createToolExecutionContext({
+          workflowVariables: {
+            'var-1': { id: 'var-1', name: 'HTTP_TRACE', type: 'plain', value: 'set-by-variable' },
+          },
+        }),
+      }
+    )
+
+    expect(result.success, result.error).toBe(true)
+    expect(outboundHeaders().trace).toBe('set-by-the-tool')
+  })
+
+  it('sends nothing extra for a run with no HTTP_ variables', async () => {
+    await executeTool(
+      'http_request',
+      { url: 'https://example.com/hook', method: 'GET' },
+      {
+        skipPostProcess: true,
+        executionContext: createToolExecutionContext({
+          workflowVariables: {
+            'var-1': { id: 'var-1', name: 'apiToken', type: 'plain', value: 'secret-value' },
+          },
+        }),
+      }
+    )
+
+    expect(JSON.stringify(outboundHeaders())).not.toContain('secret-value')
+  })
+})
+
 describe('MCP Tool Execution', () => {
   let cleanupEnvVars: () => void
 
@@ -4932,6 +5007,24 @@ describe('MCP Tool Execution', () => {
       success: true,
       output: { content: [{ type: 'text', text: 'Files listed successfully' }] },
     })
+  })
+
+  it('attributes the MCP call with the originating workflow, block and execution', async () => {
+    mockExecuteInternalToolOperation.mockResolvedValueOnce(
+      Response.json({ success: true, data: { success: true, output: { content: [] } } })
+    )
+
+    const context = createToolExecutionContext({ executionId: 'execution-1' })
+    await executeTool(
+      'mcp-123-list_files',
+      { path: '/test', _context: { blockId: 'block-1' } },
+      { executionContext: context }
+    )
+
+    const { headers } = mockExecuteInternalToolOperation.mock.calls[0][0]
+    expect(headers.get('X-Sim-Workflow-Id')).toBe(context.workflowId)
+    expect(headers.get('X-Sim-Block-Id')).toBe('block-1')
+    expect(headers.get('X-Sim-Execution-Id')).toBe(context.executionId)
   })
 
   it('preserves MCP operation error envelopes', async () => {

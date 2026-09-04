@@ -23,6 +23,8 @@ export interface InternalToolOperationContext {
   toolCallId?: string
   billingAttribution?: BillingAttributionSnapshot
   callChain?: string[]
+  /** Run variables, for the `HTTP_*` passthrough headers of `@/lib/execution/workflow-variable-headers`. */
+  workflowVariables?: Record<string, unknown>
   resolvedSecretTraceRegistry?: ResolvedSecretTraceRegistry
   largeValueExecutionIds?: string[]
   largeValueKeys?: string[]

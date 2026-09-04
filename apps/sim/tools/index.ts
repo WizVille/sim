@@ -42,6 +42,7 @@ import {
   INTERNAL_EXECUTION_DEADLINE_HEADER,
   serializeExecutionDeadlineHeader,
 } from '@/lib/execution/execution-deadline-header'
+import { buildExecutionIdentityHeaders } from '@/lib/execution/execution-identity'
 import {
   addModelInputProvenanceToRequest,
   createModelInputProvenanceRequestMetadata,
@@ -64,6 +65,7 @@ import {
   RESOLVED_SECRET_PROVENANCE_FIELD,
   RESOLVED_SECRET_PROVENANCE_METADATA_V1,
 } from '@/lib/execution/private-tool-metadata'
+import { buildWorkflowVariableHeaders } from '@/lib/execution/workflow-variable-headers'
 import { executeFunctionTool } from '@/lib/internal/function/execute'
 import { getInternalToolOperationHandler } from '@/lib/internal/tool-operations/registry.server'
 import type { InternalToolOperationContext } from '@/lib/internal/tool-operations/types'
@@ -224,6 +226,7 @@ function createInternalToolOperationContext(
     copilotToolExecution: context.copilotToolExecution,
     billingAttribution: context.metadata.billingAttribution,
     callChain: context.callChain,
+    workflowVariables: context.workflowVariables,
     resolvedSecretTraceRegistry: context.resolvedSecretTraceRegistry,
     largeValueExecutionIds: context.largeValueExecutionIds,
     largeValueKeys: context.largeValueKeys,
@@ -1555,6 +1558,10 @@ async function executeToolImplementation(
     : suppliedOperationContext
       ? { ...suppliedOperationContext, resolvedSecretTraceRegistry }
       : undefined
+  const workflowVariableHeaders = buildWorkflowVariableHeaders(
+    operationContext?.workflowVariables ??
+      (params.workflowVariables as Record<string, unknown> | undefined)
+  )
   const executeNestedTool: typeof executeTool = (nestedToolId, nestedParams, nestedOptions = {}) =>
     executeTool(nestedToolId, nestedParams, {
       ...nestedOptions,
@@ -2021,7 +2028,8 @@ async function executeToolImplementation(
               tool,
               contextParams,
               effectiveSignal,
-              resolvedSecretTraceRegistry
+              resolvedSecretTraceRegistry,
+              workflowVariableHeaders
             ),
           {
             requestId,
@@ -2046,7 +2054,8 @@ async function executeToolImplementation(
                   tool,
                   contextParams,
                   effectiveSignal,
-                  resolvedSecretTraceRegistry
+                  resolvedSecretTraceRegistry,
+                  workflowVariableHeaders
                 )
             },
           }
@@ -2056,7 +2065,8 @@ async function executeToolImplementation(
           tool,
           contextParams,
           effectiveSignal,
-          resolvedSecretTraceRegistry
+          resolvedSecretTraceRegistry,
+          workflowVariableHeaders
         )
 
     // Apply post-processing if available and not skipped
@@ -2575,13 +2585,23 @@ async function executeToolRequest(
   tool: ToolConfig,
   params: Record<string, any>,
   signal?: AbortSignal,
-  resolvedSecretTraceRegistry?: ResolvedSecretTraceRegistry
+  resolvedSecretTraceRegistry?: ResolvedSecretTraceRegistry,
+  workflowVariableHeaders: Record<string, string> = {}
 ): Promise<ToolResponse> {
   const requestId = generateRequestId()
   const structuralOnlyToolLogs = false
   try {
     const requestParams = prepareToolRequest(tool, params, resolvedSecretTraceRegistry)
     const { headers } = requestParams
+
+    /**
+     * The run's `HTTP_*` variables never displace a header the tool or the user set: the API
+     * block's own header table and a tool's auth headers are explicit intent, a passthrough
+     * variable is ambient.
+     */
+    for (const [name, value] of Object.entries(workflowVariableHeaders)) {
+      if (!headers.has(name)) headers.set(name, value)
+    }
     const fullUrl = new URL(requestParams.url).toString()
     const targetsThisSimInstance = isSelfOriginUrl(fullUrl)
 
@@ -3019,10 +3039,22 @@ async function executeMcpTool(
     validateRequestBodySize(JSON.stringify(params), actualRequestId, `mcp:${toolId}`)
     const handler = await getInternalToolOperationHandler(toolId)
     if (!handler) throw new Error(`No internal operation registered for ${toolId}`)
+    /**
+     * Attribution for the remote server. `blockId` only ever exists on the caller's
+     * `_context` — `InternalToolOperationContext` is run-scoped and has no notion of which
+     * block issued the call — so the scope reader is the one source that sees both.
+     */
+    const scope = resolveToolScope(params)
     const response = await handler({
       toolId,
       input: params,
-      headers: new Headers(),
+      headers: new Headers(
+        buildExecutionIdentityHeaders({
+          workflowId: context?.workflowId ?? scope.workflowId,
+          blockId: scope.blockId,
+          executionId: context?.executionId ?? scope.executionId,
+        })
+      ),
       context: context ?? { workflowId: '' },
       requestId: actualRequestId,
       signal,

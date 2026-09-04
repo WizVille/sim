@@ -3032,6 +3032,47 @@ describe('AgentBlockHandler', () => {
       expect(requestBody.model).toBe('gpt-5')
     })
 
+    it('carries the agent API key on MCP tool params for forward-auth servers', async () => {
+      const mcpTool = {
+        type: 'mcp' as const,
+        schema: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query'],
+        },
+        params: {
+          serverId: 'mcp-search-server',
+          toolName: 'search_files',
+          serverName: 'Docs',
+        },
+      }
+
+      for (const apiKey of ['sk-agent-key', undefined]) {
+        mockExecuteProviderRequest.mockClear()
+        mockGetProviderFromModel.mockReturnValue('openai')
+        // `execute` filters MCP availability twice per run; queue a set for each lookup.
+        queueTableRows(schemaMock.mcpServers, MCP_SERVER_ROWS)
+        queueTableRows(schemaMock.mcpServers, MCP_SERVER_ROWS)
+        mockExecuteProviderRequest.mockResolvedValueOnce({
+          content: 'ok',
+          model: 'gpt-4o',
+          tokens: { input: 1, output: 1, total: 2 },
+          timing: { total: 10 },
+        })
+
+        await handler.execute({ ...mockContext, workspaceId: 'test-workspace-123' }, mockBlock, {
+          model: 'gpt-4o',
+          userPrompt: 'search',
+          ...(apiKey ? { apiKey } : {}),
+          tools: [structuredClone(mcpTool)],
+        })
+
+        const [, providerRequest] = mockExecuteProviderRequest.mock.calls[0]
+        expect(providerRequest.tools).toHaveLength(1)
+        expect(providerRequest.tools[0].params._mcpAuthorization).toBe(apiKey)
+      }
+    })
+
     it('should handle MCP tools in agent execution', async () => {
       mockExecuteTool.mockImplementation((toolId, params, skipPostProcess, context) => {
         if (isMcpTool(toolId)) {

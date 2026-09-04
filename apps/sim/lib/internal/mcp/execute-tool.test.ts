@@ -121,6 +121,161 @@ describe('executeMcpTool', () => {
     })
   })
 
+  it('re-reads the execution identity headers for the use case', async () => {
+    await executeMcpTool({
+      toolId: 'mcp-server-lookup',
+      input: { arguments: '{"query":"sim"}' },
+      headers: new Headers({
+        'X-Sim-Workflow-Id': 'workflow-1',
+        'X-Sim-Block-Id': 'block-1',
+        'X-Sim-Execution-Id': 'execution-1',
+        'X-Sim-Unrelated': 'ignored',
+      }),
+      context: CONTEXT,
+      requestId: 'request-1',
+    })
+
+    expect(mocks.executeUseCase).toHaveBeenCalledWith({
+      principal: PRINCIPAL,
+      input: expect.objectContaining({
+        passthroughHeaders: {
+          'X-Sim-Workflow-Id': 'workflow-1',
+          'X-Sim-Block-Id': 'block-1',
+          'X-Sim-Execution-Id': 'execution-1',
+        },
+      }),
+    })
+  })
+
+  it("turns the run's HTTP_ workflow variables into passthrough headers", async () => {
+    await executeMcpTool({
+      toolId: 'mcp-server-lookup',
+      input: { arguments: '{"query":"sim"}' },
+      headers: new Headers({ 'X-Sim-Block-Id': 'block-1' }),
+      context: {
+        ...CONTEXT,
+        workflowVariables: {
+          'var-1': { id: 'var-1', name: 'HTTP_CONTEXT_UUID', type: 'plain', value: 'ctx-123' },
+          'var-2': { id: 'var-2', name: 'apiToken', type: 'plain', value: 'secret-value' },
+        },
+      },
+      requestId: 'request-1',
+    })
+
+    expect(mocks.executeUseCase).toHaveBeenCalledWith({
+      principal: PRINCIPAL,
+      input: expect.objectContaining({
+        passthroughHeaders: { 'Context-Uuid': 'ctx-123', 'X-Sim-Block-Id': 'block-1' },
+      }),
+    })
+  })
+
+  it('falls back to the variables carried on an Agent-originated input', async () => {
+    await executeMcpTool({
+      toolId: 'mcp-server-lookup',
+      input: {
+        arguments: '{"query":"sim"}',
+        workflowVariables: { HTTP_CONTEXT_UUID: 'ctx-123' },
+      },
+      headers: new Headers(),
+      context: CONTEXT,
+      requestId: 'request-1',
+    })
+
+    expect(mocks.executeUseCase).toHaveBeenCalledWith({
+      principal: PRINCIPAL,
+      input: expect.objectContaining({
+        passthroughHeaders: { 'Context-Uuid': 'ctx-123' },
+      }),
+    })
+  })
+
+  it('forwards the caller credential and keeps it out of the tool arguments', async () => {
+    await executeMcpTool({
+      toolId: 'mcp-server-lookup',
+      input: { query: 'sim', _mcpAuthorization: 'sk-caller-key' },
+      headers: new Headers(),
+      context: CONTEXT,
+      requestId: 'request-1',
+    })
+
+    expect(mocks.executeUseCase).toHaveBeenCalledWith({
+      principal: PRINCIPAL,
+      input: expect.objectContaining({
+        arguments: { query: 'sim' },
+        forwardedAuthorization: 'Bearer sk-caller-key',
+      }),
+    })
+  })
+
+  it('preserves an explicit credential scheme and ignores an empty one', async () => {
+    const cases = [
+      { credential: 'Bearer already-prefixed', expected: 'Bearer already-prefixed' },
+      { credential: 'basic dXNlcjpwYXNz', expected: 'basic dXNlcjpwYXNz' },
+      { credential: '  sk-padded  ', expected: 'Bearer sk-padded' },
+      { credential: '   ', expected: undefined },
+      { credential: '', expected: undefined },
+    ]
+
+    for (const { credential, expected } of cases) {
+      mocks.executeUseCase.mockClear()
+
+      await executeMcpTool({
+        toolId: 'mcp-server-lookup',
+        input: { arguments: '{"query":"sim"}', _mcpAuthorization: credential },
+        headers: new Headers(),
+        context: CONTEXT,
+        requestId: 'request-1',
+      })
+
+      expect(mocks.executeUseCase).toHaveBeenCalledWith({
+        principal: PRINCIPAL,
+        input: expect.objectContaining({ forwardedAuthorization: expected }),
+      })
+    }
+  })
+
+  it('treats an untouched block arguments field as no arguments', async () => {
+    for (const emptyArguments of [null, undefined, '', '   ']) {
+      mocks.executeUseCase.mockClear()
+
+      const response = await executeMcpTool({
+        toolId: 'mcp-server-get_user_context',
+        input: { server: 'mcp-server', tool: 'get_user_context', arguments: emptyArguments },
+        headers: new Headers(),
+        context: CONTEXT,
+        requestId: 'request-1',
+      })
+
+      expect(response.status).toBe(200)
+      expect(mocks.executeUseCase).toHaveBeenCalledWith({
+        principal: PRINCIPAL,
+        input: expect.objectContaining({ toolName: 'get_user_context', arguments: {} }),
+      })
+    }
+  })
+
+  it('rejects block arguments that cannot represent an argument record', async () => {
+    for (const badArguments of [42, ['sim'], '[1,2]', '"sim"']) {
+      mocks.executeUseCase.mockClear()
+
+      const response = await executeMcpTool({
+        toolId: 'mcp-server-lookup',
+        input: { arguments: badArguments },
+        headers: new Headers(),
+        context: CONTEXT,
+        requestId: 'request-1',
+      })
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({
+        success: false,
+        error: 'Invalid request format',
+      })
+      expect(mocks.executeUseCase).not.toHaveBeenCalled()
+    }
+  })
+
   it('fails closed without trusted workspace or billing context', async () => {
     const missingWorkspace = await executeMcpTool({
       toolId: 'mcp-server-lookup',

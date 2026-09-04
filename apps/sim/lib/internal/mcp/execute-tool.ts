@@ -9,6 +9,8 @@ import {
   getRemainingExecutionMs,
 } from '@/lib/core/execution-limits'
 import { asOrchestrationError, statusForOrchestrationError } from '@/lib/core/orchestration/types'
+import { extractExecutionIdentityHeaders } from '@/lib/execution/execution-identity'
+import { buildWorkflowVariableHeaders } from '@/lib/execution/workflow-variable-headers'
 import { createExecutorPrincipalFromExecutionContext } from '@/lib/internal/principals/executor'
 import {
   classifyInternalToolIdentityFault,
@@ -28,6 +30,9 @@ import {
 
 const logger = createLogger('McpInternalOperation')
 
+/** The Agent block's own credential, carried alongside the tool parameters. */
+const MCP_AUTHORIZATION_PARAMETER = '_mcpAuthorization'
+
 const MCP_SYSTEM_PARAMETERS = new Set([
   'serverId',
   'serverUrl',
@@ -39,7 +44,23 @@ const MCP_SYSTEM_PARAMETERS = new Set([
   'blockData',
   'blockNameMapping',
   '_toolSchema',
+  MCP_AUTHORIZATION_PARAMETER,
 ])
+
+/**
+ * The credential the caller forwards to servers that opt in with the
+ * `X-Sim-Forward: authorization` marker. A bare key is promoted to a `Bearer` credential;
+ * an explicit `Bearer`/`Basic` scheme is preserved as typed.
+ */
+function parseForwardedAuthorization(input: unknown): string | undefined {
+  if (!isPlainRecord(input)) return undefined
+  const value = input[MCP_AUTHORIZATION_PARAMETER]
+  if (typeof value !== 'string') return undefined
+
+  const credential = value.trim()
+  if (!credential) return undefined
+  return /^(bearer|basic)\s/i.test(credential) ? credential : `Bearer ${credential}`
+}
 
 function parseArguments(input: unknown): Record<string, unknown> | null {
   if (!isPlainRecord(input)) return null
@@ -50,7 +71,16 @@ function parseArguments(input: unknown): Record<string, unknown> | null {
   }
 
   const value = input.arguments
+  /**
+   * The MCP block always serializes its `arguments` field once a tool is selected, and a
+   * field the user never edited holds `null` — which is every tool that declares no
+   * parameters. An explicitly empty value means "no arguments", not a malformed request.
+   * It must not fall through to the branch above either: that one forwards the block's own
+   * routing fields (`server`, `tool`) as tool arguments.
+   */
+  if (value == null) return {}
   if (typeof value !== 'string') return isPlainRecord(value) ? value : null
+  if (!value.trim()) return {}
   try {
     const parsed: unknown = JSON.parse(value)
     return isPlainRecord(parsed) ? parsed : null
@@ -151,6 +181,16 @@ export const executeMcpTool: InternalToolOperationHandler = async (request) => {
         serverId,
         toolName,
         arguments: args,
+        forwardedAuthorization: parseForwardedAuthorization(request.input),
+        passthroughHeaders: {
+          ...buildWorkflowVariableHeaders(
+            request.context.workflowVariables ??
+              (isPlainRecord(request.input)
+                ? (request.input.workflowVariables as Record<string, unknown> | undefined)
+                : undefined)
+          ),
+          ...extractExecutionIdentityHeaders(request.headers),
+        },
         callChain: request.context.callChain,
         timeoutMs,
         signal: request.signal,

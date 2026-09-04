@@ -28,6 +28,20 @@ export interface ExecuteMcpToolInput {
   serverId: string
   toolName: string
   arguments?: Record<string, unknown>
+  /**
+   * The caller's own credential, in wire form (`Bearer …` / `Basic …`), for servers that
+   * opt into per-user forwarding with the `X-Sim-Forward: authorization` marker. It reaches
+   * discovery as well as the call itself: an opted-in server answers `tools/list` under the
+   * forwarded identity too, and the service caches that listing under a per-user key.
+   */
+  forwardedAuthorization?: string
+  /**
+   * Headers the run carries to the remote server, already validated for header use: the
+   * originating workflow/block/execution IDs, plus the caller's `HTTP_*` workflow variables.
+   * Sending any per-request header retires pooling for this connection, which is why these
+   * are not added to discovery.
+   */
+  passthroughHeaders?: Record<string, string>
   callChain?: string[]
   timeoutMs?: number
   signal?: AbortSignal
@@ -151,7 +165,7 @@ export const executeMcpToolUseCase = defineAuthorizedWorkspaceUseCase({
         context.workspaceId,
         'cache-aside',
         input.onResolvedSecretTraceProvenance,
-        { signal: input.signal }
+        { signal: input.signal, forwardedAuthorization: input.forwardedAuthorization }
       )
       tool = tools.find((candidate) => candidate.name === input.toolName)
       if (!tool) {
@@ -171,10 +185,11 @@ export const executeMcpToolUseCase = defineAuthorizedWorkspaceUseCase({
     if (tool) validateToolArguments(tool, args)
     input.signal?.throwIfAborted()
     const toolCall: McpToolCall = { name: input.toolName, arguments: args }
-    const extraHeaders =
-      input.callChain && input.callChain.length > 0
-        ? { [SIM_VIA_HEADER]: serializeCallChain(input.callChain) }
-        : undefined
+    const perRequestHeaders: Record<string, string> = { ...input.passthroughHeaders }
+    if (input.callChain && input.callChain.length > 0) {
+      perRequestHeaders[SIM_VIA_HEADER] = serializeCallChain(input.callChain)
+    }
+    const extraHeaders = Object.keys(perRequestHeaders).length > 0 ? perRequestHeaders : undefined
     const providerResult = await mcpService.executeTool(
       userId,
       context.server.id,
@@ -182,7 +197,11 @@ export const executeMcpToolUseCase = defineAuthorizedWorkspaceUseCase({
       context.workspaceId,
       extraHeaders,
       input.onResolvedSecretTraceProvenance,
-      { signal: input.signal, timeoutMs: input.timeoutMs }
+      {
+        signal: input.signal,
+        timeoutMs: input.timeoutMs,
+        forwardedAuthorization: input.forwardedAuthorization,
+      }
     )
     input.signal?.throwIfAborted()
     const result = transformToolResult(providerResult)

@@ -160,6 +160,96 @@ describe('executeMcpToolUseCase', () => {
     expect(mocks.telemetry).toHaveBeenCalledOnce()
   })
 
+  it('sends execution identity alongside the call chain, and neither to discovery', async () => {
+    await executeMcpToolUseCase.execute({
+      principal: PRINCIPAL,
+      input: {
+        workspaceId: WORKSPACE.workspaceId,
+        serverId: SERVER.id,
+        toolName: 'lookup',
+        arguments: { count: 2 },
+        passthroughHeaders: {
+          'X-Sim-Workflow-Id': 'workflow-1',
+          'X-Sim-Block-Id': 'block-1',
+          'X-Sim-Execution-Id': 'execution-1',
+        },
+        callChain: ['workflow-parent'],
+      },
+    })
+
+    expect(mocks.executeTool.mock.calls[0][4]).toEqual({
+      'X-Sim-Workflow-Id': 'workflow-1',
+      'X-Sim-Block-Id': 'block-1',
+      'X-Sim-Execution-Id': 'execution-1',
+      'X-Sim-Via': 'workflow-parent',
+    })
+    expect(mocks.discoverServerTools.mock.calls[0][5]).not.toHaveProperty('X-Sim-Block-Id')
+  })
+
+  it("sends the run's HTTP_ workflow variables to the server", async () => {
+    await executeMcpToolUseCase.execute({
+      principal: PRINCIPAL,
+      input: {
+        workspaceId: WORKSPACE.workspaceId,
+        serverId: SERVER.id,
+        toolName: 'lookup',
+        arguments: { count: 2 },
+        passthroughHeaders: { 'Context-Uuid': 'ctx-123', 'X-Sim-Block-Id': 'block-1' },
+      },
+    })
+
+    expect(mocks.executeTool.mock.calls[0][4]).toEqual({
+      'Context-Uuid': 'ctx-123',
+      'X-Sim-Block-Id': 'block-1',
+    })
+  })
+
+  it('sends no per-request headers when there is nothing to attribute', async () => {
+    await executeMcpToolUseCase.execute({
+      principal: PRINCIPAL,
+      input: {
+        workspaceId: WORKSPACE.workspaceId,
+        serverId: SERVER.id,
+        toolName: 'lookup',
+        arguments: { count: 2 },
+        passthroughHeaders: {},
+      },
+    })
+
+    expect(mocks.executeTool.mock.calls[0][4]).toBeUndefined()
+  })
+
+  it('forwards the caller credential to discovery as well as the call', async () => {
+    await executeMcpToolUseCase.execute({
+      principal: PRINCIPAL,
+      input: {
+        workspaceId: WORKSPACE.workspaceId,
+        serverId: SERVER.id,
+        toolName: 'lookup',
+        arguments: { count: 2 },
+        forwardedAuthorization: 'Bearer caller-credential',
+      },
+    })
+
+    expect(mocks.discoverServerTools).toHaveBeenCalledWith(
+      'user-1',
+      SERVER.id,
+      WORKSPACE.workspaceId,
+      'cache-aside',
+      undefined,
+      expect.objectContaining({ forwardedAuthorization: 'Bearer caller-credential' })
+    )
+    expect(mocks.executeTool).toHaveBeenCalledWith(
+      'user-1',
+      SERVER.id,
+      { name: 'lookup', arguments: { count: 2 } },
+      WORKSPACE.workspaceId,
+      undefined,
+      undefined,
+      expect.objectContaining({ forwardedAuthorization: 'Bearer caller-credential' })
+    )
+  })
+
   it('rejects foreign or missing servers before permission and provider work', async () => {
     mocks.getServer.mockResolvedValueOnce(null)
 
