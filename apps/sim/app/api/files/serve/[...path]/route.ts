@@ -3,13 +3,12 @@ import { type Principal, requirePrincipalSubjectUserId } from '@sim/auth/princip
 import { createLogger } from '@sim/logger'
 import type { NextRequest } from 'next/server'
 import { NextResponse } from 'next/server'
-import { checkHybridAuth } from '@/lib/auth/hybrid'
 import { fileServeParamsSchema, fileServeQuerySchema } from '@/lib/api/contracts/storage-transfer'
 import {
   concealCrossTenantResourceError,
   InternalUnauthenticatedError,
 } from '@/lib/api/server/routes'
-import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { checkHybridAuth } from '@/lib/auth/hybrid'
 import { resolveServableDocBytes } from '@/lib/copilot/tools/server/files/doc-compile'
 import { DocCompileUserError } from '@/lib/copilot/tools/server/files/doc-compile-error'
 import { asOrchestrationError } from '@/lib/core/orchestration/types'
@@ -202,13 +201,22 @@ export const GET = withRouteHandler(
       // what sent every attachment into the workspace-file use case, which matches on
       // `context = 'workspace'` and answered 404 for a file that was present.
       const storageContext = await resolveStoredFileContext(cloudKey)
+      // WizVille patch: a server to server caller (the reporting pipeline fetching a
+      // generated report) authenticates with an API key, and both policies upstream
+      // uses here refuse one outright: the internal workspace policy throws on the
+      // header, and checkSessionOrInternalAuth rejects it. Route that caller to
+      // checkHybridAuth, which validates the key and resolves the user that
+      // verifyFileAccess then authorizes the file against. Session and executor
+      // callers keep upstream's path unchanged.
+      // Re-applied after a `Merge branch 'main'` dropped it; keep it on every merge.
+      const presentsApiKey = request.headers.has('x-api-key')
       const workspacePrincipal =
-        storageContext === 'workspace'
+        storageContext === 'workspace' && !presentsApiKey
           ? await internalWorkspaceFileServeAuth.authenticate(request, { path })
           : undefined
       const legacyAuthResult = workspacePrincipal
         ? undefined
-        : await checkSessionOrInternalAuth(request, { requireWorkflowId: false })
+        : await checkHybridAuth(request, { requireWorkflowId: false })
 
       if (legacyAuthResult && (!legacyAuthResult.success || !legacyAuthResult.userId)) {
         logger.warn('Unauthorized file access attempt', {
