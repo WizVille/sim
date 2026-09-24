@@ -38,6 +38,10 @@ packages/deployment-config/src/service-account-providers.generated.ts # Generate
 packages/deployment-config/src/service-account-metadata.ts # Handwritten deployment policy
 ```
 
+If the block, its triggers, or connector fields use a `selectorKey`, also apply the `validate-selector` skill and read
+the key's entry in `apps/sim/lib/selectors/manifest.ts`, its server attachment and provider listing
+primitive, and the shared context builder. There is no client provider selector registry.
+
 ## Step 2: Pull API Documentation
 
 Fetch the official API docs for the service. This is the **source of truth** for:
@@ -211,7 +215,7 @@ For **each tool** in `tools.access`:
   - Enum/fixed options → `dropdown`
   - Free text → `short-input`
   - Long text/content → `long-input`
-  - True/false → `dropdown` with Yes/No options (not `switch` unless purely UI toggle)
+  - True/false → `switch` (a Yes/No `dropdown` only when the tool needs a third "unset" state)
   - Credentials → `oauth-input` with correct `serviceId`
 - [ ] Dropdown `value: () => 'default'` is set for dropdowns with a sensible default
 
@@ -231,19 +235,18 @@ For **each tool** in `tools.access`:
 - [ ] Timestamp fields have `wandConfig` with `generationType: 'timestamp'`
 - [ ] Comma-separated list fields have `wandConfig` with a descriptive prompt
 - [ ] Complex filter/query fields have `wandConfig` with format examples in the prompt
-- [ ] All `wandConfig` prompts end with "Return ONLY the [format] - no explanations, no extra text."
+- [ ] All `wandConfig` prompts end with an explicit `Return ONLY the <format>` instruction so the generated value can be pasted directly into the field
 - [ ] `wandConfig.placeholder` describes what to type in natural language
 
 ### Tools Config
 - [ ] `tools.access` lists **every** tool ID the block can use — none missing
 - [ ] `tools.config.tool` returns the correct tool ID for each operation
-- [ ] Type coercions are in `tools.config.params` (runs at execution time), NOT in `tools.config.tool` (runs at serialization time before variable resolution)
+- [ ] Type coercions are in `tools.config.params` (runs at execution time), NOT in `tools.config.tool` (runs at serialization time before variable resolution — coercing there destroys dynamic references like `<Block.output>`)
 - [ ] `tools.config.params` handles:
   - `Number()` conversion for numeric params that come as strings from inputs
   - `Boolean` / string-to-boolean conversion for toggle params
   - Empty string → `undefined` conversion for optional dropdown values
   - Any subBlock ID → tool param name remapping
-- [ ] No `Number()`, `JSON.parse()`, or other coercions in `tools.config.tool` — these would destroy dynamic references like `<Block.output>`
 
 ### Block Outputs
 - [ ] Outputs cover the key fields returned by ALL tools (not just one operation)
@@ -278,6 +281,22 @@ For **each tool** in `tools.access`:
 - [ ] `inputs` section lists all subBlock params that the block accepts
 - [ ] Input types match the subBlock types
 - [ ] When using `canonicalParamId`, inputs list the canonical ID (not the raw subBlock IDs)
+
+### Dynamic Selectors
+
+- [ ] Every remote `selectorKey` is classified in the browser-safe manifest and has exactly one
+      server attachment
+- [ ] The manifest allowlists the minimal active `dependsOn` context and matches list/search/detail,
+      pagination, scope, and stale-time behavior
+- [ ] Canonical basic/advanced and trigger/action modes project only their active values; exact
+      `{{KEY}}` references remain unresolved in the browser
+- [ ] Stored credentials are bound to the actor, workspace, and trusted provider/service
+- [ ] Each attachment declares and enforces a `fixed`, `credential-bound`, or explicitly reviewed
+      `user-controlled` destination policy
+- [ ] Provider results are explicitly projected to safe option fields; secrets, tokens, credential
+      IDs, context values, and raw upstream errors do not enter responses, logs, or query keys
+- [ ] No selector provider module, provider fetch, or OAuth-token request runs in the browser, and no
+      selector-only provider route remains
 
 ## Step 5: Validate OAuth Scopes (if OAuth service)
 
@@ -326,6 +345,21 @@ If any tool lists, searches, exports, imports, downloads, uploads, paginates, ba
 - [ ] List/search tools expose API limits and do not auto-fetch every page into memory
 - [ ] Transform logic does not build unbounded arrays, maps, sets, or `Promise.all` fan-outs
 - [ ] File and HTTP body reads use explicit byte caps or existing stream-limit helpers
+- [ ] Internal file results reach `createInternalToolFileResult` / `createInternalToolFilesResult`
+      before JSON serialization; external raw downloads explicitly use `request.responseType: 'binary'`
+      and return a buffered `output.file`. Provider base64 JSON needs separate handling
+- [ ] Transforms retain stored `UserFile` identity/access fields, and tests cover a >10 MiB file
+      crossing executor admission without another upload. New file outputs contain references only,
+      without inline content aliases; preserve legacy versions when removing existing inline fields
+- [ ] Scan every file-producing path, including attachment fetches inside `transformResponse`, URL
+      descriptors, export operations, and old/new block versions; checking download-named tools alone
+      misses late reads that occur after the first response admission
+- [ ] Late attachment reads share a per-call byte budget, bound actual streamed bytes independently
+      of provider size metadata, and forward `ToolResponseContext.signal` through every fetch/read
+- [ ] Both workflow and Copilot tests produce compact `UserFile` outputs; nested message attachment
+      aliases reference the same stored files, with no duplicate upload or raw bytes left behind
+- [ ] New output contracts omit redundant copies of file name, MIME type, size, URL, and success;
+      retained provider metadata has a distinct purpose, and types match the stored-file runtime shape
 - [ ] Large result payloads are summarized, paginated, referenced, or capped rather than raw-dumped
 - [ ] Pagination and download tests cover caps, early stop behavior, or partial-result preservation when relevant
 
@@ -359,6 +393,9 @@ Group findings by severity:
   legacy headerless/`NULL` data
 - A tool substitutes secret plaintext into source, leaks private metadata, or generically sanitizes
   unrelated third-party results
+- A selector resolves shared secret plaintext in the browser, lacks credential provider binding or
+  destination enforcement, or returns provider payloads or protected values across the selector
+  boundary
 
 **Warning** (follows conventions incorrectly or has usability issues):
 - Optional field not set to `mode: 'advanced'`
@@ -453,10 +490,12 @@ After fixing, confirm:
 - [ ] Confirmed legacy persisted data keeps working and tracked invalid provenance fails closed
 - [ ] Confirmed ordinary third-party results remain unchanged absent activated Sim provenance
 - [ ] Validated `{Service}BlockMeta` exported with at least 7 templates
+- [ ] Validated every dynamic selector through the shared manifest, server attachment, and
+      `selectors.execute` boundary
 - [ ] Reported all issues grouped by severity
 - [ ] Fixed all critical and warning issues
 - [ ] Ran `bun run tool-metadata:generate` if any tool outputs/params changed, and confirmed `bun run tool-metadata:check` passes
-- [ ] Ran `bun run generate-docs` if any block metadata changed, and committed the full generated diff — including stale-page catch-up for other integrations (`bun run docs:check` fails CI on reverted generator output)
+- [ ] Ran `bun run scripts/generate-docs.ts` if any block metadata changed, and committed the full generated diff — including stale-page catch-up for other integrations (`bun run docs:check` fails CI on reverted generator output)
 - [ ] Ran `bun run lint` after fixes
 - [ ] Verified TypeScript compiles clean
 - [ ] Verified added tests fail without their fix

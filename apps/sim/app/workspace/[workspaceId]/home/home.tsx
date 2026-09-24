@@ -35,12 +35,16 @@ import {
 import { captureEvent } from '@/lib/posthog/client'
 import { persistImportedWorkflow } from '@/lib/workflows/operations/import-export'
 import { RESOURCE_HEADER_CLASSES } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-tabs/resource-tab-controls'
+import { SuggestedActions } from '@/app/workspace/[workspaceId]/home/components/suggested-actions'
+import { useBrowserTabResources } from '@/app/workspace/[workspaceId]/home/hooks/use-browser-tab-resources'
+import { useTerminalTabResources } from '@/app/workspace/[workspaceId]/home/hooks/use-terminal-tab-resources'
 import { resolveWorkspaceResourceRef } from '@/app/workspace/[workspaceId]/home/resolve-resource-ref'
 import {
   resolveResourceEventPresentation,
   resolveResourceSelectionUpdate,
 } from '@/app/workspace/[workspaceId]/home/resource-view-policy'
 import { resourceParam, resourceUrlKeys } from '@/app/workspace/[workspaceId]/home/search-params'
+import { PermissionAccessBoundary } from '@/ee/access-requests/components/permission-access-boundary'
 import { useFolders } from '@/hooks/queries/folders'
 import { useMarkMothershipChatRead } from '@/hooks/queries/mothership-chats'
 import { useWorkflows } from '@/hooks/queries/workflows'
@@ -52,7 +56,6 @@ import {
   CreditsChip,
   MothershipChat,
   MothershipResourcesProvider,
-  SuggestedActions,
   UserInput,
   type UserInputHandle,
 } from './components'
@@ -89,7 +92,15 @@ interface HomeProps {
   userId?: string
 }
 
-export function Home({ chatId, userName, userId }: HomeProps) {
+export function Home(props: HomeProps) {
+  return (
+    <PermissionAccessBoundary configKey='hideCopilot'>
+      <HomeContent {...props} />
+    </PermissionAccessBoundary>
+  )
+}
+
+function HomeContent({ chatId, userName, userId }: HomeProps) {
   useOAuthReturnRouter()
   const { workspaceId } = useParams<{ workspaceId: string }>()
   const router = useRouter()
@@ -222,7 +233,7 @@ export function Home({ chatId, userName, userId }: HomeProps) {
   const resourceSelectionOwnedByUserRef = useRef(false)
 
   function handleResourceEvent(resourceId: string, options?: ResourceEventOptions) {
-    const activeResourceId = activeResourceParamRef.current
+    const activeResourceId = effectiveActiveResourceIdRef.current
     const presentation = resolveResourceEventPresentation({
       activeResourceId,
       activationRequested: shouldActivateResourceEvent(activeResourceId, resourceId, options),
@@ -315,7 +326,7 @@ export function Home({ chatId, userName, userId }: HomeProps) {
   const expandResource = () => {
     resourceCollapseOwnedByUserRef.current = false
     resourceSelectionOwnedByUserRef.current = true
-    const activeResourceId = activeResourceParamRef.current
+    const activeResourceId = effectiveActiveResourceIdRef.current
     if (activeResourceId) clearResourceActivity(activeResourceId)
     setResourceCollapsed(false)
   }
@@ -331,6 +342,19 @@ export function Home({ chatId, userName, userId }: HomeProps) {
     },
     [setActiveResourceId, clearResourceActivity]
   )
+
+  const desktopTabResourceOptions = {
+    scopeId: desktopScopeId,
+    resources,
+    activeResourceId,
+    selectedResourceId: activeResourceParam,
+    addResource,
+    removeResource,
+    selectResource: selectResourceFromUser,
+    onResourceEvent: handleResourceEvent,
+  }
+  useBrowserTabResources(desktopTabResourceOptions)
+  useTerminalTabResources(desktopTabResourceOptions)
 
   const addResourceFromUser = useCallback(
     (resource: MothershipResource) => {
@@ -422,7 +446,7 @@ export function Home({ chatId, userName, userId }: HomeProps) {
   }, [workspaceId, getCurrentRequestId, stopGeneration])
 
   const handleSubmit = useCallback(
-    (text: string, fileAttachments?: FileAttachmentForApi[], contexts?: ChatContext[]) => {
+    async (text: string, fileAttachments?: FileAttachmentForApi[], contexts?: ChatContext[]) => {
       const trimmed = text.trim()
       if (!trimmed && !(fileAttachments && fileAttachments.length > 0)) return
 
@@ -457,6 +481,8 @@ export function Home({ chatId, userName, userId }: HomeProps) {
       prepareResourceViewForAgentTurn()
       sendMessage(detail.message, detail.fileAttachments, detail.contexts, {
         ...(detail.resumeUserMessageId ? { resumeUserMessageId: detail.resumeUserMessageId } : {}),
+        ...(detail.requestMode ? { requestMode: detail.requestMode } : {}),
+        ...(detail.assistantSearch ? { assistantSearch: detail.assistantSearch } : {}),
       })
     }
     window.addEventListener(MOTHERSHIP_SEND_MESSAGE_EVENT, handler)
@@ -491,6 +517,8 @@ export function Home({ chatId, userName, userId }: HomeProps) {
         ...(handoff.resumeUserMessageId
           ? { resumeUserMessageId: handoff.resumeUserMessageId }
           : {}),
+        ...(handoff.requestMode ? { requestMode: handoff.requestMode } : {}),
+        ...(handoff.assistantSearch ? { assistantSearch: handoff.assistantSearch } : {}),
       })
       return
     }
@@ -738,7 +766,7 @@ export function Home({ chatId, userName, userId }: HomeProps) {
             isAgentResponding={isSending}
             genericResourceData={genericResourceData ?? undefined}
             onUserInteraction={handleResourceInteraction}
-            className={skipResourceTransition ? '!transition-none' : undefined}
+            className={skipResourceTransition ? 'transition-none!' : undefined}
           />
         </Suspense>
       </MothershipResourcesProvider>
@@ -759,7 +787,7 @@ export function Home({ chatId, userName, userId }: HomeProps) {
             {isResourceCollapsed && resourceActivityIds.size > 0 && (
               <span
                 aria-hidden='true'
-                className='-top-0.5 -right-0.5 absolute size-1.5 rounded-full bg-[var(--brand-primary)]'
+                className='-top-0.5 -right-0.5 absolute size-1.5 rounded-full bg-[var(--brand-blue)]'
               />
             )}
           </span>

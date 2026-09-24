@@ -25,6 +25,7 @@ const {
   mockCreateKnowledgeConnector,
   mockCreateKnowledgeTag,
   mockListKnowledgeTags,
+  mockIsKnowledgeMemberAccessAvailable,
   knowledgeOperations,
 } = vi.hoisted(() => {
   const defineOperation = (id: string, minimumRole: 'read' | 'write') =>
@@ -58,6 +59,7 @@ const {
     mockCreateKnowledgeConnector: vi.fn(),
     mockCreateKnowledgeTag: vi.fn(),
     mockListKnowledgeTags: vi.fn(),
+    mockIsKnowledgeMemberAccessAvailable: vi.fn(),
     knowledgeOperations: {
       addWorkspaceFiles: defineOperation('knowledge.documents.add_workspace_files', 'write'),
       bulkDelete: defineOperation('knowledge.bulk_delete', 'write'),
@@ -80,14 +82,18 @@ const {
   }
 })
 
+vi.mock('@/lib/copilot/chat/organization-chats', () => ({
+  authorizeOrganizationChatDelegation: { execute: vi.fn() },
+}))
+
 vi.mock('@/lib/copilot/generated/tool-catalog-v1', () => ({
   ManageKnowledgeBase: { id: 'manage_knowledge_base' },
 }))
-const { mockGetEffectiveDecryptedEnv } = vi.hoisted(() => ({
-  mockGetEffectiveDecryptedEnv: vi.fn(),
+const { mockGetEffectiveEnvironmentSnapshot } = vi.hoisted(() => ({
+  mockGetEffectiveEnvironmentSnapshot: vi.fn(),
 }))
 vi.mock('@/lib/environment/utils', () => ({
-  getEffectiveDecryptedEnv: mockGetEffectiveDecryptedEnv,
+  getEffectiveEnvironmentSnapshot: mockGetEffectiveEnvironmentSnapshot,
 }))
 vi.mock('@/lib/core/telemetry', () => ({
   PlatformEvents: {
@@ -98,6 +104,9 @@ vi.mock('@/lib/core/telemetry', () => ({
 }))
 vi.mock('@/lib/posthog/server', () => ({ captureServerEvent: mockCaptureServerEvent }))
 vi.mock('@/lib/knowledge/application/operations', () => ({ knowledgeOperations }))
+vi.mock('@/lib/knowledge/access/availability', () => ({
+  isKnowledgeMemberAccessAvailable: mockIsKnowledgeMemberAccessAvailable,
+}))
 vi.mock('@/lib/knowledge/application/add-workspace-files', () => ({
   addWorkspaceFilesToKnowledgeBase: {
     operation: knowledgeOperations.addWorkspaceFiles,
@@ -260,6 +269,7 @@ describe('manage_knowledge_base trusted application delegation', () => {
       ],
       failed: [],
     })
+    mockIsKnowledgeMemberAccessAvailable.mockResolvedValue(true)
     mockSearchKnowledge.mockResolvedValue({
       results: [],
       query: 'query',
@@ -355,6 +365,7 @@ describe('manage_knowledge_base trusted application delegation', () => {
   })
 
   it('projects query secrets before delegating search and passes only the trusted registry', async () => {
+    const controller = new AbortController()
     const registry = new ResolvedSecretTraceRegistry([
       {
         name: 'KB_QUERY',
@@ -388,7 +399,7 @@ describe('manage_knowledge_base trusted application delegation', () => {
         operation: 'query',
         args: { knowledgeBaseId: KNOWLEDGE_BASE.id, query: 'private query' },
       },
-      { ...CONTEXT, resolvedSecretTraceRegistry: registry }
+      { ...CONTEXT, resolvedSecretTraceRegistry: registry, abortSignal: controller.signal }
     )
 
     expect(result).toMatchObject({
@@ -402,9 +413,63 @@ describe('manage_knowledge_base trusted application delegation', () => {
       knowledgeBaseIds: [KNOWLEDGE_BASE.id],
       query: '{{KB_QUERY}}',
       topK: 5,
+      surface: 'copilot',
       resultSecretRegistry: registry,
+      signal: controller.signal,
     })
     expect(mockReadKnowledgeBase).not.toHaveBeenCalled()
+  })
+
+  it('attributes knowledge queries to the trusted Slack context', async () => {
+    const result = await knowledgeBaseServerTool.execute(
+      { operation: 'query', args: { knowledgeBaseId: KNOWLEDGE_BASE.id, query: 'query' } },
+      {
+        ...CONTEXT,
+        resolvedSecretTraceRegistry: new ResolvedSecretTraceRegistry(),
+        searchSurface: 'slack',
+      }
+    )
+
+    expect(result.success).toBe(true)
+    expect(mockSearchKnowledge).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ surface: 'slack' }) })
+    )
+  })
+
+  it('asks for citations where per-member access is on', async () => {
+    const result = await knowledgeBaseServerTool.execute(
+      { operation: 'query', args: { knowledgeBaseId: KNOWLEDGE_BASE.id, query: 'query' } },
+      { ...CONTEXT, resolvedSecretTraceRegistry: new ResolvedSecretTraceRegistry() }
+    )
+
+    expect(result.message).toContain('<source>')
+    expect(mockIsKnowledgeMemberAccessAvailable).toHaveBeenCalledWith({
+      workspaceId: 'workspace-paid',
+    })
+  })
+
+  it('asks for no citation where the workspace cannot render one', async () => {
+    mockIsKnowledgeMemberAccessAvailable.mockResolvedValue(false)
+
+    const result = await knowledgeBaseServerTool.execute(
+      { operation: 'query', args: { knowledgeBaseId: KNOWLEDGE_BASE.id, query: 'query' } },
+      { ...CONTEXT, resolvedSecretTraceRegistry: new ResolvedSecretTraceRegistry() }
+    )
+
+    expect(result).toMatchObject({ success: true })
+    expect(result.message).toBe('Found 0 result(s) for query "query".')
+  })
+
+  it('answers without citations when the eligibility lookup fails, rather than failing the query', async () => {
+    mockIsKnowledgeMemberAccessAvailable.mockRejectedValueOnce(new Error('billing unavailable'))
+
+    const result = await knowledgeBaseServerTool.execute(
+      { operation: 'query', args: { knowledgeBaseId: KNOWLEDGE_BASE.id, query: 'query' } },
+      { ...CONTEXT, resolvedSecretTraceRegistry: new ResolvedSecretTraceRegistry() }
+    )
+
+    expect(result).toMatchObject({ success: true })
+    expect(result.message).toBe('Found 0 result(s) for query "query".')
   })
 
   it('returns a safe model result for search infrastructure failures', async () => {
@@ -744,7 +809,12 @@ describe('manage_knowledge_base trusted application delegation', () => {
   it.each(['{{SIM_GITHUB_PAT}}', '$SIM_GITHUB_PAT', 'SIM_GITHUB_PAT'])(
     'resolves the %s environment reference into the connector API key',
     async (ref) => {
-      mockGetEffectiveDecryptedEnv.mockResolvedValue({ SIM_GITHUB_PAT: 'ghp_realtoken' })
+      mockGetEffectiveEnvironmentSnapshot.mockResolvedValue({
+        personalEncrypted: {},
+        personalDecrypted: {},
+        workspaceEncrypted: { SIM_GITHUB_PAT: 'encrypted-token' },
+        workspaceDecrypted: { SIM_GITHUB_PAT: 'ghp_realtoken' },
+      })
 
       const result = await knowledgeBaseServerTool.execute(
         {
@@ -763,7 +833,12 @@ describe('manage_knowledge_base trusted application delegation', () => {
   )
 
   it('names the missing variable instead of sending a placeholder upstream', async () => {
-    mockGetEffectiveDecryptedEnv.mockResolvedValue({})
+    mockGetEffectiveEnvironmentSnapshot.mockResolvedValue({
+      personalEncrypted: {},
+      personalDecrypted: {},
+      workspaceEncrypted: {},
+      workspaceDecrypted: {},
+    })
 
     const result = await knowledgeBaseServerTool.execute(
       {
@@ -784,7 +859,12 @@ describe('manage_knowledge_base trusted application delegation', () => {
   })
 
   it('passes a raw API key through untouched', async () => {
-    mockGetEffectiveDecryptedEnv.mockResolvedValue({ SIM_GITHUB_PAT: 'ghp_realtoken' })
+    mockGetEffectiveEnvironmentSnapshot.mockResolvedValue({
+      personalEncrypted: {},
+      personalDecrypted: {},
+      workspaceEncrypted: { SIM_GITHUB_PAT: 'encrypted-token' },
+      workspaceDecrypted: { SIM_GITHUB_PAT: 'ghp_realtoken' },
+    })
 
     const result = await knowledgeBaseServerTool.execute(
       {

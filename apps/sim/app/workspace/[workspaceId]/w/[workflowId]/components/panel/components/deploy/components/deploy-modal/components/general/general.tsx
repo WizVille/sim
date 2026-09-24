@@ -3,8 +3,8 @@
 import { useId, useState } from 'react'
 import {
   Button,
-  ButtonGroup,
-  ButtonGroupItem,
+  ChipButtonGroup,
+  ChipButtonGroupItem,
   ChipConfirmModal,
   ChipModal,
   ChipModalBody,
@@ -204,19 +204,19 @@ export function GeneralDeploy({
                 : 'Live Workflow'}
             </Label>
             <div className={cn('absolute top-[-5px] right-0', !showToggle && 'invisible')}>
-              <ButtonGroup
+              <ChipButtonGroup
                 value={previewMode}
                 onValueChange={(val) =>
                   setShowActiveDespiteSelection((val as PreviewMode) === 'active')
                 }
               >
-                <ButtonGroupItem value='active'>Live</ButtonGroupItem>
-                <ButtonGroupItem value='selected' className='truncate'>
+                <ChipButtonGroupItem value='active'>Live</ChipButtonGroupItem>
+                <ChipButtonGroupItem value='selected' className='truncate'>
                   {selectedVersionInfo
                     ? formatVersionLabel(selectedVersionInfo.version, selectedVersionInfo.name)
                     : `v${selectedVersion}`}
-                </ButtonGroupItem>
-              </ButtonGroup>
+                </ChipButtonGroupItem>
+              </ChipButtonGroup>
             </div>
           </div>
 
@@ -229,7 +229,7 @@ export function GeneralDeploy({
           >
             {workflowToShow ? (
               <>
-                <div className='[&_*]:!cursor-default h-full w-full cursor-default'>
+                <div className='h-full w-full cursor-default [&_*]:cursor-default!'>
                   <PreviewWorkflow
                     workflowState={workflowToShow}
                     height='100%'
@@ -242,10 +242,11 @@ export function GeneralDeploy({
                 <Tooltip.Root>
                   <Tooltip.Trigger asChild>
                     <Button
+                      aria-label='See preview'
                       type='button'
                       variant='default'
                       onClick={() => setShowExpandedPreview(true)}
-                      className='absolute right-[8px] bottom-2 z-10 size-[28px] cursor-pointer border border-[var(--border)] bg-transparent p-0 backdrop-blur-sm hover-hover:bg-[var(--surface-3)]'
+                      className='absolute right-[8px] bottom-2 z-10 size-[28px] cursor-pointer bg-transparent p-0 backdrop-blur-xs hover-hover:bg-[var(--surface-3)]'
                     >
                       <Expand className='size-[14px]' />
                     </Button>

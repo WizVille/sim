@@ -1,4 +1,4 @@
-import { defineWorkspaceOperation } from '@/lib/core/application'
+import { defineWorkspaceOperation } from '@/lib/core/application/workspace-operation'
 
 /**
  * Chat is a user-actor surface: the run is attributed to a person, reads their
@@ -7,10 +7,31 @@ import { defineWorkspaceOperation } from '@/lib/core/application'
  * silently substituting the key's owner.
  */
 export const chatOperations = {
-  send: defineWorkspaceOperation({
-    id: 'chat.send',
+  continue: defineWorkspaceOperation({
+    id: 'chat.continue',
     minimumRole: 'read',
     workspaceApiKey: 'deny',
-    principalKinds: ['personal_api_key'],
+    capability: 'copilot.use',
+    principalKinds: ['delegated'],
+    delegatedServices: ['copilot'],
+  }),
+  /**
+   * permission-group-exempt: Stopping existing work remains available after Copilot is disabled.
+   */
+  cancel: defineWorkspaceOperation({
+    id: 'chat.cancel',
+    minimumRole: 'read',
+    workspaceApiKey: 'deny',
+    capability: 'none',
+    principalKinds: ['delegated'],
+    delegatedServices: ['copilot'],
+  }),
+  send: defineWorkspaceOperation({
+    id: 'chat.send',
+    oauthScope: 'api:write',
+    minimumRole: 'read',
+    workspaceApiKey: 'deny',
+    capability: 'copilot.use',
+    principalKinds: ['personal_api_key', 'oauth_access_token'],
   }),
 } as const

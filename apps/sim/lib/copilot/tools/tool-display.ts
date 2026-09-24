@@ -4,16 +4,22 @@ import { stripVersionSuffix, truncate } from '@sim/utils/string'
 /**
  * Single source of truth for copilot tool-call display titles.
  *
- * The mothership (Go) no longer emits any presentation metadata on the stream —
- * tool-call titles are derived entirely here, keyed by tool name (plus arguments
- * for the dynamic cases). The live client render layer (see
+ * Model-authored invocation descriptions take precedence when available. Fallback
+ * titles are derived here from the tool name and arguments. The live client render layer (see
  * `home/hooks/stream/stream-helpers.ts`) wraps this with workspace/block-name
  * enrichment for the run_* tools; every other surface (server persistence,
  * transcript replay, fallback rendering) calls `getToolDisplayTitle` directly.
  *
  * Icons are likewise client-owned — see `getAgentIcon` in the message-content
- * utils. Nothing about tool presentation lives on the Go side anymore.
+ * utils. Tool status, icons, and fallback wording remain deterministic.
  */
+
+/** Normalizes optional model-authored activity text using the producer's Unicode bound. */
+export function normalizeToolActivityDescription(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const description = value.replace(/[\p{White_Space}\uFEFF]+/gu, ' ').trim()
+  return description && Array.from(description).length <= 160 ? description : undefined
+}
 
 type ToolArgs = Record<string, unknown> | undefined
 
@@ -77,6 +83,16 @@ function stringOrNumberArg(args: ToolArgs, key: string): string {
 }
 
 /**
+ * The verb tokens of a table operation id. Ids are verb_noun compounds —
+ * `insert_row`, `batch_update_rows`, `delete_rows_by_filter`, `list_views` —
+ * so a title matches the verb as a token; whole-id equality never fired in
+ * production and every row write rendered as the generic "Editing rows".
+ */
+function operationVerbs(op: string): Set<string> {
+  return new Set(op.split('_'))
+}
+
+/**
  * Titles for the split table tools: each names its own action, refined by the
  * operation and the named target when the args carry one — a card full of
  * table work should read as adds, updates, and wiring, never a wall of
@@ -84,6 +100,8 @@ function stringOrNumberArg(args: ToolArgs, key: string): string {
  */
 function splitTableTitle(name: string, args: ToolArgs): string {
   const op = stringArg(args, 'operation')
+  const verbs = operationVerbs(op)
+  const is = (...candidates: string[]) => candidates.some((verb) => verbs.has(verb))
   const target = firstStringArg(args, 'columnName', 'viewName', 'name', 'title')
   const suffix = target ? ` ${target}` : ''
   // "in Runtimes" / "of Runtimes" — enrichment resolves the nested tableId.
@@ -92,36 +110,34 @@ function splitTableTitle(name: string, args: ToolArgs): string {
   const ofTable = table ? ` of ${table}` : ''
   switch (name) {
     case 'table_manage':
-      if (op === 'create') return `Creating table${suffix || (table ? ` ${table}` : '')}`
-      if (op === 'delete') return `Deleting table${table ? ` ${table}` : suffix}`
-      if (op === 'read' || op === 'get' || op === 'list')
-        return `Reading${table ? ` ${table}` : ' table'}`
+      if (is('create')) return `Creating table${suffix || (table ? ` ${table}` : '')}`
+      if (is('delete')) return `Deleting table${table ? ` ${table}` : suffix}`
+      if (is('read', 'get', 'list')) return `Reading${table ? ` ${table}` : ' table'}`
       return `Updating${table ? ` ${table}` : ' table'}`
     case 'table_rows':
-      if (op === 'insert' || op === 'add' || op === 'create')
-        return `Adding rows${inTable ? ` to ${table}` : ''}`
-      if (op === 'update') return `Updating rows${inTable}`
-      if (op === 'delete') return `Deleting rows${inTable}`
-      if (op === 'read' || op === 'list' || op === 'query') return `Reading rows${ofTable}`
+      if (is('insert', 'add', 'create')) return `Adding rows${inTable ? ` to ${table}` : ''}`
+      if (is('update')) return `Updating rows${inTable}`
+      if (is('delete')) return `Deleting rows${inTable}`
+      if (is('read', 'get', 'list', 'query')) return `Reading rows${ofTable}`
       return `Editing rows${ofTable}`
     case 'table_columns':
-      if (op === 'add' || op === 'create') return `Adding column${suffix}${inTable}`
-      if (op === 'update') return `Updating column${suffix}${inTable}`
-      if (op === 'delete') return `Deleting column${suffix}${inTable}`
-      if (op === 'read' || op === 'list') return `Reading columns${ofTable}`
+      if (is('add', 'create')) return `Adding column${suffix}${inTable}`
+      if (is('update')) return `Updating column${suffix}${inTable}`
+      if (is('delete')) return `Deleting column${suffix}${inTable}`
+      if (is('read', 'get', 'list')) return `Reading columns${ofTable}`
       return `Editing columns${ofTable}`
     case 'table_automations':
-      if (op === 'read' || op === 'list') return `Reading automations${ofTable}`
-      if (op === 'delete') return `Removing automation${inTable}`
+      if (is('read', 'get', 'list')) return `Reading automations${ofTable}`
+      if (is('delete')) return `Removing automation${inTable}`
       return `Wiring automation${inTable}`
     case 'table_enrichments':
-      if (op === 'read' || op === 'list') return `Reading enrichments${ofTable}`
-      if (op === 'delete') return `Removing enrichment${inTable}`
+      if (is('read', 'get', 'list')) return `Reading enrichments${ofTable}`
+      if (is('delete')) return `Removing enrichment${inTable}`
       return `Configuring enrichment${suffix}${inTable}`
     case 'table_views':
-      if (op === 'create') return `Creating view${suffix}${inTable}`
-      if (op === 'delete') return `Deleting view${suffix}${inTable}`
-      if (op === 'read' || op === 'list') return `Reading views${ofTable}`
+      if (is('create')) return `Creating view${suffix}${inTable}`
+      if (is('delete')) return `Deleting view${suffix}${inTable}`
+      if (is('read', 'get', 'list')) return `Reading views${ofTable}`
       return `Editing views${ofTable}`
     default:
       return `Updating${table ? ` ${table}` : ' table'}`
@@ -301,10 +317,11 @@ function knowledgeBaseTitle(args: ToolArgs): string {
     'file'
   )
 
+  const query = stringArg(operationArgs, 'query')
   const titles: Record<string, string> = {
     create: `Creating ${name || 'knowledge base'}`,
     get: 'Reading knowledge base',
-    query: 'Searching knowledge base',
+    query: query ? `Searching knowledge base for ${query}` : 'Searching knowledge base',
     add_file: `Adding ${fileTarget} to knowledge base`,
     update: 'Updating knowledge base',
     delete: `Deleting ${countedResourceTarget(operationArgs, 'knowledgeBaseIds', 'knowledge base', 'knowledge bases')}`,
@@ -550,9 +567,12 @@ const TOOL_TITLES: Record<string, string> = {
   prepare_file_edit: 'Editing file',
   apply_file_edit: 'Writing changes',
   create_workflow: 'Creating workflow',
+  cancel_workflow_run: 'Cancelling workflow run',
   edit_workflow: 'Editing workflow',
   manage_knowledge_base: 'Managing knowledge base',
   search_knowledge_base: 'Searching knowledge base',
+  search_workspace: 'Searching documents',
+  read_document: 'Reading document',
   open_resource: 'Opening resource',
 
   ffmpeg: 'Processing media',
@@ -608,11 +628,14 @@ const TOOL_TITLES: Record<string, string> = {
   // Browser agent tools without an argument-aware title.
   browser_go_back: 'Going back',
   browser_go_forward: 'Going forward',
+  browser_reload: 'Reloading page',
   browser_switch_tab: 'Switching tab',
   browser_close_tab: 'Closing tab',
   browser_list_tabs: 'Listing tabs',
   browser_list_sessions: 'Checking signed-in sites',
+  browser_list_downloads: 'Checking downloads',
   browser_snapshot: 'Scanning page',
+  browser_find: 'Finding page element',
   browser_read_text: 'Reading page',
   browser_screenshot: 'Taking screenshot',
   browser_click: 'Clicking element',
@@ -620,7 +643,10 @@ const TOOL_TITLES: Record<string, string> = {
 
   browser_drag: 'Dragging element',
   browser_select_option: 'Selecting option',
+  browser_fill_form: 'Filling form',
+  browser_set_checked: 'Updating control',
   browser_hover: 'Hovering element',
+  browser_zoom: 'Changing page zoom',
   // Subagent trigger tools, when surfaced as a tool call.
   workflow: 'Workflow Agent',
   run: 'Run Agent',
@@ -1021,7 +1047,24 @@ export function getToolDisplayTitle(name: string, args?: Record<string, unknown>
     }
     case 'browser_wait_for': {
       const text = stringArg(args, 'text')
-      return text ? `Waiting for "${text}"` : 'Waiting for page'
+      const state = stringArg(args, 'state')
+      const url = stringArg(args, 'urlContains')
+      if (text) return `Waiting for "${text}"`
+      if (state) return `Waiting for element to be ${state}`
+      return url ? `Waiting for ${displayUrl(url)}` : 'Waiting for page'
+    }
+    case 'browser_find': {
+      const query = stringArg(args, 'query')
+      return query ? `Finding "${truncateMiddle(query, 32)}"` : 'Finding page element'
+    }
+    case 'browser_set_checked': {
+      return args?.checked === false ? 'Unchecking control' : 'Checking control'
+    }
+    case 'browser_zoom': {
+      const action = stringArg(args, 'action')
+      if (action === 'in') return 'Zooming in'
+      if (action === 'out') return 'Zooming out'
+      return action === 'reset' ? 'Resetting page zoom' : 'Changing page zoom'
     }
     case 'generate_image':
     case 'generate_video':
@@ -1272,6 +1315,7 @@ const COMPLETED_VERB_REWRITES: Record<string, string> = {
   Cancelling: 'Cancelled',
   Calling: 'Called',
   Checking: 'Checked',
+  Changing: 'Changed',
   Clicking: 'Clicked',
   Closing: 'Closed',
   Combining: 'Combined',
@@ -1297,6 +1341,7 @@ const COMPLETED_VERB_REWRITES: Record<string, string> = {
   Extracting: 'Extracted',
   Fading: 'Faded',
   Finding: 'Found',
+  Filling: 'Filled',
   Gathering: 'Gathered',
   Generating: 'Generated',
   Going: 'Went',
@@ -1323,9 +1368,11 @@ const COMPLETED_VERB_REWRITES: Record<string, string> = {
   Querying: 'Queried',
   Reading: 'Read',
   Redeploying: 'Redeployed',
+  Reloading: 'Reloaded',
   Removing: 'Removed',
   Renaming: 'Renamed',
   Requesting: 'Requested',
+  Resetting: 'Reset',
   Resizing: 'Resized',
   Restoring: 'Restored',
   Running: 'Ran',
@@ -1346,6 +1393,7 @@ const COMPLETED_VERB_REWRITES: Record<string, string> = {
   Toggling: 'Toggled',
   Trimming: 'Trimmed',
   Typing: 'Typed',
+  Unchecking: 'Unchecked',
   Undeploying: 'Undeployed',
   Unsharing: 'Unshared',
   Updating: 'Updated',
@@ -1354,16 +1402,14 @@ const COMPLETED_VERB_REWRITES: Record<string, string> = {
   Viewing: 'Viewed',
   Waiting: 'Waited',
   Writing: 'Wrote',
+  Zooming: 'Zoomed',
 }
 
 /**
  * Rewrite a resolved display title to its past-tense form for a successfully
  * completed tool call (e.g. "Querying logs for X" -> "Queried logs for X").
- * Operates on the already-resolved title so enriched and persisted titles both
- * work. Returns undefined when the title has no leading gerund rewrite — the
- * caller keeps the original. Integration gateway descriptions are base-form
- * verb phrases ("Read recent emails") whose first word never matches a gerund
- * key, so they intentionally pass through unchanged.
+ * Returns undefined when no leading gerund rewrite is known; status formatting
+ * handles the fallback for model-authored and legacy titles.
  */
 export function getToolCompletedTitle(title: string): string | undefined {
   const spaceIndex = title.indexOf(' ')
@@ -1373,16 +1419,7 @@ export function getToolCompletedTitle(title: string): string | undefined {
   return past + title.slice(firstWord.length)
 }
 
-/**
- * Titles that already say the work is over.
- *
- * Two layers project a terminal tense: the client tool store phrases its own
- * error and skip labels ("Attempted to read X", "Skipped reading X"), and this
- * module projects again at the render boundary. Re-projecting an
- * already-projected title stacked prefixes — "Failed: Failed: Attempted to read
- * metadata for thread_tracking" — and even a single pass over a store label
- * reads as doubly hedged. Whichever layer spoke first wins.
- */
+/** Recognize terminal wording already supplied by the tool store or persisted history. */
 const TERMINAL_TITLE_PREFIXES = new Set(['Failed', 'Attempted', 'Skipped', 'Stopped'])
 
 function firstWordOf(title: string): string {
@@ -1395,47 +1432,68 @@ function statesTerminalOutcome(title: string): boolean {
   return TERMINAL_TITLE_PREFIXES.has(firstWordOf(title).replace(/:$/, ''))
 }
 
-/**
- * Rewrite a resolved display title for a FAILED tool call. A gerund title
- * becomes "Failed <gerund>…" ("Searching for X" → "Failed searching for X");
- * anything else gets a "Failed: " prefix. Without this, an errored row kept
- * its present-tense activity title verbatim and read as still running.
- */
-export function getToolFailedTitle(title: string): string {
-  if (statesTerminalOutcome(title)) return title
+/** Apply one terminal outcome prefix while preserving already-resolved titles. */
+function getToolOutcomeTitle(
+  title: string,
+  outcome: 'Stopped' | 'Skipped',
+  preserveExistingOutcome: boolean
+): string {
+  if (preserveExistingOutcome && statesTerminalOutcome(title)) return title
   const firstWord = firstWordOf(title)
-  if (COMPLETED_VERB_REWRITES[firstWord]) {
-    return `Failed ${firstWord.charAt(0).toLowerCase()}${firstWord.slice(1)}${title.slice(firstWord.length)}`
+  const statedOutcome = firstWord.replace(/:$/, '')
+  if (
+    !preserveExistingOutcome &&
+    (TERMINAL_TITLE_PREFIXES.has(statedOutcome) || statedOutcome === 'Completed')
+  ) {
+    return outcome + title.slice(statedOutcome.length)
   }
-  return `Failed: ${title}`
+  if (COMPLETED_VERB_REWRITES[firstWord]) {
+    return `${outcome} ${firstWord.charAt(0).toLowerCase()}${firstWord.slice(1)}${title.slice(firstWord.length)}`
+  }
+  return `${outcome}: ${title}`
 }
 
-/** Rewrite a resolved display title for a CANCELLED tool call ("Stopped <gerund>…"). */
-export function getToolStoppedTitle(title: string): string {
-  if (statesTerminalOutcome(title)) return title
-  const firstWord = firstWordOf(title)
-  if (COMPLETED_VERB_REWRITES[firstWord]) {
-    return `Stopped ${firstWord.charAt(0).toLowerCase()}${firstWord.slice(1)}${title.slice(firstWord.length)}`
+/** Error rows describe the action without failure badges or claims of completion. */
+function getNeutralToolActionTitle(title: string): string {
+  let action = title
+  while (action) {
+    const firstWord = firstWordOf(action)
+    const prefix = firstWord.replace(/:$/, '').toLowerCase()
+    if (!['failed', 'stopped', 'skipped', 'completed'].includes(prefix)) break
+    action = action.slice(firstWord.length).trimStart()
   }
-  return `Stopped: ${title}`
+  if (!action) return 'Tool activity'
+  if (action === title) return title
+  const firstWord = firstWordOf(action)
+  const gerund = firstWord.charAt(0).toUpperCase() + firstWord.slice(1)
+  return COMPLETED_VERB_REWRITES[gerund] ? gerund + action.slice(firstWord.length) : action
 }
 
 /**
- * Resolve the final title for a tool status at a rendering boundary. Persisted
- * and live snapshots intentionally keep the present-tense activity title so a
- * RUNNING row remains truthful; terminal states project a tense that says the
- * work is over — completed (past tense), failed, or stopped.
+ * Resolve a tool title at the rendering boundary. Successful calls use a known
+ * past-tense rewrite when available and otherwise preserve the wording.
+ * Unsuccessful calls keep a neutral action; stopped and skipped calls retain their labels.
  */
 export function getToolStatusDisplayTitle(
   title: string,
   status: string,
-  toolName?: string
+  toolName?: string,
+  activityDescription?: string
 ): string {
+  const description = normalizeToolActivityDescription(activityDescription)
+  title = description ?? title
   if (status === 'success' && toolName === 'browser_request_takeover') {
     return 'Resumed browser control'
   }
-  if (status === 'success') return getToolCompletedTitle(title) ?? title
-  if (status === 'error' || status === 'rejected') return getToolFailedTitle(title)
-  if (status === 'cancelled' || status === 'aborted') return getToolStoppedTitle(title)
+  if (status === 'success') {
+    return getToolCompletedTitle(title) ?? title
+  }
+  if (status === 'error' || status === 'rejected') {
+    return getNeutralToolActionTitle(title)
+  }
+  if (status === 'cancelled' || status === 'aborted' || status === 'interrupted') {
+    return getToolOutcomeTitle(title, 'Stopped', !description)
+  }
+  if (status === 'skipped') return getToolOutcomeTitle(title, 'Skipped', !description)
   return title
 }

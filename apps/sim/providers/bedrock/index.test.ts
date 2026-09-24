@@ -4,6 +4,24 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockSend = vi.fn()
+const capturedRequestHistories = vi.hoisted(() => [] as unknown[])
+
+vi.mock('@/providers/conversation-history', () => ({
+  getConversationRequestContext: () => undefined,
+  captureProviderConversationStep: vi.fn(
+    (
+      _request: unknown,
+      _protocol: unknown,
+      _message: unknown,
+      _usage: unknown,
+      options?: { requestHistory?: readonly unknown[] }
+    ) => {
+      capturedRequestHistories.push(structuredClone(options?.requestHistory))
+      return Promise.resolve()
+    }
+  ),
+  recordProviderConversationToolError: vi.fn().mockResolvedValue(undefined),
+}))
 
 vi.mock('@aws-sdk/client-bedrock-runtime', () => ({
   BedrockRuntimeClient: vi.fn().mockImplementation(
@@ -22,9 +40,12 @@ vi.mock('@/providers/bedrock/utils', () => ({
   checkForForcedToolUsage: vi.fn(),
   createReadableStreamFromBedrockStream: vi.fn(),
   generateToolUseId: vi.fn().mockReturnValue('tool-1'),
+  getBedrockBaseModelId: (model: string) => model.replace(/^bedrock\//i, ''),
   getBedrockStreamError: vi.fn().mockReturnValue(null),
   // The mocked inference profile above is a Claude model, which supports it.
   supportsToolResultStatus: vi.fn().mockReturnValue(true),
+  toBedrockConversationUsage: (usage?: { inputTokens: number; outputTokens: number }) =>
+    usage ? { input: usage.inputTokens, output: usage.outputTokens } : undefined,
 }))
 
 vi.mock('@/providers/models', () => ({
@@ -35,6 +56,8 @@ vi.mock('@/providers/models', () => ({
   getProviderModels: vi.fn().mockReturnValue([]),
   getProviderDefaultModel: vi.fn().mockReturnValue('us.anthropic.claude-3-5-sonnet-20241022-v2:0'),
   supportsNativeStructuredOutputs: vi.fn().mockReturnValue(false),
+  getModelCapabilities: vi.fn().mockReturnValue({ temperature: { min: 0, max: 1 } }),
+  isKnownModelId: vi.fn().mockReturnValue(true),
 }))
 
 vi.mock('@/providers/utils', () => ({
@@ -64,11 +87,13 @@ import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-r
 import type { StreamingExecution } from '@/executor/types'
 import { bedrockProvider } from '@/providers/bedrock/index'
 import { clearProviderClientCacheForTests } from '@/providers/client-cache'
+import { getModelCapabilities, isKnownModelId } from '@/providers/models'
 import { prepareToolsWithUsageControl } from '@/providers/utils'
 
 describe('bedrockProvider credential handling', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    capturedRequestHistories.length = 0
     clearProviderClientCacheForTests()
     mockSend.mockResolvedValue({
       output: { message: { content: [{ text: 'response' }] } },
@@ -81,6 +106,29 @@ describe('bedrockProvider credential handling', () => {
     systemPrompt: 'You are helpful.',
     messages: [{ role: 'user' as const, content: 'Hello' }],
   }
+
+  it('preserves system-only instructions while supplying the required user message', async () => {
+    await bedrockProvider.executeRequest({
+      ...baseRequest,
+      messages: [{ role: 'system', content: 'Answer in French.' }],
+    })
+    expect(ConverseCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        system: [{ text: 'You are helpful.' }, { text: 'Answer in French.' }],
+        messages: [{ role: 'user', content: [{ text: 'Hello' }] }],
+      })
+    )
+  })
+
+  it('rejects an orphan tool result before sending a memory-disabled request', async () => {
+    await expect(
+      bedrockProvider.executeRequest({
+        ...baseRequest,
+        messages: [{ role: 'tool', tool_call_id: 'orphan', content: 'result' }],
+      })
+    ).rejects.toThrow('no matching unresolved assistant tool call')
+    expect(mockSend).not.toHaveBeenCalled()
+  })
 
   it('throws when only bedrockAccessKeyId is provided', async () => {
     await expect(
@@ -133,6 +181,34 @@ describe('bedrockProvider credential handling', () => {
     expect(BedrockRuntimeClient).toHaveBeenCalledWith({
       region: 'eu-west-1',
     })
+  })
+
+  it('omits temperature for catalog models that do not support it', async () => {
+    vi.mocked(getModelCapabilities).mockReturnValueOnce({ maxOutputTokens: 128000 })
+    await bedrockProvider.executeRequest({
+      ...baseRequest,
+      model: 'bedrock/anthropic.claude-opus-5',
+      temperature: 0.7,
+    })
+    expect(ConverseCommand).toHaveBeenCalledWith(expect.objectContaining({ inferenceConfig: {} }))
+  })
+
+  it('preserves explicit temperature for a custom model without catalog capabilities', async () => {
+    vi.mocked(isKnownModelId).mockReturnValueOnce(false)
+    await bedrockProvider.executeRequest({
+      ...baseRequest,
+      model: 'bedrock/MyCustomProfile',
+      temperature: 0.2,
+    })
+    expect(ConverseCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ inferenceConfig: { temperature: 0.2 } })
+    )
+  })
+
+  it('leaves temperature to the service default for a custom model when omitted', async () => {
+    vi.mocked(isKnownModelId).mockReturnValueOnce(false)
+    await bedrockProvider.executeRequest({ ...baseRequest, model: 'bedrock/MyCustomProfile' })
+    expect(ConverseCommand).toHaveBeenCalledWith(expect.objectContaining({ inferenceConfig: {} }))
   })
 
   it('uses the live loop for streaming tool requests without a caller flag', async () => {
@@ -203,6 +279,8 @@ describe('bedrockProvider credential handling', () => {
     while (!(await reader.read()).done) {}
 
     expect(mockSend).toHaveBeenCalledTimes(2)
+    expect(capturedRequestHistories[0]).toEqual([{ role: 'user', content: [{ text: 'Hello' }] }])
+    expect(capturedRequestHistories[1]).toHaveLength(3)
     expect(result.execution.output.content).toBe('settled answer')
     expect(result.execution.output.providerTiming?.iterations).toBe(2)
     expect(
@@ -289,6 +367,8 @@ describe('bedrockProvider credential handling', () => {
     })) as StreamingExecution
 
     expect(mockSend).toHaveBeenCalledTimes(3)
+    expect(capturedRequestHistories[0]).toEqual([{ role: 'user', content: [{ text: 'Hello' }] }])
+    expect(capturedRequestHistories[1]).toHaveLength(3)
     expect(result.execution.output.providerTiming?.iterations).toBe(3)
     expect(
       result.execution.output.providerTiming?.timeSegments?.filter(

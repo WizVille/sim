@@ -18,18 +18,20 @@ vi.mock('@/lib/api/client/request', () => ({
 import {
   discoverMcpToolsContract,
   getAllowedMcpDomainsContract,
+  listManagedMcpCatalogContract,
   listMcpServersContract,
   listStoredMcpToolsContract,
   type McpServer,
 } from '@/lib/api/contracts/mcp'
 import {
-  mcpKeys,
   useAllowedMcpDomains,
   useForceRefreshMcpTools,
   useMcpServers,
+  useMcpToolServers,
   useMcpToolsQuery,
   useStoredMcpTools,
 } from '@/hooks/queries/mcp'
+import { mcpKeys } from '@/hooks/queries/utils/mcp-keys'
 
 const WORKSPACE_ID = 'workspace-1'
 
@@ -103,6 +105,7 @@ function mockServers(servers: McpServer[]) {
     if (contract === discoverMcpToolsContract) {
       return { success: true, data: { tools: [], totalCount: 0, byServer: {} } }
     }
+    if (contract === listManagedMcpCatalogContract) return { servers: [], tools: [] }
     throw new Error('Unexpected MCP request')
   })
 }
@@ -115,6 +118,75 @@ class FakeEventSource {
   addEventListener(): void {}
   close(): void {}
 }
+
+describe('useMcpToolServers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('lists ordinary workspace servers when no managed connections are available', async () => {
+    const sharedServer = server('shared-server')
+    mockServers([
+      sharedServer,
+      server('managed-canonical-server', { credentialGroupId: 'group-1' }),
+    ])
+
+    const hook = renderHookWithClient(() => useMcpToolServers(WORKSPACE_ID))
+    await flush()
+
+    expect(hook.getResult()).toEqual({ data: [sharedServer], isLoading: false, error: null })
+    hook.unmount()
+  })
+
+  it('includes allowed managed connections alongside ordinary servers', async () => {
+    const sharedServer = server('shared-server')
+    const managedServer = server('mcp-cg-123456789012345678901', {
+      name: 'Fireflies — person@example.com',
+      managedConnectorId: 'fireflies',
+      authType: 'oauth',
+      url: undefined,
+    })
+    mockRequestJson.mockImplementation(async (contract) => {
+      if (contract === listMcpServersContract) {
+        return { success: true, data: { servers: [sharedServer] } }
+      }
+      if (contract === listManagedMcpCatalogContract) return { servers: [managedServer], tools: [] }
+      throw new Error('Unexpected MCP request')
+    })
+
+    const hook = renderHookWithClient(() => useMcpToolServers(WORKSPACE_ID))
+    await flush()
+
+    expect(hook.getResult()).toEqual({
+      data: [sharedServer, managedServer],
+      isLoading: false,
+      error: null,
+    })
+    hook.unmount()
+  })
+
+  it.each([
+    { name: 'shared servers', failingContract: listMcpServersContract },
+    { name: 'managed catalog', failingContract: listManagedMcpCatalogContract },
+  ])('keeps unrelated $name errors visible', async ({ failingContract }) => {
+    const error = new Error('MCP request failed')
+    mockRequestJson.mockImplementation(async (contract) => {
+      if (contract === failingContract) throw error
+      if (contract === listMcpServersContract) {
+        return { success: true, data: { servers: [server('shared-server')] } }
+      }
+      if (contract === listManagedMcpCatalogContract) return { servers: [], tools: [] }
+      throw new Error('Unexpected MCP request')
+    })
+
+    const hook = renderHookWithClient(() => useMcpToolServers(WORKSPACE_ID))
+    await flush()
+
+    expect(hook.getResult().error).toBe(error)
+    expect(hook.getResult().isLoading).toBe(false)
+    hook.unmount()
+  })
+})
 
 describe('useMcpToolsQuery', () => {
   beforeEach(() => {
@@ -141,13 +213,72 @@ describe('useMcpToolsQuery', () => {
     const { unmount } = renderHookWithClient(() => useMcpToolsQuery(WORKSPACE_ID))
     await flush()
 
-    expect(mockRequestJson).toHaveBeenCalledTimes(1)
+    expect(mockRequestJson).toHaveBeenCalledTimes(2)
     expect(mockRequestJson).toHaveBeenCalledWith(
       listMcpServersContract,
       expect.objectContaining({ query: { workspaceId: WORKSPACE_ID } })
     )
 
     unmount()
+  })
+
+  it('includes managed Credential Group connection snapshots without upstream discovery', async () => {
+    const managedServer = server('mcp-cg-123456789012345678901', {
+      name: 'Fireflies — alex@example.com',
+      authType: 'oauth',
+      url: undefined,
+    })
+    mockRequestJson.mockImplementation(async (contract) => {
+      if (contract === listMcpServersContract) {
+        return { success: true, data: { servers: [] } }
+      }
+      if (contract === listManagedMcpCatalogContract) {
+        return {
+          servers: [managedServer],
+          tools: [
+            {
+              name: 'search_transcripts',
+              description: 'Search transcripts',
+              inputSchema: { type: 'object', properties: {} },
+              serverId: managedServer.id,
+              serverName: managedServer.name,
+            },
+          ],
+        }
+      }
+      throw new Error('Managed MCP snapshots must not trigger discovery')
+    })
+
+    const hook = renderHookWithClient(() => useMcpToolsQuery(WORKSPACE_ID))
+    await flush()
+
+    expect(hook.getResult().data).toEqual([
+      expect.objectContaining({
+        name: 'search_transcripts',
+        serverId: managedServer.id,
+      }),
+    ])
+    expect(mockRequestJson).toHaveBeenCalledTimes(2)
+
+    hook.unmount()
+  })
+
+  it('surfaces a shared server-list failure when the managed catalog is empty', async () => {
+    const serverListError = new Error('server list failed')
+    mockRequestJson.mockImplementation(async (contract) => {
+      if (contract === listMcpServersContract) throw serverListError
+      if (contract === listManagedMcpCatalogContract) return { servers: [], tools: [] }
+      throw new Error('Unexpected MCP request')
+    })
+
+    const hook = renderHookWithClient(() => useMcpToolsQuery(WORKSPACE_ID))
+    await flush()
+
+    expect(hook.getResult().data).toEqual([])
+    expect(hook.getResult().error).toBe(serverListError)
+    expect(hook.getResult().isLoading).toBe(false)
+
+    hook.unmount()
   })
 
   it('defers detail and form metadata queries while their surfaces are closed', async () => {

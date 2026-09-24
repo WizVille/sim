@@ -15,10 +15,13 @@ export interface ToolCatalogEntry {
     | 'browser_close_tab'
     | 'browser_drag'
     | 'browser_extract'
+    | 'browser_fill_form'
+    | 'browser_find'
     | 'browser_go_back'
     | 'browser_go_forward'
     | 'browser_hover'
     | 'browser_insert_text'
+    | 'browser_list_downloads'
     | 'browser_list_sessions'
     | 'browser_list_tabs'
     | 'browser_navigate'
@@ -26,14 +29,18 @@ export interface ToolCatalogEntry {
     | 'browser_open_url'
     | 'browser_press_key'
     | 'browser_read_text'
+    | 'browser_reload'
     | 'browser_screenshot'
     | 'browser_scroll'
     | 'browser_select_option'
+    | 'browser_set_checked'
     | 'browser_snapshot'
     | 'browser_switch_tab'
     | 'browser_type'
     | 'browser_wait_for'
+    | 'browser_zoom'
     | 'call_integration_tool'
+    | 'cancel_workflow_run'
     | 'connect_slack_bot'
     | 'cp'
     | 'create_empty_file'
@@ -91,6 +98,7 @@ export interface ToolCatalogEntry {
     | 'query_logs'
     | 'query_user_table'
     | 'read'
+    | 'read_document'
     | 'redeploy'
     | 'respond'
     | 'restore_resource'
@@ -109,6 +117,7 @@ export interface ToolCatalogEntry {
     | 'search_integration_tools'
     | 'search_knowledge_base'
     | 'search_library_docs'
+    | 'search_workspace'
     | 'set_block_enabled'
     | 'set_environment_variables'
     | 'set_global_workflow_variables'
@@ -144,10 +153,13 @@ export interface ToolCatalogEntry {
     | 'browser_close_tab'
     | 'browser_drag'
     | 'browser_extract'
+    | 'browser_fill_form'
+    | 'browser_find'
     | 'browser_go_back'
     | 'browser_go_forward'
     | 'browser_hover'
     | 'browser_insert_text'
+    | 'browser_list_downloads'
     | 'browser_list_sessions'
     | 'browser_list_tabs'
     | 'browser_navigate'
@@ -155,14 +167,18 @@ export interface ToolCatalogEntry {
     | 'browser_open_url'
     | 'browser_press_key'
     | 'browser_read_text'
+    | 'browser_reload'
     | 'browser_screenshot'
     | 'browser_scroll'
     | 'browser_select_option'
+    | 'browser_set_checked'
     | 'browser_snapshot'
     | 'browser_switch_tab'
     | 'browser_type'
     | 'browser_wait_for'
+    | 'browser_zoom'
     | 'call_integration_tool'
+    | 'cancel_workflow_run'
     | 'connect_slack_bot'
     | 'cp'
     | 'create_empty_file'
@@ -220,6 +236,7 @@ export interface ToolCatalogEntry {
     | 'query_logs'
     | 'query_user_table'
     | 'read'
+    | 'read_document'
     | 'redeploy'
     | 'respond'
     | 'restore_resource'
@@ -238,6 +255,7 @@ export interface ToolCatalogEntry {
     | 'search_integration_tools'
     | 'search_knowledge_base'
     | 'search_library_docs'
+    | 'search_workspace'
     | 'set_block_enabled'
     | 'set_environment_variables'
     | 'set_global_workflow_variables'
@@ -482,12 +500,12 @@ export const BrowserClickAt: ToolCatalogEntry = {
       x: {
         type: 'number',
         description:
-          "X in CSS pixels within the current viewport. When read off a browser_screenshot, divide the image pixel value by the screenshot's scale.",
+          "X in CSS pixels within the current viewport. When read off a browser_screenshot, follow its caption's X mapping and crop origin.",
       },
       y: {
         type: 'number',
         description:
-          'Y in CSS pixels within the current viewport, converted from screenshot pixels the same way as x.',
+          "Y in CSS pixels within the current viewport. When read off a browser_screenshot, follow its caption's Y mapping and crop origin.",
       },
     },
     required: ['x', 'y'],
@@ -799,6 +817,207 @@ export const BrowserExtract: ToolCatalogEntry = {
   clientExecutable: true,
 }
 
+export const BrowserFillForm: ToolCatalogEntry = {
+  id: 'browser_fill_form',
+  name: 'browser_fill_form',
+  route: 'client',
+  mode: 'async',
+  parameters: {
+    additionalProperties: false,
+    properties: {
+      fields: {
+        description:
+          "Ordered list of 1–8 fields with unique elementId refs from the current top page's latest snapshot. Supply exactly one matching value parameter per kind.",
+        items: {
+          oneOf: [
+            {
+              additionalProperties: false,
+              properties: { elementId: {}, kind: { enum: ['text'] }, text: {} },
+              required: ['text'],
+            },
+            {
+              additionalProperties: false,
+              properties: { elementId: {}, kind: { enum: ['select'] }, value: {} },
+              required: ['value'],
+            },
+            {
+              additionalProperties: false,
+              properties: { checked: {}, elementId: {}, kind: { enum: ['checked'] } },
+              required: ['checked'],
+            },
+          ],
+          properties: {
+            checked: {
+              description:
+                'Desired state for kind=checked. A radio can only be set true; native checkboxes may be true or false.',
+              type: 'boolean',
+            },
+            elementId: {
+              description:
+                "Nonnegative integer element ref from the current page's latest snapshot.",
+              maximum: 9007199254740991,
+              minimum: 0,
+              type: 'integer',
+            },
+            kind: {
+              description:
+                'text requires text; select requires value; checked requires checked. Do not supply parameters for another kind.',
+              enum: ['text', 'select', 'checked'],
+              type: 'string',
+            },
+            text: {
+              description:
+                'Replacement content for kind=text, including empty to clear. At most 4096 characters. Ordinary input or textarea only.',
+              maxLength: 4096,
+              type: 'string',
+            },
+            value: {
+              description:
+                'Option value or visible label for kind=select. At most 4096 characters. Native single-selection dropdown only.',
+              maxLength: 4096,
+              type: 'string',
+            },
+          },
+          required: ['elementId', 'kind'],
+          type: 'object',
+        },
+        maxItems: 8,
+        minItems: 1,
+        type: 'array',
+      },
+    },
+    required: ['fields'],
+    type: 'object',
+  },
+  resultSchema: {
+    type: 'object',
+    properties: {
+      completed: {
+        type: 'boolean',
+        description:
+          'True only when every requested field passed exact verification and the page boundary stayed unchanged.',
+      },
+      completedCount: {
+        type: 'number',
+        description:
+          'Number of field results whose latest readback matched the requested state. Inspect results for the individual indices.',
+      },
+      doNotRetry: {
+        type: 'boolean',
+        description:
+          'True when input dispatch began: inspect partial results and a fresh snapshot before deciding on remaining work; never blindly repeat the batch.',
+      },
+      error: {
+        type: 'string',
+        description: 'Reason filling stopped; preceding fields may already have taken effect.',
+      },
+      note: {
+        type: 'string',
+        description: 'Partial-outcome recovery guidance. Form filling is not atomic.',
+      },
+      notices: { type: 'array', items: { type: 'string' } },
+      results: {
+        type: 'array',
+        description:
+          'Ordered field readbacks. An interrupted write may have no result; absence is not proof that input had no effect.',
+        items: {
+          type: 'object',
+          properties: {
+            checked: { type: 'boolean' },
+            elementId: { type: 'number' },
+            index: { type: 'number' },
+            kind: { type: 'string', enum: ['text', 'select', 'checked'] },
+            redacted: { type: 'boolean' },
+            valueLength: { type: 'number' },
+            valuePreview: {
+              type: 'string',
+              description:
+                'Bounded normalized actual field preview, withheld for sensitive autocomplete fields; full-value equality is checked inside the page.',
+            },
+            verified: {
+              type: 'boolean',
+              description:
+                'Whether the full requested value or checked state matched at the latest successful probe, not merely whether input was dispatched.',
+            },
+          },
+          required: ['index', 'elementId', 'kind', 'verified'],
+        },
+      },
+      stoppedIndex: {
+        type: 'number',
+        description: 'Zero-based field index being processed or verified when filling stopped.',
+      },
+    },
+    required: ['completed', 'completedCount', 'results'],
+  },
+  clientExecutable: true,
+}
+
+export const BrowserFind: ToolCatalogEntry = {
+  id: 'browser_find',
+  name: 'browser_find',
+  route: 'client',
+  mode: 'async',
+  parameters: {
+    type: 'object',
+    properties: {
+      elementId: {
+        type: 'number',
+        description:
+          'Optional current top-page element id to observe only that element and its subtree, such as a known form, row, or card. Returns scoped: true and fresh refs; all previous snapshot refs are invalidated. Cross-origin frame contents are omitted and mark the result truncated. Framed roots are rejected. Omit for a full-page snapshot or when the previous scope has disappeared.',
+      },
+      maxResults: {
+        type: 'number',
+        description: 'Maximum matches to return (default 20, capped at 50).',
+      },
+      query: {
+        type: 'string',
+        description: 'Literal case-insensitive text to find in ref-bearing snapshot lines.',
+      },
+    },
+    required: ['query'],
+  },
+  resultSchema: {
+    type: 'object',
+    properties: {
+      matches: {
+        type: 'array',
+        description: 'Bounded matching snapshot lines with valid element ids.',
+        items: {
+          type: 'object',
+          properties: {
+            elementId: {
+              type: 'number',
+              description: 'Fresh element id from the captured snapshot.',
+            },
+            line: { type: 'string', description: 'Matching ref-bearing snapshot line.' },
+          },
+        },
+      },
+      notices: {
+        type: 'array',
+        description:
+          'Pending auto-handled JavaScript alert/confirm/prompt notices since the previous successful browser result.',
+        items: { type: 'string' },
+      },
+      query: { type: 'string', description: 'Literal query that was searched.' },
+      scoped: {
+        type: 'boolean',
+        description: 'Whether observation was limited to the requested element subtree.',
+      },
+      title: { type: 'string', description: 'Top-page title when available.' },
+      totalMatches: { type: 'number', description: 'Total matches before applying maxResults.' },
+      truncated: {
+        type: 'boolean',
+        description: 'Whether snapshot coverage or matching results were truncated.',
+      },
+      url: { type: 'string', description: 'Top-page URL.' },
+    },
+    required: ['query', 'matches', 'totalMatches', 'truncated'],
+  },
+  clientExecutable: true,
+}
+
 export const BrowserGoBack: ToolCatalogEntry = {
   id: 'browser_go_back',
   name: 'browser_go_back',
@@ -1010,6 +1229,47 @@ export const BrowserInsertText: ToolCatalogEntry = {
   clientExecutable: true,
 }
 
+export const BrowserListDownloads: ToolCatalogEntry = {
+  id: 'browser_list_downloads',
+  name: 'browser_list_downloads',
+  route: 'client',
+  mode: 'async',
+  parameters: { type: 'object', properties: {} },
+  resultSchema: {
+    type: 'object',
+    properties: {
+      downloads: {
+        type: 'array',
+        description: 'Recent downloads for this browser session, newest first.',
+        items: {
+          type: 'object',
+          properties: {
+            filename: {
+              type: 'string',
+              description: 'Sanitized filename; no local filesystem path is exposed.',
+            },
+            id: { type: 'string', description: 'Session-local download id.' },
+            receivedBytes: { type: 'number', description: 'Bytes received so far.' },
+            startedAt: { type: 'string', description: 'ISO timestamp when the download started.' },
+            state: {
+              type: 'string',
+              description: 'Current download lifecycle state.',
+              enum: ['progressing', 'completed', 'interrupted', 'cancelled'],
+            },
+            totalBytes: {
+              type: 'number',
+              description: 'Expected total bytes when known, otherwise zero.',
+            },
+          },
+        },
+      },
+      scopeId: { type: 'string', description: 'Browser session scope that owns these downloads.' },
+    },
+    required: ['downloads', 'scopeId'],
+  },
+  clientExecutable: true,
+}
+
 export const BrowserListSessions: ToolCatalogEntry = {
   id: 'browser_list_sessions',
   name: 'browser_list_sessions',
@@ -1039,7 +1299,7 @@ export const BrowserNavigate: ToolCatalogEntry = {
       url: {
         type: 'string',
         description:
-          'The absolute URL to navigate to, including scheme (https:// or http://). Must resolve to a public address — localhost and private/internal hosts are rejected.',
+          'The absolute URL to navigate to, including scheme (https:// or http://). Public websites and localhost/loopback are supported; other private/internal hosts are rejected.',
       },
     },
     required: ['url'],
@@ -1225,12 +1485,44 @@ export const BrowserReadText: ToolCatalogEntry = {
   clientExecutable: true,
 }
 
+export const BrowserReload: ToolCatalogEntry = {
+  id: 'browser_reload',
+  name: 'browser_reload',
+  route: 'client',
+  mode: 'async',
+  parameters: { type: 'object', properties: {} },
+  resultSchema: {
+    type: 'object',
+    properties: {
+      notices: {
+        type: 'array',
+        description:
+          'Pending auto-handled JavaScript alert/confirm/prompt notices since the previous successful browser result.',
+        items: { type: 'string' },
+      },
+      title: { type: 'string', description: 'Top-page title when available.' },
+      url: { type: 'string', description: 'Top-page URL.' },
+    },
+    required: ['url', 'title'],
+  },
+  clientExecutable: true,
+}
+
 export const BrowserScreenshot: ToolCatalogEntry = {
   id: 'browser_screenshot',
   name: 'browser_screenshot',
   route: 'client',
   mode: 'async',
-  parameters: { type: 'object', properties: {} },
+  parameters: {
+    type: 'object',
+    properties: {
+      elementId: {
+        type: 'number',
+        description:
+          "Optional element id from the current tab's latest browser_snapshot. When present, capture only the visible portion of that top-page element without scrolling or changing layout. Scroll explicitly first if needed. Framed elements are rejected; use a viewport screenshot for them. Follow the image caption's coordinate mapping, including its crop origin.",
+      },
+    },
+  },
   clientExecutable: true,
 }
 
@@ -1245,9 +1537,13 @@ export const BrowserScroll: ToolCatalogEntry = {
       amount: {
         type: 'number',
         description:
-          'Optional distance to scroll in pixels (default: 85% of the viewport height, so a little context carries over).',
+          'Optional distance to scroll in pixels (default: 85% of the viewport height for up/down or width for left/right, so a little context carries over).',
       },
-      direction: { type: 'string', description: 'Scroll direction.', enum: ['up', 'down'] },
+      direction: {
+        type: 'string',
+        description: 'Scroll direction.',
+        enum: ['up', 'down', 'left', 'right'],
+      },
       elementId: {
         type: 'number',
         description:
@@ -1263,14 +1559,29 @@ export const BrowserScroll: ToolCatalogEntry = {
         type: 'boolean',
         description: 'Whether the selected region is at its bottom boundary.',
       },
+      atLeft: {
+        type: 'boolean',
+        description:
+          'Whether the selected region is at its physical left boundary, included for left/right.',
+      },
+      atRight: {
+        type: 'boolean',
+        description:
+          'Whether the selected region is at its physical right boundary, included for left/right.',
+      },
       atTop: {
         type: 'boolean',
         description: 'Whether the selected region is at its top boundary.',
       },
       clientHeight: { type: 'number', description: 'Region viewport height.' },
+      clientWidth: {
+        type: 'number',
+        description: 'Region viewport width, included for left/right.',
+      },
       movedBy: {
         type: 'number',
-        description: 'Actual signed movement; zero means the target did not move.',
+        description:
+          'Actual signed movement on the requested axis: negative for up/left, positive for down/right; zero means the target did not move.',
       },
       notices: {
         type: 'array',
@@ -1279,16 +1590,29 @@ export const BrowserScroll: ToolCatalogEntry = {
         items: { type: 'string' },
       },
       scrollHeight: { type: 'number', description: 'Region content height.' },
-      scrollTop: { type: 'number', description: 'Resulting region scroll offset.' },
+      scrollLeft: {
+        type: 'number',
+        description:
+          'Resulting horizontal region scroll offset, included for left/right; may be negative in right-to-left regions.',
+      },
+      scrollTop: { type: 'number', description: 'Resulting vertical region scroll offset.' },
+      scrollWidth: {
+        type: 'number',
+        description: 'Region content width, included for left/right.',
+      },
       target: { type: 'string', description: 'Chosen scroll region label.' },
       targetSource: {
         type: 'string',
         description:
           'element, element-boundary, focus, focus-boundary, viewport-center, viewport-center-boundary, largest-visible, or page.',
       },
+      windowScrollX: {
+        type: 'number',
+        description: 'Top-page horizontal window scroll offset after a left/right region scroll.',
+      },
       windowScrollY: {
         type: 'number',
-        description: 'Top-page window scroll offset after the region scroll.',
+        description: 'Top-page vertical window scroll offset after the region scroll.',
       },
     },
     required: ['atTop', 'atBottom'],
@@ -1302,16 +1626,27 @@ export const BrowserSelectOption: ToolCatalogEntry = {
   route: 'client',
   mode: 'async',
   parameters: {
-    type: 'object',
+    oneOf: [{ required: ['value'] }, { required: ['values'] }],
     properties: {
       elementId: {
-        type: 'number',
         description:
           "The element id to act on (from the current tab's most recent browser_snapshot). Treat refs as invalid across tab switches or later snapshots.",
+        type: 'number',
       },
-      value: { type: 'string', description: "The option's visible label or its value." },
+      value: {
+        description: "One option's visible label or value. Omit when supplying values.",
+        type: 'string',
+      },
+      values: {
+        description:
+          'The complete desired selection for a native multiple-selection control: at most 100 visible labels or values. Empty array clears the selection. Omit value when using this field.',
+        items: { type: 'string' },
+        maxItems: 100,
+        type: 'array',
+      },
     },
-    required: ['elementId', 'value'],
+    required: ['elementId'],
+    type: 'object',
   },
   resultSchema: {
     type: 'object',
@@ -1319,6 +1654,12 @@ export const BrowserSelectOption: ToolCatalogEntry = {
       effectObserved: {
         type: 'boolean',
         description: 'Whether the settled readback retained the requested selection.',
+      },
+      labels: {
+        type: 'array',
+        description:
+          'Visible labels for the complete selected set in a multiple-selection control, in option order.',
+        items: { type: 'string' },
       },
       note: { type: 'string', description: 'Guidance when the page reverted the selection.' },
       notices: {
@@ -1331,8 +1672,20 @@ export const BrowserSelectOption: ToolCatalogEntry = {
         type: 'object',
         description: 'Settled selected label and value.',
         properties: {
+          labels: {
+            type: 'array',
+            description:
+              'Visible labels for the complete selected set in a multiple-selection control, in option order.',
+            items: { type: 'string' },
+          },
           selected: { type: 'string', description: 'Settled visible option label.' },
           value: { type: 'string', description: 'Settled option value.' },
+          values: {
+            type: 'array',
+            description:
+              'Selected native option values in DOM order; included for multiple-selection controls.',
+            items: { type: 'string' },
+          },
         },
       },
       refRecovered: {
@@ -1342,8 +1695,64 @@ export const BrowserSelectOption: ToolCatalogEntry = {
       },
       selected: { type: 'string', description: 'Canonical visible label of the matched option.' },
       value: { type: 'string', description: 'Canonical value of the matched option.' },
+      values: {
+        type: 'array',
+        description:
+          'Selected native option values in DOM order; included for multiple-selection controls.',
+        items: { type: 'string' },
+      },
     },
     required: ['selected'],
+  },
+  clientExecutable: true,
+}
+
+export const BrowserSetChecked: ToolCatalogEntry = {
+  id: 'browser_set_checked',
+  name: 'browser_set_checked',
+  route: 'client',
+  mode: 'async',
+  parameters: {
+    type: 'object',
+    properties: {
+      checked: {
+        type: 'boolean',
+        description:
+          'Desired checked state. Radio buttons cannot be unchecked directly; select another radio in the group instead.',
+      },
+      elementId: {
+        type: 'number',
+        description:
+          "The element id to act on (from the current tab's most recent browser_snapshot). Treat refs as invalid across tab switches or later snapshots.",
+      },
+    },
+    required: ['elementId', 'checked'],
+  },
+  resultSchema: {
+    type: 'object',
+    properties: {
+      changed: { type: 'boolean', description: 'Whether the control needed to change.' },
+      checked: { type: 'boolean', description: 'Settled checked state after the operation.' },
+      dispatched: { type: 'boolean', description: 'Whether input was dispatched.' },
+      element: { type: 'string', description: 'Resolved checkable control kind.' },
+      note: { type: 'string', description: 'Readback or follow-up guidance.' },
+      notices: {
+        type: 'array',
+        description:
+          'Pending auto-handled JavaScript alert/confirm/prompt notices since the previous successful browser result.',
+        items: { type: 'string' },
+      },
+      refRecovered: {
+        type: 'boolean',
+        description:
+          'Whether a stale detached ref was safely rebound to one unique semantic match.',
+      },
+      trusted: {
+        type: 'boolean',
+        description: "Whether Chromium's trusted pointer pipeline dispatched the change.",
+      },
+    },
+    required: ['checked', 'changed', 'dispatched'],
   },
   clientExecutable: true,
 }
@@ -1353,7 +1762,16 @@ export const BrowserSnapshot: ToolCatalogEntry = {
   name: 'browser_snapshot',
   route: 'client',
   mode: 'async',
-  parameters: { type: 'object', properties: {} },
+  parameters: {
+    type: 'object',
+    properties: {
+      elementId: {
+        type: 'number',
+        description:
+          'Optional current top-page element id to observe only that element and its subtree, such as a known form, row, or card. Returns scoped: true and fresh refs; all previous snapshot refs are invalidated. Cross-origin frame contents are omitted and mark the result truncated. Framed roots are rejected. Omit for a full-page snapshot or when the previous scope has disappeared.',
+      },
+    },
+  },
   resultSchema: {
     type: 'object',
     properties: {
@@ -1377,6 +1795,10 @@ export const BrowserSnapshot: ToolCatalogEntry = {
         description: 'Mounted DOM/frame outline containing model-visible [ref=N] ids.',
       },
       pageHeight: { type: 'number', description: 'Top-page document height.' },
+      scoped: {
+        type: 'boolean',
+        description: 'Whether observation was limited to the requested element subtree.',
+      },
       scrollY: { type: 'number', description: 'Top-page window scroll offset.' },
       title: { type: 'string', description: 'Captured top-page title.' },
       truncated: {
@@ -1431,7 +1853,7 @@ export const BrowserType: ToolCatalogEntry = {
       text: {
         type: 'string',
         description:
-          "The text to type. Replaces the element's current content. Must be non-empty — an empty string is rejected as a missing parameter; to clear a field, press Mod+A then Backspace with browser_press_key.",
+          'The replacement value. Empty text clears an ordinary text field. For structured inputs use YYYY-MM-DD (date), HH:mm (time), YYYY-MM-DDTHH:mm (datetime-local), YYYY-MM (month), YYYY-Www (week), #rrggbb (color), or a numeric range value. Alternatively use Mod+A then Backspace to clear ordinary text with browser_press_key.',
       },
     },
     required: ['elementId', 'text'],
@@ -1549,10 +1971,38 @@ export const BrowserWaitFor: ToolCatalogEntry = {
   parameters: {
     type: 'object',
     properties: {
+      elementId: {
+        type: 'number',
+        description:
+          "Optional top-page element id from the current tab's latest browser_snapshot. Supply with state to inspect that exact registered DOM node; waits do not recover replacement nodes. Framed refs and navigation during an element wait are rejected; use text/URL conditions for those flows.",
+      },
+      state: {
+        type: 'string',
+        description:
+          'Optional semantic condition for elementId. attached/detached inspect DOM presence; visible/hidden inspect rendering; enabled/disabled include native and ARIA state; checked, expanded, and selected conditions inspect native or ARIA state. All supplied text, URL, and element conditions must pass.',
+        enum: [
+          'attached',
+          'detached',
+          'visible',
+          'hidden',
+          'enabled',
+          'disabled',
+          'checked',
+          'unchecked',
+          'expanded',
+          'collapsed',
+          'selected',
+          'unselected',
+        ],
+      },
       text: { type: 'string', description: 'Optional visible text to wait for.' },
       timeoutMs: {
         type: 'number',
         description: 'Maximum time to wait, in milliseconds (default 10000, capped at 120000).',
+      },
+      urlContains: {
+        type: 'string',
+        description: "Optional substring that the active tab's URL must contain.",
       },
     },
   },
@@ -1562,13 +2012,18 @@ export const BrowserWaitFor: ToolCatalogEntry = {
       elapsedMs: { type: 'number', description: 'Elapsed wait duration.' },
       found: {
         type: 'boolean',
-        description: 'Whether the requested text appeared before timeout.',
+        description: 'Whether every supplied wait condition passed before timeout.',
       },
       foundInFrame: {
         type: 'boolean',
         description: 'Whether the match was found in an eligible visible child frame.',
       },
-      note: { type: 'string', description: 'Timeout/recovery guidance.' },
+      matched: {
+        type: 'array',
+        description: 'Condition categories that passed: text, url, and/or element.',
+        items: { type: 'string' },
+      },
+      note: { type: 'string', description: 'Timeout or recovery guidance.' },
       notices: {
         type: 'array',
         description:
@@ -1580,6 +2035,39 @@ export const BrowserWaitFor: ToolCatalogEntry = {
         description: 'Completed sleep duration when no text was requested.',
       },
     },
+  },
+  clientExecutable: true,
+}
+
+export const BrowserZoom: ToolCatalogEntry = {
+  id: 'browser_zoom',
+  name: 'browser_zoom',
+  route: 'client',
+  mode: 'async',
+  parameters: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        description: 'Zoom action: in, out, or reset.',
+        enum: ['in', 'out', 'reset'],
+      },
+    },
+    required: ['action'],
+  },
+  resultSchema: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', description: 'Applied zoom action.' },
+      notices: {
+        type: 'array',
+        description:
+          'Pending auto-handled JavaScript alert/confirm/prompt notices since the previous successful browser result.',
+        items: { type: 'string' },
+      },
+      zoomPercent: { type: 'number', description: 'Settled tab zoom as a percentage.' },
+    },
+    required: ['action', 'zoomPercent'],
   },
   clientExecutable: true,
 }
@@ -1611,6 +2099,26 @@ export const CallIntegrationTool: ToolCatalogEntry = {
     required: ['toolId', 'description', 'arguments'],
     type: 'object',
   },
+  requiresApproval: true,
+}
+
+export const CancelWorkflowRun: ToolCatalogEntry = {
+  id: 'cancel_workflow_run',
+  name: 'cancel_workflow_run',
+  route: 'sim',
+  mode: 'async',
+  parameters: {
+    type: 'object',
+    properties: {
+      executionId: {
+        type: 'string',
+        description:
+          'Required workflow execution ID returned by run_workflow with async:true or found with query_logs. This identifies a workflow run, not an agent invocation or chat request.',
+      },
+    },
+    required: ['executionId'],
+  },
+  requiredPermission: 'write',
   requiresApproval: true,
 }
 
@@ -3324,6 +3832,7 @@ export const ManageKnowledgeBase: ToolCatalogEntry = {
             type: 'array',
             description:
               'Tag definition IDs to opt out of (optional for add_connector). See tagDefinitions in the connector schema.',
+            items: { type: 'string' },
           },
           documentId: { type: 'string', description: 'Document ID (required for update_document)' },
           documentIds: {
@@ -4191,7 +4700,7 @@ export const QueryUserTable: ToolCatalogEntry = {
           filter: {
             type: 'object',
             description:
-              'Predicate filter object for query_rows. A predicate is a tree: {"all":[...]} (AND) or {"any":[...]} (OR); members are leaves {field, op, value} or nested groups. Ops: eq, ne, gt, gte, lt, lte, in, nin, like, ilike (use * as the wildcard), nlike, nilike, contains, ncontains, startsWith, endsWith, isNull, isNotNull, isEmpty, isNotEmpty. in/nin take a non-empty array value. Examples: {"all":[{"field":"status","op":"eq","value":"active"}]}; {"any":[{"field":"status","op":"eq","value":"active"},{"field":"status","op":"eq","value":"pending"}]}; {"all":[{"field":"name","op":"ilike","value":"*jo*"}]}.',
+              'Predicate filter object for query_rows. A predicate is a tree: {"all":[...]} (AND) or {"any":[...]} (OR); members are leaves {field, op, value} or nested groups. Ops: eq, ne, gt, gte, lt, lte, in, nin, like, ilike (use * as the wildcard), nlike, nilike, contains, ncontains, startsWith, endsWith, isNull, isNotNull, isEmpty, isNotEmpty. in/nin take a non-empty array value. TTL filter values are ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00. Examples: {"all":[{"field":"status","op":"eq","value":"active"}]}; {"any":[{"field":"status","op":"eq","value":"active"},{"field":"status","op":"eq","value":"pending"}]}; {"all":[{"field":"name","op":"ilike","value":"*jo*"}]}.',
           },
           limit: {
             type: 'number',
@@ -4202,6 +4711,14 @@ export const QueryUserTable: ToolCatalogEntry = {
             type: 'array',
             description:
               'Sort spec for query_rows (optional). Ordered list of {field, direction} where direction is asc or desc, e.g. [{"field":"wins","direction":"desc"},{"field":"name","direction":"asc"}].',
+            items: {
+              type: 'object',
+              properties: {
+                direction: { type: 'string', enum: ['asc', 'desc'] },
+                field: { type: 'string' },
+              },
+              required: ['field', 'direction'],
+            },
           },
           rowId: { type: 'string', description: 'Row ID (required for get_row)' },
           tableId: { type: 'string', description: 'Table ID (required for all operations)' },
@@ -4253,6 +4770,45 @@ export const Read: ToolCatalogEntry = {
       },
     },
     required: ['path'],
+  },
+}
+
+export const ReadDocument: ToolCatalogEntry = {
+  id: 'read_document',
+  name: 'read_document',
+  route: 'sim',
+  mode: 'async',
+  parameters: {
+    properties: {
+      documentId: {
+        description: 'Canonical document ID returned by search or the selected document context.',
+        type: 'string',
+      },
+      limit: {
+        default: 3,
+        description:
+          'Maximum chunks to read; the server may return fewer to fit its text budget. Follow next when more context is needed.',
+        maximum: 8,
+        minimum: 1,
+        type: 'integer',
+      },
+      startChunkIndex: {
+        description:
+          "Inclusive chunk index from search or a previous read's next object. Gaps from disabled chunks are skipped.",
+        maximum: 2147483647,
+        minimum: 0,
+        type: 'integer',
+      },
+      startOffset: {
+        description:
+          'UTF-16 character offset within startChunkIndex. Omit to read the chunk from its start, or copy next.startOffset to continue a partial chunk.',
+        maximum: 2147483647,
+        minimum: 0,
+        type: 'integer',
+      },
+    },
+    required: ['documentId'],
+    type: 'object',
   },
 }
 
@@ -4426,7 +4982,11 @@ export const Run: ToolCatalogEntry = {
         description: 'Pre-gathered context: workflow state, block IDs, input requirements.',
         type: 'string',
       },
-      request: { description: 'What to run or what logs to check.', type: 'string' },
+      request: {
+        description:
+          'What to run or cancel, or what logs to check. Include a known workflow executionId when cancelling.',
+        type: 'string',
+      },
     },
     required: ['request'],
     type: 'object',
@@ -5065,6 +5625,52 @@ export const SearchLibraryDocs: ToolCatalogEntry = {
   },
 }
 
+export const SearchWorkspace: ToolCatalogEntry = {
+  id: 'search_workspace',
+  name: 'search_workspace',
+  route: 'sim',
+  mode: 'async',
+  parameters: {
+    properties: {
+      documentIds: {
+        description:
+          'Optional document IDs returned by search or selected by the user; narrows retrieval to these documents.',
+        items: { type: 'string' },
+        maxItems: 20,
+        minItems: 1,
+        type: 'array',
+      },
+      modifiedAfter: {
+        description:
+          'Optional ISO datetime; restrict results to documents modified after this time.',
+        format: 'date-time',
+        type: 'string',
+      },
+      query: {
+        description: 'Search query describing the information needed.',
+        maxLength: 2000,
+        minLength: 1,
+        type: 'string',
+      },
+      source: {
+        description:
+          'Optional connector type or upload source; can narrow the selected search scope.',
+        type: 'string',
+      },
+      topK: {
+        default: 20,
+        description:
+          'Maximum number of matching passage previews to return. Retrieval ranking is independent of preview length.',
+        maximum: 50,
+        minimum: 1,
+        type: 'integer',
+      },
+    },
+    required: ['query'],
+    type: 'object',
+  },
+}
+
 export const SetBlockEnabled: ToolCatalogEntry = {
   id: 'set_block_enabled',
   name: 'set_block_enabled',
@@ -5312,12 +5918,6 @@ export const TableAutomations: ToolCatalogEntry = {
               },
             },
           },
-          deploymentMode: {
-            type: 'string',
-            description:
-              'Which workflow version rows execute: "live" (default, editable draft — edits take effect immediately) or "deployed" (latest active deployment; fails if the workflow was never deployed).',
-            enum: ['live', 'deployed'],
-          },
           groupId: {
             type: 'string',
             description:
@@ -5453,7 +6053,7 @@ export const TableColumns: ToolCatalogEntry = {
           column: {
             type: 'object',
             description:
-              'Column definition for add_column: { name, type, unique?, position? }; select (enum) columns also take { options: [names], multiple?: true } — options is required for select.',
+              'Column definition for add_column: { name, type, unique?, position? }; type may be string, number, boolean, date, json, select, or ttl. Select (enum) columns also take { options: [names], multiple?: true } — options is required for select. A table may have at most one ttl column; adding it enables row expiration, accepting ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00.',
           },
           columnName: {
             type: 'string',
@@ -5464,6 +6064,7 @@ export const TableColumns: ToolCatalogEntry = {
             type: 'array',
             description:
               'Array of column names to delete at once (preferred for multi-column delete_column)',
+            items: { type: 'string' },
           },
           multiple: {
             type: 'boolean',
@@ -5474,7 +6075,7 @@ export const TableColumns: ToolCatalogEntry = {
           newType: {
             type: 'string',
             description:
-              'New column type for update_column: string, number, boolean, date, json, select. Converting to select also requires options; conversion fails if an existing cell value matches no option. A multiple select round-trips through text as a comma-separated cell.',
+              'New column type for update_column: string, number, boolean, date, json, select, ttl. Converting to select also requires options; conversion fails if an existing cell value matches no option. A multiple select round-trips through text as a comma-separated cell. Converting to ttl enables row expiration and fails if the table already has another ttl column; TTL values are ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00.',
           },
           options: {
             type: 'array',
@@ -5653,7 +6254,7 @@ export const TableManage: ToolCatalogEntry = {
           schema: {
             type: 'object',
             description:
-              'Table schema with a columns array (required for create). Each column: { name, type, unique? }; a select (enum) column also requires options (display names) and takes multiple?.',
+              'Table schema with a columns array (required for create). Each column: { name, type, unique? }; types are string, number, boolean, date, json, select, and ttl. A select (enum) column also requires options (display names) and takes multiple?. A table may have at most one ttl column; adding it enables row expiration, accepting ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00.',
           },
           tableId: {
             type: 'string',
@@ -5699,12 +6300,12 @@ export const TableRows: ToolCatalogEntry = {
           data: {
             type: 'object',
             description:
-              'Row data as column → value pairs (required for insert_row, update_row; the patch object for update_rows_by_filter). Select (enum) cells take the option NAME.',
+              'Row data as column → value pairs (required for insert_row, update_row; the patch object for update_rows_by_filter). Select (enum) cells take the option NAME. TTL cells take ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00. On insert_row, a missing or null TTL means no expiration. On update_row and update_rows_by_filter, omit the TTL to preserve its current value or set it to null to clear the expiration.',
           },
           filter: {
             type: 'object',
             description:
-              'Predicate filter for update_rows_by_filter / delete_rows_by_filter: {"all":[...]} (AND) or {"any":[...]} (OR) of {field, op, value} leaves or nested groups. Ops: eq, ne, gt, gte, lt, lte, in, nin, like, ilike (* wildcard), nlike, nilike, contains, ncontains, startsWith, endsWith, isNull, isNotNull, isEmpty, isNotEmpty. in/nin take a non-empty array. Single-select columns match by eq/ne/in/nin; multiple-select by contains/ncontains — values are option NAMES.',
+              'Predicate filter for update_rows_by_filter / delete_rows_by_filter: {"all":[...]} (AND) or {"any":[...]} (OR) of {field, op, value} leaves or nested groups. Ops: eq, ne, gt, gte, lt, lte, in, nin, like, ilike (* wildcard), nlike, nilike, contains, ncontains, startsWith, endsWith, isNull, isNotNull, isEmpty, isNotEmpty. in/nin take a non-empty array. Single-select columns match by eq/ne/in/nin; multiple-select by contains/ncontains — values are option NAMES. TTL filter values are ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00.',
           },
           limit: {
             type: 'number',
@@ -5729,18 +6330,25 @@ export const TableRows: ToolCatalogEntry = {
           },
           rows: {
             type: 'array',
-            description: 'Array of row data objects (required for batch_insert_rows)',
+            description:
+              'Array of row data objects (required for batch_insert_rows). TTL cells take ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00; a missing or null TTL means no expiration.',
+            items: { type: 'object' },
           },
           tableId: { type: 'string', description: 'Table ID (required for every operation)' },
           updates: {
             type: 'array',
             description:
-              'Array of per-row updates: [{ rowId, data: { col: val } }] (batch_update_rows format a)',
+              "Array of per-row updates: [{ rowId, data: { col: val } }] (batch_update_rows format a). TTL values are ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00; omit a row's TTL key to preserve it or set it to null to clear the expiration.",
+            items: {
+              type: 'object',
+              properties: { data: { type: 'object' }, rowId: { type: 'string' } },
+              required: ['rowId', 'data'],
+            },
           },
           values: {
             type: 'object',
             description:
-              'Map of rowId → value for single-column batch update (batch_update_rows format b, with columnName)',
+              "Map of rowId → value for single-column batch update (batch_update_rows format b, with columnName). For a TTL column, values are ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00; set a row's value to null to clear its expiration, and omit the row from the map to leave it unchanged.",
           },
         },
         required: ['tableId'],
@@ -5786,9 +6394,9 @@ export const TableViews: ToolCatalogEntry = {
         description: 'Arguments for the operation',
         properties: {
           filter: {
-            type: 'object',
+            type: ['object', 'null'],
             description:
-              'Saved row predicate, same grammar as query_rows filters: {"all":[...]} / {"any":[...]} of {field, op, value} leaves with exact column NAMES. Omit or null for an unfiltered view.',
+              'Saved row predicate, same grammar as query_rows filters: {"all":[...]} / {"any":[...]} of {field, op, value} leaves with exact column NAMES. On update_view, omit to keep the existing filter, pass null to clear it, or pass a predicate to replace it. On create_view, omit or pass null for an unfiltered view.',
           },
           hiddenColumns: {
             type: 'array',
@@ -5807,9 +6415,17 @@ export const TableViews: ToolCatalogEntry = {
               'View display name (required for create_view; optional rename on update_view). Free-form label; references always use the view ID, so names are purely display.',
           },
           sort: {
-            type: 'array',
+            type: ['array', 'null'],
             description:
-              'Saved ordered sort spec, e.g. [{"field":"due","direction":"asc"}], column NAMES. Omit or null for default ordering.',
+              'Saved ordered sort spec, e.g. [{"field":"due","direction":"asc"}], column NAMES. On update_view, omit to keep the existing sort, pass null to clear it, or pass a sort spec to replace it. On create_view, omit or pass null for default ordering.',
+            items: {
+              type: 'object',
+              properties: {
+                direction: { type: 'string', enum: ['asc', 'desc'] },
+                field: { type: 'string' },
+              },
+              required: ['field', 'direction'],
+            },
           },
           tableId: { type: 'string', description: 'Table ID (required for every operation)' },
           viewId: {
@@ -6058,7 +6674,7 @@ export const UserTable: ToolCatalogEntry = {
           column: {
             type: 'object',
             description:
-              'Column definition for add_column: { name, type, unique?, position? }. For a select (enum) column also pass { options: ["Open", "Closed"], multiple?: true } — options is a list of display names and is required for select.',
+              'Column definition for add_column: { name, type, unique?, position? }. Type may be string, number, boolean, date, json, select, or ttl. For a select (enum) column also pass { options: ["Open", "Closed"], multiple?: true } — options is a list of display names and is required for select. A table may have at most one ttl column; adding it enables row expiration, accepting ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00.',
           },
           columnName: {
             type: 'string',
@@ -6069,6 +6685,7 @@ export const UserTable: ToolCatalogEntry = {
             type: 'array',
             description:
               'Array of column names to delete at once (for delete_column). Preferred over columnName when deleting multiple columns.',
+            items: { type: 'string' },
           },
           cursor: {
             type: 'string',
@@ -6077,7 +6694,8 @@ export const UserTable: ToolCatalogEntry = {
           },
           data: {
             type: 'object',
-            description: 'Row data as key-value pairs (required for insert_row, update_row)',
+            description:
+              'Row data as key-value pairs (required for insert_row, update_row). TTL cells take ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00. On insert_row, a missing or null TTL means no expiration. On update_row, omit the TTL to preserve its current value or set it to null to clear the expiration.',
           },
           dependencies: {
             type: 'object',
@@ -6091,12 +6709,6 @@ export const UserTable: ToolCatalogEntry = {
                 items: { type: 'string' },
               },
             },
-          },
-          deploymentMode: {
-            type: 'string',
-            description:
-              "Which version of the backing workflow this group's per-row runs execute, for add_workflow_group and update_workflow_group. 'live' (default) runs the editable draft, so later edits take effect immediately. 'deployed' runs the workflow's latest active deployment, pinning rows to a published version — if that workflow has never been deployed the cell fails rather than falling back to the draft. Only meaningful for workflow groups; enrichment groups have no backing workflow.",
-            enum: ['live', 'deployed'],
           },
           description: { type: 'string', description: "Table description (optional for 'create')" },
           enrichmentId: {
@@ -6112,7 +6724,7 @@ export const UserTable: ToolCatalogEntry = {
           filter: {
             type: 'object',
             description:
-              'Predicate filter object for query_rows, update_rows_by_filter, delete_rows_by_filter. A predicate is a tree: {"all":[...]} (AND) or {"any":[...]} (OR); members are leaves {field, op, value} or nested groups. Ops: eq, ne, gt, gte, lt, lte, in, nin, like, ilike (use * as the wildcard), nlike, nilike, contains, ncontains, startsWith, endsWith, isNull, isNotNull, isEmpty, isNotEmpty. in/nin take a non-empty array value. Examples: {"all":[{"field":"status","op":"eq","value":"active"}]}; {"all":[{"field":"wins","op":"gte","value":18},{"field":"status","op":"eq","value":"pending"}]}; {"any":[{"field":"status","op":"eq","value":"active"},{"field":"status","op":"eq","value":"pending"}]}; {"all":[{"field":"name","op":"ilike","value":"*jo*"}]}; {"all":[{"field":"slack_user_id","op":"in","value":["U1","U2"]}]}.',
+              'Predicate filter object for query_rows, update_rows_by_filter, delete_rows_by_filter. A predicate is a tree: {"all":[...]} (AND) or {"any":[...]} (OR); members are leaves {field, op, value} or nested groups. Ops: eq, ne, gt, gte, lt, lte, in, nin, like, ilike (use * as the wildcard), nlike, nilike, contains, ncontains, startsWith, endsWith, isNull, isNotNull, isEmpty, isNotEmpty. in/nin take a non-empty array value. TTL filter values are ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00. Examples: {"all":[{"field":"status","op":"eq","value":"active"}]}; {"all":[{"field":"wins","op":"gte","value":18},{"field":"status","op":"eq","value":"pending"}]}; {"any":[{"field":"status","op":"eq","value":"active"},{"field":"status","op":"eq","value":"pending"}]}; {"all":[{"field":"name","op":"ilike","value":"*jo*"}]}; {"all":[{"field":"slack_user_id","op":"in","value":["U1","U2"]}]}.',
           },
           groupId: {
             type: 'string',
@@ -6201,7 +6813,7 @@ export const UserTable: ToolCatalogEntry = {
           newType: {
             type: 'string',
             description:
-              'New column type (optional for update_column). Types: string, number, boolean, date, json, select. Converting a column to select also requires options; the conversion fails if any existing cell value doesn\'t match one of them. Converting to a multiple: true select also accepts a comma-separated cell ("Open, Urgent"), which is the form a multi column converts to text as — so multiselect → text → multiselect round-trips.',
+              'New column type (optional for update_column). Types: string, number, boolean, date, json, select, ttl. Converting a column to select also requires options; the conversion fails if any existing cell value doesn\'t match one of them. Converting to a multiple: true select also accepts a comma-separated cell ("Open, Urgent"), which is the form a multi column converts to text as — so multiselect → text → multiselect round-trips. Converting to ttl enables row expiration and fails if the table already has another ttl column; TTL values are ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00.',
           },
           options: {
             type: 'array',
@@ -6213,6 +6825,14 @@ export const UserTable: ToolCatalogEntry = {
             type: 'array',
             description:
               'Sort spec for query_rows (optional). Ordered list of {field, direction} where direction is asc or desc, e.g. [{"field":"wins","direction":"desc"},{"field":"name","direction":"asc"}].',
+            items: {
+              type: 'object',
+              properties: {
+                direction: { type: 'string', enum: ['asc', 'desc'] },
+                field: { type: 'string' },
+              },
+              required: ['field', 'direction'],
+            },
           },
           outputColumnNames: {
             type: 'object',
@@ -6279,7 +6899,9 @@ export const UserTable: ToolCatalogEntry = {
           },
           rows: {
             type: 'array',
-            description: 'Array of row data objects (required for batch_insert_rows)',
+            description:
+              'Array of row data objects (required for batch_insert_rows). TTL cells take ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00; a missing or null TTL means no expiration.',
+            items: { type: 'object' },
           },
           runMode: {
             type: 'string',
@@ -6290,7 +6912,7 @@ export const UserTable: ToolCatalogEntry = {
           schema: {
             type: 'object',
             description:
-              'Table schema with columns array (required for \'create\'). Each column: { name, type, unique? }. A select (enum) column also takes { options: ["Open", "Closed"], multiple?: true } — options is a list of display names and is required for select.',
+              'Table schema with columns array (required for \'create\'). Each column: { name, type, unique? }. Types are string, number, boolean, date, json, select, and ttl. A select (enum) column also takes { options: ["Open", "Closed"], multiple?: true } — options is a list of display names and is required for select. A table may have at most one ttl column; adding it enables row expiration, accepting ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00.',
           },
           scope: {
             type: 'string',
@@ -6315,12 +6937,17 @@ export const UserTable: ToolCatalogEntry = {
           updates: {
             type: 'array',
             description:
-              'Array of per-row updates: [{ rowId, data: { col: val } }] (for batch_update_rows)',
+              "Array of per-row updates: [{ rowId, data: { col: val } }] (for batch_update_rows). TTL values are ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00; omit a row's TTL key to preserve it or set it to null to clear the expiration.",
+            items: {
+              type: 'object',
+              properties: { data: { type: 'object' }, rowId: { type: 'string' } },
+              required: ['rowId', 'data'],
+            },
           },
           values: {
             type: 'object',
             description:
-              'Map of rowId to value for single-column batch update: { "rowId1": val1, "rowId2": val2 } (for batch_update_rows with columnName)',
+              'Map of rowId to value for single-column batch update: { "rowId1": val1, "rowId2": val2 } (for batch_update_rows with columnName). For a TTL column, values are ISO timestamp strings with Z or an explicit UTC offset (for example, 2026-09-07T14:30:00-07:00); up to 6 fractional second digits are accepted; supplied numeric offsets are preserved, and Z is stored as -00:00; set a row\'s value to null to clear its expiration, and omit the row from the map to leave it unchanged.',
           },
           workflowId: {
             type: 'string',
@@ -7005,10 +7632,13 @@ export const TOOL_CATALOG: Record<string, ToolCatalogEntry> = {
   [BrowserCloseTab.id]: BrowserCloseTab,
   [BrowserDrag.id]: BrowserDrag,
   [BrowserExtract.id]: BrowserExtract,
+  [BrowserFillForm.id]: BrowserFillForm,
+  [BrowserFind.id]: BrowserFind,
   [BrowserGoBack.id]: BrowserGoBack,
   [BrowserGoForward.id]: BrowserGoForward,
   [BrowserHover.id]: BrowserHover,
   [BrowserInsertText.id]: BrowserInsertText,
+  [BrowserListDownloads.id]: BrowserListDownloads,
   [BrowserListSessions.id]: BrowserListSessions,
   [BrowserListTabs.id]: BrowserListTabs,
   [BrowserNavigate.id]: BrowserNavigate,
@@ -7016,14 +7646,18 @@ export const TOOL_CATALOG: Record<string, ToolCatalogEntry> = {
   [BrowserOpenUrl.id]: BrowserOpenUrl,
   [BrowserPressKey.id]: BrowserPressKey,
   [BrowserReadText.id]: BrowserReadText,
+  [BrowserReload.id]: BrowserReload,
   [BrowserScreenshot.id]: BrowserScreenshot,
   [BrowserScroll.id]: BrowserScroll,
   [BrowserSelectOption.id]: BrowserSelectOption,
+  [BrowserSetChecked.id]: BrowserSetChecked,
   [BrowserSnapshot.id]: BrowserSnapshot,
   [BrowserSwitchTab.id]: BrowserSwitchTab,
   [BrowserType.id]: BrowserType,
   [BrowserWaitFor.id]: BrowserWaitFor,
+  [BrowserZoom.id]: BrowserZoom,
   [CallIntegrationTool.id]: CallIntegrationTool,
+  [CancelWorkflowRun.id]: CancelWorkflowRun,
   [ConnectSlackBot.id]: ConnectSlackBot,
   [Cp.id]: Cp,
   [CreateEmptyFile.id]: CreateEmptyFile,
@@ -7081,6 +7715,7 @@ export const TOOL_CATALOG: Record<string, ToolCatalogEntry> = {
   [QueryLogs.id]: QueryLogs,
   [QueryUserTable.id]: QueryUserTable,
   [Read.id]: Read,
+  [ReadDocument.id]: ReadDocument,
   [Redeploy.id]: Redeploy,
   [Respond.id]: Respond,
   [RestoreResource.id]: RestoreResource,
@@ -7099,6 +7734,7 @@ export const TOOL_CATALOG: Record<string, ToolCatalogEntry> = {
   [SearchIntegrationTools.id]: SearchIntegrationTools,
   [SearchKnowledgeBase.id]: SearchKnowledgeBase,
   [SearchLibraryDocs.id]: SearchLibraryDocs,
+  [SearchWorkspace.id]: SearchWorkspace,
   [SetBlockEnabled.id]: SetBlockEnabled,
   [SetEnvironmentVariables.id]: SetEnvironmentVariables,
   [SetGlobalWorkflowVariables.id]: SetGlobalWorkflowVariables,

@@ -76,7 +76,7 @@ describe('document processing failure taxonomy', () => {
     expect(toPermanentDocumentProcessingError(error, 'Contract.doc')).toBe(error)
   })
 
-  it.each(['Contract.doc', 'Budget.xls', 'Deck.ppt'])(
+  it.each(['Contract.doc', 'Budget.xls', 'Deck.pptx'])(
     'classifies an unreadable legacy Office file as repairable: %s',
     (filename) => {
       const failure = classifyDocumentProcessingFailure(
@@ -187,7 +187,7 @@ describe('document processing failure taxonomy', () => {
       new Error('Storage request timed out'),
       new Error('Database connection terminated unexpectedly'),
       new Error('Embedding provider returned 503'),
-      new TypeError('parseOfficeAsync is not a function'),
+      new TypeError('parseOffice is not a function'),
     ]) {
       expect(classifyDocumentProcessingFailure(error, 'Report.docx')).toMatchObject({
         disposition: 'transient',

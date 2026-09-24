@@ -34,10 +34,6 @@ vi.mock('posthog-js/react', () => ({
   usePostHog: () => ({}),
 }))
 
-vi.mock('@/lib/core/config/env-flags', () => ({
-  isChatEnabled: true,
-}))
-
 vi.mock('@/lib/posthog/client', () => ({
   captureEvent: vi.fn(),
 }))
@@ -70,6 +66,10 @@ vi.mock('@/hooks/use-permission-config', () => ({
       hideKnowledgeBaseTab: false,
     },
   }),
+}))
+
+vi.mock('@/hooks/queries/access-requests', () => ({
+  useDiscoverAccessRequests: () => ({ data: { enabled: false, entries: [] }, isPending: false }),
 }))
 
 /**

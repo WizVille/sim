@@ -2,10 +2,21 @@ import { createHash } from 'node:crypto'
 import { db, dbReplica } from '@sim/db'
 import { usageLog, workflow } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
-import { toError } from '@sim/utils/errors'
+import { getPostgresErrorCode, toError } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { and, desc, eq, gte, inArray, lt, lte, notInArray, or, sql } from 'drizzle-orm'
+import {
+  type CursorKey,
+  keysetColumns,
+  keysetPage,
+  type ListSortOrder,
+  listOrderBy,
+  resumeKeyset,
+  textKey,
+  timestampKey,
+} from '@/lib/api/list-query'
 import { defaultBillingPeriod } from '@/lib/billing/core/billing-period'
+import { readLedgerBounded } from '@/lib/billing/core/ledger-read'
 import { getHighestPrioritySubscription } from '@/lib/billing/core/plan'
 import {
   resolveSubscriptionUsagePeriod,
@@ -228,12 +239,14 @@ export async function getBillingPeriodUsageCost(
     )
   }
 
-  const [row] = await executor
-    .select({
-      cost: sql<string>`COALESCE(SUM(${usageLog.cost}), 0)`,
-    })
-    .from(usageLog)
-    .where(and(...conditions))
+  const [row] = await readLedgerBounded(executor, (tx) =>
+    tx
+      .select({
+        cost: sql<string>`COALESCE(SUM(${usageLog.cost}), 0)`,
+      })
+      .from(usageLog)
+      .where(and(...conditions))
+  )
 
   return Number.parseFloat(row?.cost ?? '0')
 }
@@ -254,36 +267,38 @@ export async function getBillingPeriodWorkflowRunCount(
   billingPeriod: UsageQueryPeriod,
   executor: DbClient = db
 ): Promise<number> {
-  const [row] = await executor
-    .select({
-      /**
-       * The exclusion goes through `notInArray`, not `<> ALL(${array})`. Interpolating
-       * a JavaScript array into a `sql` template emits parenthesized scalar binds —
-       * `ALL(($1))` — which Postgres rejects outright with "op ANY/ALL (array)
-       * requires array on right side". Unit tests cannot catch it, because `@sim/db`
-       * is mocked and no statement is ever rendered.
-       */
-      workflowRuns:
-        sql<number>`COUNT(DISTINCT ${usageLog.executionId}) FILTER (WHERE ${usageLog.source} = 'workflow' AND ${notInArray(usageLog.category, [...UNBILLED_USAGE_CATEGORIES])})`.mapWith(
-          Number
-        ),
-    })
-    .from(usageLog)
-    .where(
-      and(
-        eq(usageLog.billingEntityType, billingEntity.type),
-        eq(usageLog.billingEntityId, billingEntity.id),
-        ...(billingPeriod.source === 'reporting'
-          ? [
-              gte(usageLog.createdAt, billingPeriod.start),
-              lt(usageLog.createdAt, billingPeriod.end),
-            ]
-          : [
-              eq(usageLog.billingPeriodStart, billingPeriod.start),
-              eq(usageLog.billingPeriodEnd, billingPeriod.end),
-            ])
+  const [row] = await readLedgerBounded(executor, (tx) =>
+    tx
+      .select({
+        /**
+         * The exclusion goes through `notInArray`, not `<> ALL(${array})`. Interpolating
+         * a JavaScript array into a `sql` template emits parenthesized scalar binds —
+         * `ALL(($1))` — which Postgres rejects outright with "op ANY/ALL (array)
+         * requires array on right side". Unit tests cannot catch it, because `@sim/db`
+         * is mocked and no statement is ever rendered.
+         */
+        workflowRuns:
+          sql<number>`COUNT(DISTINCT ${usageLog.executionId}) FILTER (WHERE ${usageLog.source} = 'workflow' AND ${notInArray(usageLog.category, [...UNBILLED_USAGE_CATEGORIES])})`.mapWith(
+            Number
+          ),
+      })
+      .from(usageLog)
+      .where(
+        and(
+          eq(usageLog.billingEntityType, billingEntity.type),
+          eq(usageLog.billingEntityId, billingEntity.id),
+          ...(billingPeriod.source === 'reporting'
+            ? [
+                gte(usageLog.createdAt, billingPeriod.start),
+                lt(usageLog.createdAt, billingPeriod.end),
+              ]
+            : [
+                eq(usageLog.billingPeriodStart, billingPeriod.start),
+                eq(usageLog.billingPeriodEnd, billingPeriod.end),
+              ])
+        )
       )
-    )
+  )
 
   return row?.workflowRuns ?? 0
 }
@@ -301,27 +316,29 @@ export async function getBillingPeriodUsageCostWithSourceSubset(
   source: UsageLogSource[],
   executor: DbClient = db
 ): Promise<{ total: number; subset: number }> {
-  const [row] = await executor
-    .select({
-      total: sql<string>`COALESCE(SUM(${usageLog.cost}), 0)`,
-      subset: sql<string>`COALESCE(SUM(${usageLog.cost}) FILTER (WHERE ${inArray(usageLog.source, source)}), 0)`,
-    })
-    .from(usageLog)
-    .where(
-      and(
-        eq(usageLog.billingEntityType, billingEntity.type),
-        eq(usageLog.billingEntityId, billingEntity.id),
-        ...(billingPeriod.source === 'reporting'
-          ? [
-              gte(usageLog.createdAt, billingPeriod.start),
-              lt(usageLog.createdAt, billingPeriod.end),
-            ]
-          : [
-              eq(usageLog.billingPeriodStart, billingPeriod.start),
-              eq(usageLog.billingPeriodEnd, billingPeriod.end),
-            ])
+  const [row] = await readLedgerBounded(executor, (tx) =>
+    tx
+      .select({
+        total: sql<string>`COALESCE(SUM(${usageLog.cost}), 0)`,
+        subset: sql<string>`COALESCE(SUM(${usageLog.cost}) FILTER (WHERE ${inArray(usageLog.source, source)}), 0)`,
+      })
+      .from(usageLog)
+      .where(
+        and(
+          eq(usageLog.billingEntityType, billingEntity.type),
+          eq(usageLog.billingEntityId, billingEntity.id),
+          ...(billingPeriod.source === 'reporting'
+            ? [
+                gte(usageLog.createdAt, billingPeriod.start),
+                lt(usageLog.createdAt, billingPeriod.end),
+              ]
+            : [
+                eq(usageLog.billingPeriodStart, billingPeriod.start),
+                eq(usageLog.billingPeriodEnd, billingPeriod.end),
+              ])
+        )
       )
-    )
+  )
 
   return {
     total: Number.parseFloat(row?.total ?? '0'),
@@ -357,14 +374,16 @@ export async function getBillingPeriodUsageCostByUser(
   }
   if (userIds) conditions.push(inArray(usageLog.userId, [...userIds]))
 
-  const rows = await executor
-    .select({
-      userId: usageLog.userId,
-      cost: sql<string>`COALESCE(SUM(${usageLog.cost}), 0)`,
-    })
-    .from(usageLog)
-    .where(and(...conditions))
-    .groupBy(usageLog.userId)
+  const rows = await readLedgerBounded(executor, (tx) =>
+    tx
+      .select({
+        userId: usageLog.userId,
+        cost: sql<string>`COALESCE(SUM(${usageLog.cost}), 0)`,
+      })
+      .from(usageLog)
+      .where(and(...conditions))
+      .groupBy(usageLog.userId)
+  )
 
   return new Map(rows.map((row) => [row.userId, Number.parseFloat(row.cost ?? '0')]))
 }
@@ -398,14 +417,16 @@ export async function getStampedPeriodRangeUsageCostByUser(
     )
   }
 
-  const rows = await executor
-    .select({
-      userId: usageLog.userId,
-      cost: sql<string>`COALESCE(SUM(${usageLog.cost}), 0)`,
-    })
-    .from(usageLog)
-    .where(and(...conditions))
-    .groupBy(usageLog.userId)
+  const rows = await readLedgerBounded(executor, (tx) =>
+    tx
+      .select({
+        userId: usageLog.userId,
+        cost: sql<string>`COALESCE(SUM(${usageLog.cost}), 0)`,
+      })
+      .from(usageLog)
+      .where(and(...conditions))
+      .groupBy(usageLog.userId)
+  )
 
   return new Map(rows.map((row) => [row.userId, Number.parseFloat(row.cost ?? '0')]))
 }
@@ -635,14 +656,18 @@ function assertCumulativeUsageLedgerBinding(
 }
 
 /**
- * Bounds the wait for the per-event-key advisory lock (and any row/index lock
- * waits inside the critical section). The Go mothership gives each UpdateCost
- * POST a 5s deadline, retries 3x with backoff, then dead-letters the charge
- * keyed on the same idempotency key — so a stuck lock holder must surface as
- * a fast, retryable failure (SQLSTATE 55P03) within that budget rather than
- * an unbounded wait that pins pooled connections.
+ * PostgreSQL 17+ bounds the entire transaction below the callback's five-second
+ * deadline. Older supported servers instead bound each idle interval between
+ * statements, alongside the per-statement budget. Both policies release an idle
+ * lock holder without waiting for its application process to resume; only the
+ * newer policy also limits total elapsed transaction time.
  */
+const CUMULATIVE_FLUSH_TRANSACTION_TIMEOUT_MS = 4_000
+const CUMULATIVE_FLUSH_STATEMENT_TIMEOUT_MS = 3_500
 const CUMULATIVE_FLUSH_LOCK_TIMEOUT_MS = 3_000
+const CUMULATIVE_FLUSH_SLOW_MS = 1_000
+
+type CumulativeUsageStage = 'pool' | 'configure' | 'lock' | 'read' | 'write' | 'commit'
 
 /**
  * Record a request's CUMULATIVE cost idempotently with monotonic top-up.
@@ -655,8 +680,9 @@ const CUMULATIVE_FLUSH_LOCK_TIMEOUT_MS = 3_000
  * An existing row must match the incoming actor, workspace, payer, and billing
  * period before either a duplicate no-op or a top-up is accepted.
  * The billing context is resolved BEFORE the transaction and the lock wait is
- * bounded by `lock_timeout`, keeping the critical section to one SELECT plus
- * one INSERT/UPDATE on a single pooled connection.
+ * bounded by `lock_timeout`. A server-enforced transaction deadline, or idle
+ * transaction deadline on older PostgreSQL, releases a stalled holder. The
+ * critical section uses one SELECT plus one INSERT/UPDATE on a single connection.
  *
  * Because every leg flushes its cumulative and this converges to the max,
  * there is no under-billing if the request recovers after a partial flush, no
@@ -684,78 +710,121 @@ export async function recordCumulativeUsage(
 
   const billingContext = await resolveBillingContext(userId, billingEntity, billingPeriod)
 
-  return db.transaction(async (tx) => {
-    // Serialize all flushes for this request (lock auto-releases at tx end),
-    // with a bounded wait so a pathological holder fails this flush fast and
-    // lets the caller retry instead of hanging the connection.
-    await tx.execute(
-      sql`select set_config('lock_timeout', ${`${CUMULATIVE_FLUSH_LOCK_TIMEOUT_MS}ms`}, true)`
-    )
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${eventKey}, 0))`)
+  const startedAt = Date.now()
+  let stage: CumulativeUsageStage = 'pool'
+  let stageStartedAt = startedAt
+  const stageDurationsMs: Partial<Record<CumulativeUsageStage, number>> = {}
+  let succeeded = false
+  let pgCode: string | undefined
+  const enterStage = (nextStage: CumulativeUsageStage) => {
+    const now = Date.now()
+    stageDurationsMs[stage] = now - stageStartedAt
+    stage = nextStage
+    stageStartedAt = now
+  }
 
-    const [existing] = await tx
-      .select({
-        id: usageLog.id,
-        cost: usageLog.cost,
-        userId: usageLog.userId,
-        workspaceId: usageLog.workspaceId,
-        billingEntityType: usageLog.billingEntityType,
-        billingEntityId: usageLog.billingEntityId,
-        billingPeriodStart: usageLog.billingPeriodStart,
-        billingPeriodEnd: usageLog.billingPeriodEnd,
-      })
-      .from(usageLog)
-      .where(eq(usageLog.eventKey, eventKey))
-      .limit(1)
+  try {
+    const result = await db.transaction(async (tx) => {
+      enterStage('configure')
+      await tx.execute(sql`
+        select
+          set_config(
+            case when current_setting('transaction_timeout', true) is null
+              then 'idle_in_transaction_session_timeout'
+              else 'transaction_timeout'
+            end,
+            ${`${CUMULATIVE_FLUSH_TRANSACTION_TIMEOUT_MS}ms`},
+            true
+          ),
+          set_config('statement_timeout', ${`${CUMULATIVE_FLUSH_STATEMENT_TIMEOUT_MS}ms`}, true),
+          set_config('lock_timeout', ${`${CUMULATIVE_FLUSH_LOCK_TIMEOUT_MS}ms`}, true)
+      `)
+      enterStage('lock')
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${eventKey}, 0))`)
 
-    if (existing) {
-      assertCumulativeUsageLedgerBinding(existing, {
-        userId,
-        workspaceId,
-        billingContext,
+      enterStage('read')
+      const [existing] = await tx
+        .select({
+          id: usageLog.id,
+          cost: usageLog.cost,
+          userId: usageLog.userId,
+          workspaceId: usageLog.workspaceId,
+          billingEntityType: usageLog.billingEntityType,
+          billingEntityId: usageLog.billingEntityId,
+          billingPeriodStart: usageLog.billingPeriodStart,
+          billingPeriodEnd: usageLog.billingPeriodEnd,
+        })
+        .from(usageLog)
+        .where(eq(usageLog.eventKey, eventKey))
+        .limit(1)
+
+      if (existing) {
+        assertCumulativeUsageLedgerBinding(existing, {
+          userId,
+          workspaceId,
+          billingContext,
+          eventKey,
+        })
+      }
+
+      const recorded = existing ? Number.parseFloat(existing.cost) : 0
+      const { shouldBill, delta, newTotal } = resolveCumulativeTopUp(recorded, cost)
+
+      if (!shouldBill) {
+        enterStage('commit')
+        return { billed: false, delta: 0, total: recorded }
+      }
+
+      enterStage('write')
+      if (existing) {
+        await tx
+          .update(usageLog)
+          .set({ cost: newTotal.toString(), metadata: metadata ?? null })
+          .where(eq(usageLog.id, existing.id))
+      } else {
+        await recordUsage({
+          userId,
+          workspaceId,
+          tx,
+          billingEntity: billingContext.billingEntity,
+          billingPeriod: billingContext.billingPeriod,
+          entries: [
+            {
+              category: 'model',
+              source,
+              description: model,
+              cost: newTotal,
+              eventKey,
+              sourceReference: eventKey,
+              ...(metadata ? { metadata } : {}),
+            },
+          ],
+        })
+      }
+
+      enterStage('commit')
+      return { billed: true, delta, total: newTotal }
+    })
+    succeeded = true
+    return result
+  } catch (error) {
+    pgCode = getPostgresErrorCode(error)
+    throw error
+  } finally {
+    const now = Date.now()
+    stageDurationsMs[stage] = now - stageStartedAt
+    const durationMs = now - startedAt
+    if (!succeeded || durationMs >= CUMULATIVE_FLUSH_SLOW_MS) {
+      logger.warn('Cumulative usage transaction did not complete promptly', {
         eventKey,
+        succeeded,
+        stage,
+        durationMs,
+        stageDurationsMs,
+        ...(pgCode ? { pgCode } : {}),
       })
     }
-
-    const recorded = existing ? Number.parseFloat(existing.cost) : 0
-    const { shouldBill, delta, newTotal } = resolveCumulativeTopUp(recorded, cost)
-
-    if (!shouldBill) {
-      return { billed: false, delta: 0, total: recorded }
-    }
-
-    if (existing) {
-      // Top up the single row to the new (higher) cumulative; the
-      // period total is SUM(usage_log.cost), so this lifts it by the delta.
-      await tx
-        .update(usageLog)
-        .set({ cost: newTotal.toString(), metadata: metadata ?? null })
-        .where(eq(usageLog.id, existing.id))
-    } else {
-      // First flush for this request: insert the canonical row with the
-      // pre-resolved billing context. Runs in the same tx + advisory lock.
-      await recordUsage({
-        userId,
-        workspaceId,
-        tx,
-        billingEntity: billingContext.billingEntity,
-        billingPeriod: billingContext.billingPeriod,
-        entries: [
-          {
-            category: 'model',
-            source,
-            description: model,
-            cost: newTotal,
-            eventKey,
-            sourceReference: eventKey,
-            ...(metadata ? { metadata } : {}),
-          },
-        ],
-      })
-    }
-
-    return { billed: true, delta, total: newTotal }
-  })
+  }
 }
 
 interface UsageLogFilter {
@@ -935,6 +1004,7 @@ export interface GetUsageLogsOptions {
    * Skips the row lookup that would otherwise resolve it from `cursor`.
    */
   cursorCreatedAt?: Date
+  keyset?: { sortOrder: ListSortOrder; cursorKeys?: CursorKey[] }
   /**
    * Whether to compute the full-filter `summary` aggregate (default `true`).
    * A cursor-paginated caller collecting every page (e.g. a CSV export) only
@@ -975,9 +1045,15 @@ export interface UsageLogsResult {
   }
   pagination: {
     nextCursor?: string
+    nextCursorKeys?: CursorKey[] | null
     hasMore: boolean
   }
 }
+
+const USAGE_LOG_KEYS = [
+  timestampKey(usageLog.createdAt, (row: { createdAt: Date; id: string }) => row.createdAt),
+  textKey(usageLog.id, (row: { createdAt: Date; id: string }) => row.id),
+]
 
 /**
  * Gets one bounded usage-log page for an explicit actor or workspace scope.
@@ -996,6 +1072,7 @@ async function getUsageLogs(
     limit = 50,
     cursor,
     cursorCreatedAt,
+    keyset,
     includeSummary = true,
   } = options
 
@@ -1009,7 +1086,10 @@ async function getUsageLogs(
       billingPeriod,
     })
 
-    if (cursor) {
+    if (keyset) {
+      const after = resumeKeyset(USAGE_LOG_KEYS, keyset.cursorKeys, keyset.sortOrder)
+      if (after) conditions.push(after)
+    } else if (cursor) {
       let resolvedCursorCreatedAt = cursorCreatedAt
 
       if (!resolvedCursorCreatedAt) {
@@ -1052,11 +1132,16 @@ async function getUsageLogs(
       .from(usageLog)
       .leftJoin(workflow, eq(usageLog.workflowId, workflow.id))
       .where(and(...conditions))
-      .orderBy(desc(usageLog.createdAt), desc(usageLog.id))
+      .orderBy(
+        ...(keyset
+          ? listOrderBy(keysetColumns(USAGE_LOG_KEYS), keyset.sortOrder)
+          : [desc(usageLog.createdAt), desc(usageLog.id)])
+      )
       .limit(limit + 1)
 
     const hasMore = logs.length > limit
-    const resultLogs = hasMore ? logs.slice(0, limit) : logs
+    const page = keyset ? keysetPage(USAGE_LOG_KEYS, logs, limit) : undefined
+    const resultLogs = page?.data ?? (hasMore ? logs.slice(0, limit) : logs)
 
     const transformedLogs: UsageLogEntry[] = resultLogs.map((log) => ({
       id: log.id,
@@ -1108,6 +1193,7 @@ async function getUsageLogs(
         bySource,
       },
       pagination: {
+        ...(page ? { nextCursorKeys: page.nextCursorKeys } : {}),
         nextCursor:
           hasMore && resultLogs.length > 0 ? resultLogs[resultLogs.length - 1].id : undefined,
         hasMore,

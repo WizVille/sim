@@ -1,12 +1,26 @@
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
+import { generateShortId } from '@sim/utils/id'
 import { omit } from '@sim/utils/object'
 import { isHosted as isHostedDeployment } from '@/lib/core/config/env-flags'
 import { isIntegrationDeploymentAvailableForVisibility } from '@/lib/integrations/availability.server'
+import { mcpOperationPolicySchema } from '@/lib/mcp/operation-policy'
+import { MCP_SERVER_ADVANCED_TOOL_TYPE } from '@/lib/mcp/shared'
 import { isBlockTypeAccessControlExempt } from '@/lib/permission-groups/block-access'
-import type { PermissionGroupConfig } from '@/lib/permission-groups/types'
+import type { PermissionGroupConfig } from '@/lib/permission-groups/fields'
+import { resolveAccessControlBlockType } from '@/lib/permission-groups/integration-allowlist'
+import {
+  FALLBACK_TUNING_KNOBS,
+  FALLBACK_TUNING_LABELS,
+  getTuningOptionsForModel,
+  isTuningValueValidForModel,
+  isWholeEnvVarReference,
+  MAX_FALLBACK_MODELS,
+  normalizeTuningValues,
+} from '@/lib/workflows/blocks/fallback-models'
 import { getCustomToolById } from '@/lib/workflows/custom-tools/operations'
 import { validateSelectorIds } from '@/lib/workflows/editing/selector-validator'
+import { containsReference } from '@/lib/workflows/sanitization/references'
 import { getSkillById } from '@/lib/workflows/skills/operations'
 import {
   buildCanonicalIndex,
@@ -20,7 +34,12 @@ import type { SubBlockConfig } from '@/blocks/types'
 import { getModelOptions } from '@/blocks/utils'
 import { overlayVisibility } from '@/blocks/visibility/context'
 import { BlockType, EDGE, normalizeName } from '@/executor/constants'
-import { isAutoModel, isKnownModelId, suggestModelIdsForUnknownModel } from '@/providers/models'
+import {
+  isAutoModel,
+  isCustomModelId,
+  isKnownModelId,
+  suggestModelIdsForUnknownModel,
+} from '@/providers/models'
 import { isPiByokOnlyMode } from '@/providers/pi-providers'
 import { getTool } from '@/tools/utils'
 import {
@@ -252,6 +271,14 @@ function validateAgentToolEntry(item: any, index: number): string | null {
     return `${where} is missing a string "type". Custom tools require "type":"custom-tool" (without it the tool will not attach or show its icon); use "mcp" for MCP tools or an integration block type (e.g. "exa") otherwise`
   }
 
+  if (
+    type === MCP_SERVER_ADVANCED_TOOL_TYPE &&
+    item.operationPolicy !== undefined &&
+    !mcpOperationPolicySchema.safeParse(item.operationPolicy).success
+  ) {
+    return `${where} has an invalid MCP operations access policy`
+  }
+
   if (type === 'custom-tool') {
     const hasReference = typeof item.customToolId === 'string' && item.customToolId.trim() !== ''
     const fn = item.schema?.function
@@ -277,6 +304,14 @@ function validateAgentToolEntry(item: any, index: number): string | null {
       toolName.trim() !== ''
     if (!ok) {
       return `${where} (mcp) must include params.serverId and params.toolName`
+    }
+    return null
+  }
+
+  if (type === MCP_SERVER_ADVANCED_TOOL_TYPE) {
+    const serverId = item.params?.serverId
+    if (typeof serverId !== 'string' || !serverId.trim()) {
+      return `${where} (${MCP_SERVER_ADVANCED_TOOL_TYPE}) must include params.serverId`
     }
     return null
   }
@@ -353,6 +388,50 @@ function validateAgentSkillEntry(item: any, index: number): string | null {
 }
 
 /**
+ * Validates one fallback-model row. Returns an error string or null when valid.
+ *
+ * Refuses rather than repairs: an unknown model, sim-auto, or a raw key is an
+ * authoring mistake the caller must see. A missing React-key `id` is the one
+ * thing filled in, since it carries no meaning.
+ */
+function validateFallbackModelEntry(item: any, index: number): string | null {
+  const where = `fallbackModels[${index}]`
+  if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+    return `${where} must be an object { model, apiKey? }`
+  }
+  const model = typeof item.model === 'string' ? item.model.trim() : ''
+  if (model === '') {
+    return `${where} is missing a string "model"`
+  }
+  if (isAutoModel(model)) {
+    return `${where}: sim-auto cannot be a fallback model; it already routes and falls back on its own`
+  }
+  if (!isKnownModelId(model) && !isCustomModelId(model)) {
+    const suggestions = suggestModelIdsForUnknownModel(model)
+    const suggestionText =
+      suggestions.length > 0 ? ` Valid options include: ${suggestions.join(', ')}.` : ''
+    return `${where}: unknown model id "${model}".${suggestionText}`
+  }
+  if (item.apiKey !== undefined && item.apiKey !== null && item.apiKey !== '') {
+    if (!isWholeEnvVarReference(item.apiKey)) {
+      return `${where}.apiKey must be a whole {{ENV_VAR}} reference; put the key in an environment variable instead of pasting it`
+    }
+  }
+  for (const knob of FALLBACK_TUNING_KNOBS) {
+    const value = item[knob]
+    if (value === undefined || value === null || value === '') continue
+    if (typeof value !== 'string' || !isTuningValueValidForModel(model, knob, value)) {
+      const options = getTuningOptionsForModel(model, knob)
+      const hint = options
+        ? ` Valid options: ${options.join(', ')}.`
+        : ` ${model} has no such setting.`
+      return `${where}.${knob}: "${String(value)}" is not a ${FALLBACK_TUNING_LABELS[knob].toLowerCase()} option for ${model}.${hint}`
+    }
+  }
+  return null
+}
+
+/**
  * Validates a value against its expected subBlock type
  * Returns validation result with the value or an error
  */
@@ -379,7 +458,10 @@ export function validateValueForSubBlockType(
           : subBlockConfig.options
       if (options && Array.isArray(options)) {
         const validIds = options.map((opt) => opt.id)
-        if (!validIds.includes(value)) {
+        const values = subBlockConfig.multiSelect && Array.isArray(value) ? value : [value]
+        const isEmptyRequiredMultiSelect =
+          subBlockConfig.multiSelect && subBlockConfig.required && values.length === 0
+        if (isEmptyRequiredMultiSelect || values.some((item) => !validIds.includes(item))) {
           return {
             valid: false,
             error: {
@@ -553,6 +635,57 @@ export function validateValueForSubBlockType(
       return { valid: true, value }
     }
 
+    case 'model-fallback-list': {
+      if (!Array.isArray(value)) {
+        return {
+          valid: false,
+          error: {
+            blockId,
+            blockType,
+            field: fieldName,
+            value,
+            error: `Invalid model-fallback-list value for field "${fieldName}" - expected an array of { model, apiKey? } objects`,
+          },
+        }
+      }
+      if (value.length > MAX_FALLBACK_MODELS) {
+        return {
+          valid: false,
+          error: {
+            blockId,
+            blockType,
+            field: fieldName,
+            value,
+            error: `"${fieldName}" allows at most ${MAX_FALLBACK_MODELS} fallback models`,
+          },
+        }
+      }
+      const fallbackErrors = value
+        .map((item, index) => validateFallbackModelEntry(item, index))
+        .filter((err): err is string => err !== null)
+      if (fallbackErrors.length > 0) {
+        return {
+          valid: false,
+          error: {
+            blockId,
+            blockType,
+            field: fieldName,
+            value,
+            error: `Invalid fallback ${fallbackErrors.length === 1 ? 'entry' : 'entries'} in "${fieldName}": ${fallbackErrors.join('; ')}`,
+          },
+        }
+      }
+      return {
+        valid: true,
+        value: value.map((item: Record<string, unknown> & { model: string }) => ({
+          id: typeof item.id === 'string' && item.id ? item.id : generateShortId(),
+          model: item.model.trim(),
+          ...(isWholeEnvVarReference(item.apiKey) ? { apiKey: item.apiKey.trim() } : {}),
+          ...normalizeTuningValues(item),
+        })),
+      }
+    }
+
     case 'skill-input': {
       // Should be an array of skill reference objects ({ skillId, name? })
       if (!Array.isArray(value)) {
@@ -657,7 +790,7 @@ export function validateValueForSubBlockType(
         if (trimmed !== '' && isAutoModel(trimmed) && isHostedDeployment) {
           return { valid: true, value: trimmed.toLowerCase() }
         }
-        if (trimmed !== '' && !isKnownModelId(trimmed)) {
+        if (trimmed !== '' && !isKnownModelId(trimmed) && !isCustomModelId(trimmed)) {
           const suggestions = suggestModelIdsForUnknownModel(trimmed)
           const suggestionText =
             suggestions.length > 0 ? ` Valid options include: ${suggestions.join(', ')}.` : ''
@@ -668,7 +801,7 @@ export function validateValueForSubBlockType(
               blockType,
               field: fieldName,
               value,
-              error: `Unknown model id "${trimmed}" for block "${blockType}". Read components/blocks/${blockType}.json (the model.options array) for valid ids; prefer entries with recommended: true and avoid deprecated: true. For user-configured models (Ollama, Ollama Cloud, vLLM, LiteLLM, OpenRouter, Fireworks, Together AI, Baseten), prefix the id with the provider slash, e.g. "ollama/llama3.1:8b" or "ollama-cloud/gpt-oss:120b".${suggestionText}`,
+              error: `Unknown model id "${trimmed}" for block "${blockType}". Read components/blocks/${blockType}.json (the model.options array) for valid ids; prefer entries with recommended: true and avoid deprecated: true. For user-configured models, use a supported provider namespace, e.g. "azure/my-deployment", "azure-anthropic/my-deployment", "bedrock/my-inference-profile", "vertex/my-model", "ollama/llama3.1:8b", or "openrouter/provider/model".${suggestionText}`,
             },
           }
         }
@@ -1000,7 +1133,16 @@ export function validateTargetHandle(targetHandle: string): EdgeHandleValidation
 }
 
 /**
- * Checks if a block type is allowed by the permission group config
+ * Whether a block may be added to a graph by this viewer.
+ *
+ * Two questions, not one: whether the viewer can see the block at all
+ * (deployment visibility — an unrevealed preview block, a kill-switched type)
+ * and whether their permission group's integration allowlist permits it.
+ * Refusing to *add* something a viewer cannot see is right.
+ *
+ * Refusing to *store* it is not, which is why the persist-time guard in
+ * `@/lib/workflows/persistence/block-access-guard` checks the allowlist alone:
+ * a graph exported before a block was gated must still save.
  */
 export function isBlockTypeAllowed(
   blockType: string,
@@ -1013,7 +1155,9 @@ export function isBlockTypeAllowed(
   if (!permissionConfig || permissionConfig.allowedIntegrations === null) {
     return true
   }
-  return permissionConfig.allowedIntegrations.includes(blockType.toLowerCase())
+  return permissionConfig.allowedIntegrations.includes(
+    resolveAccessControlBlockType(blockType).toLowerCase()
+  )
 }
 
 /**
@@ -1291,9 +1435,13 @@ export async function collectUnresolvedAgentToolReferences(
               error: toError(error).message,
             })
           }
-        } else if (tool.type === 'mcp' && workspaceId) {
+        } else if (
+          (tool.type === 'mcp' || tool.type === MCP_SERVER_ADVANCED_TOOL_TYPE) &&
+          workspaceId
+        ) {
           const serverId = tool.params?.serverId
           if (typeof serverId !== 'string' || serverId.trim() === '') continue
+          if (containsReference(serverId)) continue
           try {
             const result = await validateSelectorIds('mcp-server-selector', serverId, context)
             if (result.invalid.length > 0) {

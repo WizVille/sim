@@ -21,6 +21,27 @@ export const SCOPE_DESCRIPTIONS: Record<string, string> = {
   'Desk.webhooks.CREATE': 'Create webhooks',
   'Desk.webhooks.DELETE': 'Delete webhooks',
   'aaaserver.profile.READ': 'View your Zoho profile',
+  // ManageEngine ServiceDesk Plus Cloud scopes
+  'SDPOnDemand.requests.CREATE': 'Create requests',
+  'SDPOnDemand.requests.READ': 'View requests and their notes',
+  'SDPOnDemand.requests.UPDATE': 'Update requests and add notes',
+  'SDPOnDemand.requests.DELETE': 'Delete requests',
+  'SDPOnDemand.problems.CREATE': 'Create problems',
+  'SDPOnDemand.problems.READ': 'View problems and their notes',
+  'SDPOnDemand.problems.UPDATE': 'Update problems and add notes',
+  'SDPOnDemand.problems.DELETE': 'Delete problems',
+  'SDPOnDemand.changes.CREATE': 'Create changes',
+  'SDPOnDemand.changes.READ': 'View changes and their notes',
+  'SDPOnDemand.changes.UPDATE': 'Update changes and add notes',
+  'SDPOnDemand.changes.DELETE': 'Delete changes',
+  'SDPOnDemand.assets.CREATE': 'Create assets',
+  'SDPOnDemand.assets.READ': 'View assets',
+  'SDPOnDemand.assets.UPDATE': 'Update assets',
+  'SDPOnDemand.assets.DELETE': 'Delete assets',
+  'SDPOnDemand.solutions.CREATE': 'Create knowledge base solutions',
+  'SDPOnDemand.solutions.READ': 'View knowledge base solutions',
+  'SDPOnDemand.solutions.UPDATE': 'Update knowledge base solutions',
+  'SDPOnDemand.solutions.DELETE': 'Delete knowledge base solutions',
   // Google scopes
   'https://www.googleapis.com/auth/gmail.send': 'Send emails',
   'https://www.googleapis.com/auth/gmail.labels': 'View and manage email labels',
@@ -88,6 +109,7 @@ export const SCOPE_DESCRIPTIONS: Record<string, string> = {
   'read:hierarchical-content:confluence': 'View page hierarchy (children and ancestors)',
   'read:content.metadata:confluence': 'View content metadata (required for ancestors)',
   'read:user:confluence': 'View Confluence user profiles',
+  'read:group:confluence': 'View Confluence groups and memberships',
   'read:confluence-user': 'View Confluence user profiles (v1 API)',
   'read:task:confluence': 'View Confluence inline tasks',
   'write:task:confluence': 'Update Confluence inline tasks',
@@ -104,6 +126,8 @@ export const SCOPE_DESCRIPTIONS: Record<string, string> = {
   openid: 'Standard authentication',
   profile: 'Access profile information',
   email: 'Access email address',
+  'com.intuit.quickbooks.accounting':
+    'Access and manage accounting data in the connected QuickBooks Online company',
 
   // Notion scopes
   'database.read': 'Read database',
@@ -313,7 +337,8 @@ export const SCOPE_DESCRIPTIONS: Record<string, string> = {
   'groups:write': 'Create, archive, and manage private channels',
   'chat:write': 'Send messages',
   'chat:write.public': 'Post to public channels',
-  'assistant:write': 'Set assistant thread status, title, and suggested prompts',
+  'chat:write.customize': 'Customize message username and icon',
+  'assistant:write': 'Manage assistant status, titles, and suggested prompts',
   'im:write': 'Send direct messages',
   'im:history': 'Read direct message history',
   'im:read': 'View direct message channels',
@@ -531,6 +556,7 @@ export function getAllOAuthServices(): OAuthServiceMetadata[] {
         name: service.name,
         description: service.description,
         baseProvider: baseProviderId,
+        clientConfiguration: service.clientConfiguration,
         authType: service.authType ?? 'oauth',
       })
     }
@@ -599,6 +625,10 @@ export function getServiceConfigByProviderId(providerId: string): OAuthServiceCo
   }
 
   return null
+}
+
+export function usesCredentialConfiguredOAuthClient(providerId: string): boolean {
+  return Boolean(getServiceConfigByProviderId(providerId)?.clientConfiguration)
 }
 
 export function getServiceAccountProviderForProviderId(providerId: string): string | undefined {
@@ -733,12 +763,20 @@ const IGNORED_SCOPES = new Set([
  * as they are not returned in the token response's scope list even when granted.
  */
 export function getMissingRequiredScopes(
-  credential: { scopes?: string[] } | undefined,
+  credential: { scopes?: string[]; type?: string } | undefined,
   requiredScopes: string[] = []
 ): string[] {
   if (!credential) {
     return requiredScopes.filter((s) => !IGNORED_SCOPES.has(s))
   }
+
+  /**
+   * A service account names its scopes in the JWT it signs for each request, so
+   * it has no granted-scope list to compare against — `scopes` is always null.
+   * Measuring it against `requiredScopes` reports every scope missing and
+   * prompts a reconnect that would grant nothing.
+   */
+  if (credential.type === 'service_account') return []
 
   const granted = new Set(credential.scopes || [])
   const missing: string[] = []
@@ -761,11 +799,10 @@ export function getMissingRequiredScopes(
  * least-privileged scope would report every already-connected credential as
  * missing it and prompt a re-consent that grants nothing new.
  *
- * This only derives a scope Sim actually requests. A consumer must never
- * require a scope absent from its provider's `scopes` array — no credential can
- * carry it, since that array is what the authorize request asks for.
+ * Only the direct scope sibling is accepted: `drive.file` does not grant
+ * `drive.readonly`, and a read-only grant never satisfies a write scope.
  */
-function isScopeSatisfiedBy(required: string, granted: ReadonlySet<string>): boolean {
+export function isScopeSatisfiedBy(required: string, granted: ReadonlySet<string>): boolean {
   const readonlySuffix = '.readonly'
   if (!required.endsWith(readonlySuffix)) return false
   return granted.has(required.slice(0, -readonlySuffix.length))

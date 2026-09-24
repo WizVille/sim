@@ -10,9 +10,16 @@ const { mockFetch, mockIsPlatformAdmin, envRef } = vi.hoisted(() => ({
   mockIsPlatformAdmin: vi.fn(),
   envRef: {
     APPCONFIG_APPLICATION: 'sim-staging' as string | undefined,
+    KNOWLEDGE_PROJECTION_FILL: undefined as boolean | undefined,
+    KNOWLEDGE_ASYNC_PROJECTION: undefined as boolean | undefined,
     APPCONFIG_ENVIRONMENT: 'staging' as string | undefined,
     TABLES_V2_API: undefined as boolean | undefined,
+    TABLE_ROW_TTL: undefined as boolean | undefined,
+    AGENT_MEMORY_HISTORY: undefined as boolean | undefined,
     CREDENTIAL_GROUPS: undefined as boolean | undefined,
+    KNOWLEDGE_MEMBER_ACCESS: undefined as boolean | undefined,
+    KNOWLEDGE_TIN_KEYWORD: undefined as boolean | undefined,
+    SLACK_SEARCH_SHARED_APP: undefined as boolean | undefined,
   },
 }))
 
@@ -70,6 +77,25 @@ describe('getFeatureFlags', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     setEnvFlags({ isAppConfigEnabled: false })
+    envRef.AGENT_MEMORY_HISTORY = undefined
+  })
+
+  it('rolls Agent history out by workspace and retains a global capture switch', async () => {
+    withAppConfig({ 'agent-memory-history': { workspaceIds: ['workspace-a'] } })
+    expect(await isFeatureEnabled('agent-memory-history', { workspaceId: 'workspace-a' })).toBe(
+      true
+    )
+    expect(await isFeatureEnabled('agent-memory-history', { workspaceId: 'workspace-b' })).toBe(
+      false
+    )
+    withAppConfig({ 'agent-memory-history': { enabled: true } })
+    expect(await isFeatureEnabled('agent-memory-history', { workspaceId: 'workspace-b' })).toBe(
+      true
+    )
+    setEnvFlags({ isAppConfigEnabled: false })
+    expect(await isFeatureEnabled('agent-memory-history')).toBe(false)
+    envRef.AGENT_MEMORY_HISTORY = true
+    expect(await isFeatureEnabled('agent-memory-history')).toBe(true)
   })
 
   it('derives flags from fallback secrets when AppConfig is disabled, without fetching', async () => {
@@ -77,6 +103,7 @@ describe('getFeatureFlags', () => {
     // All registered flags should be present, disabled (env vars unset in test env)
     expect(flags['trigger-eu-region']).toEqual({ enabled: false })
     expect(flags['tables-v2-api']).toEqual({ enabled: false })
+    expect(flags['table-row-ttl']).toEqual({ enabled: false })
     expect(flags['credential-groups']).toEqual({ enabled: false })
     expect(mockFetch).not.toHaveBeenCalled()
   })
@@ -104,6 +131,7 @@ describe('getFeatureFlags', () => {
     const flags = await getFeatureFlags()
     expect(flags['trigger-eu-region']).toEqual({ enabled: false })
     expect(flags['tables-v2-api']).toEqual({ enabled: false })
+    expect(flags['table-row-ttl']).toEqual({ enabled: false })
     expect(flags['credential-groups']).toEqual({ enabled: false })
   })
 
@@ -120,6 +148,116 @@ describe('isFeatureEnabled', () => {
     vi.clearAllMocks()
     setEnvFlags({ isAppConfigEnabled: false })
     envRef.CREDENTIAL_GROUPS = undefined
+    envRef.KNOWLEDGE_MEMBER_ACCESS = undefined
+    envRef.KNOWLEDGE_TIN_KEYWORD = undefined
+    envRef.KNOWLEDGE_ASYNC_PROJECTION = undefined
+    envRef.KNOWLEDGE_PROJECTION_FILL = undefined
+    envRef.SLACK_SEARCH_SHARED_APP = undefined
+  })
+
+  describe('slack-search-shared-app flag', () => {
+    it('enables only the allowlisted organization', async () => {
+      withAppConfig({ 'slack-search-shared-app': { enabled: false, orgIds: ['review-org'] } })
+      expect(await isFeatureEnabled('slack-search-shared-app', { orgId: 'review-org' })).toBe(true)
+      expect(await isFeatureEnabled('slack-search-shared-app', { orgId: 'other-org' })).toBe(false)
+      expect(await isFeatureEnabled('slack-search-shared-app')).toBe(false)
+      expect(mockIsPlatformAdmin).not.toHaveBeenCalled()
+    })
+
+    it('does not grant organization access from user or workspace targeting', async () => {
+      withAppConfig({
+        'slack-search-shared-app': {
+          userIds: ['review-org'],
+          workspaceIds: ['review-org'],
+          adminEnabled: true,
+        },
+      })
+      expect(await isFeatureEnabled('slack-search-shared-app', { orgId: 'review-org' })).toBe(false)
+      expect(mockIsPlatformAdmin).not.toHaveBeenCalled()
+    })
+
+    it('preserves the global AppConfig switch', async () => {
+      withAppConfig({ 'slack-search-shared-app': { enabled: true } })
+      expect(await isFeatureEnabled('slack-search-shared-app', { orgId: 'any-org' })).toBe(true)
+    })
+
+    it('preserves the global fallback switch off AppConfig', async () => {
+      expect(await isFeatureEnabled('slack-search-shared-app', { orgId: 'review-org' })).toBe(false)
+      envRef.SLACK_SEARCH_SHARED_APP = true
+      expect(await isFeatureEnabled('slack-search-shared-app', { orgId: 'review-org' })).toBe(true)
+    })
+  })
+
+  describe('knowledge-tin-keyword flag', () => {
+    it('is a global switch', async () => {
+      expect(await isFeatureEnabled('knowledge-tin-keyword')).toBe(false)
+      envRef.KNOWLEDGE_TIN_KEYWORD = true
+      expect(await isFeatureEnabled('knowledge-tin-keyword')).toBe(true)
+    })
+
+    it('follows an AppConfig global rule', async () => {
+      withAppConfig({ 'knowledge-tin-keyword': { enabled: true } })
+      expect(await isFeatureEnabled('knowledge-tin-keyword')).toBe(true)
+    })
+  })
+
+  describe('knowledge-async-projection flag', () => {
+    it('is a global switch', async () => {
+      expect(await isFeatureEnabled('knowledge-async-projection')).toBe(false)
+      envRef.KNOWLEDGE_ASYNC_PROJECTION = true
+      expect(await isFeatureEnabled('knowledge-async-projection')).toBe(true)
+    })
+
+    it('follows an AppConfig global rule', async () => {
+      withAppConfig({ 'knowledge-async-projection': { enabled: true } })
+      expect(await isFeatureEnabled('knowledge-async-projection')).toBe(true)
+    })
+  })
+
+  describe('knowledge-projection-fill flag', () => {
+    it('is a global switch', async () => {
+      expect(await isFeatureEnabled('knowledge-projection-fill')).toBe(false)
+      envRef.KNOWLEDGE_PROJECTION_FILL = true
+      expect(await isFeatureEnabled('knowledge-projection-fill')).toBe(true)
+    })
+
+    it('follows an AppConfig global rule', async () => {
+      withAppConfig({ 'knowledge-projection-fill': { enabled: true } })
+      expect(await isFeatureEnabled('knowledge-projection-fill')).toBe(true)
+    })
+  })
+
+  describe('knowledge-member-access flag', () => {
+    it('uses a global fallback switch off AppConfig', async () => {
+      expect(await isFeatureEnabled('knowledge-member-access')).toBe(false)
+
+      envRef.KNOWLEDGE_MEMBER_ACCESS = true
+      expect(await isFeatureEnabled('knowledge-member-access')).toBe(true)
+    })
+
+    it('opens for an allowlisted workspace only', async () => {
+      withAppConfig({ 'knowledge-member-access': { workspaceIds: ['ws-1'] } })
+      expect(
+        await isFeatureEnabled('knowledge-member-access', { workspaceId: 'ws-1', userId: 'u1' })
+      ).toBe(true)
+      expect(
+        await isFeatureEnabled('knowledge-member-access', { workspaceId: 'ws-2', userId: 'u1' })
+      ).toBe(false)
+      expect(mockIsPlatformAdmin).not.toHaveBeenCalled()
+    })
+
+    it('opens for a platform admin in any workspace', async () => {
+      withAppConfig({ 'knowledge-member-access': { workspaceIds: ['ws-1'], adminEnabled: true } })
+      mockIsPlatformAdmin.mockResolvedValue(true)
+      expect(
+        await isFeatureEnabled('knowledge-member-access', { workspaceId: 'ws-2', userId: 'admin' })
+      ).toBe(true)
+      mockIsPlatformAdmin.mockResolvedValue(false)
+      expect(
+        await isFeatureEnabled('knowledge-member-access', { workspaceId: 'ws-2', userId: 'u1' })
+      ).toBe(false)
+      expect(await isFeatureEnabled('knowledge-member-access', { workspaceId: 'ws-2' })).toBe(false)
+    })
   })
 
   describe('credential-groups flag', () => {
@@ -135,11 +273,16 @@ describe('isFeatureEnabled', () => {
       expect(await isFeatureEnabled('credential-groups')).toBe(true)
     })
 
-    it('opens for an allowlisted workspace only', async () => {
-      withAppConfig({ 'credential-groups': { workspaceIds: ['ws-1'] } })
-      expect(await isFeatureEnabled('credential-groups', { workspaceId: 'ws-1' })).toBe(true)
-      expect(await isFeatureEnabled('credential-groups', { workspaceId: 'ws-2' })).toBe(false)
+    it('opens for an allowlisted organization only', async () => {
+      withAppConfig({ 'credential-groups': { orgIds: ['org-1'] } })
+      expect(await isFeatureEnabled('credential-groups', { orgId: 'org-1' })).toBe(true)
+      expect(await isFeatureEnabled('credential-groups', { orgId: 'org-2' })).toBe(false)
       expect(await isFeatureEnabled('credential-groups')).toBe(false)
+    })
+
+    it('a legacy workspace allowlist does not enable the organization gate', async () => {
+      withAppConfig({ 'credential-groups': { workspaceIds: ['ws-1'] } })
+      expect(await isFeatureEnabled('credential-groups', { orgId: 'org-1' })).toBe(false)
     })
   })
 
@@ -236,5 +379,25 @@ describe('tables-v2-api flag', () => {
   it('global enabled turns it on for everyone', async () => {
     withAppConfig({ 'tables-v2-api': { enabled: true } })
     expect(await isFeatureEnabled('tables-v2-api')).toBe(true)
+  })
+})
+
+describe('table-row-ttl flag', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    setEnvFlags({ isAppConfigEnabled: false })
+    envRef.TABLE_ROW_TTL = undefined
+  })
+
+  it('uses a global fallback switch off AppConfig', async () => {
+    expect(await isFeatureEnabled('table-row-ttl')).toBe(false)
+
+    envRef.TABLE_ROW_TTL = true
+    expect(await isFeatureEnabled('table-row-ttl')).toBe(true)
+  })
+
+  it('uses the global AppConfig clause', async () => {
+    withAppConfig({ 'table-row-ttl': { enabled: true } })
+    expect(await isFeatureEnabled('table-row-ttl')).toBe(true)
   })
 })

@@ -4,8 +4,12 @@
 import { dbChainMock, dbChainMockFns, resetDbChainMock } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DbOrTx } from '@/lib/db/types'
-import { loadExecutionsByRow, writeExecutionsPatch } from '@/lib/table/rows/executions'
-import type { RowExecutionMetadata } from '@/lib/table/types'
+import {
+  loadExecutionsByRow,
+  tableMayHaveRunState,
+  writeExecutionsPatch,
+} from '@/lib/table/rows/executions'
+import type { RowExecutionMetadata, TableSchema } from '@/lib/table/types'
 
 const EXECUTION_STATE: RowExecutionMetadata = {
   status: 'running',
@@ -31,6 +35,48 @@ describe('writeExecutionsPatch guards', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
+  })
+
+  /**
+   * The dispatcher's `pending` marker is drained by whichever worker owns the
+   * row's cascade lock, which may belong to another dispatch entirely. Storing
+   * the requesting subject with the marker is what lets that drain run under
+   * the person who asked rather than under the owner's own subject.
+   */
+  it('persists the pre-stamp’s governed subject on both the insert and the upsert', async () => {
+    await writeExecutionsPatch(
+      dbChainMock.db as unknown as Parameters<typeof writeExecutionsPatch>[0],
+      'table-1',
+      'row-1',
+      {
+        'group-1': {
+          ...EXECUTION_STATE,
+          status: 'pending',
+          executionId: null,
+          capabilityGovernedUserId: 'requesting-member',
+        },
+      }
+    )
+
+    const values = dbChainMockFns.values.mock.calls[0]?.[0] as Record<string, unknown>
+    expect(values.capabilityGovernedUserId).toBe('requesting-member')
+    const conflict = dbChainMockFns.onConflictDoUpdate.mock.calls[0]?.[0] as {
+      set: Record<string, unknown>
+    }
+    expect(conflict.set.capabilityGovernedUserId).toBe('requesting-member')
+  })
+
+  /** A write that names no subject clears it — only an unclaimed marker is read. */
+  it('writes null for a state that carries no subject', async () => {
+    await writeExecutionsPatch(
+      dbChainMock.db as unknown as Parameters<typeof writeExecutionsPatch>[0],
+      'table-1',
+      'row-1',
+      { 'group-1': EXECUTION_STATE }
+    )
+
+    const values = dbChainMockFns.values.mock.calls[0]?.[0] as Record<string, unknown>
+    expect(values.capabilityGovernedUserId).toBeNull()
   })
 
   it('rejects a worker write when the atomic stale-or-cancel predicate returns no row', async () => {
@@ -214,5 +260,41 @@ describe('loadExecutionsByRow', () => {
 
     expect(select).toHaveBeenCalledTimes(3)
     expect(byRow.size).toBe(750)
+  })
+})
+
+describe('tableMayHaveRunState', () => {
+  const column = (overrides: Partial<TableSchema['columns'][number]> = {}) => ({
+    id: 'col_1',
+    name: 'title',
+    type: 'string' as const,
+    ...overrides,
+  })
+
+  it('is false for a schema that declares no group', () => {
+    expect(tableMayHaveRunState({ columns: [column()] })).toBe(false)
+    expect(tableMayHaveRunState({ columns: [column()], workflowGroups: [] })).toBe(false)
+  })
+
+  it('is true once the schema declares a group', () => {
+    expect(
+      tableMayHaveRunState({
+        columns: [column()],
+        workflowGroups: [{ id: 'group-1' }] as TableSchema['workflowGroups'],
+      })
+    ).toBe(true)
+  })
+
+  /**
+   * A column still pointing at a group is group state whatever the group list says, so an
+   * unexpected schema shape must keep the sidecar read rather than silently drop run state.
+   */
+  it('is true for a column that still names a group the list has lost', () => {
+    expect(
+      tableMayHaveRunState({
+        columns: [column({ workflowGroupId: 'group-1' })],
+        workflowGroups: [],
+      })
+    ).toBe(true)
   })
 })

@@ -1,9 +1,10 @@
 import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { db } from '@sim/db'
-import { organization, outboxEvent, session, subscription, user } from '@sim/db/schema'
+import { foldedEmail, organization, outboxEvent, session, subscription, user } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { generateId } from '@sim/utils/id'
-import { isRecordLike } from '@sim/utils/object'
+import { isRecordLike, toRecord } from '@sim/utils/object'
+import { normalizeEmail } from '@sim/utils/string'
 import { and, eq, inArray, sql } from 'drizzle-orm'
 import type Stripe from 'stripe'
 import { getEmailSubject, renderEnterpriseSubscriptionEmail } from '@/components/emails'
@@ -56,9 +57,7 @@ export async function handleManualEnterpriseSubscription(event: Stripe.Event) {
 async function processManualEnterpriseSubscription(event: Stripe.Event) {
   const eventSubscription = event.data.object as Stripe.Subscription
   const rawPreviousAttributes: unknown = event.data.previous_attributes
-  const previousAttributes: Record<string, unknown> = isRecordLike(rawPreviousAttributes)
-    ? rawPreviousAttributes
-    : {}
+  const previousAttributes: Record<string, unknown> = toRecord(rawPreviousAttributes)
   return withEnterpriseReconciliationLease(eventSubscription.id, (lease) =>
     reconcileManualEnterpriseSubscription(eventSubscription, lease, {
       created: event.type === 'customer.subscription.created',
@@ -532,7 +531,7 @@ async function reconcileManualEnterpriseSubscription(
         requestedByUserId
           ? eq(user.id, requestedByUserId)
           : requestedByEmail
-            ? eq(user.normalizedEmail, requestedByEmail.toLowerCase())
+            ? eq(foldedEmail(user.email), normalizeEmail(requestedByEmail))
             : eq(user.stripeCustomerId, stripeCustomerId)
       )
       .limit(1)

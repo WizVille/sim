@@ -31,7 +31,8 @@ const { mockProviders } = vi.hoisted(() => ({
   },
 }))
 
-vi.mock('@/providers/models', () => ({
+vi.mock('@/providers/models', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/providers/models')>()),
   getProviderFileAttachment: vi
     .fn()
     .mockReturnValue({ maxBytes: 10 * 1024 * 1024, strategy: 'inline' }),
@@ -74,6 +75,8 @@ import {
   parseOptionalBooleanInput,
   parseOptionalJsonInput,
   parseOptionalNumberInput,
+  providerRequiresFamilyCredentials,
+  requiresProviderFamilyCredentials,
 } from '@/blocks/utils'
 import { getProviderFromModel } from '@/providers/utils'
 
@@ -81,6 +84,11 @@ describe('BUILT_IN_TOOL_TYPES', () => {
   it('classifies the current File block instead of the legacy File block', () => {
     expect(BUILT_IN_TOOL_TYPES.has('file_v5')).toBe(true)
     expect(BUILT_IN_TOOL_TYPES.has('file')).toBe(false)
+  })
+
+  it('classifies the current Table block instead of the legacy Table block', () => {
+    expect(BUILT_IN_TOOL_TYPES.has('table_v2')).toBe(true)
+    expect(BUILT_IN_TOOL_TYPES.has('table')).toBe(false)
   })
 })
 
@@ -90,6 +98,45 @@ const BASE_CLOUD_MODELS: Record<string, string> = {
   'gemini-2.5-pro': 'google',
   'mistral-large-latest': 'mistral',
 }
+
+describe('providerRequiresFamilyCredentials', () => {
+  it('answers for a provider the caller already resolved', () => {
+    expect(providerRequiresFamilyCredentials('vertex')).toBe(true)
+    expect(providerRequiresFamilyCredentials('openai')).toBe(false)
+    expect(providerRequiresFamilyCredentials(null)).toBe(false)
+    expect(providerRequiresFamilyCredentials(undefined)).toBe(false)
+  })
+})
+
+describe('requiresProviderFamilyCredentials', () => {
+  beforeEach(() => {
+    setEnvFlags({ isHosted: false, isAzureConfigured: false, isOllamaConfigured: false })
+  })
+
+  it('is true for Vertex, and for Bedrock until the deployment provides default credentials', () => {
+    expect(requiresProviderFamilyCredentials('vertex/gemini-2.5-pro')).toBe(true)
+    expect(requiresProviderFamilyCredentials('bedrock/my-inference-profile')).toBe(true)
+    vi.stubEnv('NEXT_PUBLIC_BEDROCK_DEFAULT_CREDENTIALS', 'true')
+    try {
+      expect(requiresProviderFamilyCredentials('bedrock/my-inference-profile')).toBe(false)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('is true for Azure only until the deployment configures it server-side', () => {
+    expect(requiresProviderFamilyCredentials('azure/my-deployment')).toBe(true)
+    expect(requiresProviderFamilyCredentials('azure-anthropic/my-deployment')).toBe(true)
+    setEnvFlags({ isAzureConfigured: true })
+    expect(requiresProviderFamilyCredentials('azure/my-deployment')).toBe(false)
+  })
+
+  it('is false for API-key providers, local servers, and unknown ids', () => {
+    expect(requiresProviderFamilyCredentials('openrouter/anthropic/claude')).toBe(false)
+    expect(requiresProviderFamilyCredentials('ollama/llama3')).toBe(false)
+    expect(requiresProviderFamilyCredentials('')).toBe(false)
+  })
+})
 
 describe('getApiKeyCondition / shouldRequireApiKeyForModel', () => {
   const evaluateCondition = (model: string): boolean => {
@@ -175,6 +222,16 @@ describe('getApiKeyCondition / shouldRequireApiKeyForModel', () => {
   })
 
   describe('provider store lookup (client-side)', () => {
+    it('requires the cloud key even when a local discovered name uses its namespace', () => {
+      mockProviders.value.ollama.models = ['azure/MyDeployment', 'ollama-cloud/MyModel']
+      expect(evaluateCondition('azure/MyDeployment')).toBe(true)
+      expect(evaluateCondition('ollama-cloud/MyModel')).toBe(true)
+    })
+
+    it('does not require an API key for an undiscovered namespaced Ollama model', () => {
+      expect(evaluateCondition('OLLAMA/Org/CustomModel')).toBe(false)
+    })
+
     it('does not require API key when model is in the Ollama store bucket', () => {
       mockProviders.value.ollama.models = ['llama3:latest', 'mistral:latest']
       expect(evaluateCondition('llama3:latest')).toBe(false)

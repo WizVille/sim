@@ -51,8 +51,18 @@ export function isPendingDesktopScopeId(scopeId: string): boolean {
  * environment stay consistent between the two.
  */
 export interface SimDesktopTerminalApi {
-  /** Open the first terminal, or adopt the ones already running. */
-  start(options: TerminalStartOptions, scopeId: string): Promise<ScopedTerminalTabsState>
+  /**
+   * Materializes a chat's saved shells without opening one for a chat that
+   * had none. Optional for compatibility with installed shells that only
+   * restored when the terminal panel started.
+   */
+  restoreScope?(scopeId: string): Promise<ScopedTerminalTabsState>
+  /**
+   * Opens the first terminal, or adopts the chat's saved shells. Only shells
+   * without {@link restoreScope} still expose it; newer ones restore on
+   * activation and open shells one at a time.
+   */
+  start?(options: TerminalStartOptions, scopeId: string): Promise<ScopedTerminalTabsState>
   /**
    * Execute one terminal operation. Resolves with the outcome; never rejects
    * for tool-level failures (those ride `ok: false`).
@@ -78,7 +88,15 @@ export interface SimDesktopTerminalApi {
   resize(terminalId: string, cols: number, rows: number, scopeId: string): void
   /** Open an additional terminal and make it active. */
   openTerminal(cwd: string | undefined, scopeId: string): Promise<ScopedTerminalTabsState>
-  switchTerminal(terminalId: string, scopeId: string): Promise<ScopedTerminalTabsState>
+  /**
+   * Show a terminal. `claim: false` mirrors a resource-strip selection without
+   * recording the shell as the user's own; older shells treat every switch as a claim.
+   */
+  switchTerminal(
+    terminalId: string,
+    scopeId: string,
+    options?: { claim?: boolean }
+  ): Promise<ScopedTerminalTabsState>
   /** Move a terminal to its final position. Optional for older installed shells. */
   reorderTerminal?(
     terminalId: string,
@@ -140,6 +158,11 @@ export interface SimDesktopBrowserAgentApi {
   /** New shells can atomically force-hide a native page before renderer effects paint. */
   readonly supportsAtomicPanelOcclusion?: true
   /**
+   * Confirms that this renderer can present and answer legacy site-origin prompts.
+   * Only installed shells with the retired per-task navigation gate expose this.
+   */
+  registerSitePermissionPromptSupport?(): void
+  /**
    * Execute one browser tool. Resolves with the tool's outcome; never
    * rejects for tool-level failures (those ride `ok: false`).
    */
@@ -160,6 +183,8 @@ export interface SimDesktopBrowserAgentApi {
    * Optional for compatibility with installed shells that predate acknowledged tab creation.
    */
   openTab?(scopeId: string): Promise<BrowserTabsState>
+  /** Atomically creates a user-owned tab and grants/navigates its exact destination origin. */
+  openUrl?(url: string, scopeId: string): Promise<BrowserTabsState>
   /** Makes a chat's browser tab set the renderer-visible set. */
   activateScope(scopeId: string): Promise<BrowserTabsState>
   /** Materializes a lazily activated chat's persisted tabs without showing its panel. */
@@ -170,12 +195,11 @@ export interface SimDesktopBrowserAgentApi {
   disposeScope(scopeId: string): Promise<boolean>
   /** Closes a soft-deleted chat's live pages while retaining its restart descriptor. */
   suspendScope(scopeId: string): Promise<boolean>
-  /** Pin or unpin a live browser tab. */
-  setTabPinned(tabId: string, pinned: boolean, scopeId: string): void
-  /** Opens the native tab actions menu without covering the embedded page. */
-  showTabContextMenu(tabId: string, scopeId: string): void
-  /** Move a live tab to a final list index. */
-  reorderTab(tabId: string, targetIndex: number, scopeId: string): void
+  /**
+   * Move a live tab to a final list index, mirroring the resource strip.
+   * Optional for compatibility with installed shells that predate strip-owned order.
+   */
+  reorderTab?(tabId: string, targetIndex: number, scopeId: string): void
   /**
    * Report where the browser panel sits in the window (CSS pixels relative
    * to the viewport), or null when the panel is hidden/unmounted. The main
@@ -949,9 +973,9 @@ export interface SimDesktopTerminalThemesApi {
 }
 
 /**
- * Where the shell's update pipeline currently is. `available` only occurs
- * when automatic downloads are disabled; with them enabled the shell moves
- * straight to `downloading`.
+ * Where the shell's update pipeline currently is. `available` occurs when
+ * automatic downloads are disabled or the shell requires a manual installer;
+ * self-updating shells with automatic downloads enabled move to `downloading`.
  */
 export type DesktopUpdateStatus =
   | 'idle'
@@ -968,11 +992,9 @@ export interface DesktopUpdateState {
   /** Whole-number download progress (0-100) while `downloading`. */
   percent?: number
   /**
-   * True when this shell cannot apply updates in place (a build without a
-   * Developer ID signature — local installs and pre-signing CI prereleases;
-   * Squirrel.Mac refuses to swap unsigned bundles). `available` is then the
-   * pipeline's terminal state and the advance action opens the download in
-   * the browser instead of downloading in the background.
+   * True when this shell cannot apply updates in place, such as an unsigned build
+   * or an app running outside /Applications. `available` is then the terminal state
+   * and the advance action opens the installer in the browser.
    */
   manual?: boolean
 }
@@ -981,11 +1003,11 @@ export interface DesktopUpdateState {
 export interface SimDesktopUpdatesApi {
   getState(): Promise<DesktopUpdateState>
   /**
-   * Advance the pipeline: checks for an update, or starts the download when
-   * one is already known to be available (auto-download off).
+   * Advances the pipeline: checks for an update, downloads an available
+   * self-update, or opens an available manual installer.
    */
   check(): void
-  /** Quit and install a `ready` update. No-op in any other state. */
+  /** Installs a ready update or opens the installer for an available manual update. */
   install(): void
   /** Subscribe to pipeline state changes. Returns an unsubscribe function. */
   onState(callback: (state: DesktopUpdateState) => void): () => void
@@ -1083,3 +1105,10 @@ export interface SimDesktopApi {
   /** Reads and selects Terminal.app or iTerm2 color profiles on macOS. */
   terminalThemes?: SimDesktopTerminalThemesApi
 }
+export {
+  applyDesktopTitleBarMode,
+  DESKTOP_TITLE_BAR_ATTRIBUTE,
+  type DesktopTitleBarMode,
+  observeDesktopTitleBar,
+  supportsDesktopTitleBar,
+} from './title-bar'

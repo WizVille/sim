@@ -127,6 +127,311 @@ describe('commands parsed through commander', () => {
     profileState.workspaceId = 'ws_local'
   })
 
+  describe('organization access-request decisions', () => {
+    it('sends apply flags through the generated operation without opaque JSON', async () => {
+      profileState.workspaceId = null
+      const [path, options] = await run(
+        [
+          'organizations',
+          'access-requests',
+          'resolve',
+          'request-1',
+          '--organization',
+          'org-1',
+          '--action',
+          'apply',
+          '--expected-fingerprint',
+          'preview',
+          '--new-limit-credits',
+          '100',
+        ],
+        { data: { id: 'request-1' } }
+      )
+      expect(path).toBe('/api/v2/organizations/org-1/access-requests/request-1/resolve')
+      expect(options.body).toEqual({
+        action: 'apply',
+        expectedFingerprint: 'preview',
+        newLimitCredits: 100,
+      })
+    })
+
+    it('sends decline without requiring apply fields', async () => {
+      const [, options] = await run(
+        [
+          'organizations',
+          'access-requests',
+          'resolve',
+          'request-1',
+          '--organization',
+          'org-1',
+          '--action',
+          'decline',
+          '--reason',
+          'Not needed',
+        ],
+        { data: { id: 'request-1' } }
+      )
+      expect(options.body).toEqual({ action: 'decline', reason: 'Not needed' })
+    })
+
+    it('rejects flags from another decision branch before calling the API', async () => {
+      await expect(
+        run([
+          'organizations',
+          'access-requests',
+          'resolve',
+          'request-1',
+          '--organization',
+          'org-1',
+          '--action',
+          'decline',
+          '--reason',
+          'Not needed',
+          '--expected-fingerprint',
+          'preview',
+        ])
+      ).rejects.toThrow('--expected-fingerprint is not available when --action is decline')
+      expect(mockRequest).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('organization member credit caps', () => {
+    it.each([
+      ['100', 100],
+      ['0', 0],
+      ['null', null],
+    ] as const)('sends --credit-limit %s without changing its meaning', async (value, expected) => {
+      profileState.workspaceId = null
+      const [path, options] = await run(
+        [
+          'organizations',
+          'members',
+          'usage-limit',
+          'update',
+          'user-1',
+          '--organization',
+          'org-1',
+          '--credit-limit',
+          value,
+        ],
+        { data: { creditLimit: expected } }
+      )
+      expect(path).toBe('/api/v2/organizations/org-1/members/user-1/usage-limit')
+      expect(options.body).toEqual({ creditLimit: expected })
+    })
+
+    it.each(['many', '1.5', 'Infinity', ''])(
+      'rejects an invalid credit cap %s before sending',
+      async (value) => {
+        await expect(
+          run([
+            'organizations',
+            'members',
+            'usage-limit',
+            'update',
+            'user-1',
+            '--organization',
+            'org-1',
+            '--credit-limit',
+            value,
+          ])
+        ).rejects.toThrow(/--credit-limit/)
+        expect(mockRequest).not.toHaveBeenCalled()
+      }
+    )
+
+    it('explains the numeric null spelling accurately in generated help', () => {
+      const help = commandAt('organizations', 'members', 'usage-limit', 'update').helpInformation()
+      expect(help).toContain('--credit-limit <number|null>')
+      expect(help).toMatch(/Send null to clear\s+the cap/)
+      expect(help).not.toContain('sends the word')
+    })
+  })
+
+  describe('permission groups', () => {
+    it('lists organization groups without a workspace', async () => {
+      profileState.workspaceId = null
+      const [path, options] = await run(['permission-groups', 'list', '--organization', 'org-1'])
+      expect(path).toBe('/api/v2/organizations/org-1/permission-groups')
+      expect(options.query).not.toHaveProperty('workspaceId')
+    })
+
+    it('passes group configuration through the shared update operation', async () => {
+      const [path, options] = await run(
+        [
+          'permission-groups',
+          'update',
+          'group-1',
+          '--organization',
+          'org-1',
+          '--config',
+          '{"disableCliAccess":true}',
+        ],
+        { data: {} }
+      )
+      expect(path).toBe('/api/v2/organizations/org-1/permission-groups/group-1')
+      expect(options).toMatchObject({
+        method: 'PATCH',
+        body: { config: { disableCliAccess: true } },
+      })
+    })
+
+    it('clears a description using the standard empty string flag', async () => {
+      const [, options] = await run(
+        ['permission-groups', 'update', 'group-1', '--organization', 'org-1', '--description', ''],
+        { data: {} }
+      )
+      expect(options.body).toEqual({ description: '' })
+    })
+
+    it('adds a member with explicit organization and group scope', async () => {
+      const [path, options] = await run(
+        [
+          'permission-groups',
+          'members',
+          'add',
+          '--organization',
+          'org-1',
+          '--group',
+          'group-1',
+          '--user',
+          'user-1',
+        ],
+        { data: { id: 'assignment-1' } }
+      )
+      expect(path).toBe('/api/v2/organizations/org-1/permission-groups/group-1/members')
+      expect(options).toMatchObject({ method: 'POST', body: { userId: 'user-1' } })
+    })
+
+    it('requires confirmation to delete a group', async () => {
+      await expect(
+        run(['permission-groups', 'delete', 'group-1', '--organization', 'org-1'])
+      ).rejects.toThrow(/--yes/)
+      expect(mockRequest).not.toHaveBeenCalled()
+      const [path, options] = await run(
+        ['permission-groups', 'delete', 'group-1', '--organization', 'org-1', '--yes'],
+        { data: { id: 'group-1', deleted: true } }
+      )
+      expect(path).toBe('/api/v2/organizations/org-1/permission-groups/group-1')
+      expect(options.method).toBe('DELETE')
+    })
+  })
+
+  it.each([
+    ['--default', true],
+    ['--no-default', false],
+  ] as const)('maps %s to the default field', async (flag, value) => {
+    const [, options] = await run(
+      ['permission-groups', 'update', 'group-1', '--organization', 'org-1', flag],
+      { data: {} }
+    )
+    expect(options.body).toEqual({ isDefault: value })
+  })
+
+  it.each([
+    [['--user', 'user-1', 'user-2'], { userIds: ['user-1', 'user-2'] }],
+    [['--all-members'], { addAllOrganizationMembers: true }],
+  ])('maps batch membership selection %j', async (flags, body) => {
+    const [, options] = await run(
+      [
+        'permission-groups',
+        'members',
+        'batch-add',
+        '--organization',
+        'org-1',
+        '--group',
+        'group-1',
+        ...flags,
+      ],
+      { data: { added: 2, skipped: 0 } }
+    )
+    expect(options.body).toEqual(body)
+  })
+
+  it('removes a permission group member by user ID', async () => {
+    const [path, options] = await run(
+      [
+        'permission-groups',
+        'members',
+        'remove',
+        'user-1',
+        '--organization',
+        'org-1',
+        '--group',
+        'group-1',
+        '--yes',
+      ],
+      { data: { userId: 'user-1', deleted: true } }
+    )
+    expect(path).toBe('/api/v2/organizations/org-1/permission-groups/group-1/members/user-1')
+    expect(options.method).toBe('DELETE')
+  })
+
+  it('creates organization invitations without a workspace', async () => {
+    profileState.workspaceId = null
+    const [path, options] = await run(
+      [
+        'organizations',
+        'invitations',
+        'create',
+        '--organization',
+        'org-1',
+        '--email',
+        'person@example.com',
+        '--role',
+        'admin',
+      ],
+      { data: {} }
+    )
+    expect(path).toBe('/api/v2/organizations/org-1/invitations')
+    expect(options).toMatchObject({
+      method: 'POST',
+      body: { email: 'person@example.com', role: 'admin' },
+    })
+  })
+
+  it('resends an invitation without requiring a JSON argument', async () => {
+    const [path, options] = await run(
+      ['organizations', 'invitations', 'resend', 'invite-1', '--organization', 'org-1'],
+      { data: {} }
+    )
+    expect(path).toBe('/api/v2/organizations/org-1/invitations/invite-1/resend')
+    expect(options.method).toBe('POST')
+  })
+
+  it('updates organization roles using user IDs', async () => {
+    const [path, options] = await run(
+      [
+        'organizations',
+        'members',
+        'update',
+        'user-1',
+        '--organization',
+        'org-1',
+        '--role',
+        'admin',
+      ],
+      { data: {} }
+    )
+    expect(path).toBe('/api/v2/organizations/org-1/members/user-1')
+    expect(options).toMatchObject({ method: 'PATCH', body: { role: 'admin' } })
+  })
+
+  it.each([
+    ['--default', true],
+    ['--no-default', false],
+    ['--is-default', true],
+    ['--no-is-default', false],
+  ] as const)(
+    'uses the same default flag for table views and preserves %s',
+    async (flag, value) => {
+      const [, options] = await run(['tables', 'views', 'update', 'table-1', 'view-1', flag], {
+        data: {},
+      })
+      expect(options.body).toEqual({ workspaceId: 'ws_local', isDefault: value })
+    }
+  )
+
   it('carries a multi-word flag all the way to the request', async () => {
     // The regression: commander stores this as `minDurationMs`, so a lookup by
     // `min-duration-ms` found nothing and the filter never reached the API.
@@ -196,6 +501,7 @@ describe('commands parsed through commander', () => {
       knowledge: 'kb',
       logs: 'log',
       'mcp-servers': 'mcp-server',
+      sandboxes: 'sandbox',
       secrets: 'secret',
       skills: 'skill',
       tables: 'table',
@@ -223,10 +529,10 @@ describe('commands parsed through commander', () => {
   describe('a command whose operation refuses a workspace API key', () => {
     it('says so in the help line it falls back to from the spec summary', () => {
       expect(commandAt('secrets', 'list').helpInformation()).toContain(
-        '(personal API key required)'
+        '(OAuth login or personal API key required)'
       )
       expect(commandAt('mcp-servers', 'tools', 'list').description()).toContain(
-        '(personal API key required)'
+        '(OAuth login or personal API key required)'
       )
     })
 
@@ -237,7 +543,7 @@ describe('commands parsed through commander', () => {
      */
     it('says so on a command carrying a hand-written describe', () => {
       expect(commandAt('workflows', 'undeploy').description()).toBe(
-        'Take a workflow out of deployment (personal API key required)'
+        'Take a workflow out of deployment (OAuth login or personal API key required)'
       )
     })
 
@@ -260,7 +566,7 @@ describe('commands parsed through commander', () => {
         ['credentials', 'reconnect'],
       ]) {
         expect(`${path.join(' ')}: ${builtCommandAt(...path).description()}`).toContain(
-          '(personal API key required)'
+          '(OAuth login or personal API key required)'
         )
       }
     })
@@ -289,7 +595,7 @@ describe('commands parsed through commander', () => {
         const text = readFileSync(source, 'utf8')
         for (const [, operation] of text.matchAll(/V2_OPERATIONS\.([A-Za-z]+)/g)) {
           const spec = (V2_OPERATIONS as Record<string, OperationSpec>)[operation]
-          if (!spec?.personalKeyOnly) continue
+          if (!spec?.workspaceKeyUnsupported) continue
           const suffixed = new RegExp(`describeOperation\\(\\s*V2_OPERATIONS\\.${operation}\\b`)
           if (suffixed.test(text)) continue
           unsuffixed.push(`${source.slice(root.length + 1)} calls ${operation}`)
@@ -772,8 +1078,8 @@ describe('commands parsed through commander', () => {
   it('runs a workflow without input and keeps output selection distinct from rendering', async () => {
     const help = commandAt('workflows', 'run').helpInformation()
     expect(help).toContain('--select-output <value...>')
-    expect(help).toContain('blockName.field')
-    expect(help).toContain('agent_1.content')
+    expect(help).toContain('blockName.path')
+    expect(help).toContain('childWorkflowId.blockName.path')
     expect(help).not.toContain('--output <value...>')
 
     const [, withoutInput] = await run(
@@ -853,6 +1159,14 @@ describe('commands parsed through commander', () => {
     expect(commandAt('files', 'set-content').helpInformation()).toMatch(
       /--encoding.*utf-8.*base64/s
     )
+  })
+
+  it('documents every exact and anchor-based file edit mode', () => {
+    const help = commandAt('files', 'edit').helpInformation()
+
+    expect(help).toMatch(/--edit.*search_replace.*replace_between.*insert_after.*delete_between/s)
+    expect(help).toContain('replaceAll')
+    expect(help).toContain('occurrence')
   })
 
   it('offers expanded trace output without changing the default summary', () => {
@@ -950,7 +1264,9 @@ describe('commands parsed through commander', () => {
 
   it('supports organization-wide audit listing explicitly', async () => {
     const help = commandAt('audit-logs', 'list').helpInformation()
-    expect(help).toMatch(/--organization <value>.*personal API key required.*required/s)
+    expect(help).toMatch(
+      /--organization <value>.*OAuth login or personal API key required.*required/s
+    )
     expect(help).toContain('--all-workspaces')
     expect(help).toContain('--actor-email')
     expect(help).not.toContain('--actor-id')
@@ -1313,6 +1629,94 @@ describe('contract-selected list rendering', () => {
 })
 
 describe('pagination slot', () => {
+  it.each([
+    { argv: ['files', 'list'], cursors: ['c1', 'c1'] },
+    { argv: ['files', 'list'], cursors: ['c1', 'c2', 'c1'] },
+    { argv: ['tables', 'rows', 'query', 'tbl_1', '--limit', '0'], cursors: ['c1', 'c1'] },
+    { argv: ['logs', 'list', '--cursor', 'c1'], cursors: ['c1'] },
+    { argv: ['tables', 'rows', 'query', 'tbl_1', '--cursor', 'c1'], cursors: ['c1'] },
+  ])(
+    'rejects cursor cycles in $argv without printing partial results',
+    async ({ argv, cursors }) => {
+      mockRequest.mockReset()
+      mockRequest.mockRejectedValue(new Error('Pagination did not stop at the cycle'))
+      for (const nextCursor of cursors) {
+        mockRequest.mockResolvedValueOnce({ data: [{ id: 'r1' }], nextCursor })
+      }
+      const printed = vi.spyOn(console, 'log').mockImplementation(() => {})
+      printed.mockClear()
+
+      await expect(program().parseAsync(['node', 'sim', ...argv])).rejects.toThrow(
+        'repeated pagination cursor'
+      )
+      expect(mockRequest).toHaveBeenCalledTimes(cursors.length)
+      expect(printed).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([
+    ['files', 'list'],
+    ['tables', 'list'],
+    ['workflows', 'list'],
+    ['knowledge', 'list'],
+    ['tools', 'list'],
+  ])('fetches the complete %s %s inventory by default', async (...argv) => {
+    mockRequest.mockReset()
+    const first = Array.from({ length: 100 }, (_, index) => ({ id: `r${index}` }))
+    const second = Array.from({ length: 50 }, (_, index) => ({ id: `r${100 + index}` }))
+    mockRequest
+      .mockResolvedValueOnce({ data: first, nextCursor: 'c1' })
+      .mockResolvedValueOnce({ data: second, nextCursor: null })
+    const printed: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((line: string) => printed.push(line))
+
+    await program().parseAsync(['node', 'sim', ...argv])
+
+    expect(mockRequest).toHaveBeenCalledTimes(2)
+    expect(mockRequest.mock.calls[1][1].query).toMatchObject({ cursor: 'c1', limit: 100 })
+    expect(JSON.parse(printed.join('\n'))).toEqual({
+      data: [...first, ...second],
+      nextCursor: null,
+    })
+  })
+
+  it.each([
+    ['tables', 'rows', 'list', 'tbl_1'],
+    ['tables', 'rows', 'query', 'tbl_1'],
+    ['logs', 'list'],
+    ['knowledge', 'documents', 'list', 'kb_1'],
+    ['knowledge', 'chunks', 'list', 'kb_1', 'doc_1'],
+    ['knowledge', 'connectors', 'documents', 'list', 'kb_1', 'connector_1'],
+    ['workflows', 'runs', 'list', '--workflow', 'wf_1'],
+    ['workflows', 'versions', 'list', 'wf_1'],
+    ['billing', 'logs'],
+    ['audit-logs', 'list', '--organization', 'org_1'],
+  ])('caps large dataset command %j at 100 items by default', async (...argv) => {
+    mockRequest.mockReset()
+    const rows = Array.from({ length: 100 }, (_, index) => ({ id: `r${index}` }))
+    mockRequest
+      .mockResolvedValueOnce({ data: rows, nextCursor: 'c1' })
+      .mockRejectedValue(new Error('The default limit must stop before another page'))
+    const printed: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((line: string) => printed.push(line))
+
+    await program().parseAsync(['node', 'sim', ...argv])
+
+    expect(mockRequest).toHaveBeenCalledTimes(1)
+    expect(JSON.parse(printed.join('\n'))).toEqual({ data: rows, nextCursor: 'c1' })
+
+    mockRequest.mockReset()
+    mockRequest.mockResolvedValueOnce({ data: [{ id: 'r100' }], nextCursor: null })
+    printed.length = 0
+
+    await program().parseAsync(['node', 'sim', ...argv, '--cursor', 'c1'])
+
+    expect(mockRequest).toHaveBeenCalledTimes(1)
+    const options = mockRequest.mock.calls[0][1]
+    expect({ ...options.query, ...options.body }).toMatchObject({ cursor: 'c1', limit: 100 })
+    expect(JSON.parse(printed.join('\n'))).toEqual({ data: [{ id: 'r100' }], nextCursor: null })
+  })
+
   it('pages a body-cursor operation and renders its rows', async () => {
     // `queryRows` is a POST whose cursor is in the body, not the query. Reading
     // only the query made it take the single-request path and print nothing.
@@ -1332,7 +1736,7 @@ describe('pagination slot', () => {
     expect(mockRequest.mock.calls[1][1].body).toMatchObject({ cursor: 'c1' })
     expect(mockRequest.mock.calls[1][1].query).not.toHaveProperty('cursor')
     // And the rows actually render rather than printing an empty record.
-    expect(JSON.parse(lines[0])).toEqual([{ id: 'r1' }, { id: 'r2' }])
+    expect(JSON.parse(lines[0])).toEqual({ data: [{ id: 'r1' }, { id: 'r2' }], nextCursor: null })
   })
 
   it('keeps a query-cursor operation on the query slot', async () => {
@@ -1390,10 +1794,14 @@ describe('pagination slot', () => {
 
   it('reads a limit the way the caller wrote it', async () => {
     mockRequest.mockReset()
-    mockRequest.mockResolvedValue({
-      data: Array.from({ length: 20 }, (_row, index) => ({ id: `f_${index}` })),
-      nextCursor: null,
-    })
+    mockRequest.mockImplementation(
+      async (_path: string, options: { query: { limit: number } }) => ({
+        data: Array.from({ length: Math.min(20, options.query.limit) }, (_row, index) => ({
+          id: `f_${index}`,
+        })),
+        nextCursor: options.query.limit < 20 ? 'c1' : null,
+      })
+    )
     const printed: string[] = []
     vi.spyOn(console, 'log').mockImplementation((line: string) => {
       printed.push(line)
@@ -1401,12 +1809,14 @@ describe('pagination slot', () => {
 
     // `parseInt(…, 10)` stopped at the `x` and read 0, which meant everything.
     await program().parseAsync(['node', 'sim', 'files', 'list', '--limit', '0x10'])
-    expect(JSON.parse(printed[0])).toHaveLength(16)
+    expect(JSON.parse(printed[0]).data).toHaveLength(16)
+    expect(JSON.parse(printed[0]).nextCursor).toBe('c1')
 
     printed.length = 0
     // And stopped at the `e`, reading a single row where 1000 was asked for.
     await program().parseAsync(['node', 'sim', 'files', 'list', '--limit', '1e3'])
-    expect(JSON.parse(printed[0])).toHaveLength(20)
+    expect(JSON.parse(printed[0]).data).toHaveLength(20)
+    expect(JSON.parse(printed[0]).nextCursor).toBeNull()
   })
 
   it('uses a valid per-page size for unlimited and large totals', async () => {
@@ -1419,6 +1829,110 @@ describe('pagination slot', () => {
 
       expect(mockRequest.mock.calls[0][1].query.limit).toBe(100)
     }
+  })
+
+  it.each([
+    { slot: 'query' as const, argv: ['logs', 'list'] },
+    { slot: 'body' as const, argv: ['tables', 'rows', 'query', 'tbl_1'] },
+  ])('returns an accurate cursor after a partial final $slot page', async ({ slot, argv }) => {
+    mockRequest.mockReset()
+    mockRequest.mockImplementation(
+      async (
+        _path: string,
+        options: {
+          query: { limit: number; cursor?: string }
+          body?: { limit: number; cursor?: string }
+        }
+      ) => {
+        const page = options[slot]
+        if (!page) throw new Error(`Missing ${slot} pagination`)
+        const offset = Number(page.cursor ?? 0)
+        const count = Math.min(page.limit, 400 - offset)
+        return {
+          data: Array.from({ length: count }, (_, index) => ({ id: `r${offset + index}` })),
+          nextCursor: offset + count < 400 ? String(offset + count) : null,
+        }
+      }
+    )
+    const printed: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((line: string) => printed.push(line))
+
+    await program().parseAsync(['node', 'sim', ...argv, '--limit', '250'])
+
+    expect(mockRequest.mock.calls.map(([, options]) => options[slot].limit)).toEqual([100, 100, 50])
+    const result = JSON.parse(printed.join('\n'))
+    expect(result.data).toHaveLength(250)
+    expect(result.data[249]).toEqual({ id: 'r249' })
+    expect(result.nextCursor).toBe('250')
+
+    printed.length = 0
+    await program().parseAsync(['node', 'sim', ...argv, '--limit', '0'])
+
+    const complete = JSON.parse(printed.join('\n'))
+    expect(complete.data).toHaveLength(400)
+    expect(complete.nextCursor).toBeNull()
+
+    printed.length = 0
+    const resumeCall = mockRequest.mock.calls.length
+    await program().parseAsync(['node', 'sim', ...argv, '--cursor', result.nextCursor])
+
+    expect(mockRequest.mock.calls[resumeCall][1][slot]).toMatchObject({ cursor: '250', limit: 100 })
+    const resumed = JSON.parse(printed.join('\n'))
+    expect(resumed.data).toHaveLength(100)
+    expect(resumed.data[0]).toEqual({ id: 'r250' })
+    expect(resumed.data[99]).toEqual({ id: 'r349' })
+    expect(resumed.nextCursor).toBe('350')
+
+    printed.length = 0
+    await program().parseAsync([
+      'node',
+      'sim',
+      ...argv,
+      '--cursor',
+      resumed.nextCursor,
+      '--limit',
+      '0',
+    ])
+
+    const remaining = JSON.parse(printed.join('\n'))
+    expect(remaining.data).toHaveLength(50)
+    expect(remaining.data[0]).toEqual({ id: 'r350' })
+    expect(remaining.nextCursor).toBeNull()
+  })
+
+  it.each([
+    ['logs', 'list'],
+    ['tables', 'rows', 'query', 'tbl_1'],
+  ])('rejects blank cursors before requesting %j', async (...argv) => {
+    for (const cursor of ['', ' ', '\t']) {
+      mockRequest.mockReset()
+
+      await expect(
+        program().parseAsync(['node', 'sim', ...argv, '--cursor', cursor])
+      ).rejects.toThrow('--cursor')
+      expect(mockRequest).not.toHaveBeenCalled()
+    }
+  })
+
+  it('does not expose manual cursors on resource inventories', async () => {
+    mockRequest.mockReset()
+
+    await expect(
+      program().parseAsync(['node', 'sim', 'files', 'list', '--cursor', 'c1'])
+    ).rejects.toThrow("unknown option '--cursor'")
+    expect(mockRequest).not.toHaveBeenCalled()
+  })
+
+  it('rejects an oversized page instead of emitting a cursor that skips rows', async () => {
+    mockRequest.mockReset()
+    mockRequest.mockResolvedValue({ data: [{ id: 'a' }, { id: 'b' }], nextCursor: 'c2' })
+    const stdout = vi.spyOn(console, 'log').mockImplementation(() => {})
+    stdout.mockClear()
+
+    await expect(
+      program().parseAsync(['node', 'sim', 'files', 'list', '--limit', '1'])
+    ).rejects.toThrow('nextCursor would skip unreturned items')
+    expect(stdout).not.toHaveBeenCalled()
   })
 })
 
@@ -2152,8 +2666,8 @@ describe('flags the root program already owns', () => {
 
 describe('the billing ledger a key can see', () => {
   /**
-   * The defect was silence, not the scoping: a personal key reports the calling
-   * user's own events and a workspace key the whole workspace ledger, and the
+   * The defect was silence, not the scoping: a user credential reports the
+   * caller's own events and a workspace key the whole workspace ledger, and the
    * two answers were indistinguishable — same workspace, same window, same
    * flags, a strictly smaller result and nothing saying why.
    */
@@ -2217,7 +2731,7 @@ describe('the billing ledger a key can see', () => {
 describe('a list that is not the whole answer', () => {
   /** Captures stderr for one invocation, in one output format. */
   async function noteFor(
-    format: 'table' | 'text' | 'json',
+    format: 'table' | 'text' | 'json' | 'yaml',
     argv: string[],
     response: unknown
   ): Promise<string> {
@@ -2238,19 +2752,14 @@ describe('a list that is not the whole answer', () => {
     return errors.join('')
   }
 
-  /**
-   * `sim tools list` answered 100 rows of 4708 with exit 0 and an empty
-   * stderr, in every format — a clipped inventory that read as the inventory.
-   */
-  it('says so, once, on stderr, in every format', async () => {
-    for (const format of ['table', 'text', 'json'] as const) {
+  it('does not announce remaining pages in any format', async () => {
+    for (const format of ['table', 'text', 'json', 'yaml'] as const) {
       const note = await noteFor(format, ['tools', 'list', '--limit', '2'], {
         data: [{ id: 'a' }, { id: 'b' }],
         nextCursor: 'c1',
       })
 
-      expect(note).toContain('more results exist')
-      expect(note).toContain('--limit 0')
+      expect(note).toBe('')
     }
   })
 
@@ -2265,8 +2774,8 @@ describe('a list that is not the whole answer', () => {
 
   /**
    * The server clips an inventory itself and says so on the envelope, which the
-   * CLI dropped: `--output json` prints `data` alone, so a reconciling caller
-   * could not tell a clipped list from a complete one.
+   * CLI reports separately from data and nextCursor so a reconciling caller
+   * can distinguish a clipped inventory from a complete one.
    */
   it('carries a truncation the server stated on the envelope', async () => {
     const paged = await noteFor('json', ['workflow-mcp-servers', 'list'], {
@@ -2318,7 +2827,7 @@ describe('a list that is not the whole answer', () => {
     expect(errors.join('')).toContain('tool names truncated')
   })
 
-  it('leaves the rows on stdout exactly as they were', async () => {
+  it('includes the remaining cursor alongside the rows', async () => {
     const lines: string[] = []
     mockRequest.mockReset()
     mockRequest.mockResolvedValue({ data: [{ id: 'a' }, { id: 'b' }], nextCursor: 'c1' })
@@ -2329,6 +2838,9 @@ describe('a list that is not the whole answer', () => {
 
     await program().parseAsync(['node', 'sim', 'tools', 'list', '--limit', '2'])
 
-    expect(JSON.parse(lines.join('\n'))).toEqual([{ id: 'a' }, { id: 'b' }])
+    expect(JSON.parse(lines.join('\n'))).toEqual({
+      data: [{ id: 'a' }, { id: 'b' }],
+      nextCursor: 'c1',
+    })
   })
 })

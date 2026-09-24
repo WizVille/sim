@@ -13,8 +13,10 @@ import { describeModelLevel } from '@/providers/utils'
 describe('buildThinkingConfig', () => {
   it('requests summarized display for omitted-display models on agent-events runs', () => {
     for (const model of [
+      'claude-fable-5-1',
       'claude-fable-5',
       'claude-sonnet-5',
+      'claude-opus-5-5',
       'claude-opus-5',
       'claude-opus-4-8',
       'claude-opus-4-7',
@@ -27,8 +29,10 @@ describe('buildThinkingConfig', () => {
 
   it('never adds display on legacy runs (no agent events)', () => {
     for (const model of [
+      'claude-fable-5-1',
       'claude-fable-5',
       'claude-sonnet-5',
+      'claude-opus-5-5',
       'claude-opus-5',
       'claude-opus-4-8',
       'claude-opus-4-7',

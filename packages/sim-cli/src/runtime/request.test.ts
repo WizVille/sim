@@ -134,6 +134,12 @@ describe('buildRequest', () => {
     })
   })
 
+  it('preserves the literal word null on string flags', () => {
+    expect(
+      buildRequest('updateWorkflow', ['wf_1'], { description: 'null' }, WORKSPACE).body
+    ).toEqual({ description: 'null' })
+  })
+
   describe('failures, all before any network call', () => {
     it('rejects a missing path arg', () => {
       expect(() => buildRequest('getTable', [], {}, WORKSPACE)).toThrow('Missing <tableId>')
@@ -271,6 +277,15 @@ describe('buildRequest', () => {
       )
     })
 
+    it.each(['Infinity', '-Infinity', '1e999'])(
+      'rejects non-finite numeric input %s before JSON can turn it into null',
+      (minCost) => {
+        expect(() => buildRequest('listLogs', [], { minCost }, WORKSPACE)).toThrow(
+          '--min-cost must be a finite number'
+        )
+      }
+    )
+
     it('explains an unset workspace in terms of how to set one', () => {
       expect(() => buildRequest('listTables', [], {}, null)).toThrow(SimApiError)
       expect(() => buildRequest('listTables', [], {}, null)).toThrow(
@@ -375,6 +390,44 @@ describe('repeated flags encode per the field kind, not uniformly', () => {
       /empty value on line 2/
     )
     rmSync(path)
+  })
+
+  /**
+   * A requirements file is passed as it is on disk: its blank lines and `#`
+   * comments are structure, not values, and the API ignores both. Only a
+   * manifest list reads a file this way; an id list keeps refusing a blank
+   * line, because there it is a typo.
+   */
+  it('skips blank lines and # comments in a manifest list file', () => {
+    const path = join(tmpdir(), 'sim-cli-requirements.txt')
+    writeFileSync(
+      path,
+      '# pinned for the ETL job\npandas==2.2.2\n\n  # transitive, kept explicit\nrequests\n'
+    )
+    expect(
+      coerce(`@${path}`, { kind: 'array' }, { list: true, manifest: true }, 'dependencies')
+    ).toEqual(['pandas==2.2.2', 'requests'])
+    rmSync(path)
+  })
+
+  it('refuses a manifest file that carries only comments', () => {
+    const path = join(tmpdir(), 'sim-cli-requirements-empty.txt')
+    writeFileSync(path, '# nothing yet\n\n')
+    expect(() =>
+      coerce(`@${path}`, { kind: 'array' }, { list: true, manifest: true }, 'dependencies')
+    ).toThrow(/contains no values/)
+    rmSync(path)
+  })
+
+  it('keeps an inline # value on a manifest list', () => {
+    expect(
+      coerce(
+        ['# not a comment here'],
+        { kind: 'array' },
+        { list: true, manifest: true },
+        'dependencies'
+      )
+    ).toEqual(['# not a comment here'])
   })
 })
 
@@ -500,6 +553,24 @@ describe('folder paths are typed by the name the app shows', () => {
   it('encodes every value of the repeatable folder filter before joining them', () => {
     const built = buildRequest('listLogs', [], { folder: ['/a b', '/c'] }, WORKSPACE)
     expect(built.query.folderPaths).toBe('/a%20b,/c')
+  })
+
+  it('encodes and joins every folder in a file-content search', () => {
+    const built = buildRequest(
+      'searchFileContent',
+      [],
+      {
+        query: 'quarterly',
+        folder: ['/Q1 reports', '/Finance,Legal'],
+        includeSubfolders: false,
+      },
+      WORKSPACE
+    )
+
+    expect(built.query).toMatchObject({
+      folderPaths: '/Q1%20reports,/Finance%2CLegal',
+      includeSubfolders: false,
+    })
   })
 
   it('leaves a field the contract has not marked untouched', () => {

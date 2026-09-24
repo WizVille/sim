@@ -238,6 +238,17 @@ export function withMissingFieldMessage<TSchema extends z.ZodString>(
 export const MAX_ID_LENGTH = 128
 
 /**
+ * Bound for an OAuth `code` callback parameter.
+ *
+ * Authorization codes have no length ceiling in RFC 6749, and providers differ by
+ * orders of magnitude: Slack's are tens of characters while Atlassian returns a
+ * signed JWT that routinely exceeds 2KB. The bound exists to keep an unbounded
+ * string out of a token exchange, so it is sized above the largest real code
+ * rather than around any one provider.
+ */
+export const MAX_OAUTH_CODE_LENGTH = 8192
+
+/**
  * Builds a required, non-empty string schema whose message covers **both**
  * failure modes.
  *
@@ -325,6 +336,32 @@ export const workspaceFileIdSchema = requiredFieldSchema('File ID is required')
   .regex(/^[A-Za-z0-9_-]+$/, 'Invalid file id')
 
 /**
+ * Upper bound of a Postgres `integer` column, the type every version number is stored as. A larger
+ * value has no row to address and overflows the comparison instead of missing, so every schema
+ * carrying a version — path param, request body, or cursor payload — must be bounded by this.
+ */
+export const INT4_MAX = 2147483647
+
+/** A version number in a body or cursor, bounded to the range its column can hold. */
+export const versionNumberSchema = z
+  .number()
+  .int('version must be an integer')
+  .min(1, 'version must be a positive integer')
+  .max(INT4_MAX, 'version is out of range')
+
+/**
+ * A version number arriving as a path segment. Coerced and bounded here rather than piped through
+ * a body schema, because a `ZodPipe` publishes none of its constraints to the generated OpenAPI
+ * document, which would leave the documented parameter unbounded even though the runtime check
+ * holds.
+ */
+export const versionNumberPathSchema = z.coerce
+  .number()
+  .int()
+  .positive()
+  .max(INT4_MAX, 'version is out of range')
+
+/**
  * Reference to an image embedded in a document: either a workspace storage `key`
  * (serve-URL embeds) or a workspace file `id` (view-URL embeds) — exactly one. Shared
  * by the in-app and public inline-image routes, which resolve it within a workspace.
@@ -371,6 +408,8 @@ export const userFileSchema = z
     key: z.string().min(1),
     context: z.string().optional(),
     base64: z.string().optional(),
+    /** Workspace file version these bytes came from; absent on files with no version history. */
+    version: versionNumberSchema.optional(),
   })
   .passthrough()
 
@@ -522,6 +561,7 @@ export const retentionOverrideSchema = z.object({
   logRetentionHours: retentionOverrideHoursSchema,
   softDeleteRetentionHours: retentionOverrideHoursSchema,
   taskCleanupHours: retentionOverrideHoursSchema,
+  fileVersionRetentionHours: retentionOverrideHoursSchema,
 })
 
 export type RetentionOverride = z.output<typeof retentionOverrideSchema>
@@ -555,3 +595,39 @@ export const booleanQueryFlagSchema = z.preprocess(
   },
   z.boolean({ error: 'must be a boolean (true/false)' })
 )
+
+/**
+ * An optional numeric query parameter that treats a present-but-empty value as
+ * omitted.
+ *
+ * `z.coerce.number().optional()` does not: a query string carrying `?minCost=`
+ * reaches the schema as `''`, `Number('')` is `0`, and the parameter arrives as
+ * a real zero. That is wrong twice — `maxCost=` silently narrows the page to
+ * free runs, and `minCost=` reads as a cost *selector*, which is what
+ * `assertLogCostQueryAllowed` refuses for a member whose group withholds spend.
+ * An empty value is a caller sending an unfilled form field, not a question
+ * about cost.
+ *
+ * `null` is dropped for the same reason and by the same arithmetic: a client
+ * that spells an unset bound as `null` rather than by omitting the key —
+ * `requestJson` parses the query object client-side, so a `null` field reaches
+ * this schema as itself — would otherwise be handed `Number(null) === 0`.
+ *
+ * An explicit `0` is preserved: `?minCost=0` is a real bound the caller typed.
+ */
+export const optionalNumberQuerySchema = z.preprocess((value) => {
+  if (value === null) return undefined
+  return typeof value === 'string' && value.trim() === '' ? undefined : value
+}, z.coerce.number().optional())
+
+/** Exactly one routed owner for resources shared by Search surfaces. */
+export const resourceOwnerSchema = z
+  .object({
+    workspaceId: workspaceIdSchema.optional(),
+    organizationId: organizationIdSchema.optional(),
+  })
+  .refine((owner) => Boolean(owner.workspaceId) !== Boolean(owner.organizationId), {
+    message: 'Provide exactly one workspaceId or organizationId',
+    path: ['workspaceId'],
+  })
+export type ResourceOwnerInput = z.input<typeof resourceOwnerSchema>

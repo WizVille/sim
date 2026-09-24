@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChipTag, Combobox, type ComboboxOption } from '@sim/emcn'
 import { generateId } from '@sim/utils/id'
 import { isRecordLike } from '@sim/utils/object'
@@ -6,6 +6,8 @@ import {
   NO_DENIED_OPERATIONS,
   OPERATION_SUBBLOCK_ID,
 } from '@/lib/permission-groups/operation-access'
+import type { SelectorKey } from '@/lib/selectors/manifest'
+import { SEARCH_DEBOUNCE_MS } from '@/lib/url-state'
 import { getDependsOnFields } from '@/lib/workflows/subblocks/dependencies'
 import { staleSelectionOptions } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/dropdown/stale-selections'
 import { formatDisplayText } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/formatted-text'
@@ -16,7 +18,8 @@ import { useActiveSearchTarget } from '@/app/workspace/[workspaceId]/w/[workflow
 import { getBlock } from '@/blocks/registry'
 import type { SubBlockConfig } from '@/blocks/types'
 import { ResponseBlockHandler } from '@/executor/handlers/response/response-handler'
-import type { SelectorKey } from '@/hooks/selectors/types'
+import { useWorkspaceOrganizationAccounts } from '@/hooks/queries/organization-accounts'
+import { useDebounce } from '@/hooks/use-debounce'
 import { useOperationAccess } from '@/hooks/use-operation-access'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
 import { useSubBlockStore } from '@/stores/workflows/subblock/store'
@@ -121,6 +124,15 @@ export const Dropdown = memo(function Dropdown({
   const dependsOnFields = useMemo(() => getDependsOnFields(dependsOn), [dependsOn])
 
   const blockType = useWorkflowStore((state) => state.blocks[blockId]?.type)
+  const workspaceId = useWorkflowRegistry((state) => state.hydration.workspaceId)
+  const organizationAccounts = useWorkspaceOrganizationAccounts(
+    workspaceId ?? undefined,
+    blockType === 'credential' && subBlockId === OPERATION_SUBBLOCK_ID
+  )
+  const hideOrganizationOperations =
+    blockType === 'credential' &&
+    subBlockId === OPERATION_SUBBLOCK_ID &&
+    organizationAccounts.data?.allowed !== true
   const blockConfig = blockType ? getBlock(blockType) : null
 
   const previousModeRef = useRef<string | null>(null)
@@ -156,22 +168,36 @@ export const Dropdown = memo(function Dropdown({
     return options ?? EMPTY_OPTIONS
   }, [options, blockValues])
 
+  const [selectorSearch, setSelectorSearch] = useState('')
+  const debouncedSelectorSearch = useDebounce(selectorSearch.trim(), SEARCH_DEBOUNCE_MS)
+  const activeSelectorSearch = selectorSearch.trim() === '' ? '' : debouncedSelectorSearch
+
   const {
     fetchedOptions,
     isLoadingOptions,
+    isFetchingMore,
+    isLoadingAll,
+    hasMore,
+    truncated,
     hasLoadedOptions,
     fetchError,
     hydratedOption,
+    hydratedOptions,
     isDynamic,
+    loadMore,
+    loadAll,
     refetch: refetchOptions,
   } = useFetchedOptions({
     blockId,
+    subBlockId,
     dependsOnFields,
     selectorKey,
     selectorExcludeSelf,
     isPreview: Boolean(isPreview),
     disabled: Boolean(disabled),
+    search: activeSelectorSearch,
     valueToHydrate: singleValue,
+    valuesToHydrate: multiValues ?? undefined,
     localOptions: evaluatedOptions,
   })
 
@@ -204,6 +230,13 @@ export const Dropdown = memo(function Dropdown({
       }
     }
 
+    for (const option of [...hydratedOptions].reverse()) {
+      const alreadyPresent = opts.some((existing) =>
+        typeof existing === 'string' ? existing === option.id : existing.id === option.id
+      )
+      if (!alreadyPresent) opts = [option, ...opts]
+    }
+
     // A multi-select can only drop a value by clicking its row; a selection the
     // loaded list no longer carries gets one so it can be removed in place.
     if (multiValues && isDynamic) {
@@ -222,6 +255,7 @@ export const Dropdown = memo(function Dropdown({
     normalizedFetchedOptions,
     evaluatedOptions,
     hydratedOption,
+    hydratedOptions,
     multiValues,
     hasLoadedOptions,
   ])
@@ -250,10 +284,19 @@ export const Dropdown = memo(function Dropdown({
         label: toLabel(opt.label),
         value: opt.id,
         icon: 'icon' in opt ? opt.icon : undefined,
-        hidden: opt.hidden || deniedOperationIds.has(opt.id),
+        hidden:
+          opt.hidden ||
+          deniedOperationIds.has(opt.id) ||
+          (hideOrganizationOperations &&
+            [
+              'find_organization_account',
+              'list_organization_accounts',
+              'find_organization_mcp_connection',
+              'list_organization_mcp_connections',
+            ].includes(opt.id)),
       }
     })
-  }, [allOptions, deniedOperationIds, preserveLabelCase])
+  }, [allOptions, deniedOperationIds, preserveLabelCase, hideOrganizationOperations])
 
   const optionMap = useMemo(() => {
     return new Map(comboboxOptions.map((opt) => [opt.value, opt.label]))
@@ -480,8 +523,15 @@ export const Dropdown = memo(function Dropdown({
       overlayContent={multiSelectOverlay ?? singleSelectOverlay}
       multiSelect={multiSelect}
       isLoading={isLoadingOptions}
+      isLoadingMore={isFetchingMore}
+      isLoadingAll={isLoadingAll}
+      hasMore={hasMore}
+      truncated={truncated}
+      onLoadMore={loadMore}
+      onLoadAll={loadAll}
       error={fetchError}
       searchable={isSearchable}
+      onSearchChange={setSelectorSearch}
       searchPlaceholder='Search...'
     />
   )

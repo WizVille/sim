@@ -1,21 +1,22 @@
 import { createLogger } from '@sim/logger'
 import { isLoopbackIp, unwrapIpv6Brackets } from '@sim/security/ssrf'
-import { describeError, findCause, getErrorMessage, toError } from '@sim/utils/errors'
+import { describeError, getErrorMessage, toError } from '@sim/utils/errors'
 import { sleep } from '@sim/utils/helpers'
 import { isPlainRecord, isRecordLike } from '@sim/utils/object'
 import { backoffWithJitter, parseRetryAfter } from '@sim/utils/retry'
-import { DrizzleQueryError } from 'drizzle-orm/errors'
+import { ApiClientError } from '@/lib/api/client/errors'
+import { requestJson } from '@/lib/api/client/request'
 import type { FunctionExecuteBody } from '@/lib/api/contracts'
-import { MANAGED_OAUTH_DELEGATION_HEADER } from '@/lib/api/contracts/oauth-connections'
+import { oauthTokenPostContract } from '@/lib/api/contracts/oauth-connections'
 import { getBYOKKey } from '@/lib/api-key/byok'
-import { generateInternalToken, type InternalSandboxProfile } from '@/lib/auth/internal'
+import type { InternalSandboxProfile } from '@/lib/auth/internal'
 import {
   BILLING_ATTRIBUTION_HEADER,
   type BillingAttributionSnapshot,
   serializeBillingAttributionHeader,
 } from '@/lib/billing/core/billing-attribution'
 import { isHosted } from '@/lib/core/config/env-flags'
-import { isRetryableInfrastructureError } from '@/lib/core/errors/retryable-infrastructure'
+import { findDatabaseQueryError } from '@/lib/core/errors/database-query-error'
 import {
   createTimeoutAbortController,
   DEFAULT_EXECUTION_TIMEOUT_MS,
@@ -35,7 +36,7 @@ import {
   readResponseToBufferWithLimit,
 } from '@/lib/core/utils/stream-limits'
 import { getBaseUrl, getInternalApiBaseUrl } from '@/lib/core/utils/urls'
-import { isUserFile } from '@/lib/core/utils/user-file'
+import { collectUserFilesById, isUserFile } from '@/lib/core/utils/user-file'
 import { isSameOrigin } from '@/lib/core/utils/validation'
 import { SIM_VIA_HEADER, serializeCallChain } from '@/lib/execution/call-chain'
 import {
@@ -67,17 +68,23 @@ import {
 } from '@/lib/execution/private-tool-metadata'
 import { buildWorkflowVariableHeaders } from '@/lib/execution/workflow-variable-headers'
 import { executeFunctionTool } from '@/lib/internal/function/execute'
+import { createInternalToolFileResult } from '@/lib/internal/tool-operations/file-result'
+import {
+  presentInternalToolOperationResult,
+  storeInternalToolFileResult,
+} from '@/lib/internal/tool-operations/file-result.server'
 import { getInternalToolOperationHandler } from '@/lib/internal/tool-operations/registry.server'
+import { MAX_TOOL_RESPONSE_BODY_BYTES } from '@/lib/internal/tool-operations/response-limits'
 import type { InternalToolOperationContext } from '@/lib/internal/tool-operations/types'
 import { hostedKeyMetrics } from '@/lib/monitoring/metrics'
 import type { CredentialTokenPayload } from '@/lib/oauth/token-resolution'
 import { resolveWorkspaceFileReference } from '@/lib/uploads/contexts/workspace/workspace-file-manager'
 import { markWorkspaceFileSecretProvenanceUnknown } from '@/lib/uploads/contexts/workspace/workspace-file-secret-provenance'
+import { MAX_FILE_SIZE } from '@/lib/uploads/utils/validation'
 import { assertPermissionsAllowed } from '@/ee/access-control/utils/permission-check'
 import { isCustomTool, isMcpTool } from '@/executor/constants'
 import { resolveSkillContent } from '@/executor/handlers/agent/skills-resolver'
 import type { ExecutionContext, UserFile } from '@/executor/types'
-import { buildExecutorDelegationHeaders } from '@/executor/utils/http'
 import { resolveEnvVarReferences } from '@/executor/utils/reference-validation'
 import { projectResolvedSecretDiagnosticContent } from '@/executor/utils/resolved-secret-content-projection'
 import {
@@ -96,7 +103,6 @@ import type {
   BYOKProviderId,
   ExecutableToolConfig,
   InternalToolConfig,
-  OAuthTokenPayload,
   ToolConfig,
   ToolDefinition,
   ToolHostingPricing,
@@ -111,8 +117,6 @@ const logger = createLogger('Tools')
 const PRIVATE_TOOL_METADATA_ERROR_MESSAGE = 'Internal tool response metadata could not be verified'
 const INTERNAL_DATABASE_ERROR_MESSAGE =
   'An internal error occurred while executing the tool. Please try again.'
-const PERMISSION_PREFLIGHT_MAX_ATTEMPTS = 3
-const PERMISSION_PREFLIGHT_RETRY_BACKOFF = { baseMs: 25, maxMs: 100 } as const
 
 function projectToolLogMetadata(
   metadata: Record<string, unknown>,
@@ -129,52 +133,18 @@ function projectToolLogMetadata(
     : { ...structuralFallback, redacted: true }
 }
 
-interface ToolPermissionPreflight {
-  userId: string
-  workspaceId: string
-  toolId: string
-  toolKind?: 'skill' | 'custom' | 'mcp'
-  ctx?: ExecutionContext
-  requestId: string
-  signal?: AbortSignal
-}
-
-async function assertToolPermissionsWithRetry({
-  requestId,
-  signal,
-  ...permission
-}: ToolPermissionPreflight): Promise<void> {
-  for (let attempt = 1; ; attempt += 1) {
-    signal?.throwIfAborted()
-    try {
-      await assertPermissionsAllowed(permission)
-      return
-    } catch (error) {
-      signal?.throwIfAborted()
-      const isDatabaseQueryError = Boolean(
-        findCause(error, (cause): cause is DrizzleQueryError => cause instanceof DrizzleQueryError)
-      )
-      if (
-        attempt >= PERMISSION_PREFLIGHT_MAX_ATTEMPTS ||
-        !isDatabaseQueryError ||
-        !isRetryableInfrastructureError(error)
-      ) {
-        throw error
-      }
-
-      const delayMs = backoffWithJitter(attempt, null, PERMISSION_PREFLIGHT_RETRY_BACKOFF)
-      logger.warn(`[${requestId}] Retrying tool permission preflight after database error`, {
-        toolId: permission.toolId,
-        attempt,
-        maxAttempts: PERMISSION_PREFLIGHT_MAX_ATTEMPTS,
-        delayMs,
-        cause: describeError(error),
-      })
-      await sleep(delayMs)
-      signal?.throwIfAborted()
-    }
-  }
-}
+/**
+ * Which environment-variable reference forms a caller's `user-only` params may use.
+ *
+ * Split out of `copilotToolExecution` because the two questions are not the same
+ * one. `explicit-and-bare` also reads a bare identifier as a variable name when a
+ * variable by that name exists, which is right for a model that improvises
+ * reference syntax and wrong for a caller that types the value: a real credential
+ * matching the identifier pattern and colliding with a variable name would be
+ * silently swapped for a different secret. A surface picks the form it can
+ * defend rather than inheriting the model's.
+ */
+export type ToolEnvReferenceMode = 'off' | 'explicit' | 'explicit-and-bare'
 
 interface ToolExecutionScope {
   workspaceId?: string
@@ -186,6 +156,7 @@ interface ToolExecutionScope {
   isDeployedContext?: boolean
   enforceCredentialAccess?: boolean
   copilotToolExecution?: boolean
+  envReferenceMode?: ToolEnvReferenceMode
   billingAttribution?: BillingAttributionSnapshot
 }
 
@@ -209,6 +180,17 @@ function resolveToolScope(
     copilotToolExecution: (executionContext?.copilotToolExecution ?? ctx?.copilotToolExecution) as
       | boolean
       | undefined,
+    /**
+     * Defaults to what the surface's other flag already implied, so every
+     * existing caller keeps its behavior: Copilot resolves both forms, and a
+     * workflow run resolves neither because the executor substitutes variables
+     * before a tool ever sees them.
+     */
+    envReferenceMode:
+      (ctx?.envReferenceMode as ToolEnvReferenceMode | undefined) ??
+      ((executionContext?.copilotToolExecution ?? ctx?.copilotToolExecution)
+        ? 'explicit-and-bare'
+        : 'off'),
     billingAttribution: (executionContext?.metadata.billingAttribution ??
       ctx?.billingAttribution) as BillingAttributionSnapshot | undefined,
   }
@@ -223,6 +205,7 @@ function createInternalToolOperationContext(
     executionId: context.executionId,
     userId: context.userId,
     executorDelegationOrigin: context.executorDelegationOrigin,
+    mcpBlockId: context.mcpBlockId,
     copilotToolExecution: context.copilotToolExecution,
     billingAttribution: context.metadata.billingAttribution,
     callChain: context.callChain,
@@ -243,6 +226,7 @@ function toUserFileFromWorkspaceRecord(record: {
   size: number
   type: string
   key: string
+  currentVersion?: number
 }): UserFile {
   return {
     id: record.id,
@@ -252,13 +236,47 @@ function toUserFileFromWorkspaceRecord(record: {
     type: record.type,
     key: record.key,
     context: 'workspace',
+    // Only a record read together with its version carries one; see resolveWorkspaceFileReference.
+    ...(record.currentVersion === undefined ? {} : { version: record.currentVersion }),
   }
 }
 
-async function resolveCopilotFileReference(
+/**
+ * Files this execution has already produced or consumed, indexed by id.
+ *
+ * Seeded from prior block outputs and extended as each tool result is processed,
+ * so a file an agent saw earlier in the same turn resolves even though it exists
+ * in no block state and no workspace row.
+ */
+function getExecutionFileIndex(executionContext?: ExecutionContext): Map<string, UserFile> {
+  if (!executionContext) return new Map()
+  if (!executionContext.executionFilesById) {
+    executionContext.executionFilesById = collectUserFilesById(
+      Object.fromEntries(executionContext.blockStates ?? new Map())
+    )
+  }
+  return executionContext.executionFilesById
+}
+
+/** Registers files a tool just produced so a later call can name them by id. */
+function recordExecutionFiles(
+  executionContext: ExecutionContext | undefined,
+  value: unknown
+): void {
+  if (!executionContext) return
+  const index = getExecutionFileIndex(executionContext)
+  for (const [id, file] of collectUserFilesById(value)) {
+    // First occurrence wins, matching collectUserFilesById, so a file echoed
+    // through several results keeps one record.
+    if (!index.has(id)) index.set(id, file)
+  }
+}
+
+async function resolveFileReference(
   value: unknown,
-  workspaceId: string,
-  paramId: string
+  scope: ToolExecutionScope,
+  paramId: string,
+  executionContext?: ExecutionContext
 ): Promise<UserFile | unknown> {
   if (isUserFile(value)) {
     return value
@@ -277,10 +295,21 @@ async function resolveCopilotFileReference(
     return value
   }
 
-  const fileRecord = await resolveWorkspaceFileReference(workspaceId, referenceId)
+  // Tried before the workspace lookup because an execution-scoped file — a tool
+  // result from earlier in this run — has no workspace row to find.
+  const executionFile = getExecutionFileIndex(executionContext).get(referenceId)
+  if (executionFile) {
+    return executionFile
+  }
+
+  if (!scope.workspaceId) {
+    throw new Error(`Missing workspaceId while resolving file parameter "${paramId}"`)
+  }
+
+  const fileRecord = await resolveWorkspaceFileReference(scope.workspaceId, referenceId)
   if (!fileRecord) {
     throw new Error(
-      `Could not resolve workspace file reference "${referenceId}" for parameter "${paramId}"`
+      `Could not resolve file reference "${referenceId}" for parameter "${paramId}". Pass a file id from an earlier tool result, or a canonical workspace file id.`
     )
   }
 
@@ -297,15 +326,20 @@ async function resolveCopilotFileReference(
   }
 }
 
-async function normalizeCopilotFileParams(
+/**
+ * Hydrates file params supplied by reference into full file objects.
+ *
+ * Runs on every surface, not just Copilot: a model cannot synthesize the `key`
+ * and `url` a file object carries, so by-reference is the only way any model can
+ * pass one. Resolution merely selects a file — the read itself is still
+ * authorized downstream, so naming an id grants nothing on its own.
+ */
+async function normalizeFileParams(
   tool: ToolDefinition,
   params: Record<string, unknown>,
-  scope: ToolExecutionScope
+  scope: ToolExecutionScope,
+  executionContext?: ExecutionContext
 ): Promise<void> {
-  if (!scope.copilotToolExecution) {
-    return
-  }
-
   for (const [paramId, paramDef] of Object.entries(tool.params || {})) {
     const paramType = paramDef?.type
     const currentValue = params[paramId]
@@ -314,60 +348,61 @@ async function normalizeCopilotFileParams(
     }
 
     if (paramType === 'file') {
-      if (!scope.workspaceId) {
-        throw new Error(`Missing workspaceId while resolving file parameter "${paramId}"`)
-      }
-      params[paramId] = await resolveCopilotFileReference(currentValue, scope.workspaceId, paramId)
+      params[paramId] = await resolveFileReference(currentValue, scope, paramId, executionContext)
       continue
     }
 
     if (paramType === 'file[]') {
-      if (!scope.workspaceId) {
-        throw new Error(`Missing workspaceId while resolving file parameter "${paramId}"`)
-      }
-
       const values = Array.isArray(currentValue) ? currentValue : [currentValue]
       params[paramId] = await Promise.all(
-        values.map((item) => resolveCopilotFileReference(item, scope.workspaceId!, paramId))
+        values.map((item) => resolveFileReference(item, scope, paramId, executionContext))
       )
     }
   }
 }
 
 /**
- * Resolves whole-value {{ENV_VAR}} references in user-only params for copilot
- * tool executions. Chat agents never see secret values (the workspace VFS
- * exposes env var names only), so they pass references; workflow runs resolve
- * these in the executor, and this is the equivalent step for direct tool
- * calls, delegating to the executor's resolver so both paths share one set of
- * reference semantics. Resolution is deliberately restricted to params
- * declared `visibility: 'user-only'` (API keys and other operator-supplied
- * secrets) and to values that are exactly one reference, so LLM-writable
- * params (URLs, headers, bodies) can never be used to extract secret values.
+ * Resolves whole-value {{ENV_VAR}} references in user-only params, for the
+ * surfaces whose {@link ToolEnvReferenceMode} asks for it.
+ *
+ * Neither surface that uses it should be holding the secret. Chat agents never
+ * see secret values (the workspace VFS exposes env var names only), and an API
+ * caller writing a tool call into a script or a CI step would otherwise put a
+ * live credential on the command line. Workflow runs resolve these in the
+ * executor, and this is the equivalent step for direct tool calls, delegating
+ * to the executor's resolver so every path shares one set of reference
+ * semantics. Resolution is deliberately restricted to params declared
+ * `visibility: 'user-only'` (API keys and other operator-supplied secrets) and
+ * to values that are exactly one reference, so LLM-writable params (URLs,
+ * headers, bodies) can never be used to extract secret values.
  *
  * Mutates only the given params object — callers pass the per-execution copy,
  * never the copilot-side tool-call state, so decrypted values cannot leak
  * into failure logs or persisted chat state.
  */
-async function resolveCopilotEnvReferences(
+async function resolveToolEnvReferences(
   tool: ToolDefinition,
   params: Record<string, unknown>,
   scope: ToolExecutionScope,
   resolvedSecretTraceRegistry?: ResolvedSecretTraceRegistry
 ): Promise<void> {
-  if (!scope.copilotToolExecution) {
+  const mode = scope.envReferenceMode ?? 'off'
+  if (mode === 'off') {
     return
   }
 
-  // Models improvise reference syntax: after `{{NAME}}`, the bare variable
-  // name is the common fallback — it previously went upstream as the literal
-  // credential and failed with an undiagnosable 401. `{{NAME}}` is the one
-  // explicit reference form, so a missing variable is a hard error. A bare
-  // name is a reference only when a variable by that exact name exists
-  // (`soft`): plenty of real API keys match the identifier pattern, and
-  // those must pass through verbatim. `$NAME` is deliberately NOT a
-  // reference — real credentials can start with `$`, and a secret must never
-  // be reinterpreted as a lookup.
+  // `{{NAME}}` is the one explicit reference form, so a missing variable is a
+  // hard error. Anything else is a literal and goes upstream verbatim, which is
+  // what lets a caller pass a real secret in the same field.
+  //
+  // Models improvise reference syntax: after `{{NAME}}`, the bare variable name
+  // is the common fallback — it previously went upstream as the literal
+  // credential and failed with an undiagnosable 401. So under
+  // `explicit-and-bare` a bare name is a reference too, but only when a variable
+  // by that exact name exists (`soft`), since plenty of real API keys match the
+  // identifier pattern. `$NAME` is deliberately NOT a reference — real
+  // credentials can start with `$`, and a secret must never be reinterpreted as
+  // a lookup.
   const pending: Array<{ paramId: string; value: string; soft?: boolean }> = []
   for (const [paramId, paramDef] of Object.entries(tool.params || {})) {
     if (paramDef?.visibility !== 'user-only') continue
@@ -377,7 +412,7 @@ async function resolveCopilotEnvReferences(
       pending.push({ paramId, value })
       continue
     }
-    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+    if (mode === 'explicit-and-bare' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
       pending.push({ paramId, value: `{{${value}}}`, soft: true })
     }
   }
@@ -394,8 +429,10 @@ async function resolveCopilotEnvReferences(
 
   const completePendingActivation = resolvedSecretTraceRegistry?.beginPendingActivation()
   try {
-    const { getEffectiveDecryptedEnv } = await import('@/lib/environment/utils')
-    const envVars = await getEffectiveDecryptedEnv(scope.userId, scope.workspaceId)
+    const environmentScope = { userId: scope.userId, workspaceId: scope.workspaceId }
+    const { getEffectiveEnvironmentSnapshot } = await import('@/lib/environment/utils')
+    const environment = await getEffectiveEnvironmentSnapshot(scope.userId, scope.workspaceId)
+    const envVars = { ...environment.personalDecrypted, ...environment.workspaceDecrypted }
 
     for (const { paramId, value, soft } of pending) {
       const missingKeys: string[] = []
@@ -403,9 +440,12 @@ async function resolveCopilotEnvReferences(
         allowEmbedded: false,
         missingKeys,
         onResolved: (name, resolvedValue) => {
-          resolvedSecretTraceRegistry?.recordResolvedAtInputPath(name, resolvedValue, [paramId], {
-            propagated: true,
-          })
+          resolvedSecretTraceRegistry?.recordResolvedFromEnvironment(
+            name,
+            resolvedValue,
+            { ...environment, scope: environmentScope },
+            { path: [paramId], propagated: true }
+          )
         },
       })
       if (missingKeys.length > 0) {
@@ -467,6 +507,28 @@ function enforceCopilotCredentialSelection(
   throw new Error(
     `Copilot must pass credentialId for ${toolLabel}. Read environment/credentials.json and pass the exact credentialId for provider "${tool.oauth.provider}".`
   )
+}
+
+/** Protects only the account secrets resolved for this Assistant call, including provider reflections. */
+async function registerAssistantCredentialSecrets(
+  registry: ResolvedSecretTraceRegistry | undefined,
+  tokens: readonly (string | undefined)[]
+): Promise<void> {
+  if (typeof window !== 'undefined' || !registry) {
+    throw new Error('Assistant credential use requires a trusted secret projection registry')
+  }
+  const { encryptSecret } = await import('@/lib/core/security/encryption')
+  const secrets = [...new Set(tokens.filter((token): token is string => Boolean(token)))]
+  const entries = await Promise.all(
+    secrets.map(async (token) => ({ encryptedValue: (await encryptSecret(token)).encrypted }))
+  )
+  const imported = await registry.importProvenance(
+    { version: 1, complete: true, entries },
+    { trusted: true, anonymous: true, origin: 'tools.assistantCredentials' }
+  )
+  if (!imported || !registry.isComplete()) {
+    throw new Error('Assistant account secrets could not be protected before execution')
+  }
 }
 
 /** Result from hosted key injection */
@@ -977,7 +1039,6 @@ import { normalizeToolId } from '@/tools/normalize'
  * Next.js 16 has a default middleware/proxy body limit of 10MB.
  */
 const MAX_REQUEST_BODY_SIZE_BYTES = 10 * 1024 * 1024 // 10MB
-const MAX_TOOL_RESPONSE_BODY_BYTES = 10 * 1024 * 1024 // 10MB
 
 /**
  * User-friendly error message for body size limit exceeded
@@ -1078,6 +1139,7 @@ function handleResponseSizeLimitError(error: unknown, requestId: string, context
     maxBytes: error.maxBytes,
     observedBytes: error.observedBytes,
   })
+  if (error.maxBytes !== MAX_TOOL_RESPONSE_BODY_BYTES) throw error
   throw new Error(RESPONSE_SIZE_LIMIT_ERROR_MESSAGE)
 }
 
@@ -1148,38 +1210,42 @@ function createTransformedErrorFromErrorInfo(errorInfo?: ErrorInfo, extractorId?
 }
 
 /**
- * Process file outputs for a tool result if execution context is available
+ * Store declared file outputs using the trusted workflow or Copilot context.
  * Uses dynamic imports to avoid client-side bundling issues
  */
 async function processFileOutputs(
   result: ToolResponse,
   tool: ToolDefinition,
-  executionContext?: ExecutionContext
+  executionContext?: ExecutionContext,
+  operationContext?: InternalToolOperationContext,
+  signal?: AbortSignal
 ): Promise<ToolResponse> {
-  // Skip file processing if no execution context or not successful
-  if (!executionContext || !result.success) {
+  if (!result.success) {
     return result
   }
 
-  // Skip file processing on client-side (no Node.js modules available)
   if (typeof window !== 'undefined') {
     return result
   }
 
   try {
-    // Dynamic import to avoid client-side bundling issues
     const { FileToolProcessor } = await import('@/executor/utils/file-tool-processor')
 
-    // Check if tool has file outputs
     if (!FileToolProcessor.hasFileOutputs(tool)) {
       return result
     }
 
+    const context = operationContext ?? executionContext
+    if (!context) throw new Error('File output requires trusted execution context')
     const processedOutput = await FileToolProcessor.processToolOutputs(
       result.output,
       tool,
-      executionContext
+      context,
+      signal
     )
+
+    /** Index stored files so later calls in the run can resolve their IDs. */
+    if (executionContext) recordExecutionFiles(executionContext, processedOutput)
 
     return {
       ...result,
@@ -1194,7 +1260,8 @@ async function processFileOutputs(
           error: normalizedError.message,
           stack: error instanceof Error ? error.stack : undefined,
         },
-        executionContext.resolvedSecretTraceRegistry,
+        executionContext?.resolvedSecretTraceRegistry ??
+          operationContext?.resolvedSecretTraceRegistry,
         {
           errorName: normalizedError.name,
           hasStack: Boolean(error instanceof Error && error.stack),
@@ -1202,8 +1269,13 @@ async function processFileOutputs(
         tool.id === 'function_execute' || isCustomTool(tool.id)
       )
     )
-    // Return original result if file processing fails
-    return result
+    /** Returning the original output would leak unstored file bytes into logs and model inputs. */
+    return {
+      ...result,
+      success: false,
+      error: `Failed to store file outputs for ${tool.id}: ${normalizedError.message}`,
+      output: {},
+    }
   }
 }
 
@@ -1487,6 +1559,46 @@ function getPrivateToolMetadataPolicy(toolId: string): PrivateToolMetadataPolicy
 }
 
 /**
+ * Resolves a credential token from the browser through `POST /api/auth/oauth/token`,
+ * authenticated by the session cookie. Server-side execution resolves in-process
+ * through `resolveExecutorCredentialToken` instead; this HTTP path exists only
+ * because the browser holds no server credentials.
+ */
+async function fetchCredentialTokenFromRoute(params: {
+  requestId: string
+  toolId: string
+  toolLabel: string
+  credentialId: string
+  workflowId?: string
+  impersonateEmail?: string
+  scopes?: string[]
+  callerUserId?: string
+}): Promise<CredentialTokenPayload> {
+  const { requestId, toolId, toolLabel, credentialId, workflowId } = params
+
+  try {
+    return await requestJson(oauthTokenPostContract, {
+      query: { userId: params.callerUserId },
+      headers: {},
+      body: {
+        credentialId,
+        toolId,
+        ...(workflowId ? { workflowId } : {}),
+        ...(params.impersonateEmail ? { impersonateEmail: params.impersonateEmail } : {}),
+        ...(params.scopes ? { scopes: params.scopes } : {}),
+      },
+    })
+  } catch (error: unknown) {
+    const status = error instanceof ApiClientError ? error.status : undefined
+    logger.error(`[${requestId}] Token fetch failed for ${toolId}:`, {
+      status,
+      error: getErrorMessage(error),
+    })
+    throw new Error(`Failed to obtain credential for ${toolLabel}: ${getErrorMessage(error)}`)
+  }
+}
+
+/**
  * Runs private-provenance tools against an isolated registry. Unavailable authenticated lineage
  * marks the parent unknown without replacing the tool's functional result; malformed metadata is
  * rejected inside the transport consumer and never committed to the parent.
@@ -1514,7 +1626,19 @@ export async function executeTool(
     : parentRegistry.forkForToolCall()
   if (!paramEntries) toolRegistry.markIncomplete('tool-input-not-enumerable')
   const executionContext = options.executionContext
-    ? { ...options.executionContext, resolvedSecretTraceRegistry: toolRegistry }
+    ? {
+        ...options.executionContext,
+        /**
+         * Materialized on the source before the spread so both objects hold the
+         * same `Map` instance. The index is lazily built on first access, and
+         * this clone is discarded when the call returns — so letting it be
+         * created here would record every file a tool produced onto a throwaway,
+         * and the next call in the run would rebuild an index that never saw
+         * them.
+         */
+        executionFilesById: getExecutionFileIndex(options.executionContext),
+        resolvedSecretTraceRegistry: toolRegistry,
+      }
     : undefined
   const operationContext = options.operationContext
     ? { ...options.operationContext, resolvedSecretTraceRegistry: toolRegistry }
@@ -1544,14 +1668,19 @@ async function executeToolImplementation(
 ): Promise<ToolResponse> {
   const {
     skipPostProcess = false,
-    executionContext,
+    executionContext: suppliedExecutionContext,
     signal,
     resolvedSecretTraceRegistry: explicitResolvedSecretTraceRegistry,
     internalSandboxProfile,
     operationContext: suppliedOperationContext,
   } = options
+  /** A nested operation cannot replace the Assistant's person with workflow execution authority. */
+  const executionContext =
+    suppliedOperationContext?.requestMode === 'assistant' ? undefined : suppliedExecutionContext
   const resolvedSecretTraceRegistry =
-    explicitResolvedSecretTraceRegistry ?? executionContext?.resolvedSecretTraceRegistry
+    explicitResolvedSecretTraceRegistry ??
+    executionContext?.resolvedSecretTraceRegistry ??
+    suppliedOperationContext?.resolvedSecretTraceRegistry
   const effectiveSignal = signal ?? executionContext?.abortSignal
   const operationContext = executionContext
     ? createInternalToolOperationContext(executionContext)
@@ -1565,7 +1694,11 @@ async function executeToolImplementation(
   const executeNestedTool: typeof executeTool = (nestedToolId, nestedParams, nestedOptions = {}) =>
     executeTool(nestedToolId, nestedParams, {
       ...nestedOptions,
-      executionContext: nestedOptions.executionContext ?? executionContext,
+      ...(operationContext?.requestMode === 'assistant' ? { operationContext } : {}),
+      executionContext:
+        operationContext?.requestMode === 'assistant'
+          ? undefined
+          : (nestedOptions.executionContext ?? executionContext),
       signal: nestedOptions.signal ?? effectiveSignal,
       resolvedSecretTraceRegistry:
         nestedOptions.resolvedSecretTraceRegistry ?? resolvedSecretTraceRegistry,
@@ -1574,11 +1707,12 @@ async function executeToolImplementation(
   const startTime = new Date()
   const startTimeISO = startTime.toISOString()
   const requestId = generateRequestId()
+  const normalizedToolId = normalizeToolId(toolId)
   const privateToolMetadataPolicy = resolvedSecretTraceRegistry
     ? getPrivateToolMetadataPolicy(toolId)
     : undefined
   const structuralOnlyToolLogs =
-    normalizeToolId(toolId) === 'function_execute' ||
+    normalizedToolId === 'function_execute' ||
     isCustomTool(toolId) ||
     privateToolMetadataPolicy !== undefined
 
@@ -1590,12 +1724,22 @@ async function executeToolImplementation(
     let tool: ExecutableToolConfig | undefined
 
     // Preserve direct-call compatibility with legacy resource-suffixed tool ids.
-    const normalizedToolId = normalizeToolId(toolId)
     if (internalSandboxProfile && normalizedToolId !== 'function_execute') {
       throw new Error('An internal sandbox profile may only be used with function_execute')
     }
 
     const scope = resolveToolScope(params, executionContext)
+    if (operationContext?.requestMode === 'assistant') {
+      const { assertAssistantIntegrationCall } = await import('@/lib/copilot/assistant/tool-policy')
+      const { getToolMetadata } = await import('@/tools/metadata')
+      const { _context, ...modelParams } = params
+      assertAssistantIntegrationCall(getToolMetadata(toolId), modelParams)
+      scope.envReferenceMode = 'off'
+      scope.userId = operationContext.userId
+      scope.workspaceId = operationContext.workspaceId
+      scope.copilotToolExecution = true
+      scope.enforceCredentialAccess = true
+    }
 
     const toolKind: 'skill' | 'custom' | 'mcp' | undefined =
       normalizedToolId === 'load_skill'
@@ -1614,15 +1758,20 @@ async function executeToolImplementation(
     // Runs for ALL tools (not just kinded ones) so the per-tool `deniedTools`
     // denylist is enforced alongside the existing mcp/custom/skill gates.
     if (scope.userId && scope.workspaceId) {
-      await assertToolPermissionsWithRetry({
-        userId: scope.userId,
-        workspaceId: scope.workspaceId,
-        toolId: normalizedToolId,
-        toolKind,
-        ctx: executionContext,
-        requestId,
-        signal: effectiveSignal,
-      })
+      effectiveSignal?.throwIfAborted()
+      try {
+        await assertPermissionsAllowed({
+          userId: scope.userId,
+          workspaceId: scope.workspaceId,
+          toolId: normalizedToolId,
+          toolKind,
+          ctx: executionContext,
+          signal: effectiveSignal,
+        })
+      } catch (error) {
+        effectiveSignal?.throwIfAborted()
+        throw error
+      }
     }
 
     if (normalizedToolId === 'load_skill') {
@@ -1694,10 +1843,10 @@ async function executeToolImplementation(
       throw new Error(`Tool not found: ${toolId}`)
     }
 
-    await normalizeCopilotFileParams(tool, contextParams, scope)
+    await normalizeFileParams(tool, contextParams, scope, executionContext)
     normalizeCopilotCredentialParams(contextParams)
     enforceCopilotCredentialSelection(toolId, tool, contextParams, scope)
-    await resolveCopilotEnvReferences(tool, contextParams, scope, resolvedSecretTraceRegistry)
+    await resolveToolEnvReferences(tool, contextParams, scope, resolvedSecretTraceRegistry)
 
     // Inject hosted API key if tool supports it and user didn't provide one
     const hostedKeyInfo = await injectHostedKeyIfNeeded(
@@ -1719,113 +1868,112 @@ async function executeToolImplementation(
     if (contextParams.oauthCredential) {
       contextParams.credential = contextParams.oauthCredential
     }
+    if (operationContext?.requestMode === 'assistant' && tool.personalToken) {
+      if (typeof window !== 'undefined' || !operationContext.workspaceId) {
+        throw new Error('Personal tokens require a trusted workspace execution context')
+      }
+      const [{ executeCopilotCredentialUseCase }, { resolvePersonalToken }] = await Promise.all([
+        import('@/lib/copilot/application/execute-credential-use-case'),
+        import('@/lib/credentials/application/resolve-personal-token'),
+      ])
+      const token = await executeCopilotCredentialUseCase(operationContext, resolvePersonalToken, {
+        credentialId: String(contextParams.credential),
+        assertedWorkspaceId: operationContext.workspaceId,
+        expectedProviderId: tool.personalToken.provider,
+      })
+      await registerAssistantCredentialSecrets(resolvedSecretTraceRegistry, [token.accessToken])
+      contextParams[tool.personalToken.tokenParam] = token.accessToken
+      contextParams[tool.personalToken.hostParam] = token.instanceUrl
+      contextParams.credential = undefined
+      contextParams.credentialId = undefined
+      contextParams.oauthCredential = undefined
+    }
     if (contextParams.credential) {
       logger.info(`[${requestId}] Resolving tool access token`, { toolId: normalizedToolId })
       try {
         const workflowId = scope.workflowId
         const userId = scope.userId
+        const credentialId = contextParams.credential as string
+        const toolLabel = tool?.name || toolId
+        const impersonateEmail = contextParams.impersonateUserEmail as string | undefined
 
-        const tokenPayload: OAuthTokenPayload = {
-          credentialId: contextParams.credential as string,
-          toolId,
-        }
-        if (workflowId) {
-          tokenPayload.workflowId = workflowId
-        }
-        if (contextParams.impersonateUserEmail) {
-          tokenPayload.impersonateEmail = contextParams.impersonateUserEmail as string
-        }
+        let providerScopes: string[] | undefined
         if (tool?.oauth?.provider) {
-          const providerScopes =
+          const scopesForProvider =
             tool.oauth.requiredScopes ??
             (await import('@/lib/oauth/utils')).getCanonicalScopesForProvider(tool.oauth.provider)
-          if (providerScopes.length > 0) {
-            tokenPayload.scopes = providerScopes
+          if (scopesForProvider.length > 0) {
+            providerScopes = scopesForProvider
           }
         }
 
         /**
-         * The acting user asserted alongside an internal token. Only sent when the
-         * run enforces credential access, matching the `userId` query param the HTTP
-         * surface accepted — it never widens access, it only pins the assertion to
-         * the token subject.
+         * The acting user asserted alongside the credential. Only asserted when the
+         * run enforces credential access — it never widens access, it only pins the
+         * assertion to the authenticated subject.
          */
-        const callerUserId =
-          userId && contextParams._context?.enforceCredentialAccess ? userId : undefined
+        const enforceCredentialAccess = Boolean(contextParams._context?.enforceCredentialAccess)
 
-        const baseUrl = getInternalApiBaseUrl()
-        logger.info(`[${requestId}] Fetching access token from ${baseUrl}/api/auth/oauth/token`)
-
-        const tokenUrlObj = new URL('/api/auth/oauth/token', baseUrl)
-        if (workflowId) {
-          tokenUrlObj.searchParams.set('workflowId', workflowId)
-        }
-        if (callerUserId) {
-          tokenUrlObj.searchParams.set('userId', callerUserId)
-        }
-
-        /**
-         * Deliberately an HTTP hop rather than an in-process call to
-         * `resolveCredentialToken`, even though both run the same authorization rule.
-         *
-         * An OAuth refresh needs the provider's client id and secret
-         * (`requireOAuthClientCapability`, which THROWS when they are absent). Only the
-         * app container loads those, from `SIM_ENV_SECRET_ID`. Tool calls execute inside
-         * the Trigger.dev worker, whose environment does not carry them, so resolving
-         * in-process there turns every credential whose access token has expired into
-         * `Failed to refresh access token`. A still-valid token hides it — the refresh
-         * path is only reached once the token lapses.
-         *
-         * Moving this in-process requires the worker to hold the OAuth client config,
-         * not just a code change.
-         */
-        const tokenHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+        let data: CredentialTokenPayload
         if (typeof window === 'undefined') {
-          const managedCredentialDelegation = executionContext?.executorDelegationOrigin
-          if (managedCredentialDelegation && !managedCredentialDelegation.currentWorkflow) {
-            throw new Error('Managed credential delegation is missing current workflow authority')
-          }
-          try {
-            const internalToken = await generateInternalToken(userId)
-            tokenHeaders.Authorization = `Bearer ${internalToken}`
-          } catch (_e) {
-            // Swallow token generation errors; the request will fail and be reported upstream
-          }
-          if (managedCredentialDelegation) {
-            const delegationHeaders = await buildExecutorDelegationHeaders(
-              managedCredentialDelegation
-            )
-            tokenHeaders[MANAGED_OAUTH_DELEGATION_HEADER] = delegationHeaders.Authorization
-          }
-        }
-
-        // boundary-raw-fetch: same-origin token route, authenticated by internal JWT on the server and the session cookie in the browser
-        const response = await fetch(tokenUrlObj.toString(), {
-          method: 'POST',
-          headers: tokenHeaders,
-          body: JSON.stringify(tokenPayload),
-        })
-
-        if (!response.ok) {
-          const errorText = await response.text()
-          logger.error(`[${requestId}] Token fetch failed for ${toolId}:`, {
-            status: response.status,
-            error: errorText,
+          /**
+           * Dynamic import for the same client-bundle reason as the workflow_executor
+           * runner below: the resolver pulls the db/audit dependency graph, which must
+           * never enter the client-bundled tool registry.
+           */
+          const { resolveExecutorCredentialToken } = await import(
+            '@/executor/utils/credential-token'
+          )
+          data = await resolveExecutorCredentialToken({
+            requestId,
+            credentialId,
+            userId,
+            workflowId,
+            toolId,
+            toolLabel,
+            scopes: providerScopes,
+            impersonateEmail,
+            enforceCredentialAccess,
+            executorDelegationOrigin: executionContext?.executorDelegationOrigin,
+            ...(operationContext?.copilotToolExecution
+              ? { copilotExecutionContext: operationContext }
+              : {}),
           })
-          let parsedError = errorText
-          try {
-            const parsed = JSON.parse(errorText)
-            if (parsed.error) parsedError = parsed.error
-          } catch {
-            // Use raw text
-          }
-          const toolLabel = tool?.name || toolId
-          throw new Error(`Failed to obtain credential for ${toolLabel}: ${parsedError}`)
+        } else {
+          data = await fetchCredentialTokenFromRoute({
+            requestId,
+            toolId,
+            toolLabel,
+            credentialId,
+            workflowId,
+            impersonateEmail,
+            scopes: providerScopes,
+            callerUserId: userId && enforceCredentialAccess ? userId : undefined,
+          })
         }
 
-        const data = (await response.json()) as CredentialTokenPayload
+        if (tool.oauth?.credentialKind) {
+          const actualCredentialKind =
+            data.credentialType === 'service_account'
+              ? 'service-account'
+              : data.credentialType === 'oauth' || data.credentialType === 'managed_oauth'
+                ? 'oauth'
+                : null
+          if (actualCredentialKind !== tool.oauth.credentialKind) {
+            throw new Error(`${tool.name} requires a ${tool.oauth.credentialKind} credential`)
+          }
+        }
 
+        if (operationContext?.requestMode === 'assistant') {
+          await registerAssistantCredentialSecrets(resolvedSecretTraceRegistry, [
+            data.accessToken,
+            data.idToken,
+          ])
+        }
         contextParams.accessToken = data.accessToken
+        if (data.credentialType && tool.oauth?.authoritativeParams?.includes('credentialType')) {
+          contextParams.credentialType = data.credentialType
+        }
         if (data.idToken) {
           contextParams.idToken = data.idToken
         }
@@ -1840,6 +1988,15 @@ async function executeToolImplementation(
         }
         if (data.domain && !contextParams.domain) {
           contextParams.domain = data.domain
+        }
+        if (data.realmId && tool.oauth?.authoritativeParams?.includes('realmId')) {
+          contextParams.realmId = data.realmId
+        }
+        if (
+          data.quickBooksEnvironment &&
+          tool.oauth?.authoritativeParams?.includes('quickBooksEnvironment')
+        ) {
+          contextParams.quickBooksEnvironment = data.quickBooksEnvironment
         }
         if (data.authStyle && !contextParams.authStyle) {
           contextParams.authStyle = data.authStyle
@@ -1992,7 +2149,13 @@ async function executeToolImplementation(
           })
         }
       }
-      finalResult = await processFileOutputs(finalResult, tool, executionContext)
+      finalResult = await processFileOutputs(
+        finalResult,
+        tool,
+        executionContext,
+        operationContext,
+        effectiveSignal
+      )
 
       if (hostedKeyInfo.isUsingHostedKey && finalResult.success) {
         await applyHostedKeyCostToResult(
@@ -2027,6 +2190,7 @@ async function executeToolImplementation(
               toolId,
               tool,
               contextParams,
+              operationContext,
               effectiveSignal,
               resolvedSecretTraceRegistry,
               workflowVariableHeaders
@@ -2053,6 +2217,7 @@ async function executeToolImplementation(
                   toolId,
                   tool,
                   contextParams,
+                  operationContext,
                   effectiveSignal,
                   resolvedSecretTraceRegistry,
                   workflowVariableHeaders
@@ -2064,6 +2229,7 @@ async function executeToolImplementation(
           toolId,
           tool,
           contextParams,
+          operationContext,
           effectiveSignal,
           resolvedSecretTraceRegistry,
           workflowVariableHeaders
@@ -2091,8 +2257,14 @@ async function executeToolImplementation(
       }
     }
 
-    // Process file outputs if execution context is available
-    finalResult = await processFileOutputs(finalResult, tool, executionContext)
+    /** Persist declared file outputs before returning the tool result. */
+    finalResult = await processFileOutputs(
+      finalResult,
+      tool,
+      executionContext,
+      operationContext,
+      effectiveSignal
+    )
 
     // Add timing data to the result
     const endTime = new Date()
@@ -2125,10 +2297,7 @@ async function executeToolImplementation(
     }
   } catch (error: any) {
     const normalizedError = toError(error)
-    const databaseQueryError = findCause(
-      error,
-      (cause): cause is DrizzleQueryError => cause instanceof DrizzleQueryError
-    )
+    const databaseQueryError = findDatabaseQueryError(error)
     const databaseErrorCause = databaseQueryError ? describeError(error) : undefined
     logger.error(
       `[${requestId}] Error executing tool ${toolId}:`,
@@ -2231,9 +2400,14 @@ async function executeToolImplementation(
     const rawResponseData =
       error instanceof Error && 'data' in error ? (error as { data?: unknown }).data : undefined
     const responseData = isRecordLike(rawResponseData) ? rawResponseData : undefined
+    const functionSandboxCost =
+      normalizedToolId === 'function_execute' ? readFunctionSandboxCost(responseData) : undefined
     return {
       success: false,
-      output: errorDetails,
+      output: {
+        ...errorDetails,
+        ...(functionSandboxCost ? { cost: functionSandboxCost } : {}),
+      },
       error: errorMessage,
       ...(responseData?.retryable === false ? { retryable: false } : {}),
       // Sim's own status (hosted-key 429/503) survives the flattening from a
@@ -2394,6 +2568,33 @@ function isFunctionExecuteBody(value: unknown): value is FunctionExecuteBody {
   return isPlainRecord(value) && typeof value.code === 'string'
 }
 
+interface FunctionSandboxCost {
+  input: number
+  output: number
+  total: number
+}
+
+function readFunctionSandboxCost(value: unknown): FunctionSandboxCost | undefined {
+  if (!isRecordLike(value) || !isRecordLike(value.output) || !isRecordLike(value.output.cost)) {
+    return undefined
+  }
+  const { input, output, total } = value.output.cost
+  if (
+    typeof input !== 'number' ||
+    !Number.isFinite(input) ||
+    input < 0 ||
+    typeof output !== 'number' ||
+    !Number.isFinite(output) ||
+    output < 0 ||
+    typeof total !== 'number' ||
+    !Number.isFinite(total) ||
+    total < 0
+  ) {
+    return undefined
+  }
+  return { input, output, total }
+}
+
 function isToolResponse(value: unknown): value is ToolResponse {
   return isRecordLike(value) && typeof value.success === 'boolean' && isRecordLike(value.output)
 }
@@ -2418,12 +2619,16 @@ async function executeDeclaredInternalOperation({
 
   const operationParams = projectToolModelInputParams(tool, params, resolvedSecretTraceRegistry)
   let operationInput = tool.operation.input(operationParams)
-  const isFunctionOperation = toolId === 'function_execute' || isCustomTool(toolId)
-  if (isFunctionOperation && !isFunctionExecuteBody(operationInput)) {
-    throw new Error('Function operation input must be an object')
+  const isRegisteredCustomTool = isCustomTool(toolId)
+  const isFunctionOperation = toolId === 'function_execute' || isRegisteredCustomTool
+  if (isFunctionOperation) {
+    if (!isFunctionExecuteBody(operationInput)) {
+      throw new Error('Function operation input must be an object')
+    }
+    operationInput = { ...operationInput, isCustomTool: isRegisteredCustomTool }
   }
   if (
-    isCustomTool(toolId) &&
+    isRegisteredCustomTool &&
     isFunctionExecuteBody(operationInput) &&
     'schema' in operationInput &&
     'params' in operationInput
@@ -2517,7 +2722,7 @@ async function executeDeclaredInternalOperation({
           : DEFAULT_EXECUTION_TIMEOUT_MS
     const operationController = createTimeoutAbortController(operationTimeout, signal)
     try {
-      response = await handler({
+      const result = await handler({
         toolId,
         input: operationInput,
         headers,
@@ -2525,6 +2730,11 @@ async function executeDeclaredInternalOperation({
         requestId,
         signal: operationController.signal,
       })
+      response = await presentInternalToolOperationResult(
+        result,
+        context,
+        operationController.signal
+      )
     } finally {
       operationController.cleanup()
     }
@@ -2567,7 +2777,7 @@ async function executeDeclaredInternalOperation({
     )
   }
 
-  if (tool.transformResponse) return tool.transformResponse(response, params)
+  if (tool.transformResponse) return tool.transformResponse(response, params, { signal })
   const responseData = await response.json()
   if (isToolResponse(responseData)) return responseData
   return {
@@ -2584,6 +2794,7 @@ async function executeToolRequest(
   toolId: string,
   tool: ToolConfig,
   params: Record<string, any>,
+  context: InternalToolOperationContext | undefined,
   signal?: AbortSignal,
   resolvedSecretTraceRegistry?: ResolvedSecretTraceRegistry,
   workflowVariableHeaders: Record<string, string> = {}
@@ -2630,13 +2841,15 @@ async function executeToolRequest(
 
     let response: Response | undefined
     let lastError: unknown
+    const maxResponseBytes =
+      tool.request.responseType === 'binary' ? MAX_FILE_SIZE : MAX_TOOL_RESPONSE_BODY_BYTES
     const nullBodyStatuses = new Set([101, 204, 205, 304])
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const isLastAttempt = attempt === maxAttempts - 1
 
       try {
-        const urlValidation = await validateUrlWithDNS(fullUrl, 'toolUrl')
+        const urlValidation = await validateUrlWithDNS(fullUrl, 'toolUrl', 'requestTarget')
         if (!urlValidation.isValid) {
           throw new Error(`Invalid tool URL: ${urlValidation.error}`)
         }
@@ -2650,12 +2863,13 @@ async function executeToolRequest(
           proxyOption = proxyValidation.pinnedProxyUrl
         }
 
-        const secureResponse = await secureFetchWithPinnedIP(fullUrl, urlValidation.resolvedIP!, {
+        const secureResponse = await secureFetchWithPinnedIP(fullUrl, urlValidation.resolvedIP, {
+          profile: 'requestTarget',
           method: requestParams.method,
           headers: headersRecord,
           body: requestParams.body ?? undefined,
           timeout: requestParams.timeout,
-          maxResponseBytes: MAX_TOOL_RESPONSE_BODY_BYTES,
+          maxResponseBytes,
           signal,
           proxyUrl: proxyOption,
           stripAuthOnRedirect: requestParams.stripAuthOnRedirect,
@@ -2692,6 +2906,7 @@ async function executeToolRequest(
             requestId,
             toolId,
             signal,
+            maxBytes: secureResponse.ok ? maxResponseBytes : MAX_TOOL_RESPONSE_BODY_BYTES,
           })
           response = new Response(new Uint8Array(bodyBuffer), {
             status: secureResponse.status,
@@ -2892,7 +3107,31 @@ async function executeToolRequest(
           blob: () => response.blob(),
         } as Response
 
-        const data = await tool.transformResponse(mockResponse, params)
+        const data = await tool.transformResponse(mockResponse, params, { signal })
+        if (tool.request.responseType === 'binary' && data.success) {
+          if (!context) throw new Error('Binary file output requires trusted execution context')
+          const file = data.output?.file
+          if (
+            !isRecordLike(file) ||
+            !Buffer.isBuffer(file.data) ||
+            typeof file.name !== 'string' ||
+            typeof file.mimeType !== 'string'
+          ) {
+            throw new Error('Binary download tools must return a buffered file output')
+          }
+          return await storeInternalToolFileResult(
+            createInternalToolFileResult(
+              { buffer: file.data, name: file.name, mimeType: file.mimeType },
+              (stored) => ({ ...data, output: { ...data.output, file: stored } })
+            ),
+            context,
+            (body) => {
+              if (!isToolResponse(body)) throw new Error('Invalid binary tool response')
+              return body
+            },
+            signal
+          )
+        }
         return data
       } catch (transformError) {
         const normalizedError = toError(transformError)
@@ -3045,7 +3284,7 @@ async function executeMcpTool(
      * block issued the call — so the scope reader is the one source that sees both.
      */
     const scope = resolveToolScope(params)
-    const response = await handler({
+    const resultResponse = await handler({
       toolId,
       input: params,
       headers: new Headers(
@@ -3059,6 +3298,11 @@ async function executeMcpTool(
       requestId: actualRequestId,
       signal,
     })
+    const response = await presentInternalToolOperationResult(
+      resultResponse,
+      context ?? { workflowId: '' },
+      signal
+    )
     const responseBody = await readToolResponseBody(response, {
       requestId: actualRequestId,
       toolId,

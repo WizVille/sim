@@ -33,12 +33,23 @@ vi.mock('@trigger.dev/sdk', () => ({
 vi.mock('@/lib/core/async-jobs/region', () => ({
   resolveTriggerRegion: mockResolveTriggerRegion,
 }))
-vi.mock('@/lib/knowledge/documents/service', () => ({
+vi.mock('@/lib/core/config/trigger-availability', () => ({
   isTriggerAvailable: mockIsTriggerAvailable,
 }))
 vi.mock('@/lib/knowledge/connectors/sync-engine', () => ({
   executeSync: mockExecuteSync,
   isConnectorRunnableStatus: (status: string) => status === 'active' || status === 'error',
+}))
+
+vi.mock('@/lib/knowledge/connectors/sync-lock', () => ({
+  buildSyncUnscheduledUpdate: (now: Date, lastSyncError: string) => ({
+    status: 'error',
+    lastSyncError,
+    nextSyncAt: null,
+    syncLockToken: null,
+    syncLockLeaseAt: null,
+    updatedAt: now,
+  }),
   connectorIsLive: () => ({ type: 'connectorIsLive' }),
   LOCKABLE_CONNECTOR_STATUSES: ['active', 'error', 'pending'],
 }))
@@ -79,6 +90,7 @@ describe('connector sync queue', () => {
       {
         knowledgeBaseId: 'knowledge-base-1',
         connectorStatus: 'active',
+        connectorAccessMode: 'workspace',
         connectorArchivedAt: null,
         connectorDeletedAt: null,
         connectorNextSyncAt: NEXT_SYNC_AT,
@@ -96,6 +108,82 @@ describe('connector sync queue', () => {
 
   afterAll(() => {
     resetDbChainMock()
+  })
+
+  it.each([false, true])(
+    'rejects a rapid manual repeat before queueing (rehydrate: %s)',
+    async (rehydrate) => {
+      queueTableRows(schemaMock.knowledgeConnector, [{ status: 'active', lastSyncError: null }])
+      queueTableRows(schemaMock.knowledgeConnectorSyncLog, [
+        { status: 'completed', completedAt: new Date(), failures: 0 },
+      ])
+      await expect(
+        dispatchSync('connector-1', {
+          billingAttribution: BILLING_ATTRIBUTION,
+          manual: true,
+          rehydrate,
+        })
+      ).rejects.toMatchObject({ code: 'conflict' })
+      expect(dbChainMockFns.transaction).toHaveBeenCalledOnce()
+      expect(dbChainMockFns.update).not.toHaveBeenCalled()
+      expect(mockTrigger).not.toHaveBeenCalled()
+      expect(mockExecuteSync).not.toHaveBeenCalled()
+    }
+  )
+
+  it('does not consult manual cooldown history for automatic or initial dispatch', async () => {
+    await dispatchSync('connector-1', { billingAttribution: BILLING_ATTRIBUTION })
+    expect(dbChainMockFns.transaction).not.toHaveBeenCalled()
+    expect(dbChainMockFns.from).not.toHaveBeenCalledWith(schemaMock.knowledgeConnectorSyncLog)
+    expect(mockTrigger).toHaveBeenCalledOnce()
+  })
+
+  /**
+   * The bug this pins: the queue once refused anything but workspace mode, so
+   * every admin-mode connector the scheduler selected was dropped before the
+   * queue entry was taken, and the content engine's admin branch never ran.
+   */
+  it('dispatches an admin-mode connector, which the content engine drives', async () => {
+    resetDbChainMock()
+    queueTableRows(schemaMock.knowledgeConnector, [
+      {
+        knowledgeBaseId: 'knowledge-base-1',
+        connectorStatus: 'active',
+        connectorAccessMode: 'admin',
+        connectorArchivedAt: null,
+        connectorDeletedAt: null,
+        connectorNextSyncAt: NEXT_SYNC_AT,
+        workspaceId: 'workspace-paid',
+        kbDeletedAt: null,
+      },
+    ])
+    dbChainMockFns.returning.mockResolvedValue([{ id: 'connector-1' }])
+
+    await expect(
+      dispatchSync('connector-1', { billingAttribution: BILLING_ATTRIBUTION, requestId: 'r' })
+    ).resolves.toEqual({ queued: true })
+    expect(mockTrigger).toHaveBeenCalledTimes(1)
+  })
+
+  it('refuses a members-mode connector, which the member engine drives', async () => {
+    resetDbChainMock()
+    queueTableRows(schemaMock.knowledgeConnector, [
+      {
+        knowledgeBaseId: 'knowledge-base-1',
+        connectorStatus: 'active',
+        connectorAccessMode: 'members',
+        connectorArchivedAt: null,
+        connectorDeletedAt: null,
+        connectorNextSyncAt: NEXT_SYNC_AT,
+        workspaceId: 'workspace-paid',
+        kbDeletedAt: null,
+      },
+    ])
+
+    await expect(
+      dispatchSync('connector-1', { billingAttribution: BILLING_ATTRIBUTION, requestId: 'r' })
+    ).resolves.toMatchObject({ queued: false })
+    expect(mockTrigger).not.toHaveBeenCalled()
   })
 
   it('preserves the actor and immutable workspace payer in the queued payload', async () => {
@@ -194,6 +282,7 @@ describe('connector sync queue', () => {
       {
         knowledgeBaseId: 'knowledge-base-1',
         connectorStatus: 'paused',
+        connectorAccessMode: 'workspace',
         connectorArchivedAt: null,
         connectorDeletedAt: null,
         workspaceId: 'workspace-paid',
@@ -232,6 +321,7 @@ describe('connector sync queue', () => {
       {
         knowledgeBaseId: 'knowledge-base-1',
         connectorStatus: 'paused',
+        connectorAccessMode: 'workspace',
         connectorArchivedAt: null,
         connectorDeletedAt: null,
         connectorNextSyncAt: NEXT_SYNC_AT,
@@ -570,7 +660,7 @@ describe('connector sync queue', () => {
         },
         requestId: 'request-1',
       })
-    ).rejects.toThrow('does not match connector workspace workspace-paid')
+    ).rejects.toThrow('Billing attribution does not match resource owner')
 
     expect(mockTrigger).not.toHaveBeenCalled()
   })

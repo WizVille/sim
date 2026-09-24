@@ -1,3 +1,5 @@
+import type { WorkspaceSearchFilters } from '@/lib/api/contracts/knowledge/search'
+import type { ManagedMcpConnectorId } from '@/lib/credential-groups/managed-mcp-connectors'
 import type { ChatContext } from '@/stores/panel'
 import type { BrowserTextSelection, TerminalTextSelection } from '@/stores/panel/types'
 
@@ -22,11 +24,16 @@ export interface FileAttachmentForApi {
   path?: string
 }
 
+/** Assistant searches as the signed-in person and uses their connected accounts. */
+export type ChatRequestMode = 'assistant'
+
 export interface QueuedMessage {
   id: string
   content: string
   fileAttachments?: FileAttachmentForApi[]
   contexts?: ChatContext[]
+  requestMode?: ChatRequestMode
+  assistantSearch?: WorkspaceSearchFilters
 }
 
 export const ToolCallStatus = {
@@ -66,6 +73,7 @@ export interface ToolCallData {
   id: string
   toolName: string
   displayTitle: string
+  activityDescription?: string
   status: ToolCallStatus
   params?: Record<string, unknown>
   result?: ToolCallResult
@@ -79,6 +87,8 @@ export interface ToolCallInfo {
   name: string
   status: ToolCallStatus
   displayTitle?: string
+  /** Model-authored activity text, separate from executable tool arguments. */
+  activityDescription?: string
   /** Model-authored activity phrase for a gateway-resolved integration call. */
   integrationDescription?: string
   params?: Record<string, unknown>
@@ -152,6 +162,7 @@ export interface ChatMessageContext {
   blockType?: string
   skillId?: string
   serverId?: string
+  managedConnectorId?: ManagedMcpConnectorId
   /** Selected passage for a `file_selection` context. */
   text?: string
   /** Source file name for a `file_selection` context. */
@@ -173,6 +184,7 @@ export interface ChatMessageContext {
 export interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
+  requestMode?: 'agent' | 'assistant'
   content: string
   contentBlocks?: ContentBlock[]
   attachments?: ChatMessageAttachment[]

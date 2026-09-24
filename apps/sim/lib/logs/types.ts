@@ -1,4 +1,4 @@
-import type { Edge } from 'reactflow'
+import type { Edge } from '@xyflow/react'
 import type { BillingAttributionSnapshot } from '@/lib/billing/core/billing-attribution'
 import type { AsyncExecutionCorrelation } from '@/lib/core/async-jobs/types'
 import type { ParentIteration, SerializableExecutionState } from '@/executor/execution/types'
@@ -285,6 +285,8 @@ export interface TraceSpan {
   errorHandled?: boolean
   /** Total handler tries, present only when the block retried at least once. */
   tries?: number
+  /** Models that failed before the one that answered; present only when the block fell back. */
+  modelFallbacks?: string[]
   tokens?: TokenInfo
   relativeStartMs?: number
   blockId?: string

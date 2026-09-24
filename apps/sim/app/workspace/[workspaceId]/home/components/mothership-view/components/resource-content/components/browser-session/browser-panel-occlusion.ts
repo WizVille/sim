@@ -30,10 +30,8 @@ export type BrowserPanelSnapshotLayer = 'modal' | 'popover'
 export type BrowserPanelOverlay =
   | 'credentials'
   | 'downloads'
-  | 'permissions'
   | 'resources'
   | 'suggestions'
-  | 'tab'
   | 'toolbar'
 
 export interface BrowserPanelOverlayController {

@@ -1,35 +1,39 @@
 'use client'
 
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
+import { cn, Expandable, ExpandableContent, SecretReveal, Tooltip, toast } from '@sim/emcn'
 import {
   ArrowRight,
   Check,
   ChevronDown,
-  cn,
-  Expandable,
-  ExpandableContent,
-  SecretReveal,
+  Lock,
   SquareArrowUpRight,
-  Tooltip,
-  toast,
-} from '@sim/emcn'
-import { TerminalWindow } from '@sim/emcn/icons'
+  TerminalWindow,
+} from '@sim/emcn/icons'
 import { isRecordLike } from '@sim/utils/object'
 import { useParams } from 'next/navigation'
-import { ThinkingLoader } from '@/components/ui'
 import { useSession } from '@/lib/auth/auth-client'
 import { buildHostedUpgradeUrl, HOSTED_BILLING_SETTINGS_URL } from '@/lib/billing/upgrade-reasons'
 import { canManageWorkspaceBilling } from '@/lib/billing/workspace-permissions'
 import { isBrowserAgentAvailable, sendBrowserPanelAction } from '@/lib/browser-agent/transport'
-import { isHosted } from '@/lib/core/config/env-flags'
+import { useDeploymentShape } from '@/lib/core/config/deployment-shape'
 import { isSafeHttpUrl } from '@/lib/core/utils/urls'
 import { readLatestOAuthChatAttempt } from '@/lib/credentials/oauth-chat-attempt'
 import { getDesktopBridge } from '@/lib/desktop'
 import { desktopChatScopeId } from '@/lib/desktop/chat-scope'
+import { resolveCredentialDisplay } from '@/lib/integrations/credential-display'
 import {
   resolveOAuthServiceForSlug,
   resolveServiceAccountIntegration,
 } from '@/lib/integrations/oauth-service'
+import {
+  readSearchConnectionAttempt,
+  searchConnectionAttemptKey,
+} from '@/lib/knowledge/search/connection-attempt'
+import {
+  parseSearchConnectionBody,
+  searchConnectionTargetSchema,
+} from '@/lib/knowledge/search/connection-target'
 import { OAUTH_PROVIDERS } from '@/lib/oauth/oauth'
 import { getServiceConfigByProviderId } from '@/lib/oauth/utils'
 import { finishTerminalHandoff, isTerminalAvailable } from '@/lib/terminal/transport'
@@ -46,10 +50,12 @@ import {
   parseQuestionAnswerMessage,
   QuestionDisplay,
 } from '@/app/workspace/[workspaceId]/home/components/message-content/components/question'
+import { ResourceMention } from '@/app/workspace/[workspaceId]/home/components/message-content/components/resource-mention'
 import {
   resolveOAuthChipTarget,
   useOAuthChipConnection,
 } from '@/app/workspace/[workspaceId]/home/components/message-content/components/special-tags/use-oauth-chip-connection'
+import { usePersonalCredentialConnection } from '@/app/workspace/[workspaceId]/home/components/message-content/components/special-tags/use-personal-credential-connection'
 import type {
   ChatMessageContext,
   MothershipResource,
@@ -62,6 +68,7 @@ import { useServiceAccountConnectTarget } from '@/app/workspace/[workspaceId]/in
 import { useWorkspaceHostContext } from '@/app/workspace/[workspaceId]/providers/workspace-host-provider'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import { BrandIcon } from '@/blocks/brand-icon'
+import { MemberLimitRequestAction } from '@/ee/access-requests/components/member-limit-request-action'
 import {
   useUpdateWorkspaceCredential,
   useWorkspaceCredential,
@@ -77,6 +84,7 @@ import { useTablesList } from '@/hooks/queries/tables'
 import { findWorkspaceFileByPath } from '@/hooks/queries/utils/find-workspace-file-by-src'
 import { useWorkflows } from '@/hooks/queries/workflows'
 import { useWorkspaceFiles } from '@/hooks/queries/workspace-files'
+import { useWorkspaceUsageGate } from '@/hooks/queries/workspace-usage'
 import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
 
 export interface OptionsItemData {
@@ -109,6 +117,12 @@ const ConnectServiceAccountModal = lazy(() =>
   import(
     '@/app/workspace/[workspaceId]/integrations/components/connect-service-account-modal/connect-service-account-modal'
   ).then((m) => ({ default: m.ConnectServiceAccountModal }))
+)
+
+const ConnectPersonalTokenModal = lazy(() =>
+  import('@/app/workspace/[workspaceId]/integrations/components/connect-personal-token-modal').then(
+    (module) => ({ default: module.ConnectPersonalTokenModal })
+  )
 )
 
 export const CREDENTIAL_TAG_TYPES = [
@@ -153,6 +167,9 @@ export interface CredentialItemData {
    * rotate the secret on this credential; absent = create a new one.
    */
   credentialId?: string
+  /** Canonical Search source requested by an organization connection control. */
+  connectorType?: string
+  connectorId?: string
 }
 
 /**
@@ -316,6 +333,41 @@ export interface WorkspaceResourceTagData {
   title?: string
 }
 
+/**
+ * A `<source>` tag: one document the reply drew on. The tag contract for
+ * search answers — the model emits it inline, right after the sentence, list
+ * item, or paragraph the document supports, as a JSON body:
+ *
+ * `<source>{"url":"https://docs.github.com/…","siteName":"GitHub Docs"}</source>`
+ *
+ * Each tag renders as its own small chip where it sits (adjacent tags are
+ * never collapsed into a count), and every distinct `url` in the message is
+ * repeated in the footer strip below the reply.
+ */
+export interface SourceTagData {
+  /** Canonical http(s) link to the referenced document. */
+  url: string
+  /** Document title, used as the citation label and shown in full on hover. */
+  title?: string
+  /**
+   * The site or product the document lives in ("GitHub Docs", "Confluence"),
+   * used when its title is missing and as secondary metadata in source cards.
+   */
+  siteName?: string
+  /**
+   * Knowledge-base connector the document was synced through
+   * (`CONNECTOR_META_REGISTRY` key). Lends the chip the product's brand mark;
+   * without it the chip shows the site favicon.
+   */
+  connectorType?: string
+  /** The passage the reply relied on; a reply whose sources carry one is listed as result cards. */
+  snippet?: string
+  /** When the source last changed the document, as an ISO timestamp. */
+  updatedAt?: string
+  /** The person behind the document, as the source names them. */
+  author?: string
+}
+
 export type ContentSegment =
   | { type: 'text'; content: string }
   | { type: 'thinking'; content: string }
@@ -325,6 +377,7 @@ export type ContentSegment =
   | { type: 'mothership-error'; data: MothershipErrorTagData }
   | { type: 'workspace_resource'; data: WorkspaceResourceTagData }
   | { type: 'question'; data: QuestionTagData }
+  | { type: 'source'; data: SourceTagData }
 
 export type RuntimeSpecialTagName =
   | 'thinking'
@@ -334,6 +387,7 @@ export type RuntimeSpecialTagName =
   | 'file'
   | 'workspace_resource'
   | 'question'
+  | 'source'
 
 export interface ParsedSpecialContent {
   segments: ContentSegment[]
@@ -348,6 +402,7 @@ const RUNTIME_SPECIAL_TAG_NAMES = [
   'file',
   'workspace_resource',
   'question',
+  'source',
 ] as const
 
 /**
@@ -363,6 +418,7 @@ export const SPECIAL_TAG_NAMES = [
   'mothership-error',
   'workspace_resource',
   'question',
+  'source',
 ] as const
 
 function isOptionsItemData(value: unknown): value is OptionsItemData {
@@ -484,10 +540,14 @@ function isCredentialItemData(value: unknown): value is CredentialItemData {
     }
     return typeof value.provider === 'string' && value.provider.trim().length > 0
   }
+  if (value.type === 'link' && value.connectorType !== undefined)
+    return searchConnectionTargetSchema.safeParse(value).success
+  if (value.type === 'link' && value.value === undefined) {
+    return typeof value.provider === 'string' && value.provider.trim().length > 0
+  }
   // A sim_key chip is platform-filled: the model only marks where the workspace
   // API key belongs (it never holds the value) and Sim injects it from the tool
-  // result, so the tag is valid with or without a `value`. Every other rendered
-  // type (e.g. link) needs a string value to render.
+  // result, so the tag is valid with or without a `value`.
   if (value.type === 'sim_key') return true
   return typeof value.value === 'string'
 }
@@ -500,6 +560,8 @@ export function parseCredentialTagBody(body: string): CredentialTagData | null {
   try {
     const parsed = JSON.parse(body) as unknown
     const items = Array.isArray(parsed) ? parsed : [parsed]
+    if (items.some((item) => isRecordLike(item) && item.connectorType !== undefined))
+      return parseSearchConnectionBody(body)
     return items.length > 0 && items.every(isCredentialItemData) ? items : null
   } catch {
     return null
@@ -521,6 +583,33 @@ function isMothershipErrorTagData(value: unknown): value is MothershipErrorTagDa
     (value.code === undefined || typeof value.code === 'string') &&
     (value.provider === undefined || typeof value.provider === 'string')
   )
+}
+
+/**
+ * Only an absolute http(s) URL with a host can be linked; anything else is not
+ * a source. Parsed rather than pattern-matched so a malformed value such as
+ * `https://?` — which a prefix check would accept — never becomes a dead link.
+ */
+export function isHttpUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || /\s/.test(value)) return false
+  try {
+    const url = new URL(value)
+    return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname.length > 0
+  } catch {
+    return false
+  }
+}
+
+function isSourceTagData(value: unknown): value is SourceTagData {
+  if (!isRecordLike(value)) return false
+  if (!isHttpUrl(value.url)) return false
+  if (value.title !== undefined && typeof value.title !== 'string') return false
+  if (value.siteName !== undefined && typeof value.siteName !== 'string') return false
+  if (value.connectorType !== undefined && typeof value.connectorType !== 'string') return false
+  if (value.snippet !== undefined && typeof value.snippet !== 'string') return false
+  if (value.updatedAt !== undefined && typeof value.updatedAt !== 'string') return false
+  if (value.author !== undefined && typeof value.author !== 'string') return false
+  return true
 }
 
 function isWorkspaceResourceTagData(value: unknown): value is WorkspaceResourceTagData {
@@ -713,6 +802,7 @@ function parseSpecialTagData(
   | { type: 'mothership-error'; data: MothershipErrorTagData }
   | { type: 'workspace_resource'; data: WorkspaceResourceTagData }
   | { type: 'question'; data: QuestionTagData }
+  | { type: 'source'; data: SourceTagData }
   | null {
   if (tagName === 'thinking') {
     const content = parseTextTagBody(body)
@@ -742,6 +832,11 @@ function parseSpecialTagData(
   if (tagName === 'workspace_resource') {
     const data = parseJsonTagBody(body, isWorkspaceResourceTagData)
     return data ? { type: 'workspace_resource', data } : null
+  }
+
+  if (tagName === 'source') {
+    const data = parseJsonTagBody(body, isSourceTagData)
+    return data ? { type: 'source', data } : null
   }
 
   if (tagName === 'question') {
@@ -1644,6 +1739,7 @@ function recoverTrailingBareOptions(segments: ContentSegment[]): void {
 
 interface SpecialTagsProps {
   segment: Exclude<ContentSegment, { type: 'text' }>
+  requestMode?: 'agent' | 'assistant'
   /** Stable identity for interaction state owned by this message/tag. */
   interactionId?: string
   /** Transcript-derived answers for this message's question card (renders the recap). */
@@ -1659,10 +1755,12 @@ interface SpecialTagsProps {
 
 /**
  * Unified renderer for inline special tags: `<options>`, `<usage_upgrade>`, `<credential>`,
- * and `<workspace_resource>`.
+ * and `<workspace_resource>`. A `<source>` never reaches here — the chat renderer
+ * folds it into the surrounding markdown as an inline chip.
  */
 export function SpecialTags({
   segment,
+  requestMode,
   interactionId,
   questionAnswers,
   credentialSubmission,
@@ -1682,6 +1780,7 @@ export function SpecialTags({
       return (
         <CredentialDisplay
           data={segment.data}
+          requestMode={requestMode}
           interactionId={interactionId}
           submitted={credentialSubmission}
           abandoned={credentialAbandoned}
@@ -1692,6 +1791,8 @@ export function SpecialTags({
       return <MothershipErrorDisplay data={segment.data} />
     case 'workspace_resource':
       return <WorkspaceResourceDisplay data={segment.data} onSelect={onWorkspaceResourceSelect} />
+    case 'source':
+      return null
     case 'question':
       return (
         <QuestionDisplay
@@ -1704,22 +1805,6 @@ export function SpecialTags({
     default:
       return null
   }
-}
-
-interface PendingTagIndicatorProps {
-  /** Activity phrase next to the loader; crossfades on change. */
-  label: string
-}
-
-/**
- * Renders the turn-level activity shimmer.
- */
-export function PendingTagIndicator({ label }: PendingTagIndicatorProps) {
-  return (
-    <div className='animate-stream-fade-in py-2'>
-      <ThinkingLoader size={20} startVariant='corners' label={label} labelRatio={0.7} />
-    </div>
-  )
 }
 
 interface OptionsDisplayProps {
@@ -1774,7 +1859,7 @@ function OptionsDisplay({ data, onSelect }: OptionsDisplayProps) {
                     i > 0 && 'border-t'
                   )}
                 >
-                  <div className='flex size-[16px] flex-shrink-0 items-center justify-center'>
+                  <div className='flex size-[16px] shrink-0 items-center justify-center'>
                     <span className='text-[var(--text-icon)] text-sm'>{i + 1}</span>
                   </div>
                   <span className='flex-1 text-[var(--text-body)] text-sm'>{title}</span>
@@ -1857,36 +1942,28 @@ export function WorkspaceResourceDisplay({
 
   const context = toChatMessageContext(data, resource.title)
 
-  const mentionContent = (
-    <>
-      <ContextMentionIcon
-        context={context}
-        className='relative top-0.5 size-[12px] flex-shrink-0 text-[var(--text-icon)]'
-      />
-      {resource.title}
-    </>
-  )
-
-  const classes =
-    'inline-flex items-baseline gap-1 rounded-[5px] bg-[var(--surface-5)] px-[5px] align-baseline font-[inherit] text-[inherit] leading-[inherit]'
-
-  if (!onSelect) {
-    return <span className={classes}>{mentionContent}</span>
-  }
-
   return (
-    <button
-      type='button'
-      onClick={() => onSelect(resource)}
-      className={cn(classes, 'cursor-pointer transition-colors hover-hover:bg-[var(--surface-6)]')}
-    >
-      {mentionContent}
-    </button>
+    <ResourceMention
+      icon={
+        <ContextMentionIcon
+          context={context}
+          className='relative top-0.5 size-[12px] shrink-0 text-[var(--text-icon)]'
+        />
+      }
+      title={resource.title}
+      onSelect={onSelect ? () => onSelect(resource) : undefined}
+    />
   )
 }
 
 function getCredentialIcon(provider: string): React.ComponentType<{ className?: string }> | null {
   const lower = provider.toLowerCase()
+  if (lower === 'gitlab')
+    return resolveCredentialDisplay({
+      type: 'personal_token',
+      providerId: lower,
+      displayName: provider,
+    }).icon
 
   const directMatch = OAUTH_PROVIDERS[lower]
   if (directMatch) return directMatch.icon
@@ -1903,30 +1980,18 @@ function getCredentialIcon(provider: string): React.ComponentType<{ className?: 
 }
 
 function getCredentialProviderDisplayName(provider: string): string {
+  if (provider.toLowerCase() === 'gitlab')
+    return resolveCredentialDisplay({
+      type: 'personal_token',
+      providerId: 'gitlab',
+      displayName: provider,
+    }).detailTitle
   return (
     getServiceConfigByProviderId(provider)?.name ??
     OAUTH_PROVIDERS[provider.toLowerCase()]?.name ??
     provider
   )
 }
-
-const LockIcon = (props: { className?: string }) => (
-  <svg
-    className={props.className}
-    viewBox='0 0 16 16'
-    fill='none'
-    xmlns='http://www.w3.org/2000/svg'
-  >
-    <rect x='2' y='5' width='12' height='8' rx='1.5' stroke='currentColor' strokeWidth='1.3' />
-    <path
-      d='M5 5V3.5a3 3 0 1 1 6 0V5'
-      stroke='currentColor'
-      strokeWidth='1.3'
-      strokeLinecap='round'
-    />
-    <circle cx='8' cy='9.5' r='1.25' fill='currentColor' />
-  </svg>
-)
 
 /**
  * Inline "paste a secret" widget rendered for
@@ -1937,6 +2002,7 @@ const LockIcon = (props: { className?: string }) => (
  */
 interface CredentialControlProps {
   data: CredentialItemData
+  requestMode?: 'agent' | 'assistant'
   controlId?: string
   embedded?: boolean
   divided?: boolean
@@ -2360,6 +2426,7 @@ function ServiceAccountConnectDisplay({
             onOpenChange={setOpen}
             workspaceId={workspaceId}
             serviceAccountProviderId={target.serviceAccountProviderId}
+            atlassianProduct={match?.providerId === 'confluence' ? 'confluence' : 'jira'}
             serviceName={target.serviceName}
             serviceIcon={target.serviceIcon}
             credentialId={reconnectCredentialId}
@@ -2406,7 +2473,7 @@ function CredentialLinkDisplay({
   // The connect link value comes from the streamed model output, so only
   // render it as a clickable link when it resolves to a real http(s) URL.
   if (!data.value || !isSafeHttpUrl(data.value)) return null
-  const Icon = getCredentialIcon(data.provider) ?? LockIcon
+  const Icon = getCredentialIcon(data.provider) ?? Lock
   const label = reconnectCredentialId
     ? `Reconnect ${reconnectCredential?.displayName ?? integrationName}`
     : hasExistingCredential
@@ -2450,6 +2517,95 @@ function CredentialLinkDisplay({
         <ArrowRight className='size-[16px] shrink-0 text-[var(--text-icon)]' />
       )}
     </a>
+  )
+}
+
+function PersonalCredentialLinkDisplay({
+  data,
+  controlId = 'credential-link',
+  embedded = false,
+  divided = false,
+  onConnected,
+}: CredentialControlProps) {
+  const { workspaceId } = useParams<{ workspaceId: string }>()
+  const { canEdit } = useUserPermissionsContext()
+  const [tokenModalOpen, setTokenModalOpen] = useState(false)
+  const provider = data.provider?.trim() ?? ''
+  const name = getCredentialProviderDisplayName(provider)
+  const connection = usePersonalCredentialConnection({
+    provider,
+    displayName: name,
+    controlId,
+    onConnected,
+  })
+  if (!provider || (provider.toLowerCase() === 'gitlab' && !canEdit)) return null
+  const Icon = getCredentialIcon(provider) ?? Lock
+  const connected = connection.status === 'connected'
+  const label = connected
+    ? `Connected ${name}`
+    : connection.hasMetadataError
+      ? `Retry checking ${name} connections`
+      : !connection.isReady
+        ? `Checking ${name} connections…`
+        : connection.status === 'pending'
+          ? `Waiting for ${name} connection…`
+          : connection.status === 'failed'
+            ? `Not connected — connect ${name}`
+            : `Connect ${name}`
+  return (
+    <>
+      <button
+        type='button'
+        disabled={
+          (!connection.isReady && !connection.hasMetadataError) ||
+          connected ||
+          connection.isStarting
+        }
+        onClick={() => {
+          if (connection.hasMetadataError) {
+            void connection.retryMetadata()
+            return
+          }
+          if (provider.toLowerCase() === 'gitlab') {
+            connection.beginPersonalToken()
+            setTokenModalOpen(true)
+          } else connection.connectOAuth()
+        }}
+        className={cn(
+          embedded
+            ? INTERACTION_CARD_ROW_CLASSES
+            : 'flex w-full items-center gap-2 rounded-2xl border border-[var(--border)] px-3 py-2.5 text-left transition-colors',
+          embedded && divided && 'border-t',
+          'hover-hover:bg-[var(--surface-5)]'
+        )}
+      >
+        <BrandIcon icon={Icon} className='size-[16px] shrink-0' />
+        <span className='flex-1 text-[var(--text-body)] text-sm'>{label}</span>
+        {connected ? (
+          <Check className='size-[16px] shrink-0 text-[var(--text-icon)]' />
+        ) : (
+          <ArrowRight className='size-[16px] shrink-0 text-[var(--text-icon)]' />
+        )}
+      </button>
+      {connection.error && (
+        <p role='alert' className='px-3 py-2 text-[var(--text-error)] text-caption'>
+          {connection.error}
+        </p>
+      )}
+      {tokenModalOpen && (
+        <Suspense fallback={null}>
+          <ConnectPersonalTokenModal
+            open={tokenModalOpen}
+            onOpenChange={(open) => {
+              setTokenModalOpen(open)
+              if (!open) connection.cancelPersonalToken()
+            }}
+            workspaceId={workspaceId}
+            onConnected={connection.connectedPersonalToken}
+          />
+        </Suspense>
+      )}
+    </>
   )
 }
 
@@ -2506,7 +2662,17 @@ const CREDENTIAL_CARD_TYPES: ReadonlySet<CredentialTagType> = new Set([
   'sim_key',
 ])
 
-function isCredentialCardItemVisible(item: CredentialItemData, canEdit: boolean): boolean {
+function isCredentialCardItemVisible(
+  item: CredentialItemData,
+  canEdit: boolean,
+  requestMode?: 'agent' | 'assistant'
+): boolean {
+  if (requestMode === 'assistant')
+    return (
+      item.type === 'link' &&
+      Boolean(item.provider?.trim()) &&
+      (item.provider?.trim().toLowerCase() !== 'gitlab' || canEdit)
+    )
   if (item.type === 'sim_key') return false
   if (item.type === 'secret_input') return item.scope === 'personal' || canEdit
   if (item.type === 'link') {
@@ -2516,17 +2682,22 @@ function isCredentialCardItemVisible(item: CredentialItemData, canEdit: boolean)
 }
 
 /** Whether a terminal credential tag produces the shared question-style card. */
-export function credentialTagHasVisibleCard(data: CredentialTagData, canEdit: boolean): boolean {
+export function credentialTagHasVisibleCard(
+  data: CredentialTagData,
+  canEdit: boolean,
+  requestMode?: 'agent' | 'assistant'
+): boolean {
   return (
     data.length > 0 &&
     data.every((item) => CREDENTIAL_CARD_TYPES.has(item.type)) &&
-    data.some((item) => isCredentialCardItemVisible(item, canEdit))
+    data.some((item) => isCredentialCardItemVisible(item, canEdit, requestMode))
   )
 }
 
 function CredentialItemDisplay({
   data,
-  controlId,
+  requestMode,
+  controlId = 'credential-link',
   embedded = false,
   divided = false,
   secretValue,
@@ -2534,6 +2705,16 @@ function CredentialItemDisplay({
   onSaved,
   onConnected,
 }: CredentialControlProps) {
+  const { organizationId } = useParams<{ organizationId?: string }>()
+  const { SearchConnectionComponent } = useChatSurface()
+  const { data: session } = useSession()
+  if (
+    requestMode === 'assistant' &&
+    data.type !== 'link' &&
+    data.type !== 'browser_takeover' &&
+    data.type !== 'terminal_handoff'
+  )
+    return null
   if (data.type === 'secret_input') {
     const secretName = data.name?.trim()
     if (embedded) {
@@ -2565,6 +2746,34 @@ function CredentialItemDisplay({
   }
 
   if (data.type === 'link') {
+    if (requestMode === 'assistant') {
+      if (organizationId) {
+        const target = searchConnectionTargetSchema.safeParse(data)
+        if (!target.success || !session?.user?.id) return null
+        if (!SearchConnectionComponent)
+          throw new Error('Search connection controls require an organization chat surface')
+        return (
+          <SearchConnectionComponent
+            organizationId={organizationId}
+            userId={session.user.id}
+            target={target.data}
+            controlId={controlId}
+            embedded={embedded}
+            divided={divided}
+            onConnected={onConnected}
+          />
+        )
+      }
+      return (
+        <PersonalCredentialLinkDisplay
+          data={data}
+          controlId={controlId}
+          embedded={embedded}
+          divided={divided}
+          onConnected={onConnected}
+        />
+      )
+    }
     return (
       <CredentialLinkDisplay
         data={data}
@@ -2599,23 +2808,29 @@ function CredentialItemDisplay({
  */
 function CredentialInputCard({
   data,
+  requestMode,
   interactionId,
   submitted,
   abandoned,
   onContinue,
 }: {
   data: CredentialTagData
+  requestMode?: 'agent' | 'assistant'
   interactionId?: string
   submitted?: CredentialSubmissionPayload
   abandoned?: boolean
   onContinue?: (message: string) => void
 }) {
-  const { workspaceId } = useParams<{ workspaceId: string }>()
+  const { workspaceId, organizationId } = useParams<{
+    workspaceId: string
+    organizationId?: string
+  }>()
+  const { data: session } = useSession()
   const { canEdit } = useUserPermissionsContext()
   const upsertWorkspace = useUpsertWorkspaceEnvironment()
   const savePersonal = useSavePersonalEnvironment()
-  const personalQuery = usePersonalEnvironment()
-  const attachDescriptions = useWorkspaceSecretDescriptions(data)
+  const personalQuery = usePersonalEnvironment({ enabled: requestMode !== 'assistant' })
+  const attachDescriptions = useWorkspaceSecretDescriptions(requestMode === 'assistant' ? [] : data)
   const [secretDrafts, setSecretDrafts] = useState<Record<number, string>>({})
   const [savedSecretRows, setSavedSecretRows] = useState<Set<number>>(() => new Set())
   const [connectedIntegrationRows, setConnectedIntegrationRows] = useState<Set<number>>(
@@ -2644,15 +2859,32 @@ function CredentialInputCard({
       if (item.type !== 'link' && item.type !== 'service_account') continue
       const index = restoreIndex++
       if (item.type !== 'link') continue
-      const { providerId, reconnectCredentialId } = resolveOAuthChipTarget(
-        item.value,
-        item.provider
-      )
+      if (requestMode === 'assistant' && organizationId && session?.user?.id) {
+        const target = searchConnectionTargetSchema.safeParse(item)
+        if (!target.success) continue
+        const attempt = readSearchConnectionAttempt(
+          searchConnectionAttemptKey(
+            organizationId,
+            session.user.id,
+            `${controlIdPrefix}:${dataIndex}:${JSON.stringify(target.data)}`
+          )
+        )
+        if (attempt?.status === 'connected') restored.add(index)
+        continue
+      }
+      const { providerId, reconnectCredentialId } =
+        requestMode === 'assistant'
+          ? {
+              providerId:
+                resolveOAuthServiceForSlug(item.provider ?? '')?.providerId ?? item.provider ?? '',
+              reconnectCredentialId: undefined,
+            }
+          : resolveOAuthChipTarget(item.value, item.provider)
       if (!providerId) continue
       const attempt = readLatestOAuthChatAttempt({
         workspaceId,
         providerId,
-        controlId: `${controlIdPrefix}:${dataIndex}`,
+        controlId: `${requestMode === 'assistant' ? 'personal:' : ''}${controlIdPrefix}:${dataIndex}`,
         credentialId: reconnectCredentialId,
       })
       if (attempt?.status === 'connected') restored.add(index)
@@ -2662,7 +2894,15 @@ function CredentialInputCard({
       if (Array.from(restored).every((index) => current.has(index))) return current
       return new Set([...current, ...restored])
     })
-  }, [abandoned, controlIdPrefix, data, workspaceId])
+  }, [
+    abandoned,
+    controlIdPrefix,
+    data,
+    workspaceId,
+    requestMode,
+    organizationId,
+    session?.user?.id,
+  ])
 
   let integrationIndex = 0
   let secretIndex = 0
@@ -2673,7 +2913,9 @@ function CredentialInputCard({
       item.type === 'link' || item.type === 'service_account' ? integrationIndex++ : undefined,
     secretIndex: item.type === 'secret_input' ? secretIndex++ : undefined,
   }))
-  const visibleRows = indexedRows.filter(({ item }) => isCredentialCardItemVisible(item, canEdit))
+  const visibleRows = indexedRows.filter(({ item }) =>
+    isCredentialCardItemVisible(item, canEdit, requestMode)
+  )
   if (visibleRows.length === 0) return null
 
   const integrationRows = visibleRows.filter(
@@ -2691,6 +2933,7 @@ function CredentialInputCard({
       <CredentialItemDisplay
         key={`${item.type}-${item.provider ?? dataIndex}-${dataIndex}`}
         data={item}
+        requestMode={requestMode}
         controlId={`${controlIdPrefix}:${dataIndex}`}
         embedded
         divided={index > 0}
@@ -2845,12 +3088,14 @@ function CredentialInputCard({
 
 export function CredentialDisplay({
   data,
+  requestMode,
   interactionId,
   submitted,
   abandoned,
   onContinue,
 }: {
   data: CredentialTagData
+  requestMode?: 'agent' | 'assistant'
   interactionId?: string
   submitted?: CredentialSubmissionPayload
   abandoned?: boolean
@@ -2865,7 +3110,9 @@ export function CredentialDisplay({
   // pairing) stay stable — the card simply renders no sim_key rows.
   const simKeyReveals = data
     .map((item, index) =>
-      item.type === 'sim_key' ? <SecretReveal key={`sim-key-${index}`} value={item.value} /> : null
+      item.type === 'sim_key' && requestMode !== 'assistant' ? (
+        <SecretReveal key={`sim-key-${index}`} value={item.value} />
+      ) : null
     )
     .filter(Boolean)
   const inputItems = data.filter((item) => item.type !== 'sim_key')
@@ -2874,6 +3121,7 @@ export function CredentialDisplay({
   const inputControls = usesCredentialCard ? (
     <CredentialInputCard
       data={data}
+      requestMode={requestMode}
       interactionId={interactionId}
       submitted={submitted}
       abandoned={abandoned}
@@ -2885,6 +3133,7 @@ export function CredentialDisplay({
         <CredentialItemDisplay
           key={`${item.type}-${item.provider ?? item.name ?? index}`}
           data={item}
+          requestMode={requestMode}
         />
       ))}
     </div>
@@ -2907,7 +3156,7 @@ export function CredentialDisplay({
  */
 function MothershipErrorDisplay({ data }: { data: MothershipErrorTagData }) {
   return (
-    <p className='text-[13px] text-[var(--text-secondary)] italic leading-[20px]'>{data.message}</p>
+    <p className='text-[var(--text-secondary)] text-small italic leading-[20px]'>{data.message}</p>
   )
 }
 
@@ -2915,16 +3164,20 @@ function UsageUpgradeDisplay({ data }: { data: UsageUpgradeTagData }) {
   const { data: session } = useSession()
   const hostContext = useWorkspaceHostContext()
   const { getSettingsHref } = useSettingsNavigation()
+  const { hosted } = useDeploymentShape()
   const buttonLabel = data.action === 'upgrade_plan' ? 'Upgrade Plan' : 'Increase Limit'
 
   // Self-hosted plan and limit both live on the hosted account, so local
   // workspace billing roles say nothing about who may change them.
-  const href = isHosted
+  const href = hosted
     ? getSettingsHref({ section: 'billing' })
     : data.action === 'upgrade_plan'
       ? buildHostedUpgradeUrl()
       : HOSTED_BILLING_SETTINGS_URL
-  const canManageBilling = !isHosted || canManageWorkspaceBilling(hostContext, session?.user?.id)
+  const canManageBilling = !hosted || canManageWorkspaceBilling(hostContext, session?.user?.id)
+  const usageGate = useWorkspaceUsageGate(
+    data.action === 'increase_limit' && !canManageBilling ? hostContext.workspace.id : undefined
+  )
   const unavailableMessage = hostContext.hostOrganizationId
     ? 'Contact an organization admin to manage this workspace’s usage limits.'
     : 'Only the workspace owner can manage this workspace’s usage limits.'
@@ -2957,16 +3210,25 @@ function UsageUpgradeDisplay({ data }: { data: UsageUpgradeTagData }) {
       {canManageBilling ? (
         <a
           href={href}
-          target={isHosted ? undefined : '_blank'}
-          rel={isHosted ? undefined : 'noopener noreferrer'}
-          aria-label={isHosted ? undefined : `${buttonLabel} (opens in a new tab)`}
+          target={hosted ? undefined : '_blank'}
+          rel={hosted ? undefined : 'noopener noreferrer'}
+          aria-label={hosted ? undefined : `${buttonLabel} (opens in a new tab)`}
           className='mt-2 inline-flex items-center gap-1 text-amber-700 text-small underline decoration-dashed underline-offset-2 transition-colors hover-hover:text-amber-900 dark:text-amber-300 dark:hover-hover:text-amber-200'
         >
           {buttonLabel}
-          {isHosted ? <ArrowRight className='size-3' /> : <SquareArrowUpRight className='size-3' />}
+          {hosted ? <ArrowRight className='size-3' /> : <SquareArrowUpRight className='size-3' />}
         </a>
       ) : (
-        <p className='mt-2 text-amber-700 text-small dark:text-amber-300'>{unavailableMessage}</p>
+        <div className='mt-2 flex flex-col items-start gap-2'>
+          <p className='text-amber-700 text-small dark:text-amber-300'>{unavailableMessage}</p>
+          {usageGate.isSuccess &&
+            usageGate.data.isExceeded &&
+            usageGate.data.scope === 'member' && (
+              <MemberLimitRequestAction
+                scope={{ kind: 'workspace', workspaceId: hostContext.workspace.id }}
+              />
+            )}
+        </div>
       )}
     </div>
   )

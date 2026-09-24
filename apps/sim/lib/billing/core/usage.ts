@@ -1,20 +1,13 @@
 import { db } from '@sim/db'
-import { member, organization, settings, user, userStats, userStatsColumns } from '@sim/db/schema'
+import { member, organization, settings, user, userStats } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { isOrgAdminRole } from '@sim/platform-authz/workspace'
 import { generateId } from '@sim/utils/id'
 import { and, eq, isNull, sql } from 'drizzle-orm'
-import {
-  getEmailSubject,
-  getLimitEmailSubject,
-  renderCreditsExhaustedEmail,
-  renderFreeTierUpgradeEmail,
-  renderUsageLimitReachedEmail,
-  renderUsageThresholdEmail,
-} from '@/components/emails'
 import { getEffectiveBillingStatus } from '@/lib/billing/core/access'
 import { defaultBillingPeriod } from '@/lib/billing/core/billing-period'
 import {
+  getHighestPriorityPersonalSubscription,
   getHighestPrioritySubscription,
   type HighestPrioritySubscription,
 } from '@/lib/billing/core/plan'
@@ -45,10 +38,23 @@ import { Decimal, toDecimal, toNumber } from '@/lib/billing/utils/decimal'
 import { isBillingEnabled } from '@/lib/core/config/env-flags'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import type { DbClient } from '@/lib/db/types'
-import { sendEmail } from '@/lib/messaging/email/mailer'
 import { getEmailPreferences } from '@/lib/messaging/email/unsubscribe'
+import { APP_ENTRY_PATH } from '@/lib/navigation/paths'
 
 const logger = createLogger('UsageManagement')
+
+/**
+ * Email rendering pulls the React templates and every mail provider into the
+ * module graph, which is ~1.2s of imports on every route that reaches billing
+ * attribution. Load it only when a threshold email is actually being sent.
+ */
+async function loadEmailDelivery() {
+  const [emails, mailer] = await Promise.all([
+    import('@/components/emails'),
+    import('@/lib/messaging/email/mailer'),
+  ])
+  return { ...emails, sendEmail: mailer.sendEmail }
+}
 
 export interface OrgUsageLimitResult {
   limit: number
@@ -105,17 +111,40 @@ export async function getOrgUsageLimit(
   seats: number | null,
   executor: DbClient = db
 ): Promise<OrgUsageLimitResult> {
-  const orgData = await executor
+  return (
+    (await findOrgUsageLimit(organizationId, plan, seats, executor)) ??
+    calculateOrgUsageLimit(organizationId, plan, seats, null)
+  )
+}
+
+async function findOrgUsageLimit(
+  organizationId: string,
+  plan: string,
+  seats: number | null,
+  executor: DbClient = db
+): Promise<OrgUsageLimitResult | null> {
+  const [orgData] = await executor
     .select({ orgUsageLimit: organization.orgUsageLimit })
     .from(organization)
     .where(eq(organization.id, organizationId))
     .limit(1)
 
-  const configured =
-    orgData.length > 0 && orgData[0].orgUsageLimit
-      ? toNumber(toDecimal(orgData[0].orgUsageLimit))
-      : null
+  if (!orgData) return null
 
+  return calculateOrgUsageLimit(
+    organizationId,
+    plan,
+    seats,
+    orgData.orgUsageLimit ? toNumber(toDecimal(orgData.orgUsageLimit)) : null
+  )
+}
+
+function calculateOrgUsageLimit(
+  organizationId: string,
+  plan: string,
+  seats: number | null,
+  configured: number | null
+): OrgUsageLimitResult {
   if (isEnterprise(plan)) {
     // Enterprise: Use configured limit directly (no per-seat minimum)
     if (configured !== null) {
@@ -207,7 +236,7 @@ export async function getResolvedUserUsageData(
       // inserted, which a lagging replica can miss (this path throws on a
       // missing row). Stays on the primary deliberately.
       db
-        .select(userStatsColumns)
+        .select()
         .from(userStats)
         .where(eq(userStats.userId, userId))
         .limit(1),
@@ -324,7 +353,7 @@ export async function getUserUsageLimitInfo(userId: string): Promise<UsageLimitI
   try {
     const [subscription, userStatsRecord] = await Promise.all([
       getHighestPrioritySubscription(userId),
-      db.select(userStatsColumns).from(userStats).where(eq(userStats.userId, userId)).limit(1),
+      db.select().from(userStats).where(eq(userStats.userId, userId)).limit(1),
     ])
 
     if (userStatsRecord.length === 0) {
@@ -444,13 +473,11 @@ export async function updateUserUsageLimit(
  * checks). Org-scoped subs return the organization limit;
  * personally-scoped subs return the individual user limit from userStats.
  *
- * Org-scoped members carry a null `currentUsageLimit` by design (see
- * `syncUsageLimitsFromSubscription`). A user whose subscription stops being
- * org-scoped without a resync would otherwise stay null and fail closed on
- * every execution, so a null limit self-heals to the plan/free base plus the
- * exact prepaid balance here. The write-back is best-effort: a limit written
- * concurrently wins, and a failed write still resolves to the fallback
- * instead of blocking execution.
+ * Legacy organization membership syncs may have cleared the personal limit.
+ * A null limit self-heals to the personal plan/free base plus the exact prepaid
+ * balance here. The write-back is best-effort: a limit written concurrently
+ * wins, and a failed write still resolves to the fallback instead of blocking
+ * execution.
  */
 export async function getUserUsageLimit(
   userId: string,
@@ -462,21 +489,16 @@ export async function getUserUsageLimit(
       : await getHighestPrioritySubscription(userId)
 
   if (isOrgScopedSubscription(subscription, userId) && subscription) {
-    const orgExists = await db
-      .select({ id: organization.id })
-      .from(organization)
-      .where(eq(organization.id, subscription.referenceId))
-      .limit(1)
-
-    if (orgExists.length === 0) {
-      throw new Error(`Organization not found: ${subscription.referenceId} for user: ${userId}`)
-    }
-
-    const orgLimit = await getOrgUsageLimit(
+    const orgLimit = await findOrgUsageLimit(
       subscription.referenceId,
       subscription.plan,
       subscription.seats
     )
+
+    if (!orgLimit) {
+      throw new Error(`Organization not found: ${subscription.referenceId} for user: ${userId}`)
+    }
+
     return orgLimit.limit
   }
 
@@ -571,37 +593,19 @@ export async function checkUsageStatus(userId: string): Promise<{
 }
 
 /**
- * Sync usage limits based on subscription changes
+ * Syncs the user's personal billing pool from their exact personal subscription.
+ * Organization subscriptions have a separate pool and never clear personal limits.
  */
 export async function syncUsageLimitsFromSubscription(userId: string): Promise<void> {
   const [subscription, currentUserStats] = await Promise.all([
-    getHighestPrioritySubscription(userId),
-    db.select(userStatsColumns).from(userStats).where(eq(userStats.userId, userId)).limit(1),
+    getHighestPriorityPersonalSubscription(userId, { onError: 'throw' }),
+    db.select().from(userStats).where(eq(userStats.userId, userId)).limit(1),
   ])
 
   if (currentUserStats.length === 0) {
     throw new Error(`User stats not found for userId: ${userId}`)
   }
 
-  const currentStats = currentUserStats[0]
-
-  if (isOrgScopedSubscription(subscription, userId)) {
-    if (currentStats.currentUsageLimit !== null) {
-      await db
-        .update(userStats)
-        .set({
-          currentUsageLimit: null,
-          usageLimitUpdatedAt: new Date(),
-        })
-        .where(eq(userStats.userId, userId))
-
-      logger.info('Cleared individual limit for org-scoped member', {
-        userId,
-        plan: subscription?.plan,
-      })
-    }
-    return
-  }
   const baseLimit = toDecimal(getPerUserMinimumLimit(subscription)).toString()
   const hasEntitledPersonalSubscription =
     subscription !== null && hasPaidSubscriptionStatus(subscription.status)
@@ -629,7 +633,6 @@ export async function syncUsageLimitsFromSubscription(userId: string): Promise<v
       : 'Reset limit to free-plus-prepaid minimum',
     { userId, baseLimit: Number(baseLimit) }
   )
-  // Keep higher custom limits unchanged only while personal billing is entitled.
 }
 
 /**
@@ -707,7 +710,7 @@ export async function maybeSendUsageThresholdEmail(params: {
 
     const upgradeCreditsLink = params.workspaceId
       ? `${baseUrl}${buildUpgradeHref(params.workspaceId, 'credits')}`
-      : `${baseUrl}/workspace`
+      : `${baseUrl}${APP_ENTRY_PATH}`
     /**
      * Organization billing is reached through the workspace the usage occurred in
      * — that is the only plane that serves it. Without a workspace there is no such
@@ -773,6 +776,7 @@ export async function maybeSendUsageThresholdEmail(params: {
         const prefs = await getEmailPreferences(email)
         if (prefs?.unsubscribeAll || prefs?.unsubscribeNotifications) return
 
+        const { renderUsageThresholdEmail, getEmailSubject, sendEmail } = await loadEmailDelivery()
         const html = await renderUsageThresholdEmail({
           userName: name,
           planName: params.planName,
@@ -798,6 +802,7 @@ export async function maybeSendUsageThresholdEmail(params: {
         const prefs = await getEmailPreferences(email)
         if (prefs?.unsubscribeAll || prefs?.unsubscribeNotifications) return
 
+        const { renderFreeTierUpgradeEmail, getEmailSubject, sendEmail } = await loadEmailDelivery()
         const html = await renderFreeTierUpgradeEmail({
           userName: name,
           percentUsed: Math.min(100, Math.round(params.percentAfter)),
@@ -830,6 +835,13 @@ export async function maybeSendUsageThresholdEmail(params: {
         const prefs = await getEmailPreferences(email)
         if (prefs?.unsubscribeAll || prefs?.unsubscribeNotifications) return
 
+        const {
+          renderCreditsExhaustedEmail,
+          renderUsageLimitReachedEmail,
+          getEmailSubject,
+          getLimitEmailSubject,
+          sendEmail,
+        } = await loadEmailDelivery()
         const html = useFreeCopy
           ? await renderCreditsExhaustedEmail({
               userName: name,

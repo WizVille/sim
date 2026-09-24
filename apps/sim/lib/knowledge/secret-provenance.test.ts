@@ -2,31 +2,36 @@
  * @vitest-environment node
  */
 import { document, embedding } from '@sim/db/schema'
-import { queueTableRows, resetDbChainMock } from '@sim/testing'
+import { dbChainMock, queueTableRows, resetDbChainMock } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { hashDurableSecretProvenanceValue } from '@/lib/execution/durable-secret-provenance'
+import type { DbTransaction } from '@/lib/db/types'
+import {
+  type DurableSecretProvenance,
+  hashDurableSecretProvenanceValue,
+} from '@/lib/execution/durable-secret-provenance'
 import {
   createKnowledgeDocumentSourceValue,
   importKnowledgePersistedResponseSecretProvenance,
   importKnowledgeSearchResultSecretProvenance,
   loadKnowledgeDocumentSecretRegistry,
   readBoundKnowledgeDocumentSecretProvenance,
+  replaceKnowledgeDocumentSecretProvenanceInTx,
 } from '@/lib/knowledge/secret-provenance'
 import { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
 
-const { mockDecryptSecret, mockIsEnforced, mockReport } = vi.hoisted(() => ({
+const { mockDecryptSecret, mockReportWrite, mockReportRefusal } = vi.hoisted(() => ({
   mockDecryptSecret: vi.fn(),
-  mockIsEnforced: vi.fn(() => false),
-  mockReport: vi.fn(),
+  mockReportWrite: vi.fn(),
+  mockReportRefusal: vi.fn(),
 }))
 
 vi.mock('@/lib/core/security/encryption', () => ({
   decryptSecret: mockDecryptSecret,
 }))
 
-vi.mock('@/lib/execution/durable-secret-provenance-enforcement', () => ({
-  isDurableSecretProvenanceEnforced: mockIsEnforced,
-  reportUnrecordedDurableProvenance: mockReport,
+vi.mock('@/lib/execution/durable-secret-provenance-telemetry', () => ({
+  reportDurableSecretProvenanceWrite: mockReportWrite,
+  reportDurableSecretProvenanceRefusal: mockReportRefusal,
 }))
 
 const DOCUMENT_SOURCE = createKnowledgeDocumentSourceValue({
@@ -49,7 +54,6 @@ describe('knowledge durable secret provenance', () => {
     resetDbChainMock()
     queueTableRows(document, [DOCUMENT_ROW])
     mockDecryptSecret.mockResolvedValue({ decrypted: 'tracked-secret' })
-    mockIsEnforced.mockReturnValue(false)
   })
 
   it('uses the same explicit source shape for joined rows and persisted writes', () => {
@@ -126,6 +130,43 @@ describe('knowledge durable secret provenance', () => {
         { status: 'unknown' }
       )
     ).rejects.toThrow('Knowledge document secret provenance is unavailable')
+    expect(mockReportRefusal).toHaveBeenCalledWith({
+      surface: 'knowledge',
+      cause: 'knowledge-document-source-unavailable',
+      workspaceId: 'workspace-1',
+      resourceId: DOCUMENT_ROW.id,
+    })
+  })
+
+  it.each([
+    [{ status: 'unknown' }, 'source-provenance-unknown'],
+    [{ status: 'exact', entries: [{ encryptedValue: '' }] }, 'invalid-provenance-entries'],
+  ] satisfies [DurableSecretProvenance, string][])(
+    'reports a non-exact document write without source values',
+    async (provenance, cause) => {
+      await replaceKnowledgeDocumentSecretProvenanceInTx(
+        dbChainMock.db as unknown as DbTransaction,
+        DOCUMENT_ROW.id,
+        DOCUMENT_SOURCE,
+        provenance
+      )
+      expect(mockReportWrite).toHaveBeenCalledExactlyOnceWith({
+        surface: 'knowledge',
+        status: 'unknown',
+        cause,
+        resourceId: DOCUMENT_ROW.id,
+      })
+    }
+  )
+
+  it('does not report an exact-empty document write as a writer failure', async () => {
+    await replaceKnowledgeDocumentSecretProvenanceInTx(
+      dbChainMock.db as unknown as DbTransaction,
+      DOCUMENT_ROW.id,
+      DOCUMENT_SOURCE,
+      { status: 'exact', entries: [] }
+    )
+    expect(mockReportWrite).not.toHaveBeenCalled()
   })
 
   it('marks a fresh exact-empty source as tracked without creating a registry', async () => {
@@ -142,7 +183,7 @@ describe('knowledge durable secret provenance', () => {
   })
 })
 
-describe('knowledge unrecorded-read reporting', () => {
+describe('knowledge durable provenance enforcement', () => {
   const SCOPE = { userId: 'user-1', workspaceId: 'workspace-1' }
   const UNRECORDED_DOCUMENT_ROW = {
     id: 'doc-1',
@@ -166,10 +207,9 @@ describe('knowledge unrecorded-read reporting', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
-    mockIsEnforced.mockReturnValue(false)
   })
 
-  it('reports one aggregated entry per read, naming workspace, actor, and count', async () => {
+  it('refuses unknown document provenance in a mixed persisted response', async () => {
     queueTableRows(document, [UNRECORDED_DOCUMENT_ROW])
     queueTableRows(embedding, [UNRECORDED_CHUNK_ROW])
     const registry = new ResolvedSecretTraceRegistry([], SCOPE)
@@ -179,24 +219,13 @@ describe('knowledge unrecorded-read reporting', () => {
         registry,
         documents: [{ id: 'doc-1', source: DOCUMENT_SOURCE, value: {} }],
         chunks: [{ id: 'chunk-1', documentId: 'doc-1', content: 'chunk text', value: {} }],
-        workspaceId: 'workspace-1',
-        actorUserId: 'user-1',
       })
-    ).resolves.toBe(true)
+    ).resolves.toBe(false)
 
-    expect(registry.isPermanentlyIncomplete()).toBe(false)
-    expect(mockReport).toHaveBeenCalledTimes(1)
-    expect(mockReport).toHaveBeenCalledWith({
-      surface: 'knowledge',
-      cause: 'durable-provenance-unknown',
-      affectedCount: 2,
-      workspaceId: 'workspace-1',
-      actorUserId: 'user-1',
-    })
+    expect(registry.isPermanentlyIncomplete()).toBe(true)
   })
 
-  /** A fault return fails the read closed, so no unvouched record reached anything to report. */
-  it('reports nothing when the read fails closed on a missing row', async () => {
+  it('refuses missing persisted rows', async () => {
     queueTableRows(document, [])
     const registry = new ResolvedSecretTraceRegistry([], SCOPE)
 
@@ -204,16 +233,11 @@ describe('knowledge unrecorded-read reporting', () => {
       importKnowledgePersistedResponseSecretProvenance({
         registry,
         documents: [{ id: 'doc-1', source: DOCUMENT_SOURCE, value: {} }],
-        workspaceId: 'workspace-1',
-        actorUserId: 'user-1',
       })
     ).resolves.toBe(false)
-
-    expect(mockReport).not.toHaveBeenCalled()
   })
 
-  it('latches without reporting once the surface is enforced', async () => {
-    mockIsEnforced.mockReturnValue(true)
+  it('refuses unknown document provenance', async () => {
     queueTableRows(document, [UNRECORDED_DOCUMENT_ROW])
     const registry = new ResolvedSecretTraceRegistry([], SCOPE)
 
@@ -221,17 +245,13 @@ describe('knowledge unrecorded-read reporting', () => {
       importKnowledgePersistedResponseSecretProvenance({
         registry,
         documents: [{ id: 'doc-1', source: DOCUMENT_SOURCE, value: {} }],
-        workspaceId: 'workspace-1',
-        actorUserId: 'user-1',
       })
     ).resolves.toBe(false)
 
     expect(registry.isPermanentlyIncomplete()).toBe(true)
-    expect(mockReport).not.toHaveBeenCalled()
   })
 
-  /** The search read spans chunks and rendered metadata, so its caller owns the one report. */
-  it('returns the unrecorded count from a search import instead of reporting it', async () => {
+  it('refuses unrecorded chunks during a search import', async () => {
     queueTableRows(embedding, [{ ...UNRECORDED_CHUNK_ROW, documentId: DOCUMENT_ROW.id }])
     queueTableRows(document, [DOCUMENT_ROW])
     const registry = new ResolvedSecretTraceRegistry([], SCOPE)
@@ -241,8 +261,7 @@ describe('knowledge unrecorded-read reporting', () => {
       results: [{ id: 'chunk-1', documentId: DOCUMENT_ROW.id, content: 'chunk text' }],
     })
 
-    expect(snapshot.imported).toBe(true)
-    expect(snapshot.unrecordedCount).toBe(1)
-    expect(mockReport).not.toHaveBeenCalled()
+    expect(snapshot.imported).toBe(false)
+    expect(registry.isPermanentlyIncomplete()).toBe(true)
   })
 })

@@ -4,6 +4,7 @@
 
 import { sleep } from '@sim/utils/helpers'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { AsyncToolCallOwnershipError } from '@/lib/copilot/async-runs/errors'
 import { TraceCollector } from '@/lib/copilot/request/trace'
 
 const { isSimExecuted, executeTool, ensureHandlersRegistered, toolRequiresApproval } = vi.hoisted(
@@ -63,6 +64,12 @@ vi.mock('@/lib/copilot/async-runs/repository', () => ({
   markAsyncToolRunning,
   completeAsyncToolCall,
   claimWorkflowToolExecution,
+}))
+
+/** Table side effects are not exercised here, and the real module loads the table application layer. */
+vi.mock('@/lib/copilot/request/tools/tables', () => ({
+  maybeWriteOutputToTable: vi.fn(async (_toolName, _params, result) => result),
+  maybeWriteReadCsvToTable: vi.fn(async (_toolName, _params, result) => result),
 }))
 
 vi.mock('@/lib/copilot/request/tools/client', () => ({
@@ -134,6 +141,7 @@ describe('sse-handlers tool lifecycle', () => {
       toolPermissions: {
         enabled: false,
         autoAllowed: new Set(),
+        autoAllowPermitted: true,
       },
     }
     execContext = {
@@ -141,6 +149,26 @@ describe('sse-handlers tool lifecycle', () => {
       workflowId: 'workflow-1',
       resolvedSecretTraceRegistry: new ResolvedSecretTraceRegistry([]),
     }
+  })
+
+  it('propagates an ownership conflict before a client call can be forwarded', async () => {
+    isSimExecuted.mockReturnValue(false)
+    context.runId = 'current-run'
+    upsertAsyncToolCall.mockRejectedValueOnce(new AsyncToolCallOwnershipError())
+    const event: StreamEvent = {
+      type: 'tool',
+      payload: {
+        toolCallId: 'colliding-call',
+        toolName: 'run_workflow',
+        arguments: {},
+        executor: 'client',
+        mode: 'async',
+        phase: 'call',
+      },
+    }
+    await expect(
+      prePersistClientExecutableToolCall(event, context, {}, execContext)
+    ).rejects.toBeInstanceOf(AsyncToolCallOwnershipError)
   })
 
   it('pins the workflow target into the args it persists and forwards', async () => {
@@ -238,6 +266,7 @@ describe('sse-handlers tool lifecycle', () => {
     context.toolPermissions = {
       enabled: true,
       autoAllowed: new Set(),
+      autoAllowPermitted: true,
     }
 
     const event = {
@@ -275,6 +304,7 @@ describe('sse-handlers tool lifecycle', () => {
     context.toolPermissions = {
       enabled: false,
       autoAllowed: new Set(),
+      autoAllowPermitted: true,
     }
 
     const event = {
@@ -302,6 +332,7 @@ describe('sse-handlers tool lifecycle', () => {
     context.toolPermissions = {
       enabled: true,
       autoAllowed: new Set(),
+      autoAllowPermitted: true,
     }
 
     const event = {
@@ -331,6 +362,7 @@ describe('sse-handlers tool lifecycle', () => {
     context.toolPermissions = {
       enabled: true,
       autoAllowed: new Set(['deploy_as_api']),
+      autoAllowPermitted: true,
     }
 
     const event = {
@@ -1838,6 +1870,7 @@ describe('sse-handlers tool lifecycle', () => {
           toolCallId: 'tool-dynamic-sim',
           toolName: 'gmail_read',
           arguments: { maxResults: 10 },
+          activityDescription: 'Reading the latest project updates',
           executor: MothershipStreamV1ToolExecutor.sim,
           mode: MothershipStreamV1ToolMode.async,
           phase: MothershipStreamV1ToolPhase.call,
@@ -1854,7 +1887,91 @@ describe('sse-handlers tool lifecycle', () => {
     expect(context.toolCalls.get('tool-dynamic-sim')?.status).toBe(
       MothershipStreamV1ToolOutcome.success
     )
+    expect(context.toolCalls.get('tool-dynamic-sim')?.activityDescription).toBe(
+      'Reading the latest project updates'
+    )
   })
+
+  it.each(['main', 'subagent'] as const)(
+    'retains a model-authored description on a finalized %s call without changing arguments',
+    async (lane) => {
+      isSimExecuted.mockReturnValue(false)
+      const handler = lane === 'subagent' ? subAgentHandlers.tool : sseHandlers.tool
+      const scope =
+        lane === 'subagent'
+          ? { lane, parentToolCallId: 'activity-parent', agentId: 'workflow' }
+          : undefined
+      const payload = {
+        toolCallId: `activity-${lane}`,
+        toolName: 'run_function',
+        executor: MothershipStreamV1ToolExecutor.go,
+        mode: MothershipStreamV1ToolMode.sync,
+        phase: MothershipStreamV1ToolPhase.call,
+      } as const
+      await handler(
+        { type: MothershipStreamV1EventType.tool, scope, payload: { ...payload, partial: true } },
+        context,
+        execContext,
+        {}
+      )
+      await handler(
+        {
+          type: MothershipStreamV1EventType.tool,
+          scope,
+          payload: {
+            ...payload,
+            arguments: { code: 'return 1' },
+            activityDescription: '  Checking   the project setup  ',
+          },
+        },
+        context,
+        execContext,
+        {}
+      )
+      const tool = context.toolCalls.get(payload.toolCallId)
+      expect(tool).toMatchObject({
+        activityDescription: 'Checking the project setup',
+        displayTitle: 'Checking the project setup',
+        params: { code: 'return 1' },
+      })
+      if (lane === 'subagent') {
+        expect(context.subAgentToolCalls['activity-parent'][0]).toBe(tool)
+      }
+      expect(executeTool).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each(['executing', 'awaiting_approval', 'success'] as const)(
+    'captures late activity metadata for a %s call without reopening or executing it',
+    async (status) => {
+      context.toolCalls.set('activity-late', { id: 'activity-late', name: 'read', status })
+      const event: StreamEvent = {
+        type: MothershipStreamV1EventType.tool,
+        payload: {
+          phase: MothershipStreamV1ToolPhase.call,
+          executor: MothershipStreamV1ToolExecutor.go,
+          mode: MothershipStreamV1ToolMode.sync,
+          toolCallId: 'activity-late',
+          toolName: 'read',
+          arguments: { path: 'WORKSPACE.md' },
+          activityDescription: 'Checking the project setup',
+        },
+      }
+      await sseHandlers.tool(event, context, execContext, {})
+      await sseHandlers.tool(
+        { ...event, payload: { ...event.payload, activityDescription: 'Reading something else' } },
+        context,
+        execContext,
+        {}
+      )
+      expect(context.toolCalls.get('activity-late')).toMatchObject({
+        status,
+        activityDescription: 'Checking the project setup',
+        displayTitle: 'Checking the project setup',
+      })
+      expect(executeTool).not.toHaveBeenCalled()
+    }
+  )
 
   it('rebinds a gateway call to the resolved integration operation and branded activity', async () => {
     isSimExecuted.mockReturnValue(false)

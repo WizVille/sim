@@ -16,6 +16,9 @@ import {
 } from '@sim/emcn/icons'
 import type { QueryClient } from '@tanstack/react-query'
 import { getDocumentIcon } from '@/components/icons/document-icons'
+import { terminalIdFromResourceId } from '@/lib/terminal/resource-id'
+import { BrowserTabIcon } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-registry/browser-tab-icon'
+import { TerminalTabIcon } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-registry/terminal-tab-icon'
 import type {
   MothershipResource,
   MothershipResourceType,
@@ -39,7 +42,12 @@ export interface ResourceTypeConfig {
   type: MothershipResourceType
   label: string
   icon: ElementType
-  renderTabIcon: (resource: MothershipResource, className: string) => ReactNode
+  /** `desktopScopeId` names the desktop browser scope a browser tab belongs to. */
+  renderTabIcon: (
+    resource: MothershipResource,
+    className: string,
+    desktopScopeId?: string
+  ) => ReactNode
   renderDropdownItem: (props: DropdownItemRenderProps) => ReactNode
   /**
    * How many of this family's candidates an unfiltered `@` list shows, overriding
@@ -53,7 +61,7 @@ export interface ResourceTypeConfig {
 function WorkflowDropdownItem({ item }: DropdownItemRenderProps) {
   return (
     <>
-      <Workflow className='size-[14px] flex-shrink-0 text-[var(--text-icon)]' />
+      <Workflow className='size-[14px] shrink-0 text-[var(--text-icon)]' />
       <OverflowText label={item.name} />
     </>
   )
@@ -67,7 +75,7 @@ function FileDropdownItem({ item }: DropdownItemRenderProps) {
   const DocIcon = getDocumentIcon('', item.name)
   return (
     <>
-      <DocIcon className='size-[14px] flex-shrink-0 text-[var(--text-icon)]' />
+      <DocIcon className='size-[14px] shrink-0 text-[var(--text-icon)]' />
       <OverflowText label={item.name} />
     </>
   )
@@ -76,7 +84,7 @@ function FileDropdownItem({ item }: DropdownItemRenderProps) {
 function IconDropdownItem({ item, icon: Icon }: DropdownItemRenderProps & { icon: ElementType }) {
   return (
     <>
-      <Icon className='size-[14px] flex-shrink-0 text-[var(--text-icon)]' />
+      <Icon className='size-[14px] shrink-0 text-[var(--text-icon)]' />
       <OverflowText label={item.name} />
     </>
   )
@@ -93,7 +101,7 @@ function IntegrationDropdownItem({ item }: DropdownItemRenderProps) {
   if (!Icon) return <OverflowText label={item.name} />
   return (
     <>
-      <BrandIcon icon={Icon} className='size-[14px] flex-shrink-0' />
+      <BrandIcon icon={Icon} className='size-[14px] shrink-0' />
       <OverflowText label={item.name} />
     </>
   )
@@ -114,19 +122,19 @@ function LogDropdownItem({ item }: DropdownItemRenderProps) {
   const statusColor = status === 'info' ? null : STATUS_CONFIG[status].color
   return (
     <>
-      <Library className='size-[14px] flex-shrink-0 text-[var(--text-icon)]' />
+      <Library className='size-[14px] shrink-0 text-[var(--text-icon)]' />
       <OverflowText label={workflowName} />
       {statusColor && (
         <div
           aria-hidden
-          className='ml-auto size-[5px] flex-shrink-0 rounded-xs'
+          className='ml-auto size-[5px] shrink-0 rounded-xs'
           style={{ backgroundColor: statusColor }}
         />
       )}
       {time && (
         <span
           className={cn(
-            'flex-shrink-0 text-[var(--text-tertiary)] text-caption',
+            'shrink-0 text-[var(--text-tertiary)] text-caption',
             !statusColor && 'ml-auto'
           )}
         >
@@ -233,8 +241,8 @@ export const RESOURCE_REGISTRY: Record<MothershipResourceType, ResourceTypeConfi
     type: 'browser',
     label: 'Browser',
     icon: Globe,
-    renderTabIcon: (_resource, className) => (
-      <Globe className={cn(className, 'text-[var(--text-icon)]')} />
+    renderTabIcon: (resource, className, desktopScopeId) => (
+      <BrowserTabIcon tabId={resource.id} scopeId={desktopScopeId} className={className} />
     ),
     renderDropdownItem: (props) => <IconDropdownItem {...props} icon={Globe} />,
   },
@@ -242,8 +250,12 @@ export const RESOURCE_REGISTRY: Record<MothershipResourceType, ResourceTypeConfi
     type: 'terminal',
     label: 'Terminal',
     icon: TerminalWindow,
-    renderTabIcon: (_resource, className) => (
-      <TerminalWindow className={cn(className, 'text-[var(--text-icon)]')} />
+    renderTabIcon: (resource, className, desktopScopeId) => (
+      <TerminalTabIcon
+        terminalId={terminalIdFromResourceId(resource.id)}
+        scopeId={desktopScopeId}
+        className={className}
+      />
     ),
     renderDropdownItem: (props) => <IconDropdownItem {...props} icon={TerminalWindow} />,
   },
@@ -300,6 +312,9 @@ const RESOURCE_INVALIDATORS: Record<
   table: (qc, _wId, id) => {
     qc.invalidateQueries({ queryKey: tableKeys.lists() })
     qc.invalidateQueries({ queryKey: tableKeys.detail(id) })
+    // A view the agent just created must be in the list before the embedded
+    // table can switch to it; see the view-pin store.
+    qc.invalidateQueries({ queryKey: tableKeys.views(id) })
   },
   file: (qc, wId, id) => {
     qc.invalidateQueries({ queryKey: workspaceFilesKeys.lists() })

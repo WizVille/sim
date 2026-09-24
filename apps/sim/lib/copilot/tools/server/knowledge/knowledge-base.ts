@@ -19,7 +19,8 @@ import {
 } from '@/lib/copilot/tools/server/base-tool'
 import { asOrchestrationError } from '@/lib/core/orchestration/types'
 import { PlatformEvents } from '@/lib/core/telemetry'
-import { getEffectiveDecryptedEnv } from '@/lib/environment/utils'
+import { getEffectiveEnvironmentSnapshot } from '@/lib/environment/utils'
+import { isKnowledgeMemberAccessAvailable } from '@/lib/knowledge/access/availability'
 import { addWorkspaceFilesToKnowledgeBase } from '@/lib/knowledge/application/add-workspace-files'
 import { KnowledgeUsageLimitExceededError } from '@/lib/knowledge/application/billing'
 import {
@@ -52,10 +53,27 @@ import {
   KNOWLEDGE_TAG_DISPLAY_NAME_MAX_LENGTH,
   MAX_KNOWLEDGE_BATCH_ITEMS,
 } from '@/lib/knowledge/constants'
+import { sourceAuthor } from '@/lib/knowledge/search/author'
 import { captureServerEvent } from '@/lib/posthog/server'
 import { projectResolvedSecretModelContent } from '@/executor/utils/resolved-secret-content-projection'
 
 const logger = createLogger('KnowledgeBaseServerTool')
+
+/** Results a query returns unless the caller asks for a number. */
+const DEFAULT_QUERY_TOP_K = 5
+/**
+ * How the model cites a knowledge result in its reply. The `<source>` tag is
+ * what the chat renders as a link back to the document, so a result without
+ * a source URL is quoted by name instead.
+ *
+ * Asked for only where per-member access is on. The chip and the sources strip
+ * that render the tag arrived with Sim Search, so a workspace without the
+ * feature must not be told to emit one: the gate belongs here, at the emission,
+ * because a client that merely declined to render the tag would leave the raw
+ * `<source>{...}</source>` JSON sitting in the visible reply.
+ */
+const KNOWLEDGE_CITATION_INSTRUCTION =
+  'Cite each result you use inline, right after the sentence it supports, as <source>{"url":"<sourceUrl>","title":"<documentName>","siteName":"<knowledgeBaseName>","connectorType":"<connectorType>","snippet":"<the sentence or two of content you relied on>","updatedAt":"<sourceModifiedAt>","author":"<author>"}</source> with every value JSON-escaped; leave out any optional field whose value is null or unknown, and omit the tag for a result whose sourceUrl is null and name the document instead.'
 
 /**
  * Resolves an environment-variable reference passed as a connector API key.
@@ -78,7 +96,8 @@ async function resolveConnectorApiKey(
   const braced = apiKey.match(/^\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$/)
   const dollar = apiKey.match(/^\$([A-Za-z_][A-Za-z0-9_]*)$/)
   const referencedName = braced?.[1] ?? dollar?.[1]
-  const env = await getEffectiveDecryptedEnv(context.userId, workspaceId)
+  const environment = await getEffectiveEnvironmentSnapshot(context.userId, workspaceId)
+  const env = { ...environment.personalDecrypted, ...environment.workspaceDecrypted }
   const name = referencedName ?? (Object.hasOwn(env, apiKey) ? apiKey : undefined)
   if (!name) return { apiKey }
   const value = env[name]
@@ -87,9 +106,10 @@ async function resolveConnectorApiKey(
       error: `Environment variable "${name}" is not set for this workspace or user, so it cannot be used as the connector API key. Set it first, pass a different {{ENV_VAR}} reference, or pass the raw key.`,
     }
   }
-  // Activate the resolved secret on the call's egress registry so any
-  // accidental echo of it (provider error bodies, logs) is redacted.
-  context.resolvedSecretTraceRegistry?.recordResolved(name, value)
+  context.resolvedSecretTraceRegistry?.recordResolvedFromEnvironment(name, value, {
+    ...environment,
+    scope: { userId: context.userId, workspaceId },
+  })
   return { apiKey: value }
 }
 
@@ -405,7 +425,7 @@ export const knowledgeBaseServerTool: BaseServerTool<KnowledgeBaseArgs, Knowledg
             }
           }
 
-          const topK = args.topK || 5
+          const topK = args.topK || DEFAULT_QUERY_TOP_K
           const queryProjection = projectResolvedSecretModelContent(
             args.query,
             context.resolvedSecretTraceRegistry
@@ -425,13 +445,31 @@ export const knowledgeBaseServerTool: BaseServerTool<KnowledgeBaseArgs, Knowledg
                 'Failed to query knowledge base: Knowledge result secret provenance is unavailable',
             }
           }
-          const searchResult = await executeCopilotKnowledgeUseCase(context, searchKnowledge, {
-            workspaceId,
-            knowledgeBaseIds: [args.knowledgeBaseId],
-            query: modelQuery,
-            topK,
-            resultSecretRegistry: context.resolvedSecretTraceRegistry,
-          })
+          const [searchResult, citable] = await Promise.all([
+            executeCopilotKnowledgeUseCase(context, searchKnowledge, {
+              workspaceId,
+              knowledgeBaseIds: [args.knowledgeBaseId],
+              query: modelQuery,
+              topK,
+              surface: context?.searchSurface ?? 'copilot',
+              resultSecretRegistry: context.resolvedSecretTraceRegistry,
+              signal: context.abortSignal,
+            }),
+            /**
+             * Whether to ask for a citation is a presentation choice, and it is
+             * answered by a billing-backed lookup that can reject. A rejection
+             * must not discard a search that succeeded, so it settles to "do not
+             * cite" — the same answer the feature being off gives — rather than
+             * failing the query.
+             */
+            isKnowledgeMemberAccessAvailable({ workspaceId }).catch((error) => {
+              logger.warn('Citation eligibility unavailable; answering without citations', {
+                workspaceId,
+                error: getErrorMessage(error),
+              })
+              return false
+            }),
+          ])
           const results = searchResult.results
           const knowledgeBase = searchResult.knowledgeBases[0]
           if (!knowledgeBase)
@@ -444,9 +482,11 @@ export const knowledgeBaseServerTool: BaseServerTool<KnowledgeBaseArgs, Knowledg
             userId: context.userId,
           })
 
+          const foundMessage = `Found ${results.length} result(s) for query "${truncate(args.query, 50)}".`
+
           return {
             success: true,
-            message: `Found ${results.length} result(s) for query "${truncate(args.query, 50)}"`,
+            message: citable ? `${foundMessage} ${KNOWLEDGE_CITATION_INSTRUCTION}` : foundMessage,
             data: {
               knowledgeBaseId: args.knowledgeBaseId,
               knowledgeBaseName: knowledgeBase.name,
@@ -455,6 +495,11 @@ export const knowledgeBaseServerTool: BaseServerTool<KnowledgeBaseArgs, Knowledg
               totalResults: results.length,
               results: results.map((result) => ({
                 documentId: result.documentId,
+                documentName: result.documentName,
+                sourceUrl: result.sourceUrl,
+                sourceModifiedAt: result.sourceModifiedAt?.toISOString() ?? null,
+                author: sourceAuthor(result.metadata),
+                connectorType: result.connectorType,
                 content: result.content,
                 chunkIndex: result.chunkIndex,
                 similarity: result.similarity,
@@ -982,6 +1027,9 @@ export const knowledgeBaseServerTool: BaseServerTool<KnowledgeBaseArgs, Knowledg
                 requireKnowledgeBillingAttribution(context, billingWorkspaceId),
               source: 'agent',
             })
+          if (canonicalWorkspaceId !== workspaceId) {
+            throw new Error('Knowledge connector workspace does not match the authorized workspace')
+          }
           captureKnowledgeConnectorAdded(
             context.userId,
             canonicalWorkspaceId,
@@ -1098,6 +1146,9 @@ export const knowledgeBaseServerTool: BaseServerTool<KnowledgeBaseArgs, Knowledg
               requireKnowledgeBillingAttribution(context, canonicalWorkspaceId),
             source: 'agent',
           })
+          if (outcome.workspaceId !== workspaceId) {
+            throw new Error('Knowledge connector workspace does not match the authorized workspace')
+          }
           captureKnowledgeConnectorSynced(
             context.userId,
             outcome.workspaceId,

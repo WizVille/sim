@@ -25,10 +25,8 @@ vi.mock('@/components/icons', () => ({
   RootlyIcon: () => null,
   AzureIcon: () => null,
 }))
-vi.mock('@/lib/knowledge/documents/utils', () => ({
-  fetchWithRetry: vi.fn(),
-  VALIDATE_RETRY_OPTIONS: {},
-}))
+vi.mock('@/lib/knowledge/documents/utils', () => ({ VALIDATE_RETRY_OPTIONS: {} }))
+vi.mock('@/lib/knowledge/documents/secure-fetch.server', () => ({ fetchWithRetry: vi.fn() }))
 vi.mock('@/tools/jira/utils', () => ({ extractAdfText: vi.fn(), getJiraCloudId: vi.fn() }))
 vi.mock('@/tools/confluence/utils', () => ({ getConfluenceCloudId: vi.fn() }))
 vi.mock('@/tools/jsm/utils', () => ({
@@ -63,27 +61,72 @@ import { typeformConnector } from '@/connectors/typeform/typeform'
 import {
   appendPendingMicrosoftGraphFolders,
   assertMicrosoftGraphNextLink,
+  BoundedLines,
   ConnectorFileTooLargeError,
+  ConnectorListingScopeUnavailableError,
   decodeMicrosoftGraphTraversalCursor,
   encodeMicrosoftGraphTraversalCursor,
   extractConnectorText,
   hasIndexablePayload,
   htmlToPlainText,
   isIndexableConnectorFile,
+  isSkippableMicrosoftGraphFolderError,
   isSkippedDocument,
   MICROSOFT_GRAPH_MAX_CURSOR_ENCODED_BYTES,
   MICROSOFT_GRAPH_MAX_ITEM_ID_BYTES,
   MICROSOFT_GRAPH_MAX_PENDING_FOLDERS,
   markSkipped,
+  memberDocumentId,
+  PER_MEMBER_LISTING_CONTEXT,
+  parseDefaultedUnlimitedSafeInteger,
   pipelineParsedMimeType,
   readBodyWithLimit,
   sizeLimitSkipReason,
+  sourceDocumentId,
   takeIndexableWithinCap,
 } from '@/connectors/utils'
 import { xConnector } from '@/connectors/x/x'
 import { youtubeConnector } from '@/connectors/youtube/youtube'
 
 const ISO_DATE = '2025-06-15T10:30:00.000Z'
+
+describe('member document identity', () => {
+  const alice = { ...PER_MEMBER_LISTING_CONTEXT, memberId: 'alice' }
+  const bob = { ...PER_MEMBER_LISTING_CONTEXT, memberId: 'bob' }
+
+  it('isolates different member representations of the same source item', () => {
+    const aliceId = memberDocumentId('site:document', alice)
+    const bobId = memberDocumentId('site:document', bob)
+    expect(aliceId).not.toBe(bobId)
+    expect(sourceDocumentId(aliceId, alice)).toBe('site:document')
+    expect(sourceDocumentId(aliceId, bob)).toBeNull()
+    expect(sourceDocumentId(bobId, alice)).toBeNull()
+    expect(sourceDocumentId('site:document', alice)).toBeNull()
+  })
+
+  it('preserves workspace document identities', () => {
+    expect(memberDocumentId('site:document', undefined)).toBe('site:document')
+    expect(sourceDocumentId('site:document', undefined)).toBe('site:document')
+    expect(memberDocumentId('site:document', { memberId: 'alice' })).toBe('site:document')
+  })
+
+  it('encodes member delimiters without changing the source identity', () => {
+    const context = { ...PER_MEMBER_LISTING_CONTEXT, memberId: 'alice:team/%' }
+    const id = memberDocumentId('calendar:recurring:event', context)
+    expect(sourceDocumentId(id, context)).toBe('calendar:recurring:event')
+    expect(sourceDocumentId(id, alice)).toBeNull()
+    expect(sourceDocumentId('member:alice:', alice)).toBeNull()
+  })
+
+  it.each([undefined, '', ' ', 42])(
+    'fails closed without a canonical member ID (%s)',
+    (memberId) => {
+      const context = { ...PER_MEMBER_LISTING_CONTEXT, memberId }
+      expect(() => memberDocumentId('document', context)).toThrow('connector member ID')
+      expect(() => sourceDocumentId('document', context)).toThrow('connector member ID')
+    }
+  )
+})
 
 describe('Jira mapTags', () => {
   const mapTags = jiraConnector.mapTags!
@@ -1453,17 +1496,13 @@ describe('htmlToPlainText entity decoding', () => {
 
 describe('isIndexableConnectorFile', () => {
   it('accepts the Office and PDF formats the knowledge base can parse', () => {
-    for (const name of [
-      'sop.pdf',
-      'sop.doc',
-      'sop.docx',
-      'sheet.xls',
-      'sheet.xlsx',
-      'deck.ppt',
-      'deck.pptx',
-    ]) {
+    for (const name of ['sop.pdf', 'sop.doc', 'sop.docx', 'sheet.xls', 'sheet.xlsx', 'deck.pptx']) {
       expect(isIndexableConnectorFile(name)).toBe(true)
     }
+  })
+
+  it('refuses legacy .ppt up front because no parser reads it', () => {
+    expect(isIndexableConnectorFile('deck.ppt')).toBe(false)
   })
 
   it('still accepts the plain-text formats connectors already synced', () => {
@@ -1533,6 +1572,30 @@ describe('extractConnectorText', () => {
   it('leaves whitespace-only content alone for the caller to reject', () => {
     expect(extractConnectorText(Buffer.from('   '), 'blank.txt')).toBe('   ')
   })
+
+  it('decodes a Latin-1 file as Windows-1252 instead of indexing mojibake', () => {
+    expect(extractConnectorText(Buffer.from('Caf\xe9 \xa3 42', 'latin1'), 'notes.txt')).toBe(
+      'Café £ 42'
+    )
+  })
+
+  it('strips a UTF-8 BOM', () => {
+    expect(
+      extractConnectorText(
+        Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('a,b')]),
+        'data.csv'
+      )
+    ).toBe('a,b')
+  })
+
+  it('decodes UTF-16 with a BOM', () => {
+    expect(
+      extractConnectorText(
+        Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('<p>Hällo</p>', 'utf16le')]),
+        'page.html'
+      )
+    ).toBe('Hällo')
+  })
 })
 
 describe('pipelineParsedMimeType', () => {
@@ -1592,5 +1655,102 @@ describe('hasIndexablePayload', () => {
 
   it('rejects blank text', () => {
     expect(hasIndexablePayload({ content: '   ' })).toBe(false)
+  })
+})
+
+describe('parseDefaultedUnlimitedSafeInteger', () => {
+  const ERROR = 'bad cap'
+
+  it.each([undefined, null, '', '   '])('keeps the default for a blank field (%j)', (value) => {
+    expect(parseDefaultedUnlimitedSafeInteger(value, 500, ERROR)).toBe(500)
+  })
+
+  it('reads an explicit 0 as unlimited', () => {
+    expect(parseDefaultedUnlimitedSafeInteger(0, 500, ERROR)).toBe(0)
+    expect(parseDefaultedUnlimitedSafeInteger('0', 500, ERROR)).toBe(0)
+  })
+
+  it('parses a set cap and rejects a malformed one', () => {
+    expect(parseDefaultedUnlimitedSafeInteger(' 200 ', 500, ERROR)).toBe(200)
+    expect(() => parseDefaultedUnlimitedSafeInteger('many', 500, ERROR)).toThrow(ERROR)
+    expect(() => parseDefaultedUnlimitedSafeInteger(-1, 500, ERROR)).toThrow(ERROR)
+  })
+})
+
+describe('isSkippableMicrosoftGraphFolderError', () => {
+  const unreachable = new ConnectorListingScopeUnavailableError('folder', 403)
+  const perMember = { ...PER_MEMBER_LISTING_CONTEXT }
+
+  it('skips an unreachable descendant folder under a per-member listing', () => {
+    expect(isSkippableMicrosoftGraphFolderError(unreachable, perMember, false)).toBe(true)
+  })
+
+  it('never skips the configured root', () => {
+    expect(isSkippableMicrosoftGraphFolderError(unreachable, perMember, true)).toBe(false)
+  })
+
+  it('never skips under a shared credential', () => {
+    expect(isSkippableMicrosoftGraphFolderError(unreachable, {}, false)).toBe(false)
+    expect(isSkippableMicrosoftGraphFolderError(unreachable, undefined, false)).toBe(false)
+  })
+
+  it('never skips a fault the engine should retry', () => {
+    expect(isSkippableMicrosoftGraphFolderError(new Error('500'), perMember, false)).toBe(false)
+  })
+})
+
+describe('BoundedLines', () => {
+  it('joins everything when the text fits', () => {
+    const lines = new BoundedLines(64)
+    expect(lines.push('Subject: hi', '')).toBe(true)
+    expect(lines.push('--- a ---', 'body')).toBe(true)
+    expect(lines.join()).toBe('Subject: hi\n\n--- a ---\nbody')
+  })
+
+  it('refuses a record that would cross the ceiling, whole, and says so in the output', () => {
+    const lines = new BoundedLines(20)
+    expect(lines.push('first')).toBe(true)
+    expect(lines.push('--- header ---', 'a long body')).toBe(false)
+    expect(lines.push('x')).toBe(false)
+    expect(lines.join()).toBe('first\n[Truncated: the indexed text reached the size limit]')
+  })
+
+  it('counts encoded bytes, not characters', () => {
+    const lines = new BoundedLines(6)
+    expect(lines.push('éé')).toBe(true)
+    expect(lines.push('é')).toBe(false)
+  })
+
+  describe('keeping the last records', () => {
+    it('lets the oldest records go so the newest fit, under a header that stays', () => {
+      const lines = new BoundedLines(24, 'last')
+      lines.pin('# room')
+      expect(lines.push('one')).toBe(true)
+      expect(lines.push('two')).toBe(true)
+      expect(lines.push('three')).toBe(true)
+      expect(lines.push('four')).toBe(true)
+      expect(lines.count).toBe(3)
+      expect(lines.join()).toBe(
+        '# room\n[Truncated: earlier text was left out to fit the size limit]\ntwo\nthree\nfour'
+      )
+    })
+
+    it('refuses only a record that cannot fit on its own and carries on', () => {
+      const lines = new BoundedLines(12, 'last')
+      expect(lines.push('a very long record')).toBe(false)
+      expect(lines.push('short')).toBe(true)
+      expect(lines.push('next')).toBe(true)
+      expect(lines.count).toBe(2)
+      expect(lines.join()).toBe(
+        '[Truncated: earlier text was left out to fit the size limit]\nshort\nnext'
+      )
+    })
+
+    it('joins the header and records plainly when everything fits', () => {
+      const lines = new BoundedLines(64, 'last')
+      lines.pin('# room', '')
+      lines.push('hello')
+      expect(lines.join()).toBe('# room\n\nhello')
+    })
   })
 })

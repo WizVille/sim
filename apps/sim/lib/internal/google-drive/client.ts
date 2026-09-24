@@ -1,3 +1,4 @@
+import { toRecord } from '@sim/utils/object'
 import {
   MAX_JSON_API_RESPONSE_BYTES,
   type SecureFetchResponse,
@@ -25,7 +26,7 @@ export async function requestGoogleDrive(
   options: GoogleDriveRequestOptions
 ): Promise<SecureFetchResponse> {
   options.signal?.throwIfAborted()
-  const validation = await validateUrlWithDNS(options.url, options.label)
+  const validation = await validateUrlWithDNS(options.url, options.label, 'configuredEndpoint')
   options.signal?.throwIfAborted()
   if (!validation.isValid) {
     throw new GoogleDriveOperationError(400, {
@@ -34,7 +35,8 @@ export async function requestGoogleDrive(
     })
   }
 
-  return secureFetchWithPinnedIP(options.url, validation.resolvedIP!, {
+  return secureFetchWithPinnedIP(options.url, validation.resolvedIP, {
+    profile: 'configuredEndpoint',
     method: options.method,
     headers: {
       Authorization: `Bearer ${options.accessToken}`,
@@ -53,9 +55,7 @@ export async function requestGoogleDrive(
 export type JsonObject = Record<string, unknown>
 
 export function asObject(value: unknown): JsonObject {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as JsonObject)
-    : {}
+  return toRecord(value)
 }
 
 export async function responseObject(response: SecureFetchResponse): Promise<JsonObject> {

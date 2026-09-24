@@ -24,12 +24,15 @@ import type { PlusMenuHandle } from '@/app/workspace/[workspaceId]/home/componen
 import {
   buildMentionPreview,
   resourceMentionMatches,
-  withDesktopTabMentions,
+  withBrowserTabMentions,
+  withFolderMentions,
+  withTerminalTabMentions,
 } from '@/app/workspace/[workspaceId]/home/components/user-input/components/plus-menu-dropdown/resource-mention-items'
 import type {
   MothershipResource,
   MothershipResourceType,
 } from '@/app/workspace/[workspaceId]/home/types'
+import { useSettledTerminalCommands } from '@/hooks/use-settled-terminal-commands'
 import { useBrowserSessionStore } from '@/stores/browser-session/store'
 import { useCopilotTerminalStore } from '@/stores/copilot-terminal/store'
 
@@ -52,7 +55,6 @@ const MENTION_MAX_HEIGHT_CLASS = 'max-h-[min(280px,var(--radix-popper-available-
  * (`ADD_RESOURCE_EXCLUDED_TYPES` in `resource-tabs`).
  */
 const MENTION_ONLY_RESOURCE_TYPES = new Set<MothershipResourceType>(['integration'])
-const NON_ATTACHABLE_RESOURCE_TYPES = new Set<MothershipResourceType>(['browser'])
 const EMPTY_BROWSER_TABS = [] as const
 const EMPTY_TERMINAL_TABS = [] as const
 
@@ -104,6 +106,7 @@ export const PlusMenuDropdown = React.memo(
       isHydrating,
     } = useAvailableResources(workspaceId, {
       enabled: open || !!warm,
+      includeFolderMentions: true,
     })
 
     const doOpen = useCallback(
@@ -121,22 +124,31 @@ export const PlusMenuDropdown = React.memo(
       setOpen(false)
     }, [])
 
-    // The `+` browse menu hides non-attachable and mention-only resource types.
-    // `@` mode exposes the full catalog and adds each live Browser/Terminal tab
-    // after its always-present whole-resource row.
+    const settledCommands = useSettledTerminalCommands(terminalTabs)
     const visibleResources = useMemo(() => {
-      if (isMention) {
-        return withDesktopTabMentions(availableResources, browserTabs, terminalTabs)
-      }
-      const attachable = availableResources.filter(
-        ({ type }) => !NON_ATTACHABLE_RESOURCE_TYPES.has(type)
+      const resources = withTerminalTabMentions(
+        withBrowserTabMentions(
+          withFolderMentions(availableResources, structureFolders),
+          browserTabs
+        ),
+        terminalTabs,
+        settledCommands
       )
-      return attachable.filter(({ type }) => !MENTION_ONLY_RESOURCE_TYPES.has(type))
-    }, [availableResources, browserTabs, isMention, terminalTabs])
+      if (isMention) return resources
+      return resources.filter(({ type }) => !MENTION_ONLY_RESOURCE_TYPES.has(type))
+    }, [
+      availableResources,
+      structureFolders,
+      browserTabs,
+      isMention,
+      settledCommands,
+      terminalTabs,
+    ])
 
     const treeSections = useResourceTreeSections({
-      groups: visibleResources,
+      groups: availableResources,
       structureFolders,
+      selectFolders: true,
     })
 
     const filteredItems = useMemo(() => {

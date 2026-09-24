@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
+import ts from '@typescript/typescript6'
 import { describe, expect, it } from 'vitest'
 import { MAX_ID_LENGTH } from '../../apps/sim/lib/api/contracts/primitives'
 import { billingOpenApiDocument } from '../../apps/sim/lib/api/contracts/v2/openapi/billing'
@@ -22,6 +23,7 @@ import { generateOpenApiDocument, serializeOpenApiDocument } from './generator'
 type JsonObject = Record<string, unknown>
 
 const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete'])
+const MAX_DESCRIPTION_WORDS = 80
 
 const DOCUMENTS = [
   workflowsOpenApiDocument,
@@ -33,15 +35,98 @@ const DOCUMENTS = [
   resourcesOpenApiDocument,
 ] as const
 
+/** Reads route admission policy without importing its database and provider implementations. */
+async function routeApplicationOperation(routePath: string, method: string): Promise<unknown> {
+  const sourcePath = path.resolve(
+    import.meta.dirname,
+    '../../apps/sim/app',
+    `.${routePath}`,
+    'route.ts'
+  )
+  const source = ts.createSourceFile(
+    sourcePath,
+    readFileSync(sourcePath, 'utf8'),
+    ts.ScriptTarget.Latest,
+    true
+  )
+  let handler: ts.Expression | undefined
+  const imports = new Map<string, { module: string; name: string }>()
+  function visit(node: ts.Node): void {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === method) {
+      handler = node.initializer
+    }
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      const bindings = node.importClause?.namedBindings
+      if (bindings && ts.isNamedImports(bindings)) {
+        for (const item of bindings.elements) {
+          imports.set(item.name.text, {
+            module: node.moduleSpecifier.text,
+            name: item.propertyName?.text ?? item.name.text,
+          })
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(source)
+  if (!handler || !ts.isCallExpression(handler))
+    throw new Error(`Missing ${method} handler: ${sourcePath}`)
+  let operation: ts.Expression | undefined
+  const options = handler.arguments[0]
+  if (options && ts.isObjectLiteralExpression(options)) {
+    const property = options.properties.find(
+      (item) => ts.isPropertyAssignment(item) && item.name.getText(source) === 'operation'
+    )
+    if (property && ts.isPropertyAssignment(property)) operation = property.initializer
+  } else {
+    function findAdmission(node: ts.Node): void {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        ['admitV2Request', 'admitOptionalV2Request'].includes(node.expression.text)
+      ) {
+        if (operation) throw new Error(`Ambiguous admission policy: ${sourcePath}`)
+        operation = node.arguments[1]
+      }
+      ts.forEachChild(node, findAdmission)
+    }
+    findAdmission(handler)
+  }
+  if (
+    !operation ||
+    !ts.isPropertyAccessExpression(operation) ||
+    !ts.isIdentifier(operation.expression)
+  ) {
+    throw new Error(`Unresolved admission policy: ${sourcePath}`)
+  }
+  const imported = imports.get(operation.expression.text)
+  if (!imported || !imported.module.endsWith('/operations')) {
+    throw new Error(`Admission policy must reference its operation registry: ${sourcePath}`)
+  }
+  const registryModule = (await import(imported.module)) as Record<string, Record<string, unknown>>
+  return registryModule[imported.name]?.[operation.name.text]
+}
+
 const EXPECTED_OPERATION_COUNTS = new Map<string, number>([
-  ['apps/docs/openapi-v2-workflows.json', 38],
+  ['apps/docs/openapi-v2-workflows.json', 58],
   ['apps/docs/openapi-v2-logs.json', 3],
-  ['apps/docs/openapi-v2-files-audit.json', 27],
+  ['apps/docs/openapi-v2-files-audit.json', 35],
   ['apps/docs/openapi-v2-tables.json', 53],
-  ['apps/docs/openapi-v2-knowledge.json', 44],
+  ['apps/docs/openapi-v2-knowledge.json', 45],
   ['apps/docs/openapi-v2-billing.json', 2],
-  ['apps/docs/openapi-v2-resources.json', 45],
+  ['apps/docs/openapi-v2-resources.json', 92],
 ])
+
+const generatedDocuments = new Map<(typeof DOCUMENTS)[number], JsonObject>()
+
+function generatedDocument(document: (typeof DOCUMENTS)[number]): JsonObject {
+  const cached = generatedDocuments.get(document)
+  if (cached) return cached
+
+  const generated = generateOpenApiDocument(document)
+  generatedDocuments.set(document, generated)
+  return generated
+}
 
 function getOperation(spec: JsonObject, path: string, method: string): JsonObject {
   const paths = spec.paths as JsonObject
@@ -56,6 +141,26 @@ function operations(spec: JsonObject): JsonObject[] {
     }
   }
   return result
+}
+
+function oversizedDescriptions(value: unknown, location: string, out: string[]): void {
+  if (!value || typeof value !== 'object') return
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => oversizedDescriptions(item, `${location}[${index}]`, out))
+    return
+  }
+
+  for (const [key, nested] of Object.entries(value as JsonObject)) {
+    const nestedLocation = `${location}.${key}`
+    if (key === 'description' && typeof nested === 'string') {
+      const wordCount = nested.trim() ? nested.trim().split(/\s+/).length : 0
+      if (wordCount > MAX_DESCRIPTION_WORDS) {
+        out.push(`${nestedLocation} (${wordCount} words)`)
+      }
+      continue
+    }
+    oversizedDescriptions(nested, nestedLocation, out)
+  }
 }
 
 function isStructuredObject(schema: JsonObject): boolean {
@@ -141,13 +246,46 @@ function anonymousTopLevelResponseObjects(spec: JsonObject): string[] {
 }
 
 describe('generated OpenAPI documents', () => {
+  it('documents the canonical operation and its public API OAuth scope', async () => {
+    for (const document of DOCUMENTS) {
+      for (const route of document.routes) {
+        const runtimeOperation = await routeApplicationOperation(
+          route.contract.path,
+          route.contract.method
+        )
+        expect(runtimeOperation, `${route.contract.method} ${route.contract.path}`).toBe(
+          route.operation.applicationOperation
+        )
+        const generated = getOperation(
+          generatedDocument(document),
+          route.contract.path.replace(/\[([^\]]+)\]/g, '{$1}'),
+          route.contract.method.toLowerCase()
+        )
+        expect(generated['x-sim-operation']).toBe(route.operation.applicationOperation.id)
+        const operationScope = route.operation.applicationOperation.oauthScope
+        expect(generated['x-oauth-scope']).toBe(
+          operationScope === 'search:read' ? 'api:read' : operationScope
+        )
+      }
+    }
+  })
+
+  it('keeps every description concise without padding simple fields', () => {
+    const outliers: string[] = []
+    for (const document of DOCUMENTS) {
+      oversizedDescriptions(generatedDocument(document), document.output, outliers)
+    }
+
+    expect(outliers).toEqual([])
+  })
+
   it('covers the complete public v2 operation surface with canonical errors', () => {
     const outputs = DOCUMENTS.map((document) => document.output)
     expect(new Set(outputs).size).toBe(DOCUMENTS.length)
 
     let totalOperations = 0
     for (const document of DOCUMENTS) {
-      const spec = generateOpenApiDocument(document)
+      const spec = generatedDocument(document)
       const documentOperations = operations(spec)
       const expectedCount = EXPECTED_OPERATION_COUNTS.get(document.output)
 
@@ -172,11 +310,11 @@ describe('generated OpenAPI documents', () => {
         })
       }
     }
-    expect(totalOperations).toBe(212)
+    expect(totalOperations).toBe(288)
   })
 
   it('documents mixed workflow execution and resume responses', () => {
-    const spec = generateOpenApiDocument(workflowsOpenApiDocument)
+    const spec = generatedDocument(workflowsOpenApiDocument)
     const execute = getOperation(spec, '/api/v2/workflows/{workflowId}/execute', 'post')
     const executeResponses = execute.responses as JsonObject
     const executeOk = executeResponses['200'] as JsonObject
@@ -185,12 +323,17 @@ describe('generated OpenAPI documents', () => {
     const executeQueuedContent = executeQueued.content as JsonObject
 
     expect((spec.tags as JsonObject[]).map((tag) => tag.name)).toEqual([
+      'Workspace Sync',
       'Workflows',
       'Workflow Runs',
     ])
     expect(execute.tags).toEqual(['Workflows'])
-    expect(execute.security).toEqual([{ apiKey: [] }, {}])
-    expect(Object.keys(executeOkContent).sort()).toEqual(['application/json', 'text/event-stream'])
+    expect(execute.security).toEqual([{ apiKey: [] }, { oauthBearer: [] }, {}])
+    expect(Object.keys(executeOkContent).sort()).toEqual([
+      'application/json',
+      'application/x-ndjson',
+      'text/event-stream',
+    ])
     expect(Object.keys(executeQueuedContent)).toEqual(['application/json'])
 
     const resume = getOperation(spec, '/api/v2/workflows/{workflowId}/runs/{runId}/resume', 'post')
@@ -220,7 +363,7 @@ describe('generated OpenAPI documents', () => {
   })
 
   it('documents multipart uploads, dual-status secret sets, and nullable file shares', () => {
-    const knowledgeSpec = generateOpenApiDocument(knowledgeOpenApiDocument)
+    const knowledgeSpec = generatedDocument(knowledgeOpenApiDocument)
     const upload = getOperation(
       knowledgeSpec,
       '/api/v2/knowledge/{knowledgeBaseId}/documents',
@@ -238,13 +381,13 @@ describe('generated OpenAPI documents', () => {
     expect(Object.keys(uploadContent)).toEqual(['multipart/form-data'])
     expect(uploadProperties.file).toMatchObject({ type: 'string', format: 'binary' })
 
-    const resourcesSpec = generateOpenApiDocument(resourcesOpenApiDocument)
+    const resourcesSpec = generatedDocument(resourcesOpenApiDocument)
     const setSecret = getOperation(resourcesSpec, '/api/v2/secrets/{name}', 'put')
     expect(
       Object.keys(setSecret.responses as JsonObject).filter((status) => status.startsWith('2'))
     ).toEqual(['200', '201'])
 
-    const filesSpec = generateOpenApiDocument(filesAuditOpenApiDocument)
+    const filesSpec = generatedDocument(filesAuditOpenApiDocument)
     const fileSchemas = (filesSpec.components as JsonObject).schemas as JsonObject
     const fileMetadata = fileSchemas.V2FileMetadata as JsonObject
     const fileMetadataProperties = fileMetadata.properties as JsonObject
@@ -254,12 +397,12 @@ describe('generated OpenAPI documents', () => {
   })
 
   it('documents public resource owner email addresses', () => {
-    const knowledgeSpec = generateOpenApiDocument(knowledgeOpenApiDocument)
+    const knowledgeSpec = generatedDocument(knowledgeOpenApiDocument)
     const knowledgeSchemas = (knowledgeSpec.components as JsonObject).schemas as JsonObject
     const knowledgeBase = knowledgeSchemas.V2KnowledgeBase as JsonObject
     const knowledgeBaseProperties = knowledgeBase.properties as JsonObject
 
-    const tablesSpec = generateOpenApiDocument(tablesOpenApiDocument)
+    const tablesSpec = generatedDocument(tablesOpenApiDocument)
     const tableSchemas = (tablesSpec.components as JsonObject).schemas as JsonObject
     const table = tableSchemas.V2ApiTable as JsonObject
     const tableProperties = table.properties as JsonObject
@@ -268,15 +411,19 @@ describe('generated OpenAPI documents', () => {
     expect(tableProperties.ownerEmail).toMatchObject({ type: 'string', format: 'email' })
   })
 
+  it('omits feature-flagged table column types', () => {
+    expect(JSON.stringify(generatedDocument(tablesOpenApiDocument))).not.toContain('"ttl"')
+  })
+
   it('keeps billing as its own API reference group', () => {
-    const spec = generateOpenApiDocument(billingOpenApiDocument)
+    const spec = generatedDocument(billingOpenApiDocument)
     expect((spec.tags as JsonObject[]).map((tag) => tag.name)).toEqual(['Billing'])
     expect(getOperation(spec, '/api/v2/billing/status', 'get').tags).toEqual(['Billing'])
     expect(getOperation(spec, '/api/v2/billing/logs', 'get').tags).toEqual(['Billing'])
   })
 
   it('documents workspace details as a named schema without internal mode', () => {
-    const resourcesSpec = generateOpenApiDocument(resourcesOpenApiDocument)
+    const resourcesSpec = generatedDocument(resourcesOpenApiDocument)
     const schemas = (resourcesSpec.components as JsonObject).schemas as JsonObject
     const response = schemas.GetWorkspaceResponse as JsonObject
     const responseProperties = response.properties as JsonObject
@@ -296,8 +443,8 @@ describe('generated OpenAPI documents', () => {
     )
   })
 
-  it('publishes Agent tools as named integration, custom, and MCP schemas', () => {
-    const workflowsSpec = generateOpenApiDocument(workflowsOpenApiDocument)
+  it('publishes Agent tools as integration, custom, MCP tool, and advanced MCP schemas', () => {
+    const workflowsSpec = generatedDocument(workflowsOpenApiDocument)
     const schemas = (workflowsSpec.components as JsonObject).schemas as JsonObject
     const agentToolInput = schemas.AgentToolInput as JsonObject
     const agentTool = schemas.AgentTool as JsonObject
@@ -321,6 +468,7 @@ describe('generated OpenAPI documents', () => {
       { $ref: '#/components/schemas/AgentIntegrationTool' },
       { $ref: '#/components/schemas/AgentCustomTool' },
       { $ref: '#/components/schemas/AgentMcpTool' },
+      { $ref: '#/components/schemas/AgentMcpServerAdvanced' },
     ])
     expect(agentToolInput).toEqual(
       expect.objectContaining({ type: 'array', maxItems: MAX_AGENT_TOOLS_PER_BLOCK })
@@ -354,7 +502,7 @@ describe('generated OpenAPI documents', () => {
 
   it('uses named schemas for top-level response objects and list items', () => {
     for (const document of DOCUMENTS) {
-      expect(anonymousTopLevelResponseObjects(generateOpenApiDocument(document))).toEqual([])
+      expect(anonymousTopLevelResponseObjects(generatedDocument(document))).toEqual([])
     }
   })
 
@@ -438,7 +586,7 @@ describe('documented error sets', () => {
    * selection is an empty page. `getAuditLog` does 404 and keeps it.
    */
   it('does not publish a 404 the audit-log list cannot emit', () => {
-    const spec = generateOpenApiDocument(filesAuditOpenApiDocument)
+    const spec = generatedDocument(filesAuditOpenApiDocument)
     expect(
       Object.keys(getOperation(spec, '/api/v2/audit-logs', 'get').responses as JsonObject)
     ).not.toContain('404')
@@ -483,7 +631,7 @@ describe('shared parameter descriptions do not fork', () => {
 
   const descriptionsByParameter = new Map<string, Set<string>>()
   for (const document of DOCUMENTS) {
-    const spec = generateOpenApiDocument(document)
+    const spec = generatedDocument(document)
     for (const operation of operations(spec)) {
       for (const parameter of (operation.parameters ?? []) as JsonObject[]) {
         const name = parameter.name as string

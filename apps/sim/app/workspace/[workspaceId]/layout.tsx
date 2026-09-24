@@ -3,6 +3,7 @@ import { cookies } from 'next/headers'
 import { redirect } from 'next/navigation'
 import { getSession } from '@/lib/auth'
 import { getActiveOrganizationId } from '@/lib/auth/session-response'
+import { isTableRowTtlEnabled } from '@/lib/table/ttl-availability'
 import { getQueryClient } from '@/app/_shell/providers/get-query-client'
 import { ImpersonationBanner } from '@/app/workspace/[workspaceId]/components/impersonation-banner'
 import { SessionExpired } from '@/app/workspace/[workspaceId]/components/session-expired'
@@ -12,15 +13,18 @@ import {
   prefetchWorkspaceHostContext,
   prefetchWorkspaceSidebar,
 } from '@/app/workspace/[workspaceId]/prefetch'
+import { prefetchWorkspaceAccess } from '@/app/workspace/[workspaceId]/prefetch-access'
 import { BlockVisibilityLoader } from '@/app/workspace/[workspaceId]/providers/block-visibility-loader'
 import { CustomBlocksLoader } from '@/app/workspace/[workspaceId]/providers/custom-blocks-loader'
 import { DesktopOAuthConnectListener } from '@/app/workspace/[workspaceId]/providers/desktop-oauth-connect-listener'
+import { FeatureFlagsProvider } from '@/app/workspace/[workspaceId]/providers/feature-flags-provider'
 import { GlobalCommandsProvider } from '@/app/workspace/[workspaceId]/providers/global-commands-provider'
 import { ProviderModelsLoader } from '@/app/workspace/[workspaceId]/providers/provider-models-loader'
 import { SettingsLoader } from '@/app/workspace/[workspaceId]/providers/settings-loader'
 import { WorkspaceHostProvider } from '@/app/workspace/[workspaceId]/providers/workspace-host-provider'
 import { WorkspacePermissionsProvider } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import { WorkspaceScopeSync } from '@/app/workspace/[workspaceId]/providers/workspace-scope-sync'
+import { Sidebar } from '@/app/workspace/[workspaceId]/w/components/sidebar/sidebar'
 import { BrandingProvider } from '@/ee/whitelabeling/components/branding-provider'
 import { getOrgWhitelabelSettings } from '@/ee/whitelabeling/org-branding'
 
@@ -44,7 +48,7 @@ export default async function WorkspaceLayout({
   }
 
   const activeOrganizationId = getActiveOrganizationId(session)
-  const [cookieStore, initialOrgSettings] = await Promise.all([
+  const [cookieStore, initialOrgSettings, , tableRowTtlEnabled] = await Promise.all([
     cookies(),
     hostContext.hostOrganizationId
       ? getOrgWhitelabelSettings(hostContext.hostOrganizationId)
@@ -56,36 +60,47 @@ export default async function WorkspaceLayout({
       hostContext,
       activeOrganizationId
     ),
+    isTableRowTtlEnabled(),
+    prefetchWorkspaceAccess(queryClient, workspaceId, {
+      kind: 'session',
+      userId: session.user.id,
+      sessionId: session.session.id,
+    }),
   ])
   const initialSidebarCollapsed = cookieStore.get('sidebar_collapsed')?.value === '1'
 
   return (
     <HydrationBoundary state={dehydrate(queryClient)}>
-      <WorkspaceHostProvider workspaceId={workspaceId} initialContext={hostContext}>
-        <BrandingProvider
-          hostOrganizationId={hostContext.hostOrganizationId}
-          viewerIsHostOrganizationMember={hostContext.viewer.isHostOrganizationMember}
-          initialOrgSettings={initialOrgSettings}
-        >
-          <DesktopOAuthConnectListener />
-          <SettingsLoader />
-          <ProviderModelsLoader />
-          <CustomBlocksLoader />
-          <BlockVisibilityLoader />
-          <GlobalCommandsProvider>
-            <div className='flex h-screen w-full flex-col overflow-hidden bg-[var(--surface-1)]'>
-              <ImpersonationBanner />
-              <SessionExpired />
-              <WorkspacePermissionsProvider>
-                <WorkspaceScopeSync />
-                <WorkspaceChrome initialSidebarCollapsed={initialSidebarCollapsed}>
-                  {children}
-                </WorkspaceChrome>
-              </WorkspacePermissionsProvider>
-            </div>
-          </GlobalCommandsProvider>
-        </BrandingProvider>
-      </WorkspaceHostProvider>
+      <FeatureFlagsProvider flags={{ 'table-row-ttl': tableRowTtlEnabled }}>
+        <WorkspaceHostProvider workspaceId={workspaceId} initialContext={hostContext}>
+          <BrandingProvider
+            hostOrganizationId={hostContext.hostOrganizationId}
+            viewerIsHostOrganizationMember={hostContext.viewer.isHostOrganizationMember}
+            initialOrgSettings={initialOrgSettings}
+          >
+            <DesktopOAuthConnectListener />
+            <SettingsLoader />
+            <ProviderModelsLoader />
+            <CustomBlocksLoader />
+            <BlockVisibilityLoader />
+            <GlobalCommandsProvider>
+              <div className='flex h-screen w-full flex-col overflow-hidden bg-[var(--surface-1)]'>
+                <ImpersonationBanner />
+                <SessionExpired />
+                <WorkspacePermissionsProvider>
+                  <WorkspaceScopeSync />
+                  <WorkspaceChrome
+                    sidebar={<Sidebar />}
+                    initialSidebarCollapsed={initialSidebarCollapsed}
+                  >
+                    {children}
+                  </WorkspaceChrome>
+                </WorkspacePermissionsProvider>
+              </div>
+            </GlobalCommandsProvider>
+          </BrandingProvider>
+        </WorkspaceHostProvider>
+      </FeatureFlagsProvider>
     </HydrationBoundary>
   )
 }

@@ -2,7 +2,14 @@
  * @vitest-environment node
  */
 import type { SessionPrincipal } from '@sim/auth/principal'
+import {
+  permissionGroupScopeMock,
+  permissionGroupScopeMockFns,
+  resetPermissionGroupScopeMock,
+} from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('@/lib/permission-groups/config-scope.server', () => permissionGroupScopeMock)
 
 const mocks = vi.hoisted(() => ({
   loadWorkspace: vi.fn(),
@@ -26,6 +33,11 @@ const mocks = vi.hoisted(() => ({
   recordAudit: vi.fn(),
   canUserManageWorkspaceBilling: vi.fn(),
   canUserManageBillingEntity: vi.fn(),
+  isCapabilityWithheldForUser: vi.fn(),
+}))
+
+vi.mock('@/lib/permission-groups/user-scope.server', () => ({
+  isCapabilityWithheldForUser: mocks.isCapabilityWithheldForUser,
 }))
 
 vi.mock('@/lib/billing/core/workspace-billing-authority', () => ({
@@ -78,6 +90,8 @@ vi.mock('@sim/audit', () => ({ recordAudit: mocks.recordAudit }))
 
 import { getBillingStatus } from '@/lib/billing/application/get-billing-status'
 import { listBillingLogs } from '@/lib/billing/application/list-billing-logs'
+import { PersonalApiKeysDisabledError } from '@/lib/core/application'
+import { DEFAULT_PERMISSION_GROUP_CONFIG } from '@/lib/permission-groups/fields'
 
 const workspaceContext = {
   workspaceId: 'workspace-1',
@@ -95,14 +109,43 @@ const workspacePrincipal = {
   workspaceId: 'workspace-1',
   keyId: 'workspace-key-1',
 }
+const oauthPrincipal = {
+  kind: 'oauth_access_token' as const,
+  userId: 'user-1',
+  clientId: 'partner-app',
+  tokenId: 'token-1',
+  scopes: ['api:read'],
+  expiresAt: new Date('2099-01-01T00:00:00Z'),
+}
 
 describe('billing application use cases', () => {
+  it('rejects an OAuth grant without API access before loading billing or workspace state', async () => {
+    vi.clearAllMocks()
+    const principal = {
+      kind: 'oauth_access_token',
+      userId: 'user-1',
+      clientId: 'client-1',
+      tokenId: 'token-1',
+      scopes: ['offline_access'],
+      expiresAt: new Date('2099-01-01T00:00:00.000Z'),
+    } as const
+
+    await expect(
+      getBillingStatus.execute({ principal, input: { workspaceId: 'workspace-1' } })
+    ).rejects.toMatchObject({ requiredScope: 'api:read' })
+    expect(mocks.loadWorkspace).not.toHaveBeenCalled()
+    expect(mocks.resolveAttribution).not.toHaveBeenCalled()
+    expect(mocks.resolveSystemAttribution).not.toHaveBeenCalled()
+  })
+
   beforeEach(() => {
     vi.clearAllMocks()
+    resetPermissionGroupScopeMock()
     mocks.loadWorkspace.mockResolvedValue(workspaceContext)
     mocks.resolvePermission.mockResolvedValue('read')
     mocks.canUserManageWorkspaceBilling.mockResolvedValue(false)
     mocks.canUserManageBillingEntity.mockResolvedValue(false)
+    mocks.isCapabilityWithheldForUser.mockResolvedValue(false)
     mocks.checkUsageStatus.mockResolvedValue({ currentUsage: 1, limit: 10, isExceeded: false })
     mocks.checkAttributedBlocks.mockResolvedValue({ blocked: false })
     mocks.toUsageLimitSubscription.mockReturnValue(null)
@@ -192,6 +235,99 @@ describe('billing application use cases', () => {
     expect(result.credits).toBeNull()
     expect(result.storage).toBeNull()
     expect(mocks.canUserManageWorkspaceBilling).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The billing reads resolve their own workspace scope instead of running
+   * through `authorizeWorkspaceOperation`, so the funnel's personal-key refusal
+   * has to be repeated here — otherwise the same key v2 refuses everywhere else
+   * still reads a workspace's plan and ledger.
+   */
+  it('refuses a personal key whose group withholds personal keys', async () => {
+    permissionGroupScopeMockFns.mockResolvePermissionGroupConfig.mockResolvedValue({
+      ...DEFAULT_PERMISSION_GROUP_CONFIG,
+      disablePersonalApiKeys: true,
+    })
+
+    await expect(
+      getBillingStatus.execute({
+        principal: personalPrincipal,
+        input: { workspaceId: 'workspace-1' },
+      })
+    ).rejects.toBeInstanceOf(PersonalApiKeysDisabledError)
+  })
+
+  /**
+   * The account-scoped read names no workspace, so the workspace branch's
+   * `personal_api_key.use` check never runs on it. Without a gate of its own,
+   * the same key an organization withholds from the workspace-scoped read still
+   * reads the account's plan, balance and usage by dropping the parameter.
+   */
+  it('refuses an account-scoped personal key through the organization default group', async () => {
+    mocks.isCapabilityWithheldForUser.mockResolvedValue(true)
+
+    await expect(
+      getBillingStatus.execute({ principal: personalPrincipal, input: {} })
+    ).rejects.toBeInstanceOf(PersonalApiKeysDisabledError)
+
+    expect(mocks.isCapabilityWithheldForUser).toHaveBeenCalledWith('user-1', 'personal_api_key.use')
+  })
+
+  it('never applies the account-scoped personal-key gate to a workspace key', async () => {
+    mocks.isCapabilityWithheldForUser.mockResolvedValue(true)
+
+    await expect(
+      getBillingStatus.execute({ principal: workspacePrincipal, input: {} })
+    ).resolves.toBeDefined()
+  })
+
+  it.each(['sim-cli', 'partner-app'])(
+    'withholds account billing from the %s OAuth token through the default group',
+    async (clientId) => {
+      mocks.isCapabilityWithheldForUser.mockImplementation(
+        async (_userId: string, capability: string) => capability === 'oauth_apps.use'
+      )
+      await expect(
+        getBillingStatus.execute({ principal: { ...oauthPrincipal, clientId }, input: {} })
+      ).rejects.toMatchObject({ capability: 'oauth_apps.use' })
+      expect(mocks.isCapabilityWithheldForUser).toHaveBeenCalledWith('user-1', 'oauth_apps.use')
+      expect(mocks.getSubscription).not.toHaveBeenCalled()
+      expect(mocks.getUsageLogs).not.toHaveBeenCalled()
+    }
+  )
+
+  it('rechecks an existing OAuth token against the billing workspace group', async () => {
+    await expect(
+      getBillingStatus.execute({ principal: oauthPrincipal, input: { workspaceId: 'workspace-1' } })
+    ).resolves.toBeDefined()
+    permissionGroupScopeMockFns.mockResolvePermissionGroupConfig.mockResolvedValue({
+      ...DEFAULT_PERMISSION_GROUP_CONFIG,
+      disableOAuthAppAccess: true,
+    })
+    mocks.resolveAttribution.mockClear()
+    await expect(
+      getBillingStatus.execute({ principal: oauthPrincipal, input: { workspaceId: 'workspace-1' } })
+    ).rejects.toMatchObject({ capability: 'oauth_apps.use' })
+    expect(mocks.resolveAttribution).not.toHaveBeenCalled()
+  })
+
+  it('preserves API-key billing when only OAuth app access is withheld', async () => {
+    mocks.isCapabilityWithheldForUser.mockImplementation(
+      async (_userId: string, capability: string) => capability === 'oauth_apps.use'
+    )
+    permissionGroupScopeMockFns.mockResolvePermissionGroupConfig.mockResolvedValue({
+      ...DEFAULT_PERMISSION_GROUP_CONFIG,
+      disableOAuthAppAccess: true,
+    })
+    await expect(
+      getBillingStatus.execute({
+        principal: personalPrincipal,
+        input: { workspaceId: 'workspace-1' },
+      })
+    ).resolves.toBeDefined()
+    await expect(
+      getBillingStatus.execute({ principal: workspacePrincipal, input: {} })
+    ).resolves.toBeDefined()
   })
 
   it('never reads the payer storage pool it may not disclose', async () => {

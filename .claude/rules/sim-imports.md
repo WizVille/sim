@@ -1,4 +1,5 @@
 ---
+description: Import patterns for the Sim application
 paths:
   - "apps/sim/**/*.ts"
   - "apps/sim/**/*.tsx"
@@ -12,8 +13,8 @@ paths:
 
 ```typescript
 // ✓ Good
+import { Chip } from '@sim/emcn'
 import { useWorkflowStore } from '@/stores/workflows/store'
-import { Button } from '@/components/ui/button'
 
 // ✗ Bad
 import { useWorkflowStore } from '../../../stores/workflows/store'

@@ -1,5 +1,6 @@
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
+import { compareStrings } from '@sim/utils/string'
 import { decryptSecret } from '@/lib/core/security/encryption'
 import { isLargeArrayManifest } from '@/lib/execution/payloads/large-array-manifest-metadata'
 import { isLargeValueRef } from '@/lib/execution/payloads/large-value-ref'
@@ -226,6 +227,18 @@ export interface ResolvedSecretIncompletenessDiagnostics {
 export const ANONYMOUS_SECRET_TRACE_REPLACEMENT = OPAQUE_RESOLVED_SECRET_REPLACEMENT
 export const RESOLVED_SECRET_TRACE_CHECKPOINT_VERSION = 1
 
+/**
+ * The envelope for content no secret ever reached: vouched for, naming nothing.
+ *
+ * Distinct from an incomplete envelope, which says the opposite — that something may be carried
+ * and cannot be named. A boundary that knows nothing was resolved should say so with this rather
+ * than latch, since latching is the claim that redaction is impossible. Returned fresh so no
+ * caller shares a value it may serialize or extend.
+ */
+export function emptyResolvedSecretTraceProvenance(): ResolvedSecretTraceProvenanceV1 {
+  return { version: 1, complete: true, entries: [] }
+}
+
 const MAX_PROVENANCE_ENTRIES = PROVENANCE_MAX_ENTRIES
 const MAX_SERIALIZED_PROVENANCE_BYTES = PROVENANCE_MAX_SERIALIZED_BYTES
 const MAX_TRACE_CATALOG_ENTRIES = PROVENANCE_MAX_ENTRIES
@@ -429,12 +442,6 @@ export interface CreateResolvedSecretTraceRegistryOptions {
    * `{{NAME}}` and are omitted from exported provenance envelopes.
    */
   workspaceUnredactedKeys?: readonly string[]
-}
-
-function compareStrings(left: string, right: string): number {
-  if (left < right) return -1
-  if (left > right) return 1
-  return 0
 }
 
 function cloneProvenanceScope(scope: ResolvedSecretTraceScopeV1): ResolvedSecretTraceScopeV1 {
@@ -1161,6 +1168,46 @@ export class ResolvedSecretTraceRegistry {
       )
     }
     child.copyResolvedInputPathsTo(this)
+  }
+
+  /**
+   * Vouches for one explicit resolution using the same authorized environment snapshot that
+   * supplied its value. A long-lived Copilot turn can outlive a secret addition or rotation;
+   * refreshing this name leaves earlier active values and sibling call registries intact.
+   */
+  recordResolvedFromEnvironment(
+    name: string,
+    resolvedValue: string,
+    environment: CreateResolvedSecretTraceRegistryOptions,
+    options: { path?: ResolvedSecretInputPath; propagated?: boolean } = {}
+  ): boolean {
+    if (!scopesMatch(this.scope, environment.scope)) {
+      this.markIncomplete('tool-call-scope-mismatch')
+      return false
+    }
+
+    const encryptedValue = hasOwn(environment.workspaceEncrypted, name)
+      ? environment.workspaceEncrypted[name]
+      : environment.personalEncrypted[name]
+    const entry =
+      typeof encryptedValue === 'string' && encryptedValue.length > 0
+        ? buildEffectiveCatalogEntry(
+            environment,
+            new Set(environment.decryptionFailures ?? []),
+            new Set(environment.workspaceUnredactedKeys ?? []),
+            name,
+            encryptedValue
+          )
+        : undefined
+    if (!entry || entry.plaintext !== resolvedValue || !this.addCatalogEntry(entry)) {
+      if (options.path?.length) {
+        this.markInputPathIncomplete(options.path, 'unverified-resolved-entry')
+      } else {
+        this.markIncomplete('unverified-resolved-entry')
+      }
+      return false
+    }
+    return this.recordResolvedAtInputPath(name, resolvedValue, options.path, options)
   }
 
   /** Activates a configured secret only when the resolved runtime value matches its catalog value. */

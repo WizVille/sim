@@ -22,14 +22,14 @@ import {
   scopeCanonicalModesForTool,
 } from '@/lib/workflows/subblocks/visibility'
 import { assembleCustomBlockInputMapping, isCustomBlockType } from '@/blocks/custom/build-config'
+import type { SubBlockConfig } from '@/blocks/types'
 import { isCustomTool } from '@/executor/constants'
 import {
+  findProviderFromModel as findProviderFromDefinitions,
   getComputerUseModels,
-  getEmbeddingModelPricing,
   getHostedModels as getHostedModelsFromDefinitions,
   getMaxOutputTokensForModel as getMaxOutputTokensForModelFromDefinitions,
   getMaxTemperature as getMaxTempFromDefinitions,
-  getModelPricing as getModelPricingFromDefinitions,
   getModelsWithDeepResearch,
   getModelsWithoutMemory,
   getModelsWithPromptCaching,
@@ -50,15 +50,19 @@ import {
   supportsToolUsageControl as supportsToolUsageControlFromDefinitions,
   updateOllamaModels as updateOllamaModelsInDefinitions,
 } from '@/providers/models'
+import {
+  getModelPricing as getRegisteredModelPricing,
+  resolveModelTokenPricing,
+} from '@/providers/pricing'
 import { collectToolResourceBindings, registerProviderToolBindings } from '@/providers/tool-binding'
 import {
   getProviderToolInputProvenance,
   getProviderToolModelInputRegistry,
   registerPreparedProviderToolInputProvenance,
 } from '@/providers/tool-input-provenance'
-import type { ProviderId, ProviderToolConfig } from '@/providers/types'
-import { useProvidersStore } from '@/stores/providers/store'
+import type { ModelPricing, ProviderId, ProviderToolConfig } from '@/providers/types'
 import { mergeToolParameters } from '@/tools/merge-params'
+import { buildToolParamShapes, decodeToolParams } from '@/tools/param-shape'
 import type { WorkflowToolExecutionContext } from '@/tools/types'
 
 const logger = createLogger('ProviderUtils')
@@ -156,6 +160,7 @@ export const providers: Record<ProviderId, ProviderMetadata> = {
   cerebras: buildProviderMetadata('cerebras'),
   groq: buildProviderMetadata('groq'),
   sakana: buildProviderMetadata('sakana'),
+  typesafe: buildProviderMetadata('typesafe'),
   nvidia: buildProviderMetadata('nvidia'),
   meta: buildProviderMetadata('meta'),
   zai: buildProviderMetadata('zai'),
@@ -278,18 +283,7 @@ export function getAllModelProviders(): Record<string, ProviderId> {
  * that was never about it.
  */
 export function findProviderFromModel(model: string): ProviderId | null {
-  const normalizedModel = model.toLowerCase()
-
-  const declared = getAllModelProviders()[normalizedModel]
-  if (declared) return declared
-
-  for (const [id, config] of Object.entries(providers)) {
-    for (const pattern of config.modelPatterns ?? []) {
-      if (pattern.test(normalizedModel)) return id as ProviderId
-    }
-  }
-
-  return null
+  return findProviderFromDefinitions(model)
 }
 
 export function getProviderFromModel(model: string): ProviderId {
@@ -579,6 +573,117 @@ function buildCustomBlockInputMappingSchema(
   }
 }
 
+type BlockToolParamsFn = (params: Record<string, any>) => Record<string, any>
+
+/**
+ * Builds the transform that turns a tool row's stored sub-block values into the
+ * arguments a block's tool actually expects.
+ *
+ * Four steps, in an order each of which is load-bearing:
+ *
+ * 1. Collapse canonical basic/advanced pairs onto the canonical id, so a value stored
+ *    under `manualChannel` becomes the `channel` the tool declares.
+ * 2. Decode the stringified values back to their real shapes, and expand a
+ *    `checkbox-list` onto its option params. After the collapse so a pair is decoded
+ *    once under its canonical id, and BEFORE the block's `params` function because
+ *    several blocks consume the value inside it — `if (includeAttachments)` on the
+ *    string `'false'` is the bug this closes.
+ * 3. Run the block's own `tools.config.params` mapping.
+ * 4. Parse `json`/`array` block inputs, the same loop `GenericBlockHandler` runs on the
+ *    canvas; it covers keys the tool itself does not declare.
+ *
+ * Shared so every surface that executes a block tool applies the identical pipeline —
+ * the agent block, Pi's local tools, and the Human block v2. The Human block v1 ran
+ * none of it, which is why it needed a new version rather than a fix in place.
+ */
+export function buildBlockToolParamsTransform(config: {
+  blockSubBlocks: SubBlockConfig[] | undefined
+  blockParamsFn: BlockToolParamsFn | undefined
+  blockInputDefs: Record<string, unknown> | undefined
+  toolParams: Record<string, { type?: string }> | undefined
+  canonicalGroups: CanonicalGroup[]
+  scopedCanonicalModes: CanonicalModeOverrides | undefined
+}): {
+  paramsTransform: BlockToolParamsFn | undefined
+  jsonShapedParamKeys: string[]
+} {
+  const {
+    blockSubBlocks,
+    blockParamsFn,
+    blockInputDefs,
+    toolParams,
+    canonicalGroups,
+    scopedCanonicalModes,
+  } = config
+
+  /**
+   * The value shape of every key this tool can receive. Keyed by the sub-block that
+   * produced the encoding — not by the tool's declared type — because a `dropdown`
+   * collecting a `boolean` param stores a string on the canvas too, and the block's
+   * `params` function compares it as one.
+   */
+  const paramShapes = buildToolParamShapes(blockSubBlocks ?? [], toolParams)
+
+  const needsTransform =
+    blockParamsFn || blockInputDefs || canonicalGroups.length > 0 || paramShapes.size > 0
+
+  const paramsTransform = needsTransform
+    ? (params: Record<string, any>): Record<string, any> => {
+        let result = { ...params }
+
+        for (const group of canonicalGroups) {
+          // Route through the canonical SOT: an explicit scoped override wins, else the value
+          // heuristic - no `?? 'basic'` (which dropped an advanced-only value when basic was empty).
+          const explicitMode = scopedCanonicalModes?.[group.canonicalId]
+          const chosen = resolveActiveCanonicalValue(
+            group,
+            result,
+            explicitMode ? { [group.canonicalId]: explicitMode } : undefined
+          )
+
+          const sourceIds = [group.basicId, ...group.advancedIds].filter(Boolean) as string[]
+          result = omit(result, sourceIds)
+
+          if (chosen !== undefined) {
+            result[group.canonicalId] = chosen
+          }
+        }
+
+        result = decodeToolParams(result, paramShapes, blockSubBlocks ?? [])
+
+        if (blockParamsFn) {
+          const transformed = blockParamsFn(result)
+          result = { ...result, ...transformed }
+        }
+
+        if (blockInputDefs) {
+          for (const [key, schema] of Object.entries(blockInputDefs)) {
+            const value = result[key]
+            if (typeof value === 'string' && value.trim().length > 0) {
+              const inputType =
+                typeof schema === 'object' && schema ? (schema as { type?: unknown }).type : schema
+              if (inputType === 'json' || inputType === 'array') {
+                try {
+                  result[key] = JSON.parse(value.trim())
+                } catch {
+                  // Not valid JSON — keep as string
+                }
+              }
+            }
+          }
+        }
+
+        return result
+      }
+    : undefined
+
+  const jsonShapedParamKeys = [...paramShapes]
+    .filter(([, shape]) => shape === 'json')
+    .map(([paramId]) => paramId)
+
+  return { paramsTransform, jsonShapedParamKeys }
+}
+
 /**
  * Transforms a block tool into a provider tool config with operation selection
  *
@@ -695,7 +800,11 @@ export async function transformBlockTool(
       logger.warn('deployed_block_executor tool not registered')
       return null
     }
-    const inputMapping = assembleCustomBlockInputMapping(block.params || {})
+    // From the BINDING, not `blockDef.subBlocks`: the server overlay builds custom-block
+    // configs with `inputFields: []`, so on the execution path the block config carries no
+    // field sub-blocks and the decode would silently no-op, handing the child workflow the
+    // string 'false' for a boolean input.
+    const inputMapping = assembleCustomBlockInputMapping(block.params || {}, binding.inputFields)
     // A `file[]` field is omitted from the model schema (the model can't synthesize
     // upload descriptors). If such a field is REQUIRED and the user hasn't
     // pre-filled it on the block, no invocation could ever satisfy the child's
@@ -721,6 +830,9 @@ export async function transformBlockTool(
         blockType: block.type,
         inputMapping,
       },
+      // The projection has to assemble its copy from the same fields, or the two mappings
+      // decode differently and the provenance comparison reads that as a shape divergence.
+      customBlockInputFields: binding.inputFields,
       parameters: buildCustomBlockInputMappingSchema(
         blockDef.name,
         binding.inputFields,
@@ -816,70 +928,28 @@ export async function transformBlockTool(
         toolDescription = workflowMetadata.description
       }
     }
-  } else if (toolId === 'function_execute' && resolvedResourceParams.secretScope === 'selected') {
-    // Scoping alone would leave the model guessing: the secrets are injected
-    // server-side and nothing else advertises them. Names only — values never
-    // enter the provider request, matching the copilot's workspace-context rule.
-    // `StoredTool.params` holds strings, so a multi-select arrives JSON-encoded;
-    // the executor's paramsTransform parses it later, but this runs before that.
-    const mounted = readMountedSecretNames(resolvedResourceParams.mountedSecrets)
-    toolDescription = mounted.length
-      ? `${toolDescription}\n\nWorkspace secret names available to this code: ${mounted.join(', ')}. Reference one with the exact {{NAME}} syntax. Its value is bound only while the code executes and is not included in the model request. No other secrets are readable.`
-      : `${toolDescription}\n\nThis code has no access to workspace secrets.`
+  } else if (toolId === 'function_execute') {
+    if (resolvedResourceParams.secretScope === 'selected') {
+      // Scoping alone would leave the model guessing: the secrets are injected
+      // server-side and nothing else advertises them. Names only — values never
+      // enter the provider request, matching the copilot's workspace-context rule.
+      // `StoredTool.params` holds strings, so a multi-select arrives JSON-encoded;
+      // the executor's paramsTransform parses it later, but this runs before that.
+      const mounted = readMountedSecretNames(resolvedResourceParams.mountedSecrets)
+      toolDescription = mounted.length
+        ? `${toolDescription}\n\nWorkspace secret names available to this code: ${mounted.join(', ')}. Reference one with the exact {{NAME}} syntax. Its value is bound only while the code executes and is not included in the model request. No other secrets are readable.`
+        : `${toolDescription}\n\nThis code has no access to workspace secrets.`
+    }
   }
 
-  const blockParamsFn = blockDef?.tools?.config?.params as
-    | ((p: Record<string, any>) => Record<string, any>)
-    | undefined
-  const blockInputDefs = blockDef?.inputs as Record<string, any> | undefined
-
-  const needsTransform = blockParamsFn || blockInputDefs || canonicalGroups.length > 0
-  const paramsTransform = needsTransform
-    ? (params: Record<string, any>): Record<string, any> => {
-        let result = { ...params }
-
-        for (const group of canonicalGroups) {
-          // Route through the canonical SOT: an explicit scoped override wins, else the value
-          // heuristic - no `?? 'basic'` (which dropped an advanced-only value when basic was empty).
-          const explicitMode = scopedCanonicalModes?.[group.canonicalId]
-          const chosen = resolveActiveCanonicalValue(
-            group,
-            result,
-            explicitMode ? { [group.canonicalId]: explicitMode } : undefined
-          )
-
-          const sourceIds = [group.basicId, ...group.advancedIds].filter(Boolean) as string[]
-          result = omit(result, sourceIds)
-
-          if (chosen !== undefined) {
-            result[group.canonicalId] = chosen
-          }
-        }
-
-        if (blockParamsFn) {
-          const transformed = blockParamsFn(result)
-          result = { ...result, ...transformed }
-        }
-
-        if (blockInputDefs) {
-          for (const [key, schema] of Object.entries(blockInputDefs)) {
-            const value = result[key]
-            if (typeof value === 'string' && value.trim().length > 0) {
-              const inputType = typeof schema === 'object' ? schema.type : schema
-              if (inputType === 'json' || inputType === 'array') {
-                try {
-                  result[key] = JSON.parse(value.trim())
-                } catch {
-                  // Not valid JSON — keep as string
-                }
-              }
-            }
-          }
-        }
-
-        return result
-      }
-    : undefined
+  const { paramsTransform, jsonShapedParamKeys } = buildBlockToolParamsTransform({
+    blockSubBlocks: blockDef?.subBlocks,
+    blockParamsFn: blockDef?.tools?.config?.params as BlockToolParamsFn | undefined,
+    blockInputDefs: blockDef?.inputs as Record<string, unknown> | undefined,
+    toolParams: toolConfig.params,
+    canonicalGroups,
+    scopedCanonicalModes,
+  })
 
   const providerTool: ProviderToolConfig = {
     id: toolConfig.id,
@@ -888,6 +958,7 @@ export async function transformBlockTool(
     parameters: llmSchema,
     modelBlockedParams,
     paramsTransform,
+    ...(jsonShapedParamKeys.length > 0 && { jsonShapedParamKeys }),
   }
 
   // A tool that rewrote its own description from a bound param already names that resource, so the
@@ -930,11 +1001,7 @@ export function calculateCost(
   inputMultiplier?: number,
   outputMultiplier?: number
 ) {
-  let pricing = getEmbeddingModelPricing(model)
-
-  if (!pricing) {
-    pricing = getModelPricingFromDefinitions(model)
-  }
+  const pricing = getRegisteredModelPricing(model)
 
   if (!pricing) {
     const defaultPricing = {
@@ -951,13 +1018,14 @@ export function calculateCost(
     }
   }
 
+  const tokenPricing = resolveModelTokenPricing(pricing, promptTokens)
   const inputCost =
     promptTokens *
-    (useCachedInput && pricing.cachedInput
-      ? pricing.cachedInput / 1_000_000
-      : pricing.input / 1_000_000)
+    (useCachedInput && tokenPricing.cachedInput
+      ? tokenPricing.cachedInput / 1_000_000
+      : tokenPricing.input / 1_000_000)
 
-  const outputCost = completionTokens * (pricing.output / 1_000_000)
+  const outputCost = completionTokens * (tokenPricing.output / 1_000_000)
   const finalInputCost = inputCost * (inputMultiplier ?? 1)
   const finalOutputCost = outputCost * (outputMultiplier ?? 1)
   const finalTotalCost = finalInputCost + finalOutputCost
@@ -1037,13 +1105,8 @@ export function sumToolCosts(toolResults?: Record<string, unknown>[]): number {
   return total
 }
 
-export function getModelPricing(modelId: string): any {
-  const embeddingPricing = getEmbeddingModelPricing(modelId)
-  if (embeddingPricing) {
-    return embeddingPricing
-  }
-
-  return getModelPricingFromDefinitions(modelId)
+export function getModelPricing(modelId: string): ModelPricing | null {
+  return getRegisteredModelPricing(modelId)
 }
 
 /**
@@ -1090,27 +1153,20 @@ export const PROVIDER_PLACEHOLDER_KEY = 'provider-uses-own-credentials'
 export function getApiKey(provider: string, model: string, userProvidedKey?: string): string {
   const hasUserKey = !!userProvidedKey
 
-  const isOllamaModel =
-    provider === 'ollama' || useProvidersStore.getState().providers.ollama.models.includes(model)
-  if (isOllamaModel) {
+  if (provider === 'ollama') {
     return 'empty'
   }
 
-  const isVllmModel =
-    provider === 'vllm' || useProvidersStore.getState().providers.vllm.models.includes(model)
-  if (isVllmModel) {
+  if (provider === 'vllm') {
     return userProvidedKey || 'empty'
   }
 
-  const isLitellmModel =
-    provider === 'litellm' || useProvidersStore.getState().providers.litellm.models.includes(model)
-  if (isLitellmModel) {
+  if (provider === 'litellm') {
     return userProvidedKey || 'empty'
   }
 
-  // Bedrock uses its own credentials (bedrockAccessKeyId/bedrockSecretKey), not apiKey
-  const isBedrockModel = provider === 'bedrock' || model.startsWith('bedrock/')
-  if (isBedrockModel) {
+  /** Bedrock authenticates through its configured AWS credentials. */
+  if (provider === 'bedrock') {
     return PROVIDER_PLACEHOLDER_KEY
   }
 
@@ -1120,10 +1176,17 @@ export function getApiKey(provider: string, model: string, userProvidedKey?: str
   const isZaiModel = provider === 'zai'
   const isXaiModel = provider === 'xai'
   const isKimiModel = provider === 'kimi'
+  const isTypeSafeModel = provider === 'typesafe'
 
   if (
     isHosted &&
-    (isOpenAIModel || isClaudeModel || isGeminiModel || isZaiModel || isXaiModel || isKimiModel)
+    (isOpenAIModel ||
+      isClaudeModel ||
+      isGeminiModel ||
+      isZaiModel ||
+      isXaiModel ||
+      isKimiModel ||
+      isTypeSafeModel)
   ) {
     const hostedModels = getHostedModels()
     const isModelHosted = hostedModels.some((m) => m.toLowerCase() === model.toLowerCase())
@@ -1496,7 +1559,13 @@ export function isDeepResearchModel(model: string): boolean {
 }
 
 export function isGemini3Model(model: string): boolean {
-  const normalized = model.toLowerCase().replace(/^vertex\//, '')
+  const normalized = model
+    .toLowerCase()
+    .replace(/^vertex\//, '')
+    .replace(
+      /^(?:google\/|(?:projects\/[^/]+\/locations\/[^/]+\/)?publishers\/google\/models\/)/,
+      ''
+    )
   return normalized.startsWith('gemini-3')
 }
 
@@ -1550,6 +1619,7 @@ export function getMaxOutputTokensForModel(model: string): number {
  */
 export function prepareToolExecution(
   tool: {
+    id?: string
     params?: Record<string, any>
     parameters?: Record<string, any>
     modelBlockedParams?: string[]
@@ -1557,6 +1627,10 @@ export function prepareToolExecution(
   },
   llmArgs: Record<string, any>,
   request: {
+    resolveToolInvocationId?: (
+      providerCallId: string | undefined,
+      toolId: string
+    ) => string | undefined
     workflowId?: string
     workspaceId?: string
     chatId?: string
@@ -1648,6 +1722,10 @@ export function prepareToolExecution(
   const { _mcpAuthorization, ...displayToolParams } = toolParams
   toolParams = displayToolParams
 
+  const invocationId =
+    request.resolveToolInvocationId?.(toolCallId, tool.id ?? '') ??
+    toolCallId ??
+    request.invocationId
   const executionParams = {
     ...toolParams,
     ...(typeof _mcpAuthorization === 'string' && _mcpAuthorization ? { _mcpAuthorization } : {}),
@@ -1664,9 +1742,7 @@ export function prepareToolExecution(
             ...(request.callChain ? { callChain: request.callChain } : {}),
             ...(request.executionId ? { executionId: request.executionId } : {}),
             ...(request.blockId ? { blockId: request.blockId } : {}),
-            ...((toolCallId ?? request.invocationId)
-              ? { invocationId: toolCallId ?? request.invocationId }
-              : {}),
+            ...(invocationId ? { invocationId } : {}),
             ...(request.billingAttribution
               ? { billingAttribution: request.billingAttribution }
               : {}),

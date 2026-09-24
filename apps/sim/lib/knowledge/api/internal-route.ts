@@ -10,6 +10,7 @@ import { type ChunkData, chunkDataSchema } from '@/lib/api/contracts/knowledge/c
 import {
   type ConnectorData,
   type ConnectorDetailData,
+  type ConnectorMemberSummary,
   connectorDataSchema,
   connectorDetailDataSchema,
 } from '@/lib/api/contracts/knowledge/connectors'
@@ -132,14 +133,21 @@ export function toInternalKnowledgeConnector<
     updatedAt: Date | string
     lastSyncAt: Date | string | null
     nextSyncAt: Date | string | null
+    lastMemberSyncAt: Date | string | null
+    nextMemberSyncAt: Date | string | null
+    viewerMembership?: ConnectorData['viewerMembership']
   },
 >(connector: T): ConnectorData {
   return connectorDataSchema.parse({
+    /** A mutation answers with the row alone; only a viewer's read carries their membership. */
+    viewerMembership: null,
     ...connector,
     createdAt: serializeDate(connector.createdAt),
     updatedAt: serializeDate(connector.updatedAt),
     lastSyncAt: serializeNullableDate(connector.lastSyncAt),
     nextSyncAt: serializeNullableDate(connector.nextSyncAt),
+    lastMemberSyncAt: serializeNullableDate(connector.lastMemberSyncAt),
+    nextMemberSyncAt: serializeNullableDate(connector.nextMemberSyncAt),
   })
 }
 
@@ -150,6 +158,12 @@ export function toInternalKnowledgeConnectorDetail<
       completedAt: Date | string | null
       [key: string]: unknown
     }>
+    memberSyncLogs: Array<{
+      startedAt: Date | string
+      completedAt: Date | string | null
+      [key: string]: unknown
+    }>
+    members: ConnectorMemberSummary
   },
 >(connector: T): ConnectorDetailData {
   return connectorDetailDataSchema.parse({
@@ -159,6 +173,12 @@ export function toInternalKnowledgeConnectorDetail<
       startedAt: serializeDate(log.startedAt),
       completedAt: serializeNullableDate(log.completedAt),
     })),
+    memberSyncLogs: connector.memberSyncLogs.map((log) => ({
+      ...log,
+      startedAt: serializeDate(log.startedAt),
+      completedAt: serializeNullableDate(log.completedAt),
+    })),
+    members: connector.members,
   })
 }
 
@@ -336,12 +356,13 @@ export const internalKnowledgeAnalytics = {
   },
   connectorAdded({
     principal,
-    result: { connector, workspaceId },
+    result: { connector, workspaceId, organizationId },
   }: {
     principal: Principal
     input: unknown
     result: {
-      workspaceId: string
+      workspaceId?: string
+      organizationId?: string
       connector: {
         knowledgeBaseId: string
         connectorType: string
@@ -357,11 +378,16 @@ export const internalKnowledgeAnalytics = {
       {
         knowledge_base_id: connector.knowledgeBaseId,
         workspace_id: workspaceId,
+        organization_id: organizationId,
         connector_type: connector.connectorType,
         sync_interval_minutes: connector.syncIntervalMinutes,
       },
       {
-        groups: { workspace: workspaceId },
+        groups: workspaceId
+          ? { workspace: workspaceId }
+          : organizationId
+            ? { organization: organizationId }
+            : undefined,
         setOnce: { first_connector_added_at: new Date().toISOString() },
       }
     )
@@ -379,9 +405,7 @@ export const internalKnowledgeAnalytics = {
       workspaceId?: string
     }
   }): void {
-    if (!result.workspaceId) {
-      throw new Error('Deleted connector result is missing its workspace analytics scope')
-    }
+    if (!result.workspaceId) return
     const userId = internalKnowledgeAnalyticsUserId(principal)
     if (!userId) return
     captureServerEvent(
@@ -406,10 +430,11 @@ export const internalKnowledgeAnalytics = {
       knowledgeBaseId: string
       connectorType: string
       workspaceId?: string
+      organizationId?: string
     }
   }): void {
-    if (!result.workspaceId) {
-      throw new Error('Synced connector result is missing its workspace analytics scope')
+    if (!result.workspaceId && !result.organizationId) {
+      throw new Error('Synced connector result is missing its owner analytics scope')
     }
     const userId = internalKnowledgeAnalyticsUserId(principal)
     if (!userId) return
@@ -419,9 +444,14 @@ export const internalKnowledgeAnalytics = {
       {
         knowledge_base_id: result.knowledgeBaseId,
         workspace_id: result.workspaceId,
+        organization_id: result.organizationId,
         connector_type: result.connectorType,
       },
-      { groups: { workspace: result.workspaceId } }
+      {
+        groups: result.workspaceId
+          ? { workspace: result.workspaceId }
+          : { organization: result.organizationId! },
+      }
     )
   },
 } as const

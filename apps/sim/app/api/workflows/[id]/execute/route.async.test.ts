@@ -38,6 +38,7 @@ import {
 
 const {
   mockAssertBillingAttributionSnapshot,
+  mockGetWorkspaceBilledAccountUserId,
   mockClaimExecutionId,
   mockClaimWorkflowToolExecution,
   mockCheckNeedsRedeployment,
@@ -89,12 +90,14 @@ const {
   mockReleaseExecutionSlot: vi.fn(),
   mockReleaseWorkflowToolExecutionClaim: vi.fn(),
   mockRequireBillingAttributionHeader: vi.fn(),
+  mockGetWorkspaceBilledAccountUserId: vi.fn().mockResolvedValue('billing-1'),
   mockShouldExecuteInline: vi.fn().mockReturnValue(false),
   mockValidatePublicApiAllowed: vi.fn(),
 }))
 
 vi.mock('@/lib/billing/core/billing-attribution', () => ({
   assertBillingAttributionSnapshot: mockAssertBillingAttributionSnapshot,
+  getWorkspaceBilledAccountUserId: mockGetWorkspaceBilledAccountUserId,
   requireBillingAttributionHeader: mockRequireBillingAttributionHeader,
 }))
 
@@ -345,7 +348,6 @@ function configureExecutionCaller(caller: ExecutionCallerCase, requestCount = 1)
       {
         isPublicApi: true,
         isDeployed: true,
-        userId: 'owner-1',
         workspaceId: 'workspace-1',
       },
     ])
@@ -466,7 +468,6 @@ describe('workflow execute async route', () => {
 
     requestUtilsMockFns.mockGenerateRequestId.mockReturnValue('req-12345678')
     workflowsUtilsMockFns.mockWorkflowHasResponseBlock.mockReturnValue(false)
-    hybridAuthMockFns.mockHasExternalApiCredentials.mockReturnValue(true)
     mockGetWorkspaceBillingSettings.mockResolvedValue({
       billedAccountUserId: 'owner-1',
       allowPersonalApiKeys: true,

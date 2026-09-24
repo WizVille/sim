@@ -9,12 +9,12 @@ import {
 import {
   assertBillingAttributionSnapshot,
   type BillingAttributionSnapshot,
-  checkAttributedUsageLimits,
   resolveBillingAttribution,
   resolveSystemBillingAttribution,
 } from '@/lib/billing/core/billing-attribution'
 import type { HighestPrioritySubscription } from '@/lib/billing/core/plan'
 import { getHighestPrioritySubscription } from '@/lib/billing/core/subscription'
+import { checkExecutionUsageLimits } from '@/lib/billing/core/usage-gate-cache'
 import {
   type AdmissionErrorDescriptor,
   getReservationDenialDescriptor,
@@ -35,6 +35,7 @@ import {
 } from '@/lib/core/execution-limits/metrics'
 import { RateLimiter } from '@/lib/core/rate-limiter/rate-limiter'
 import type { SubscriptionPlan } from '@/lib/core/rate-limiter/types'
+import { withDatabaseReadRetry } from '@/lib/db/read-retry'
 import { LoggingSession, type SessionStartParams } from '@/lib/logs/execution/logging-session'
 import type { CoreTriggerType } from '@/stores/logs/filters/types'
 
@@ -97,6 +98,18 @@ export interface PreprocessExecutionOptions {
   triggerData?: SessionStartParams['triggerData']
   /** Use the authenticated user as actor for client executions and personal API keys. */
   useAuthenticatedUserAsActor?: boolean
+  /**
+   * Declares that `userId` names a stored reference — a workflow owner, a chat's
+   * creator — rather than someone who just acted, so the suspension gate skips
+   * it. Suspending one member must not take down the schedules, webhooks, and
+   * deployed chats their teammates depend on merely because that person's name
+   * sits on the row.
+   *
+   * Defaults to false so an unset call site keeps blocking. Withholding the
+   * suspended account's personal variables is handled separately, in
+   * {@link getExecutionEnvironment}.
+   */
+  userIdIsStoredReference?: boolean
   /** Pre-fetched workflow row for caller context; preprocessing still re-checks active state. */
   workflowRecord?: WorkflowRecord
   /**
@@ -189,6 +202,7 @@ export async function preprocessExecution(
     loggingSession: providedLoggingSession,
     triggerData,
     useAuthenticatedUserAsActor = false,
+    userIdIsStoredReference = false,
     workflowRecord: prefetchedWorkflowRecord,
     billingAttribution: providedBillingAttribution,
     executionType = 'sync',
@@ -223,7 +237,9 @@ export async function preprocessExecution(
   let workflowRecord: WorkflowRecord | null = prefetchedWorkflowRecord ?? null
   if (!workflowRecord) {
     try {
-      workflowRecord = await getActiveWorkflowRecord(workflowId)
+      workflowRecord = await withDatabaseReadRetry(() => getActiveWorkflowRecord(workflowId), {
+        label: 'getActiveWorkflowRecord',
+      })
 
       if (!workflowRecord) {
         logger.warn(`[${requestId}] Workflow not found: ${workflowId}`)
@@ -284,7 +300,9 @@ export async function preprocessExecution(
       },
     }
   } else {
-    const activeWorkflow = await getActiveWorkflowRecord(workflowId)
+    const activeWorkflow = await withDatabaseReadRetry(() => getActiveWorkflowRecord(workflowId), {
+      label: 'getActiveWorkflowRecord',
+    })
     if (!activeWorkflow) {
       logger.warn(`[${requestId}] Workflow archived before execution started: ${workflowId}`)
       return {
@@ -352,7 +370,10 @@ export async function preprocessExecution(
     }
 
     if (!actorUserId) {
-      billingAttribution = await resolveSystemBillingAttribution(workspaceId)
+      billingAttribution = await withDatabaseReadRetry(
+        () => resolveSystemBillingAttribution(workspaceId),
+        { label: 'resolveSystemBillingAttribution' }
+      )
       actorUserId = billingAttribution.actorUserId
       logger.info(`[${requestId}] Using atomically resolved system actor and payer`, {
         actorUserId,
@@ -389,7 +410,11 @@ export async function preprocessExecution(
     }
 
     if (!billingAttribution) {
-      billingAttribution = await resolveBillingAttribution({ actorUserId, workspaceId })
+      const attributionInput = { actorUserId, workspaceId }
+      billingAttribution = await withDatabaseReadRetry(
+        () => resolveBillingAttribution(attributionInput),
+        { label: 'resolveBillingAttribution' }
+      )
     }
   } catch (error) {
     logger.error(`[${requestId}] Error resolving billing attribution`, { error, workflowId })
@@ -449,19 +474,35 @@ export async function preprocessExecution(
 
   const banCheck = (async (): Promise<GateFailure | null> => {
     /**
-     * Blocks when the resolved actor, workflow owner, or caller-provided user
-     * has an active ban or blocked email domain. Including the workflow owner
-     * covers system-triggered executions.
+     * Blocks when an identity this run actually acts as has an active ban or
+     * blocked email domain.
+     *
+     * `userId` is a candidate unless the caller declares it a stored reference.
+     * The default is deliberately the blocking one: callers overload the
+     * parameter, and only the caller knows which kind it passed, so a call site
+     * that forgets to say must fail closed rather than silently admit a
+     * suspended account.
+     *
+     * `useAuthenticatedUserAsActor` cannot stand in for that declaration, which
+     * an earlier revision of this gate assumed. Resume passes the live
+     * authenticated resumer as `userId` and leaves that flag false on purpose —
+     * attribution is captured before the pause and must not move — so keying on
+     * it excluded exactly the person who just acted.
+     *
+     * A stored reference being banned must not take down work their teammates
+     * still depend on — but it must not lend that person's credentials either,
+     * which is why {@link getExecutionEnvironment} drops a suspended identity's
+     * personal namespace rather than this gate blocking the whole run.
      */
     const banCandidateIds = [actorUserId]
-    if (userId && userId !== 'unknown' && userId !== actorUserId) {
+    if (!userIdIsStoredReference && userId && userId !== 'unknown' && userId !== actorUserId) {
       banCandidateIds.push(userId)
     }
-    if (workflowRecord.userId && !banCandidateIds.includes(workflowRecord.userId)) {
-      banCandidateIds.push(workflowRecord.userId)
-    }
     try {
-      const bannedUserIds = await getActivelyBannedUserIds(banCandidateIds)
+      const bannedUserIds = await withDatabaseReadRetry(
+        () => getActivelyBannedUserIds(banCandidateIds),
+        { label: 'getActivelyBannedUserIds' }
+      )
       if (bannedUserIds.length > 0) {
         logger.warn(`[${requestId}] Execution blocked: banned account`, {
           workflowId,
@@ -532,7 +573,10 @@ export async function preprocessExecution(
     if (skipUsageLimits) return { failure: null, snapshot: null }
     let snapshot: UsageSnapshot | null = null
     try {
-      const usageCheck = await checkAttributedUsageLimits(billingAttribution)
+      const usageCheck = await withDatabaseReadRetry(
+        () => checkExecutionUsageLimits(billingAttribution),
+        { label: 'checkExecutionUsageLimits' }
+      )
       snapshot = usageCheck.payerUsage
         ? {
             ...usageCheck.payerUsage,

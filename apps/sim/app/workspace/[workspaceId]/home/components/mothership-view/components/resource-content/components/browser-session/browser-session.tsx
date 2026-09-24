@@ -2,11 +2,12 @@
 
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
+  BrowserMediaPermissionRequest,
   BrowserOmniboxFocusMode,
   BrowserPanelAnchor,
   BrowserPanelBounds,
   BrowserPanelSnapshot,
-  BrowserTabState,
+  BrowserSitePermissionRequest,
 } from '@sim/browser-protocol'
 import { isBrowserTheme } from '@sim/browser-protocol'
 import type {
@@ -16,6 +17,7 @@ import type {
 } from '@sim/desktop-bridge'
 import {
   Button,
+  ChipConfirmModal,
   ChipInput,
   chipVariants,
   cn,
@@ -30,11 +32,12 @@ import {
   PopoverAnchor,
   PopoverContent,
   PopoverItem,
-  toast,
 } from '@sim/emcn'
 import { ArrowLeft, ArrowRight, Globe, Key, Link, RefreshCw, Search } from '@sim/emcn/icons'
 import { useTheme } from 'next-themes'
 import { createPortal } from 'react-dom'
+import { BrowserImportDialog } from '@/components/browser-import/browser-import-dialog'
+import { EmptyState } from '@/components/empty-state/empty-state'
 import { onFocusVisibleBrowserOmnibox } from '@/lib/browser-agent/renderer-shortcuts'
 import {
   fillBrowserCredential,
@@ -48,28 +51,23 @@ import {
   onBrowserFindOpen,
   onBrowserOmniboxFocus,
   onBrowserToolbarCommand,
-  openBrowserTab,
-  reorderBrowserTab,
   reportBrowserPanelBounds,
   reportBrowserPanelFocused,
   reportBrowserTheme,
   sendBrowserPanelAction,
   setBrowserPanelOccluded,
-  setBrowserTabPinned,
   showBrowserCredentialChooser,
-  showBrowserTabContextMenu,
   showBrowserToolbarMenu,
   supportsAtomicBrowserPanelOcclusion,
 } from '@/lib/browser-agent/transport'
-import { BROWSER_SESSION_RESOURCE_ID } from '@/lib/copilot/resources/types'
 import { faviconUrl } from '@/lib/core/utils/favicon'
+import { getDesktopBridge } from '@/lib/desktop'
 import {
   loadDesktopBrowserAppearanceTheme,
   resolveDesktopAppearanceTheme,
 } from '@/lib/desktop/appearance'
 import { trackPanelFocus } from '@/lib/desktop/panel-focus'
 import { addMothershipContext } from '@/lib/mothership/events'
-import { useMothershipResources } from '@/app/workspace/[workspaceId]/home/components/mothership-resources-context'
 import { BrowserDownloads } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-content/components/browser-session/browser-downloads'
 import { BrowserFindBar } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-content/components/browser-session/browser-find-bar'
 import { BrowserLoadingBar } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-content/components/browser-session/browser-loading-bar'
@@ -83,7 +81,6 @@ import {
   mutationsTouchNativeSurfaceOcclusion,
   useBrowserPanelOcclusion,
 } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-content/components/browser-session/browser-panel-occlusion'
-import { BrowserTabStrip } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-content/components/browser-session/browser-tab-strip'
 import { BrowserThemeNotice } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-content/components/browser-session/browser-theme-notice'
 import {
   buildOmniboxSuggestions,
@@ -104,9 +101,7 @@ import type { ChatContext } from '@/stores/panel'
 /** Ties the omnibox to its listbox for assistive tech. */
 const SUGGESTIONS_LIST_ID = 'browser-url-suggestions'
 const SEARCH_SUGGESTIONS_DEBOUNCE_MS = 160
-const NEW_TAB_CONFIRM_TIMEOUT_MS = 10_000
 const OMNIBOX_DRAG_THRESHOLD_PX = 4
-const EMPTY_BROWSER_TABS: BrowserTabState[] = []
 
 const suggestionRowId = (index: number) => `${SUGGESTIONS_LIST_ID}-${index}`
 
@@ -195,14 +190,97 @@ export function clearOmniboxSelection(input: HTMLInputElement): void {
   input.setSelectionRange(caret, caret)
 }
 
-/** Claims the one renderer response allowed for a native media permission request. */
-export function claimMediaPermissionResponse(
-  handledRequestId: { current: string | null },
+/** Covers both prompt types across every globally admitted native tab without unbounded retention. */
+const MAX_HANDLED_PERMISSION_REQUESTS = 256
+
+/** Claims the one renderer response allowed for a native browser permission request. */
+export function claimPermissionResponse(
+  handledRequestIds: { current: Set<string> },
   requestId: string
 ): boolean {
-  if (handledRequestId.current === requestId) return false
-  handledRequestId.current = requestId
+  if (handledRequestIds.current.has(requestId)) return false
+  handledRequestIds.current.add(requestId)
+  while (handledRequestIds.current.size > MAX_HANDLED_PERMISSION_REQUESTS) {
+    const oldest = handledRequestIds.current.values().next().value
+    if (typeof oldest !== 'string') break
+    handledRequestIds.current.delete(oldest)
+  }
   return true
+}
+
+type BrowserPermissionRequest = BrowserMediaPermissionRequest | BrowserSitePermissionRequest
+
+export function browserPermissionResponseAction(
+  request: BrowserPermissionRequest
+): 'respond-media-permission' | 'respond-site-permission' {
+  return 'tabId' in request ? 'respond-site-permission' : 'respond-media-permission'
+}
+
+export function shouldShowBrowserPermissionRequest(
+  requestId: string | undefined,
+  answeredRequestId: string | null,
+  visible: boolean
+): boolean {
+  return visible && requestId !== undefined && requestId !== answeredRequestId
+}
+
+export function browserPermissionPrompt(request: BrowserPermissionRequest): {
+  title: string
+  text: string
+} {
+  if ('tabId' in request) {
+    return {
+      title: 'Open another website?',
+      text: `This page wants to open ${request.origin}. Allow this destination for the rest of this browser task? Only continue if you trust this website.`,
+    }
+  }
+
+  const devices = request.devices.join(' and ')
+  return {
+    title: `Allow ${request.origin} to use your ${devices}?`,
+    text: `Allowing gives this page access to your ${devices} until it navigates. Block if you did not expect this request.`,
+  }
+}
+
+interface BrowserPermissionModalProps {
+  request: BrowserPermissionRequest | undefined
+  open: boolean
+  onDecision: (
+    requestId: string,
+    action: ReturnType<typeof browserPermissionResponseAction>,
+    allowed: boolean
+  ) => void
+}
+
+export function BrowserPermissionModal({ request, open, onDecision }: BrowserPermissionModalProps) {
+  const requestId = request?.requestId
+  const responseAction = request ? browserPermissionResponseAction(request) : undefined
+  useEffect(() => {
+    if (!requestId || !responseAction) return
+    return () => onDecision(requestId, responseAction, false)
+  }, [onDecision, requestId, responseAction])
+
+  if (!request) return null
+  const prompt = browserPermissionPrompt(request)
+  const activeResponseAction = browserPermissionResponseAction(request)
+
+  return (
+    <ChipConfirmModal
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen) onDecision(request.requestId, activeResponseAction, false)
+      }}
+      title={prompt.title}
+      text={prompt.text}
+      defaultAction='dismiss'
+      dismissLabel='Block'
+      confirm={{
+        label: 'Allow',
+        onClick: () => onDecision(request.requestId, activeResponseAction, true),
+        variant: 'primary',
+      }}
+    />
+  )
 }
 
 /** Places the replacement on the native view's exact, unclipped viewport rectangle. */
@@ -279,15 +357,6 @@ interface BrowserSessionProps {
   onOverlayControllerChange?: (controller: BrowserPanelOverlayController | null) => void
 }
 
-/** Administrative suspension retains the resource even though live tabs are gone. */
-export function shouldRemoveBrowserResource(
-  sessionAlive: boolean,
-  observedLiveSession: boolean,
-  suspended: boolean
-): boolean {
-  return !suspended && !sessionAlive && observedLiveSession
-}
-
 /** A suspended scope never leases native compositor bounds. */
 export function shouldReportBrowserBounds(visible: boolean, suspended: boolean): boolean {
   return visible && !suspended
@@ -332,23 +401,6 @@ export function initialUrlSuggestionIndex(
   return query.trim() || !pageUrl || pageUrl === 'about:blank' ? 0 : null
 }
 
-/** A new-tab request is complete only after the authoritative strip grows and activates a new id. */
-export function hasConfirmedBrowserTabCreation(
-  previousActiveTabId: string | null,
-  previousTabCount: number,
-  activeTabId: string | null,
-  tabCount: number
-): boolean {
-  return tabCount > previousTabCount && activeTabId !== null && activeTabId !== previousActiveTabId
-}
-
-interface PendingNewTabFocus {
-  scopeId: string
-  previousActiveTabId: string | null
-  previousTabCount: number
-  timeoutId: number
-}
-
 interface OmniboxPointerSelection {
   pointerId: number
   originX: number
@@ -372,30 +424,23 @@ export function BrowserSession({
   // panel. Direct selection prevents that one render from showing or acting on
   // another chat's tabs.
   const pageState = useBrowserSessionStore((state) => state.sessions[scopeId]?.pageState ?? null)
-  const tabs = useBrowserSessionStore(
-    (state) => state.sessions[scopeId]?.tabs ?? EMPTY_BROWSER_TABS
-  )
   const activeTabId = useBrowserSessionStore(
     (state) => state.sessions[scopeId]?.activeTabId ?? null
   )
-  const automationTabId = useBrowserSessionStore(
-    (state) => state.sessions[scopeId]?.automationTabId ?? null
-  )
-  const automationActive = useBrowserSessionStore(
-    (state) => state.sessions[scopeId]?.automationActive ?? false
-  )
-  const automationNeedsAttention = useBrowserSessionStore(
-    (state) => state.sessions[scopeId]?.automationNeedsAttention ?? false
-  )
-  const browserAgentActive = useBrowserSessionStore(
-    (state) => (state.sessions[scopeId]?.agentRunIds.length ?? 0) > 0
-  )
-  const sessionAlive = useBrowserSessionStore(
-    (state) => state.sessions[scopeId]?.sessionAlive ?? true
-  )
   const suspended = useBrowserSessionStore((state) => state.sessions[scopeId]?.suspended ?? false)
-  const hasPageIssue = Boolean(pageState?.issue)
+  const showEmptyState = Boolean(
+    pageState &&
+      !pageState.loading &&
+      !pageState.issue &&
+      (!pageState.url || pageState.url === 'about:blank')
+  )
+  const hasRendererPage = Boolean(pageState?.issue) || showEmptyState
+  const [importOpen, setImportOpen] = useState(false)
+  const [importVersion, setImportVersion] = useState(0)
+  const canImport = Boolean(getDesktopBridge()?.browserImport?.importFromChrome)
   const mediaPermissionRequest = pageState?.mediaPermissionRequest
+  const sitePermissionRequest = pageState?.sitePermissionRequest
+  const permissionRequest = sitePermissionRequest ?? mediaPermissionRequest
   const panelRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   // Lets the occlusion handshake reject a capture taken before a modal's
@@ -407,39 +452,14 @@ export function BrowserSession({
   const toolbarMenuButtonRef = useRef<HTMLButtonElement>(null)
   const omniboxFocusRafRef = useRef<number | null>(null)
   const omniboxPointerSelectionRef = useRef<OmniboxPointerSelection | null>(null)
-  const pendingNewTabFocusRef = useRef<PendingNewTabFocus | null>(null)
-  const handledMediaPermissionRequestIdRef = useRef<string | null>(null)
+  const handledPermissionRequestIdsRef = useRef<Set<string>>(new Set())
+  const [answeredPermissionRequestId, setAnsweredPermissionRequestId] = useState<string | null>(
+    null
+  )
   const visibleRef = useRef(visible)
   visibleRef.current = visible
-  const { removeResource } = useMothershipResources()
   const { navigateToSettings } = useSettingsNavigation()
 
-  // The browser session ending closes the panel, the way the terminal panel
-  // goes when its last shell does. What it leaves otherwise is a tab whose
-  // only content explains that there is nothing to show and that starting
-  // again has to happen from somewhere else — the agent reopens the panel on
-  // its next browser action anyway. Guarded on having seen a live session so
-  // that opening the panel while the store still remembers a closed one does
-  // not immediately close it again.
-  const observedLiveSession = useRef(false)
-  useEffect(() => {
-    if (suspended) {
-      observedLiveSession.current = false
-      return
-    }
-    if (sessionAlive) {
-      // A new scope starts optimistically alive until the desktop answers.
-      // Only a real tab proves that this panel observed a live session;
-      // otherwise the expected empty response from lazy activation would look
-      // like a user closing the last tab and delete the persisted resource
-      // before its encrypted descriptor gets a chance to hydrate.
-      if (tabs.length > 0) observedLiveSession.current = true
-      return
-    }
-    if (!shouldRemoveBrowserResource(sessionAlive, observedLiveSession.current, suspended)) return
-    observedLiveSession.current = false
-    removeResource('browser', BROWSER_SESSION_RESOURCE_ID)
-  }, [sessionAlive, suspended, tabs.length, removeResource])
   const pageUrlRef = useRef(pageState?.url ?? '')
   pageUrlRef.current = pageState?.url ?? ''
   /** Non-null while the user is editing the URL bar; otherwise it mirrors the page. */
@@ -483,68 +503,35 @@ export function BrowserSession({
     onSnapshotError,
   } = useBrowserPanelOcclusion(scopeId, activeTabId, panelVisible, getHostRect)
 
-  useEffect(() => {
-    const request = mediaPermissionRequest
-    if (!request) {
-      handledMediaPermissionRequestIdRef.current = null
-      void closeOverlay('permissions')
-      return
-    }
-
-    let active = true
-    let decided = false
-    let toastId: string | null = null
-    const respond = (allowed: boolean) => {
-      if (decided) return
-      decided = true
-      if (!claimMediaPermissionResponse(handledMediaPermissionRequestIdRef, request.requestId))
-        return
-      sendBrowserPanelAction(
-        'respond-media-permission',
-        { requestId: request.requestId, allowed },
-        scopeId
-      )
-    }
-
-    const dismissPrompt = () => {
-      respond(false)
-      if (!toastId) return
-      const id = toastId
-      toastId = null
-      toast.dismiss(id)
-    }
-
-    if (!visible) {
-      respond(false)
-      void closeOverlay('permissions')
-      return
-    }
-
-    void requestOverlay('permissions', () => respond(false), dismissPrompt).then((ready) => {
-      if (!active) return
-      if (!ready) {
-        respond(false)
+  const respondToPermission = useCallback(
+    (
+      requestId: string,
+      action: ReturnType<typeof browserPermissionResponseAction>,
+      allowed: boolean
+    ) => {
+      if (!claimPermissionResponse(handledPermissionRequestIdsRef, requestId)) {
         return
       }
-      const origin = URL.canParse(request.origin) ? new URL(request.origin).host : request.origin
-      const devices = request.devices.join(' and ')
-      toastId = toast.info(`${origin} wants to use your ${devices}`, {
-        description: 'Access applies only to this page and ends when it navigates.',
-        action: { label: 'Allow', onClick: () => respond(true) },
-        onDismiss: () => {
-          if (!active) return
-          respond(false)
-          void closeOverlay('permissions')
-        },
-      })
-    })
+      setAnsweredPermissionRequestId(requestId)
+      sendBrowserPanelAction(action, { requestId, allowed }, scopeId)
+    },
+    [scopeId]
+  )
 
-    return () => {
-      active = false
-      dismissPrompt()
-      void closeOverlay('permissions')
-    }
-  }, [closeOverlay, mediaPermissionRequest, requestOverlay, scopeId, visible])
+  useEffect(() => {
+    if (visible || !permissionRequest) return
+    respondToPermission(
+      permissionRequest.requestId,
+      browserPermissionResponseAction(permissionRequest),
+      false
+    )
+  }, [permissionRequest, respondToPermission, visible])
+
+  const permissionModalOpen = shouldShowBrowserPermissionRequest(
+    permissionRequest?.requestId,
+    answeredPermissionRequestId,
+    visible
+  )
 
   // The resource picker lives above this component in the panel tab bar. Give
   // that one external browser overlay access to the same capture/hide handshake
@@ -578,11 +565,7 @@ export function BrowserSession({
     () =>
       onBrowserToolbarCommand((command) => {
         if (command === 'import') {
-          navigateToSettings({
-            section: 'browser',
-            browserView: 'passwords',
-            browserImport: true,
-          })
+          setImportOpen(true)
           return
         }
         navigateToSettings({ section: 'browser' })
@@ -610,7 +593,7 @@ export function BrowserSession({
     return () => {
       active = false
     }
-  }, [panelVisible])
+  }, [panelVisible, importVersion])
 
   /** Debounced live completions never block the immediate local/search row. */
   useEffect(() => {
@@ -668,61 +651,18 @@ export function BrowserSession({
     })
   }, [])
 
-  const clearPendingNewTabFocus = useCallback((pending?: PendingNewTabFocus): boolean => {
-    const current = pendingNewTabFocusRef.current
-    if (!current || (pending && current !== pending)) return false
-    window.clearTimeout(current.timeoutId)
-    pendingNewTabFocusRef.current = null
-    return true
-  }, [])
-
-  // New shells acknowledge tab creation directly; older installed shells only
-  // publish the resulting strip. Both paths land here so neither clears the
-  // current page's omnibox before a distinct tab actually exists.
-  useEffect(() => {
-    const pending = pendingNewTabFocusRef.current
-    if (
-      !pending ||
-      pending.scopeId !== scopeId ||
-      !hasConfirmedBrowserTabCreation(
-        pending.previousActiveTabId,
-        pending.previousTabCount,
-        activeTabId,
-        tabs.length
-      )
-    ) {
-      return
-    }
-    if (!clearPendingNewTabFocus(pending)) return
-    if (visible) focusOmnibox('clear')
-  }, [activeTabId, clearPendingNewTabFocus, focusOmnibox, scopeId, tabs.length, visible])
-
-  useEffect(() => {
-    return () => {
-      const pending = pendingNewTabFocusRef.current
-      if (pending?.scopeId === scopeId) clearPendingNewTabFocus(pending)
-    }
-  }, [clearPendingNewTabFocus, scopeId])
-
   useEffect(() => onBrowserOmniboxFocus(focusOmnibox, scopeId), [focusOmnibox, scopeId])
 
-  // Follow the agent's tab. The panel already marks the automated tab in the
-  // strip; this makes it the VISIBLE one, so watching the agent never means
-  // hunting for which tab it moved to. Keyed on the automation target
-  // CHANGING, not on it merely being set — the user can still browse a
-  // different tab mid-run and is only pulled along when the agent itself
-  // moves to another tab.
-  const followedAutomationTabRef = useRef<string | null>(null)
+  // A fresh blank tab coming on screen — opened from the resource strip or by
+  // Cmd+T — gets the omnibox, the way Chrome's new-tab page does. A tab with a
+  // page keeps its content.
+  const focusedBlankTabIdRef = useRef<string | null>(null)
   useEffect(() => {
-    if (!automationActive || !automationTabId) {
-      if (!automationActive) followedAutomationTabRef.current = null
-      return
-    }
-    if (followedAutomationTabRef.current === automationTabId) return
-    followedAutomationTabRef.current = automationTabId
-    if (automationTabId === activeTabId) return
-    sendBrowserPanelAction('switch-tab', { tabId: automationTabId }, scopeId)
-  }, [activeTabId, automationActive, automationTabId, scopeId])
+    if (!visible || !activeTabId || !showEmptyState) return
+    if (focusedBlankTabIdRef.current === activeTabId) return
+    focusedBlankTabIdRef.current = activeTabId
+    focusOmnibox('clear')
+  }, [activeTabId, focusOmnibox, showEmptyState, visible])
 
   // Sim owns keyboard events while its renderer has focus. Claim Cmd+L here
   // before the workspace's global "Go to Logs" command can navigate away.
@@ -822,7 +762,7 @@ export function BrowserSession({
       reportBrowserPanelBounds(null, null, scopeId)
       return
     }
-    if (hasPageIssue) {
+    if (hasRendererPage) {
       setPanelVisible(true)
       reportBrowserPanelBounds(null, null, scopeId)
       return
@@ -988,7 +928,7 @@ export function BrowserSession({
       void geometryOcclusionLease.setDesired(false)
       reportBrowserPanelBounds(null, null, scopeId)
     }
-  }, [hasPageIssue, visible, suspended, scopeId])
+  }, [hasRendererPage, visible, suspended, scopeId])
 
   /**
    * Programmatic focus on a new tab keeps the omnibox ready for typing without
@@ -1011,11 +951,11 @@ export function BrowserSession({
   // Keep the page's exact captured frame underneath it while it is open so
   // pointer events reach the Sim popover instead of the WebContentsView.
   useEffect(() => {
-    if (mediaPermissionRequest) {
+    if (mediaPermissionRequest || sitePermissionRequest) {
       void closeOverlay('suggestions')
       return
     }
-    if (hasPageIssue) {
+    if (hasRendererPage) {
       void closeOverlay('suggestions')
       return
     }
@@ -1024,9 +964,16 @@ export function BrowserSession({
       return
     }
     void closeOverlay('suggestions')
-  }, [closeOverlay, hasPageIssue, mediaPermissionRequest, requestOverlay, suggestions.length])
+  }, [
+    closeOverlay,
+    hasRendererPage,
+    mediaPermissionRequest,
+    requestOverlay,
+    sitePermissionRequest,
+    suggestions.length,
+  ])
 
-  const suggestionsOpen = hasPageIssue
+  const suggestionsOpen = hasRendererPage
     ? suggestions.length > 0
     : shouldOpenUrlSuggestions(activeOverlay, suggestions.length)
 
@@ -1054,46 +1001,6 @@ export function BrowserSession({
     }
     urlInputRef.current?.blur()
   }
-
-  const handleNewTab = useCallback(() => {
-    setSuggestionsVisible(false)
-    setSuggestionQuery(null)
-    setActiveSuggestion(null)
-    setSuggestionOriginUrl('')
-    clearPendingNewTabFocus()
-    const pending: PendingNewTabFocus = {
-      scopeId,
-      previousActiveTabId: activeTabId,
-      previousTabCount: tabs.length,
-      timeoutId: 0,
-    }
-    pending.timeoutId = window.setTimeout(() => {
-      if (clearPendingNewTabFocus(pending)) {
-        toast.error('Could not open a new browser tab. Please try again.')
-      }
-    }, NEW_TAB_CONFIRM_TIMEOUT_MS)
-    pendingNewTabFocusRef.current = pending
-    void openBrowserTab(scopeId)
-      .then((state) => {
-        // Older shells resolve null and confirm through the tab-state effect.
-        if (!state) return
-        if (
-          !hasConfirmedBrowserTabCreation(
-            pending.previousActiveTabId,
-            pending.previousTabCount,
-            state.activeTabId,
-            state.tabs.length
-          )
-        ) {
-          throw new Error('The desktop browser did not create a distinct tab.')
-        }
-      })
-      .catch(() => {
-        if (clearPendingNewTabFocus(pending)) {
-          toast.error('Could not open a new browser tab. Please try again.')
-        }
-      })
-  }, [activeTabId, clearPendingNewTabFocus, scopeId, tabs.length])
 
   /**
    * Opens the shell's native account chooser under the key icon. Called
@@ -1123,70 +1030,9 @@ export function BrowserSession({
     showBrowserToolbarMenu({ x: rect.left, y: rect.bottom }, scopeId)
   }, [scopeId])
 
-  const handleSwitchTab = useCallback(
-    (tabId: string) => {
-      setSuggestionsVisible(false)
-      setSuggestionQuery(null)
-      setUrlDraft(null)
-      urlInputRef.current?.blur()
-      sendBrowserPanelAction('switch-tab', { tabId }, scopeId)
-    },
-    [scopeId]
-  )
-
-  const handleCloseTab = useCallback(
-    (tabId: string) => {
-      setSuggestionsVisible(false)
-      setSuggestionQuery(null)
-      setUrlDraft(null)
-      urlInputRef.current?.blur()
-      sendBrowserPanelAction('close-tab', { tabId }, scopeId)
-    },
-    [scopeId]
-  )
-
-  const handleDuplicateTab = useCallback(
-    (tabId: string) => {
-      sendBrowserPanelAction('duplicate-tab', { tabId }, scopeId)
-    },
-    [scopeId]
-  )
-
-  const handleSetTabPinned = useCallback(
-    (tabId: string, pinned: boolean) => {
-      setBrowserTabPinned(tabId, pinned, scopeId)
-    },
-    [scopeId]
-  )
-
-  const handleReorderTab = useCallback(
-    (tabId: string, targetIndex: number) => {
-      reorderBrowserTab(tabId, targetIndex, scopeId)
-    },
-    [scopeId]
-  )
-
   return (
     <div ref={panelRef} className='flex h-full flex-col overflow-hidden'>
       <div className='relative shrink-0 border-[var(--border)] border-b bg-[var(--bg)]'>
-        <BrowserTabStrip
-          tabs={tabs}
-          activeTabId={activeTabId}
-          automationTabId={automationTabId}
-          automationActive={automationActive || browserAgentActive}
-          automationNeedsAttention={automationNeedsAttention}
-          onNewTab={handleNewTab}
-          onSwitchTab={handleSwitchTab}
-          onCloseTab={handleCloseTab}
-          onDuplicateTab={handleDuplicateTab}
-          onSetTabPinned={handleSetTabPinned}
-          onOpenTabMenu={(tabId) =>
-            requestOverlay('tab', () => showBrowserTabContextMenu(tabId, scopeId))
-          }
-          onCloseTabMenu={() => void closeOverlay('tab')}
-          onReorderTab={handleReorderTab}
-          contextMenuOpen={activeOverlay === 'tab'}
-        />
         <div className='flex items-center gap-1 px-2.5 py-1.5'>
           <Button
             type='button'
@@ -1194,7 +1040,7 @@ export function BrowserSession({
             size='sm'
             aria-label='Back'
             disabled={!pageState?.canGoBack}
-            className='size-[30px] flex-shrink-0 p-0'
+            className='size-[30px] shrink-0 p-0'
             onClick={() => sendBrowserPanelAction('back', {}, scopeId)}
           >
             <ArrowLeft className='size-[14px]' />
@@ -1205,7 +1051,7 @@ export function BrowserSession({
             size='sm'
             aria-label='Forward'
             disabled={!pageState?.canGoForward}
-            className='size-[30px] flex-shrink-0 p-0'
+            className='size-[30px] shrink-0 p-0'
             onClick={() => sendBrowserPanelAction('forward', {}, scopeId)}
           >
             <ArrowRight className='size-[14px]' />
@@ -1215,7 +1061,7 @@ export function BrowserSession({
             variant='ghost-secondary'
             size='sm'
             aria-label='Reload page'
-            className='size-[30px] flex-shrink-0 p-0'
+            className='size-[30px] shrink-0 p-0'
             onClick={() => sendBrowserPanelAction('reload', {}, scopeId)}
           >
             <RefreshCw className='size-[14px]' />
@@ -1266,7 +1112,10 @@ export function BrowserSession({
                           }
                         : null
                     setSuggestionsVisible(true)
-                    if (document.activeElement !== event.currentTarget) {
+                    if (
+                      document.activeElement !== event.currentTarget ||
+                      suggestionQuery === null
+                    ) {
                       setSuggestionOriginUrl(pageState?.url ?? '')
                       setSuggestionQuery('')
                     }
@@ -1360,6 +1209,9 @@ export function BrowserSession({
               // Focus has to stay in the omnibox: the user is still typing, and
               // the list is driven by arrow keys rather than by tabbing into it.
               onOpenAutoFocus={(event) => event.preventDefault()}
+              onInteractOutside={(event) => {
+                if (event.target === urlInputRef.current) event.preventDefault()
+              }}
             >
               {suggestions.map((suggestion, index) => (
                 <PopoverItem
@@ -1421,7 +1273,7 @@ export function BrowserSession({
                   size='sm'
                   aria-label='Fill a saved password'
                   title='Fill a saved password'
-                  className='size-[30px] flex-shrink-0 p-0'
+                  className='size-[30px] shrink-0 p-0'
                 >
                   <Key className='size-[14px]' />
                 </Button>
@@ -1460,9 +1312,9 @@ export function BrowserSession({
                 type='button'
                 aria-label='Browser menu'
                 title='Browser menu'
-                className={cn(chipVariants(), 'flex-shrink-0')}
+                className={cn(chipVariants(), 'shrink-0')}
               >
-                <MoreHorizontal className='size-[14px] flex-shrink-0 text-[var(--text-icon)]' />
+                <MoreHorizontal className='size-[14px] shrink-0 text-[var(--text-icon)]' />
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent
@@ -1487,13 +1339,8 @@ export function BrowserSession({
               />
               <DropdownMenuSeparator />
               <DropdownMenuItem
-                onSelect={afterToolbarClose(() =>
-                  navigateToSettings({
-                    section: 'browser',
-                    browserView: 'passwords',
-                    browserImport: true,
-                  })
-                )}
+                onSelect={afterToolbarClose(() => setImportOpen(true))}
+                disabled={!canImport}
               >
                 Import Passwords
               </DropdownMenuItem>
@@ -1529,6 +1376,18 @@ export function BrowserSession({
             </p>
           </div>
         )}
+        {showEmptyState && (
+          <section
+            aria-label='New tab'
+            className='absolute inset-0 flex overflow-auto bg-[var(--bg)]'
+          >
+            <EmptyState
+              graphic={<Globe className='size-6 text-[var(--text-icon)]' aria-hidden='true' />}
+              title='Browse the web'
+              description='Search or enter a URL above.'
+            />
+          </section>
+        )}
         {pageState?.issue && (
           <BrowserPageIssueView
             issue={pageState.issue}
@@ -1537,6 +1396,16 @@ export function BrowserSession({
           />
         )}
       </div>
+      <BrowserImportDialog
+        open={importOpen}
+        onOpenChange={setImportOpen}
+        onImported={async () => setImportVersion((version) => version + 1)}
+      />
+      <BrowserPermissionModal
+        request={permissionRequest}
+        open={permissionModalOpen}
+        onDecision={respondToPermission}
+      />
     </div>
   )
 }

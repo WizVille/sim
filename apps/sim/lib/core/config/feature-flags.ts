@@ -29,16 +29,6 @@ export type FeatureFlagsConfig = Record<string, FeatureFlagRule>
 export type FeatureFlagContext = AppConfigGateContext
 
 /**
- * Registry of known feature flags. Each maps to the secret consulted ONLY when
- * AppConfig is not the source of truth (self-hosted/OSS, local dev, or hosted
- * without APPCONFIG_*). A truthy secret turns the flag on globally.
- *
- * Gating by workspace/org/user/admin is available ONLY through the hosted AppConfig document
- * — it deliberately cannot be expressed here, so no environment can grant (e.g.)
- * admin access from a code literal. To add a flag, register its name and the secret
- * to fall back on.
- */
-/**
  * The single definition of a feature flag. Everything about a flag lives in one
  * place: its name (the registry key), a human-readable `description`, and the
  * `fallback` secret consulted when AppConfig isn't the source of truth (truthy ⇒ on
@@ -56,6 +46,18 @@ interface FeatureFlagDefinition {
 
 /** The single registry of known flags. To add a flag, add one entry here. */
 const FEATURE_FLAGS = {
+  'agent-memory-history': {
+    description:
+      'Capture durable Workflow Agent tool history and continue existing retries. Supports workspace rollout targeting; version-aware memory storage remains active when capture is disabled.',
+    fallback: 'AGENT_MEMORY_HISTORY',
+  },
+  'slack-search-shared-app': {
+    description:
+      'Enable the official shared Slack app for existing Search customers. Supports orgId ' +
+      'targeting for setup, personal connections, and bot execution. Off-AppConfig falls back ' +
+      'to SLACK_SEARCH_SHARED_APP.',
+    fallback: 'SLACK_SEARCH_SHARED_APP',
+  },
   'trigger-eu-region': {
     description:
       'Route Trigger.dev runs to eu-central-1 instead of the default us-east-1. Global on/off ' +
@@ -72,12 +74,53 @@ const FEATURE_FLAGS = {
       'AppConfig; off-AppConfig falls back to TABLES_V2_API.',
     fallback: 'TABLES_V2_API',
   },
+  'table-row-ttl': {
+    description:
+      'Enable TTL columns and the scheduled cleanup that removes expired table rows. ' +
+      'Global on/off only; existing TTL data remains readable when disabled.',
+    fallback: 'TABLE_ROW_TTL',
+  },
   'credential-groups': {
     description:
-      'Workspace-owned collections that gather managed OAuth credentials from external users. ' +
-      'Gated by workspaceId via AppConfig (or globally); hosted workspaces must also have an ' +
-      'Enterprise subscription. Off-AppConfig falls back to CREDENTIAL_GROUPS.',
+      'Managed connected accounts, including organization account pools and their settings UI. ' +
+      'Uses orgId targeting only; workspace callers resolve their canonical organization. Hosted ' +
+      'owners also require an active Enterprise subscription. Organization Search additionally ' +
+      'requires knowledge-member-access. Off-AppConfig falls back to CREDENTIAL_GROUPS.',
     fallback: 'CREDENTIAL_GROUPS',
+  },
+  'knowledge-member-access': {
+    description:
+      'Permission-aware indexing and retrieval. Organization Search UI, MCP, and search APIs ' +
+      'require this flag and credential-groups for the canonical orgId; user/admin/workspace ' +
+      'targeting cannot enable another organization. Workspace member sync uses workspaceId; ' +
+      'workspace retrieval defaults may additionally use user/admin targeting. Source ACL ' +
+      'mirroring remains independent of managed identities. Off-AppConfig falls back to ' +
+      'KNOWLEDGE_MEMBER_ACCESS.',
+    fallback: 'KNOWLEDGE_MEMBER_ACCESS',
+  },
+  'knowledge-tin-keyword': {
+    description:
+      'Rank keyword retrieval for members whose permitted set is too large to enumerate through ' +
+      'the Tin text index instead of GIN. Has no effect where the Tin keyword index is absent or ' +
+      'invalid. Off-AppConfig falls back to KNOWLEDGE_TIN_KEYWORD.',
+    fallback: 'KNOWLEDGE_TIN_KEYWORD',
+  },
+  'knowledge-async-projection': {
+    description:
+      'Knowledge writers (document processing and connector ACL writes) leave search projection ' +
+      'rows to the background knowledge projector instead of rewriting them in their own ' +
+      'transaction. Global on/off only; turn it on only once no release older than the ' +
+      'projector serves search. Off-AppConfig falls back to KNOWLEDGE_ASYNC_PROJECTION.',
+    fallback: 'KNOWLEDGE_ASYNC_PROJECTION',
+  },
+  'knowledge-projection-fill': {
+    description:
+      'The knowledge projector also fills search projection rows written before they carried ' +
+      "their document's source and ACL, marking at most 100 documents at once so fresh writes " +
+      'never wait behind much of it. Global on/off only; off pauses the fill, and search keeps ' +
+      'deciding unfilled rows on their document. Off-AppConfig falls back to ' +
+      'KNOWLEDGE_PROJECTION_FILL.',
+    fallback: 'KNOWLEDGE_PROJECTION_FILL',
   },
 } satisfies Record<string, FeatureFlagDefinition>
 

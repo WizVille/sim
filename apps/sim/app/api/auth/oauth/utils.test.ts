@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 vi.mock('@/lib/oauth/oauth', () => ({
   refreshOAuthToken: vi.fn(),
   OAUTH_PROVIDERS: {},
+  TOKEN_REFRESH_TIMEOUT_MS: 15_000,
 }))
 
 const { mockDecryptSecret } = vi.hoisted(() => ({ mockDecryptSecret: vi.fn() }))
@@ -37,6 +38,7 @@ import {
   refreshTokenIfNeeded,
   resolveServiceAccountToken,
 } from '@/lib/oauth/credential-service'
+import { getOAuthRefreshCoordinationIdentity } from '@/lib/oauth/refresh-coordination'
 import {
   ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID,
   GOOGLE_SERVICE_ACCOUNT_PROVIDER_ID,
@@ -64,7 +66,9 @@ function mockSelectChain(limitResult: unknown[]) {
  * Returns a nested chain: update() -> set() -> where()
  */
 function mockUpdateChain() {
-  const mockWhere = vi.fn().mockResolvedValue({})
+  /** The rotated write returns the row it matched; an empty result means the chain moved first. */
+  const mockReturning = vi.fn().mockResolvedValue([{ id: 'account-1' }])
+  const mockWhere = vi.fn().mockReturnValue({ returning: mockReturning })
   const mockSet = vi.fn().mockReturnValue({ where: mockWhere })
   mockDb.update.mockReturnValueOnce({ set: mockSet })
   return { mockSet, mockWhere }
@@ -141,12 +145,18 @@ describe('OAuth Utils', () => {
         refreshToken: 'new-refresh-token',
       })
 
-      mockUpdateChain()
+      const { mockSet } = mockUpdateChain()
 
       const result = await refreshTokenIfNeeded('request-id', mockCredential, 'credential-id')
 
       expect(mockRefreshOAuthToken).toHaveBeenCalledWith('google', 'refresh-token')
-      expect(mockDb.update).toHaveBeenCalled()
+      expect(mockSet).toHaveBeenCalledWith(
+        expect.objectContaining({
+          accessToken: 'new-token',
+          refreshToken: 'new-refresh-token',
+          accessTokenExpiresAt: expect.any(Date),
+        })
+      )
       expect(result).toEqual({ accessToken: 'new-token', refreshed: true })
     })
 
@@ -170,7 +180,7 @@ describe('OAuth Utils', () => {
       ).rejects.toThrow('Failed to refresh token')
     })
 
-    it('should not attempt refresh if no refresh token', async () => {
+    it('requires reconnection for an expired token without attempting an unavailable refresh', async () => {
       const mockCredential = {
         id: 'credential-id',
         accessToken: 'token',
@@ -179,10 +189,26 @@ describe('OAuth Utils', () => {
         providerId: 'google',
       }
 
-      const result = await refreshTokenIfNeeded('request-id', mockCredential, 'credential-id')
+      await expect(
+        refreshTokenIfNeeded('request-id', mockCredential, 'credential-id')
+      ).rejects.toThrow('OAuth access token expired and cannot be refreshed; reconnect the account')
 
       expect(mockRefreshOAuthToken).not.toHaveBeenCalled()
-      expect(result).toEqual({ accessToken: 'token', refreshed: false })
+    })
+
+    it('keeps a legacy non-expiring Monday credential usable without refreshing it', async () => {
+      const legacyCredential = {
+        id: 'legacy-monday-credential-id',
+        accessToken: 'legacy-monday-access-token',
+        refreshToken: null,
+        accessTokenExpiresAt: null,
+        providerId: 'monday',
+      }
+
+      const result = await refreshTokenIfNeeded('request-id', legacyCredential, legacyCredential.id)
+
+      expect(mockRefreshOAuthToken).not.toHaveBeenCalled()
+      expect(result).toEqual({ accessToken: 'legacy-monday-access-token', refreshed: false })
     })
   })
 
@@ -326,9 +352,11 @@ describe('OAuth Utils', () => {
       const result = await refreshTokenIfNeeded('request-id', slackCredential(), 'row-1')
 
       expect(result).toEqual({ accessToken: 'new-at', refreshed: true })
+      const installationIdentity = getOAuthRefreshCoordinationIdentity('slack:T08CM6ZNYBE')
       expect(redisConfigMockFns.mockAcquireLock.mock.calls[0][0]).toBe(
-        'oauth:refresh:slack:T08CM6ZNYBE'
+        `oauth:refresh:${installationIdentity}`
       )
+      expect(installationIdentity).not.toContain('T08CM6ZNYBE')
       expect(redisConfigMockFns.mockAcquireLock.mock.calls[0][2]).toBe(30)
       expect(mockRefreshOAuthToken).toHaveBeenCalledWith('slack', 'live-rt')
       expect(mockSet).toHaveBeenCalledWith(
@@ -367,7 +395,11 @@ describe('OAuth Utils', () => {
       )
 
       expect(result).toEqual({ accessToken: 'new-at', refreshed: true })
-      expect(redisConfigMockFns.mockAcquireLock.mock.calls[0][0]).toBe('oauth:refresh:row-1')
+      const rowIdentity = getOAuthRefreshCoordinationIdentity('row-1')
+      expect(redisConfigMockFns.mockAcquireLock.mock.calls[0][0]).toBe(
+        `oauth:refresh:${rowIdentity}`
+      )
+      expect(rowIdentity).not.toContain('row-1')
       expect(mockRefreshOAuthToken).toHaveBeenCalledWith('slack', 'stale-rt')
     })
 
@@ -391,8 +423,9 @@ describe('OAuth Utils', () => {
         'Failed to refresh token'
       )
 
+      const installationIdentity = getOAuthRefreshCoordinationIdentity('slack:T08CM6ZNYBE')
       expect(fakeRedis.set).toHaveBeenCalledWith(
-        'oauth:dead:slack:T08CM6ZNYBE',
+        `oauth:dead:${installationIdentity}`,
         'token_revoked',
         'EX',
         3600

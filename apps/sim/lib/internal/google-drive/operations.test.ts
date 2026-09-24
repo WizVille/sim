@@ -9,8 +9,7 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@/lib/internal/google-drive/client', () => ({
-  asObject: (value: unknown) =>
-    value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {},
+  asObject: (value: unknown) => toRecord(value),
   googleApiErrorMessage: (data: { error?: { message?: string } }, fallback: string) =>
     data.error?.message || fallback,
   requestGoogleDrive: mocks.request,
@@ -21,6 +20,7 @@ vi.mock('@/lib/internal/google-drive/file-input', () => ({
   resolveGoogleDriveUploadFile: mocks.resolveFile,
 }))
 
+import { toRecord } from '@sim/utils/object'
 import {
   executeGoogleDriveDownload,
   executeGoogleDriveExport,
@@ -48,6 +48,17 @@ const context = {
   signal: new AbortController().signal,
   userId: 'user-1',
 }
+
+const storedFile = {
+  id: 'stored-file',
+  name: 'stored.bin',
+  size: 5,
+  type: 'application/octet-stream',
+  mimeType: 'application/octet-stream',
+  url: '/api/files/stored',
+  key: 'execution/workspace/workflow/run/stored.bin',
+  context: 'execution',
+} as const
 
 describe('Google Drive operations', () => {
   beforeEach(() => {
@@ -82,11 +93,12 @@ describe('Google Drive operations', () => {
       maxResponseBytes: MAX_FILE_SIZE,
       signal: context.signal,
     })
-    expect(result.output.file).toEqual({
-      name: 'report.pdf',
-      mimeType: 'application/pdf',
-      data: 'AAAAAA==',
-      size: 4,
+    expect(result.files).toEqual([
+      { name: 'report.pdf', mimeType: 'application/pdf', buffer: Buffer.alloc(4) },
+    ])
+    expect(result.present([storedFile])).toMatchObject({
+      success: true,
+      output: { file: storedFile },
     })
   })
 
@@ -112,7 +124,9 @@ describe('Google Drive operations', () => {
       label: 'revisionsUrl',
       signal: context.signal,
     })
-    expect(result.output.metadata.revisions).toEqual([{ id: 'rev-1' }])
+    expect(result.present([storedFile])).toMatchObject({
+      output: { metadata: { revisions: [{ id: 'rev-1' }] } },
+    })
   })
 
   it('preserves the export byte limit and exact error', async () => {

@@ -13,7 +13,7 @@ vi.mock('@/lib/auth', () => ({
   getSession: mockGetSession,
 }))
 
-import { PATCH } from '@/app/api/users/me/settings/route'
+import { GET, PATCH } from '@/app/api/users/me/settings/route'
 
 describe('PATCH /api/users/me/settings', () => {
   beforeEach(() => {
@@ -27,6 +27,15 @@ describe('PATCH /api/users/me/settings', () => {
 
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual({ success: true })
+  })
+
+  it('does not acknowledge a privacy update when the session has expired', async () => {
+    mockGetSession.mockResolvedValue(null)
+
+    const response = await PATCH(createMockRequest('PATCH', { telemetryEnabled: false }))
+
+    expect(response.status).toBe(401)
+    expect(dbChainMockFns.insert).not.toHaveBeenCalled()
   })
 
   /**
@@ -44,5 +53,34 @@ describe('PATCH /api/users/me/settings', () => {
 
     expect(response.status).toBe(500)
     expect(await response.json()).not.toMatchObject({ success: true })
+  })
+})
+
+describe('GET /api/users/me/settings', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetSession.mockResolvedValue(null)
+  })
+
+  it('preserves anonymous defaults without entering the protected current-user read', async () => {
+    const response = await GET()
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      data: { theme: 'system', autoConnect: true, telemetryEnabled: false },
+    })
+    expect(dbChainMockFns.select).not.toHaveBeenCalled()
+  })
+
+  it('does not replace unavailable saved preferences with permission to collect', async () => {
+    mockGetSession.mockResolvedValue({ user: { id: 'user-1' } })
+    dbChainMockFns.select.mockImplementationOnce(() => {
+      throw new Error('Database unavailable')
+    })
+
+    const response = await GET()
+
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toEqual({ error: 'Failed to load settings' })
   })
 })

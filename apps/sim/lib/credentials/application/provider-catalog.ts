@@ -10,7 +10,12 @@ import {
   type TokenServiceAccountField,
 } from '@/lib/credentials/token-service-accounts/descriptors'
 import { createIntegrationCredentialVisibility } from '@/lib/integrations/credential-visibility.server'
-import { allowedIntegrationTypes, principalUserId } from '@/lib/integrations/principal-scope.server'
+import {
+  allowedIntegrationTypes,
+  allowedOrganizationIntegrationTypes,
+  principalUserId,
+} from '@/lib/integrations/principal-scope.server'
+import { GITHUB_INSTALLATION_PROVIDER_ID } from '@/lib/oauth/github-installation-types'
 import {
   ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID,
   GOOGLE_SERVICE_ACCOUNT_PROVIDER_ID,
@@ -54,6 +59,7 @@ export interface OAuthCredentialProviderCatalogEntry extends CredentialProviderC
   type: 'oauth'
   supportsReconnect: boolean
   authorizationOptions: CredentialProviderAuthorizationOption[]
+  fields: CredentialProviderField[]
 }
 
 export interface ServiceAccountCredentialProviderCatalogEntry
@@ -70,10 +76,9 @@ export type CredentialProviderCatalogEntry =
   | OAuthCredentialProviderCatalogEntry
   | ServiceAccountCredentialProviderCatalogEntry
 
-interface CredentialProviderCatalogContext {
-  workspaceId: string
-  workspaceOrganizationId: string | null
-}
+type CredentialProviderCatalogContext =
+  | { workspaceId: string; workspaceOrganizationId: string | null }
+  | { organizationId: string }
 
 interface ServiceAccountDescriptor {
   name: string
@@ -111,6 +116,16 @@ function providerField(
 }
 
 function getServiceAccountDescriptor(providerId: string): ServiceAccountDescriptor {
+  if (providerId === GITHUB_INSTALLATION_PROVIDER_ID) {
+    return {
+      name: 'GitHub App installation',
+      description: 'Index repository content with a GitHub App installation.',
+      docsUrl: 'https://docs.sim.ai/search/github',
+      helpText:
+        'Connect an installation through your organization’s Search integrations. Each person connects their own GitHub account to establish access.',
+      fields: [],
+    }
+  }
   if (providerId === GOOGLE_SERVICE_ACCOUNT_PROVIDER_ID) {
     return {
       name: 'Google service account',
@@ -149,6 +164,19 @@ function getServiceAccountDescriptor(providerId: string): ServiceAccountDescript
           required: true,
           secret: false,
           multiline: false,
+        },
+        {
+          id: 'atlassianProduct',
+          label: 'Product',
+          placeholder: 'jira',
+          required: false,
+          secret: false,
+          multiline: false,
+          options: [
+            { value: 'jira', label: 'Jira' },
+            { value: 'confluence', label: 'Confluence' },
+          ],
+          hint: 'Select the product this token can access. Defaults to Jira.',
         },
       ],
     }
@@ -215,14 +243,19 @@ function getServiceAccountDescriptor(providerId: string): ServiceAccountDescript
 
 export async function listCredentialProviderCatalog(
   principal: Principal,
-  context: CredentialProviderCatalogContext
+  context: CredentialProviderCatalogContext,
+  oauthType: 'oauth' | 'managed_oauth' = 'oauth'
 ): Promise<CredentialProviderCatalogEntry[]> {
   const userId = principalUserId(principal)
+  const organizationId =
+    'organizationId' in context ? context.organizationId : context.workspaceOrganizationId
   const [allowedIntegrations, blockVisibility] = await Promise.all([
-    allowedIntegrationTypes(principal, context.workspaceId),
+    'organizationId' in context
+      ? allowedOrganizationIntegrationTypes(context.organizationId)
+      : allowedIntegrationTypes(principal, context.workspaceId),
     getBlockVisibility({
       ...(userId ? { userId } : {}),
-      ...(context.workspaceOrganizationId ? { orgId: context.workspaceOrganizationId } : {}),
+      ...(organizationId ? { orgId: organizationId } : {}),
     }),
   ])
   const services = getAllOAuthServices()
@@ -256,9 +289,22 @@ export async function listCredentialProviderCatalog(
       name: service.name,
       description: service.description,
       providerFamily: service.baseProvider,
-      available: visibility.isOAuthServiceVisible(service),
+      available:
+        oauthType === 'managed_oauth'
+          ? visibility.isCredentialVisible({ providerId: service.providerId, type: oauthType })
+          : visibility.isOAuthServiceVisible(service),
       supportsReconnect: true,
       authorizationOptions,
+      fields: (service.clientConfiguration?.fields ?? []).map((field) => ({
+        id: field.id,
+        label: field.label,
+        placeholder: field.placeholder,
+        required: true,
+        secret: field.secret,
+        multiline: false,
+        ...(field.options ? { options: [...field.options] } : {}),
+        ...(field.hint ? { hint: field.hint } : {}),
+      })),
     }
   })
 

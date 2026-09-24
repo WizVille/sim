@@ -2,12 +2,13 @@
 
 import { useMemo } from 'react'
 import { cn } from '@sim/emcn'
+import { escapeRegExp } from '@sim/utils/string'
 import { ContextMentionIcon } from '@/app/workspace/[workspaceId]/home/components/context-mention-icon'
 import type { ChatMessageContext } from '@/app/workspace/[workspaceId]/home/types'
 import { getIntegrationMatcher } from '@/blocks/integration-matcher'
 
 const USER_MESSAGE_CLASSES =
-  'whitespace-pre-wrap break-words [overflow-wrap:anywhere] font-[family-name:var(--font-inter)] text-base text-[var(--text-primary)] leading-[23px] tracking-[0] antialiased'
+  'whitespace-pre-wrap [overflow-wrap:anywhere] font-[family-name:var(--font-inter)] text-base text-[var(--text-primary)] leading-[23px] tracking-[0] antialiased'
 
 const COMPACT_CLASSES =
   'truncate text-small leading-[20px] font-[family-name:var(--font-inter)] text-[var(--text-primary)] tracking-[0] antialiased'
@@ -20,10 +21,6 @@ interface UserMessageContentProps {
   plainMentions?: boolean
   /** Use compact single-line layout with truncation. */
   compact?: boolean
-}
-
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 interface MentionRange {
@@ -54,7 +51,7 @@ function computeMentionRanges(text: string, contexts: ChatMessageContext[]): Men
     const ctx = withResolvedBlockType(rawCtx)
     const prefix = ctx.kind === 'skill' || ctx.kind === 'mcp' ? '/' : '@'
     const token = `${prefix}${ctx.label}`
-    const pattern = new RegExp(`(^|\\s)(${escapeRegex(token)})(\\s|$)`, 'g')
+    const pattern = new RegExp(`(^|\\s)(${escapeRegExp(token)})(\\s|$)`, 'g')
     let match: RegExpExecArray | null
     while ((match = pattern.exec(text)) !== null) {
       const leadingSpace = match[1]
@@ -111,7 +108,7 @@ function MentionHighlight({ context }: { context: ChatMessageContext }) {
     <span className='inline-flex items-baseline gap-1 rounded-[5px] bg-[var(--surface-5)] px-[5px]'>
       <ContextMentionIcon
         context={context}
-        className='relative top-0.5 size-[12px] flex-shrink-0 text-[var(--text-icon)]'
+        className='relative top-0.5 size-[12px] shrink-0 text-[var(--text-icon)]'
       />
       {context.label}
     </span>

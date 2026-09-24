@@ -1,4 +1,5 @@
 ---
+description: Settings page layout and SettingsPanel design-system compliance
 paths:
   - "apps/sim/app/workspace/*/settings/**"
   - "apps/sim/app/workspace/*/{integrations,skills,upgrade}/**"
@@ -104,11 +105,16 @@ Adding a new settings page:
 2. Render the component inside the shell's `effectiveSection` switch in
    `settings/[section]/settings.tsx`.
 3. Build the component body inside `<SettingsPanel>` — no shell, no title block.
+4. When a real second consumer or server boundary needs it, extract client-safe React Query options;
+   otherwise keep them with the hook. Approved intent warmers reuse those exact options and must keep
+   `check-tool-registry-boundary` green. Warm only authorized destinations, preserve the current
+   section during the transition, and follow `sim-react-performance.md` recovery rules; never render
+   temporary default data that will be replaced after load.
 
 ## Text-scale tokens (no literal pixel sizes)
 
 Settings pages never use a literal `text-[Npx]` class — always the named Tailwind
-scale token from `apps/sim/tailwind.config.ts`'s `fontSize` extension (`text-micro`
+scale token from the `@theme` block in `apps/sim/app/_styles/globals.css` (`text-micro`
 10px, `text-xs` 11px, `text-caption` 12px, `text-small` 13px, `text-sm` 14px
 [Tailwind default, unmodified], `text-base` 15px, `text-md` 16px, `text-lg` 18px
 [Tailwind default]). A literal size is either a straight rename to the equivalent

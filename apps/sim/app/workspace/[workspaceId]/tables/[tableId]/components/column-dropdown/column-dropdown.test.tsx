@@ -23,19 +23,50 @@ afterEach(() => {
 })
 
 describe('ColumnDropdown', () => {
+  it('keeps a schema-locked trigger focusable for its explanation without opening a menu', () => {
+    const onPickType = vi.fn()
+    act(() => {
+      root.render(
+        <ColumnDropdown
+          columns={[]}
+          tableRowTtlEnabled
+          trigger='header'
+          disabled={false}
+          blocked
+          onPickType={onPickType}
+          onPickWorkflow={vi.fn()}
+          onPickEnrichment={vi.fn()}
+        />
+      )
+    })
+    const trigger = container.querySelector<HTMLButtonElement>('button')!
+    expect(trigger.getAttribute('aria-disabled')).toBe('true')
+    expect(trigger.disabled).toBe(false)
+    act(() => {
+      trigger.focus()
+      trigger.click()
+    })
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toContain(
+      'Changing the table schema is disabled in Table Security.'
+    )
+    expect(document.querySelector('[role="menu"]')).toBeNull()
+    expect(onPickType).not.toHaveBeenCalled()
+  })
+
   it('lists Enrichments as a regular entry after the column options', () => {
     const onPickEnrichment = vi.fn()
 
     act(() => {
       root.render(
         <ColumnDropdown
+          columns={[]}
+          tableRowTtlEnabled
           trigger='header'
           disabled={false}
           onPickType={vi.fn()}
           onPickWorkflow={vi.fn()}
           onPickEnrichment={onPickEnrichment}
           blocked={false}
-          onBlocked={vi.fn()}
         />
       )
     })

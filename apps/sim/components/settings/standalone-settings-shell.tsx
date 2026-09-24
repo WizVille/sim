@@ -17,11 +17,15 @@ import { SettingsHeaderProvider, SettingsHeaderShell } from '@/components/settin
 import { SettingsSectionProvider } from '@/components/settings/settings-panel'
 import { SettingsSidebar } from '@/components/settings/settings-sidebar'
 import { useSettingsBeforeUnload } from '@/components/settings/use-settings-before-unload'
-import { isBillingEnabled, isHosted } from '@/lib/core/config/env-flags'
+import type { DeploymentShape } from '@/lib/api/contracts/workspaces'
+import { useDeploymentShape } from '@/lib/core/config/deployment-shape'
+import { useSeedDeploymentShape } from '@/hooks/use-seed-deployment-shape'
 import { SIDEBAR_WIDTH } from '@/stores/constants'
 
 interface StandaloneSettingsShellBaseProps {
   children: ReactNode
+  /** The server-resolved deployment shape, seeded before the sidebar and sections read it. */
+  deployment: DeploymentShape
 }
 
 interface AccountSettingsShellProps extends StandaloneSettingsShellBaseProps {
@@ -37,21 +41,23 @@ type StandaloneSettingsShellProps = AccountSettingsShellProps | SelfHostSettings
 
 export function StandaloneSettingsShell(props: StandaloneSettingsShellProps) {
   const { children, plane } = props
+  useSeedDeploymentShape(props.deployment)
   useSettingsBeforeUnload()
   const pathname = usePathname()
+  const { hosted, billingEnabled } = useDeploymentShape()
   const isSuperUser = plane === 'account' ? (props.isSuperUser ?? false) : false
 
   const accountItems = ACCOUNT_SETTINGS_ITEMS.filter((item) => {
-    if (item.id === 'billing' && !isBillingEnabled) return false
+    if (item.id === 'billing' && !billingEnabled) return false
     if ((item.id === 'admin' || item.id === 'mothership') && !isSuperUser) return false
     return true
   })
   const selfHostItems = SELFHOST_SETTINGS_ITEMS.filter((item) => {
-    if (item.id === 'billing' && !isBillingEnabled) return false
+    if (item.id === 'billing' && !billingEnabled) return false
     // Chat keys are issued by the managed service, so there are none to list on
-    // a self-hosted deployment — useCopilotKeys is `enabled: isHosted` for the
+    // a self-hosted deployment — useCopilotKeys is `enabled: hosted` for the
     // same reason. Self-hosters manage their keys on sim.ai.
-    if (item.id === 'chat-keys' && !isHosted) return false
+    if (item.id === 'chat-keys' && !hosted) return false
     return true
   })
   const selfHostSection = parseSettingsPathSection({
@@ -89,19 +95,19 @@ export function StandaloneSettingsShell(props: StandaloneSettingsShellProps) {
     <div className='flex h-screen w-full overflow-hidden bg-[var(--surface-1)]'>
       {/*
         Mirrors the in-workspace chrome (WorkspaceChrome): a flush, borderless
-        sidebar column against the app surface, and only the content pane
-        carrying the rounded border. Keep the two in step — a settings page
-        should look the same whether it is reached inside a workspace or not.
+        sidebar column against the app surface, meeting the content pane on a
+        single hairline divider with no gutter. Keep the two in step — a settings
+        page should look the same whether it is reached inside a workspace or not.
       */}
       <aside
         style={{ width: SIDEBAR_WIDTH.DEFAULT }}
-        className='flex h-full flex-shrink-0 flex-col overflow-hidden bg-[var(--surface-1)] pt-3'
+        className='flex h-full shrink-0 flex-col overflow-hidden bg-[var(--surface-1)] pt-3'
         aria-label={`${SETTINGS_PLANE_CHROME[plane].label} settings navigation`}
       >
         {sidebar}
       </aside>
-      <div className='flex min-w-0 flex-1 flex-col p-[8px] pl-0'>
-        <main className='flex-1 overflow-hidden rounded-[8px] border border-[var(--border)] bg-[var(--bg)]'>
+      <div className='flex min-w-0 flex-1 flex-col'>
+        <main className='flex-1 overflow-hidden border-[var(--border)] border-l bg-[var(--bg)]'>
           <SettingsHeaderProvider>
             <SettingsHeaderShell>
               <SettingsSectionProvider plane={plane} section={activeSection}>

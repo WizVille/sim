@@ -1,3 +1,7 @@
+---
+description: Global coding standards that apply to all files
+---
+
 # Global Standards
 
 ## Logging
@@ -47,7 +51,12 @@ Use shared helpers from `@sim/utils` instead of writing inline implementations:
 - `structuredClone(value)` — built-in deep clone, no import needed. Never write `JSON.parse(JSON.stringify(obj))`
 - `omit(obj, keys)` from `@sim/utils/object` — remove keys from object
 - `filterUndefined(obj)` from `@sim/utils/object` — strip undefined-valued keys. Never write `Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined))`
+- `isRecordLike(value)` from `@sim/utils/object` — indexable-object guard. Never redeclare `typeof value === 'object' && value !== null && !Array.isArray(value)`
+- `toRecord(value)` / `toRecordOrNull(value)` / `toArray(value)` from `@sim/utils/object` — coerce an untyped payload value to a record or array. Never inline `isRecordLike(v) ? v : {}` or `Array.isArray(v) ? v : []`. Where the source is already typed, keep the inline `Array.isArray` check: it narrows, while `toArray` asserts
+- `toStringOrNull(value)` / `toNumberOrNull(value)` / `toBooleanOrNull(value)` from `@sim/utils/coerce` — read one scalar out of an untyped payload. Never declare a local one-liner that is byte-identical to one of these (`asString`, `getString`, `nullableString`, …). Keep a local helper that differs: one returning `undefined` rather than `null` changes the wire shape, and one adding `Number.isFinite` or a string parse is a stricter check these deliberately omit
 - `truncate(str, maxLength, suffix?)` from `@sim/utils/string` — safe string truncation with ellipsis
+- `escapeRegExp(value)` from `@sim/utils/string` — escape regex metacharacters. Never inline `replace(/[.*+?^${}()|[\]\\]/g, '\\$&')`
+- `compareStrings(left, right)` from `@sim/utils/string` — code-unit string comparator for hashes, fingerprints, and values compared across processes. Never `localeCompare` there
 - `backoffWithJitter(attempt, retryAfterMs, options?)` from `@sim/utils/retry` — exponential backoff with jitter
 - `parseRetryAfter(header)` from `@sim/utils/retry` — parse HTTP `Retry-After` header to milliseconds
 
@@ -67,6 +76,9 @@ const msg = getErrorMessage(error, 'Unknown error')
 const clone = structuredClone(obj)
 const filtered = filterUndefined(obj)
 ```
+
+## Deployment flags in the browser
+Client code inside a workspace, organization, or standalone settings surface reads `hosted`, `billingEnabled`, `chatEnabled`, and the enterprise feature set through `useDeploymentShape()` (components) or `getDeploymentShape()` (block conditions, stores, helpers) from `@/lib/core/config/deployment-shape`, never the `isHosted`/`isBillingEnabled` constants from `env-flags`. Those constants freeze at module init from the root layout's `NEXT_PUBLIC_*` transport, which Next's bare 404 shell and `global-error` never emit, so a tab recovered from one would render Sim Cloud as self-hosted. The reader is seeded from the server-resolved workspace host context, organization layout, or standalone settings layout. Server code keeps reading `env-flags`.
 
 ## Package Manager
 Use `bun` and `bunx`, not `npm` and `npx`.

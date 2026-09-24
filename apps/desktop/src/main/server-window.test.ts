@@ -1,9 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('electron', () => import('@/test/electron-mock'))
 
 import type { ConfigStore, OriginValidation } from '@/main/config'
 import { createServerWindow, type ServerWindowDeps } from '@/main/server-window'
+import { dialog, BrowserWindow as MockBrowserWindow, session } from '@/test/electron-mock'
 
 const CURRENT = 'https://sim.example.com'
 const DEFAULT = 'https://www.sim.ai'
@@ -31,7 +32,6 @@ function makeDeps(overrides: Partial<ServerWindowDeps> = {}): ServerWindowDeps {
       raw.startsWith('https://') ? { ok: true, origin: raw } : { ok: false, error: 'bad origin' }
     ),
     defaultOrigin: DEFAULT,
-    pagePath: 'static/server.html',
     preloadPath: '/tmp/preload.cjs',
     isPackaged: false,
     getParentWindow: () => null,
@@ -43,11 +43,95 @@ function makeDeps(overrides: Partial<ServerWindowDeps> = {}): ServerWindowDeps {
   }
 }
 
+type WebContentsHandler = (...args: unknown[]) => void
+
+function openPicker(deps: ServerWindowDeps) {
+  const ses = {
+    setPermissionRequestHandler: vi.fn(),
+    setPermissionCheckHandler: vi.fn(),
+    protocol: { isProtocolHandled: vi.fn(() => false), handle: vi.fn() },
+  }
+  vi.mocked(session.fromPartition).mockReturnValue(ses as never)
+  createServerWindow(deps).open()
+  const win = MockBrowserWindow.instances.at(-1)
+  if (!win) throw new Error('no window was created')
+  const handler = (name: string): WebContentsHandler => {
+    const found = win.webContents.on.mock.calls.find(([event]) => event === name)?.[1]
+    if (!found) throw new Error(`no ${name} handler`)
+    return found as WebContentsHandler
+  }
+  return { win, ses, handler }
+}
+
 describe('server window', () => {
   let deps: ServerWindowDeps
 
   beforeEach(() => {
+    vi.useFakeTimers()
     deps = makeDeps()
+    MockBrowserWindow.instances = []
+    vi.mocked(dialog.showMessageBox).mockClear()
+  })
+
+  afterEach(() => {
+    vi.clearAllTimers()
+    vi.useRealTimers()
+  })
+
+  // The page ships inside app.asar. Loaded over `file:` it never rendered in a
+  // packaged build (the file-protocol fuse is off), which is the blank sheet
+  // this window used to open as.
+  it('loads the picker over the shell scheme and serves it on its own partition', () => {
+    const { win, ses } = openPicker(deps)
+
+    expect(win.loadURL).toHaveBeenCalledWith('sim-shell://pages/server.html')
+    expect(ses.protocol.handle).toHaveBeenCalledWith('sim-shell', expect.any(Function))
+    expect(MockBrowserWindow.lastOptions).toMatchObject({
+      webPreferences: expect.objectContaining({ partition: 'server-selection' }),
+    })
+  })
+
+  it('closes on Escape without needing the page', () => {
+    const { win, handler } = openPicker(deps)
+    const event = { preventDefault: vi.fn() }
+
+    handler('before-input-event')(event, { type: 'keyDown', key: 'a' })
+    expect(win.destroy).not.toHaveBeenCalled()
+
+    handler('before-input-event')(event, { type: 'keyDown', key: 'Escape' })
+    expect(win.destroy).toHaveBeenCalledTimes(1)
+    expect(event.preventDefault).toHaveBeenCalledTimes(1)
+  })
+
+  it('only shows the picker once its renderer has supplied a content size', () => {
+    const { win } = openPicker(deps)
+    expect(win.show).not.toHaveBeenCalled()
+    win.webContents.mainFrame.url = 'sim-shell://pages/server.html'
+    const resize = win.webContents.ipc.on.mock.calls.find(([name]) => name === 'shell:resize')?.[1]
+    resize?.({ sender: win.webContents, senderFrame: win.webContents.mainFrame }, 320)
+    expect(win.show).toHaveBeenCalledOnce()
+    vi.advanceTimersByTime(10_000)
+    expect(dialog.showMessageBox).not.toHaveBeenCalled()
+  })
+
+  it('recovers if the HTML loads but the renderer never becomes ready', () => {
+    const { win } = openPicker(deps)
+    vi.advanceTimersByTime(10_000)
+    expect(win.destroy).toHaveBeenCalledOnce()
+    expect(dialog.showMessageBox).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }))
+  })
+
+  it('never leaves a blank sheet when the page fails to load', () => {
+    const { win, handler } = openPicker(deps)
+
+    handler('did-fail-load')({}, -6, 'ERR_FILE_NOT_FOUND', 'sim-shell://pages/server.html', false)
+    expect(win.destroy).not.toHaveBeenCalled()
+    handler('did-fail-load')({}, -3, 'ERR_ABORTED', 'sim-shell://pages/server.html', true)
+    expect(win.destroy).not.toHaveBeenCalled()
+
+    handler('did-fail-load')({}, -6, 'ERR_FILE_NOT_FOUND', 'sim-shell://pages/server.html', true)
+    expect(win.destroy).toHaveBeenCalledTimes(1)
+    expect(dialog.showMessageBox).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }))
   })
 
   it('reports the configured origin alongside the build default', () => {

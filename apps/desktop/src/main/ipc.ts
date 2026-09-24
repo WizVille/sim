@@ -1,6 +1,5 @@
-import { normalize } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import {
+  BROWSER_TOOL_AUTHORIZATION_TIMEOUT_MS,
   type BrowserPanelAction,
   type BrowserPanelAnchor,
   type BrowserPanelBounds,
@@ -28,7 +27,7 @@ import {
   type TerminalToolArgs,
 } from '@sim/terminal-protocol'
 import { getErrorMessage } from '@sim/utils/errors'
-import { isRecordLike } from '@sim/utils/object'
+import { isRecordLike, toRecord } from '@sim/utils/object'
 import { PASTE_LIMITS, utf8ByteLength } from '@sim/utils/paste'
 import type { BrowserWindow, IpcMainEvent, IpcMainInvokeEvent, WebContents } from 'electron'
 import { clipboard, ipcMain, shell } from 'electron'
@@ -43,6 +42,7 @@ import {
   getKnownSessions,
   handlePanelAction,
   migrateBrowserScope,
+  releaseBrowserToolQueueBoundary,
   restoreBrowserScope,
   showToolbarMenu,
   suspendBrowserScope,
@@ -55,10 +55,8 @@ import {
   peekTabsState,
   reorderTab,
   setBrowserAppTheme,
-  setTabPinned,
   showBrowserDownloadInFolder,
   showBrowserDownloadsMenu,
-  showTabContextMenu,
   stopFindInActiveTab,
   withBrowserScope,
 } from '@/main/browser-agent/session'
@@ -94,7 +92,6 @@ const logger = createLogger('DesktopIpc')
 /** Workspace/chat ids are opaque tokens; anything else never reaches a URL. */
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
 const TERMINAL_WRITE_CHUNK_CHARACTERS = 64 * 1024
-const DESKTOP_TOOL_AUTHORIZATION_TIMEOUT_MS = 8_000
 
 function writeTerminalText(
   terminal: TerminalRegistry,
@@ -149,6 +146,10 @@ export async function openMicrophoneSettings(
  */
 function parseDesktopScope(raw: unknown): string | null {
   return isDesktopScopeId(raw) ? raw : null
+}
+
+function isDesktopToolCallId(raw: unknown): raw is string {
+  return typeof raw === 'string' && raw.length >= 1 && raw.length <= 256
 }
 
 export interface OAuthConnectScope {
@@ -326,8 +327,8 @@ export interface IpcDeps {
   allowHttpLocalhost: () => boolean
   /** False while local account-data persistence is unavailable or teardown must be retried. */
   accountDataAvailable: () => boolean
-  /** Absolute paths of the bundled recovery pages allowed to control the shell. */
-  localPagePaths: readonly string[]
+  /** Whether a frame URL is one of the bundled pages allowed to control the shell. */
+  isLocalPageUrl: (url: string) => boolean
   retryLoad: (sender: WebContents) => void
   localFilesystem: LocalFilesystemService
   terminal: TerminalRegistry
@@ -373,7 +374,9 @@ export interface IpcDeps {
 /**
  * Who may call a channel:
  * - `app-origin`: only the remote app origin (main window pages).
- * - `local-page`: only bundled `file:` pages (offline) — shell control.
+ * - `local-page`: only the bundled pages served from the shell's own scheme
+ *   (offline, server) — shell control.
+ * - `app-or-local-page`: read-only window state used by both hosted and bundled pages.
  * - `browser-page`: only the built-in browser's own tabs, identified by
  *   WebContents rather than by URL. These carry reports from the browser
  *   preload about untrusted pages, so they are the one inbound surface whose
@@ -381,7 +384,7 @@ export interface IpcDeps {
  *   as an instruction.
  * - `any`: sender-independent channels that validate their input instead.
  */
-type ChannelGate = 'app-origin' | 'local-page' | 'browser-page' | 'any'
+type ChannelGate = 'app-origin' | 'local-page' | 'app-or-local-page' | 'browser-page' | 'any'
 
 /**
  * A desktop surface the user can switch off. Channels that drive one are
@@ -425,16 +428,9 @@ type ChannelSpec =
 
 function isLocalPageSender(
   event: IpcMainEvent | IpcMainInvokeEvent,
-  localPagePaths: readonly string[]
+  isLocalPageUrl: (url: string) => boolean
 ): boolean {
-  try {
-    const url = new URL(event.senderFrame?.url ?? '')
-    if (url.protocol !== 'file:') return false
-    const senderPath = normalize(fileURLToPath(url))
-    return localPagePaths.some((allowedPath) => senderPath === normalize(allowedPath))
-  } catch {
-    return false
-  }
+  return isLocalPageUrl(event.senderFrame?.url ?? '')
 }
 
 /**
@@ -489,6 +485,18 @@ const PTY_REPLY = new RegExp(
 )
 const MAX_TERMINAL_WRITE_CHARS = 256_000
 const MAX_PTY_REPLY_CHARS = 8_192
+const MAX_BROWSER_NAVIGATION_URL_CHARS = 8_192
+
+function canonicalHttpNavigationUrl(rawUrl: unknown): string | null {
+  if (typeof rawUrl !== 'string' || rawUrl.length > MAX_BROWSER_NAVIGATION_URL_CHARS) return null
+  try {
+    const url = new URL(rawUrl)
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
+    return url.href.length <= MAX_BROWSER_NAVIGATION_URL_CHARS ? url.href : null
+  } catch {
+    return null
+  }
+}
 
 interface DesktopToolAuthorization {
   chatId: string
@@ -501,9 +509,7 @@ async function fetchDesktopToolAuthorization(
   deps: IpcDeps,
   toolCallId: unknown
 ): Promise<DesktopToolAuthorization | null> {
-  if (typeof toolCallId !== 'string' || toolCallId.length < 1 || toolCallId.length > 256) {
-    return null
-  }
+  if (!isDesktopToolCallId(toolCallId)) return null
   const startedAt = Date.now()
   try {
     const response = await event.sender.session.fetch(
@@ -513,7 +519,7 @@ async function fetchDesktopToolAuthorization(
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ toolCallId }),
-        signal: AbortSignal.timeout(DESKTOP_TOOL_AUTHORIZATION_TIMEOUT_MS),
+        signal: AbortSignal.timeout(BROWSER_TOOL_AUTHORIZATION_TIMEOUT_MS),
       }
     )
     if (!response.ok) {
@@ -811,7 +817,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     },
     'desktop:window-state:get': {
       kind: 'invoke',
-      gate: 'app-origin',
+      gate: 'app-or-local-page',
+      deviationReason:
+        'Bundled offline pages share the app title-bar geometry and need their own native fullscreen state.',
       passSender: true,
       denied: { isFullScreen: false },
       handler: (sender) => deps.getWindowState(sender as WebContents),
@@ -848,7 +856,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         ) {
           return { ok: false, error: `Unknown browser tool: ${String(tool)}` }
         }
-        const toolParams = isRecordLike(params) ? params : {}
+        const toolParams = toRecord(params)
         return executeTool(
           scope,
           tool,
@@ -914,6 +922,30 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         if (!scope) return { scopeId: '', tabs: [], activeTabId: null }
         return withBrowserScope(scope, () => {
           addTab()
+          return peekTabsState()
+        })
+      },
+    },
+    'browser-agent:open-url': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requires: 'browser',
+      passSender: true,
+      needsUserActivation: true,
+      denied: { scopeId: '', tabs: [], activeTabId: null },
+      handler: (sender, rawUrl, rawScope) => {
+        const contents = sender as WebContents
+        const scope = activeRendererScope(browserScopeBySender, contents, rawScope)
+        const destination = canonicalHttpNavigationUrl(rawUrl)
+        if (!scope || !destination) {
+          return { scopeId: '', tabs: [], activeTabId: null }
+        }
+        return withBrowserScope(scope, () => {
+          const tab = addTab()
+          if (tab.view.webContents.isDestroyed()) {
+            return peekTabsState()
+          }
+          void tab.view.webContents.loadURL(destination).catch(() => {})
           return peekTabsState()
         })
       },
@@ -1100,10 +1132,11 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       gate: 'app-origin',
       requires: 'browser',
       passSender: true,
-      needsUserActivation: ([action]) =>
-        isRecordLike(action) &&
-        action.action === 'respond-media-permission' &&
-        action.allowed === true,
+      needsUserActivation: ([action]) => {
+        if (!isRecordLike(action)) return false
+        if (action.action === 'navigate') return true
+        return action.action === 'respond-media-permission' && action.allowed === true
+      },
       handler: (sender, action, rawScope) => {
         const scope = activeRendererScope(browserScopeBySender, sender as WebContents, rawScope)
         if (
@@ -1114,31 +1147,14 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         ) {
           return
         }
-        void handlePanelAction(scope, action as BrowserPanelAction).catch(() => {})
-      },
-    },
-    'browser-agent:set-tab-pinned': {
-      kind: 'send',
-      gate: 'app-origin',
-      requires: 'browser',
-      passSender: true,
-      handler: (sender, tabId, pinned, rawScope) => {
-        const scope = activeRendererScope(browserScopeBySender, sender as WebContents, rawScope)
-        if (!scope || typeof tabId !== 'string' || typeof pinned !== 'boolean') return
-        try {
-          withBrowserScope(scope, () => setTabPinned(tabId, pinned))
-        } catch {}
-      },
-    },
-    'browser-agent:show-tab-context-menu': {
-      kind: 'send',
-      gate: 'app-origin',
-      requires: 'browser',
-      passSender: true,
-      handler: (sender, tabId, rawScope) => {
-        const scope = activeRendererScope(browserScopeBySender, sender as WebContents, rawScope)
-        if (!scope || typeof tabId !== 'string') return
-        withBrowserScope(scope, () => showTabContextMenu(tabId))
+        const panelAction = action as BrowserPanelAction
+        if (panelAction.action === 'navigate') {
+          const destination = canonicalHttpNavigationUrl(panelAction.url)
+          if (!destination) return
+          void handlePanelAction(scope, { ...panelAction, url: destination }).catch(() => {})
+          return
+        }
+        void handlePanelAction(scope, panelAction).catch(() => {})
       },
     },
     'browser-agent:reorder-tab': {
@@ -1485,39 +1501,20 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         return fillCoordinator()?.fillCredential(id, scope) ?? false
       },
     },
-    'terminal:start': {
+    'terminal:restore-scope': {
       kind: 'invoke',
       gate: 'app-origin',
       requires: 'terminal',
       passSender: true,
-      denied: { ok: false, code: 'ACCESS_DENIED', error: 'Not allowed from this page.' },
-      handler: (sender, raw, rawScope) => {
-        const contents = sender as WebContents
-        const scope = rendererScope(terminalScopeBySender, contents, rawScope)
-        if (!scope) {
-          return { ok: false, code: 'STALE_SCOPE', error: 'This terminal chat is not active.' }
-        }
-        const options = isRecordLike(raw) ? raw : {}
-        const cols = Number(options.cols)
-        const rows = Number(options.rows)
+      denied: { tabs: [], activeTerminalId: null },
+      handler: (sender, rawScope) => {
+        const scope = rendererScope(terminalScopeBySender, sender as WebContents, rawScope)
+        if (!scope) return { tabs: [], activeTerminalId: null }
         try {
-          return {
-            ok: true,
-            tabs: {
-              ...deps.terminal.start(scope, {
-                cols: toCellCount(cols, 80),
-                rows: toCellCount(rows, 24),
-              }),
-              scopeId: scope,
-            },
-          }
+          return { ...deps.terminal.restoreScope(scope), scopeId: scope }
         } catch (error) {
-          const failure = error as { code?: string; message?: string }
-          return {
-            ok: false,
-            code: failure.code ?? 'SPAWN_FAILED',
-            error: failure.message ?? 'Could not open a terminal.',
-          }
+          logger.warn('Could not restore saved terminals', { error: getErrorMessage(error) })
+          return { ...deps.terminal.getTabs(scope), scopeId: scope }
         }
       },
     },
@@ -1535,7 +1532,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         ) {
           return { ok: false, error: `Unknown terminal tool: ${String(tool)}` }
         }
-        const call = isRecordLike(params) ? params : {}
+        const call = toRecord(params)
         if (!isTerminalOperation(call.operation)) {
           return { ok: false, error: `Unknown terminal operation: ${String(call.operation)}` }
         }
@@ -1747,12 +1744,13 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       requires: 'terminal',
       passSender: true,
       denied: { tabs: [], activeTerminalId: null },
-      handler: (sender, terminalId, rawScope) => {
+      handler: (sender, terminalId, rawScope, rawOptions) => {
         const scope = rendererScope(terminalScopeBySender, sender as WebContents, rawScope)
         if (!scope) return { tabs: [], activeTerminalId: null }
+        const claim = !(isRecordLike(rawOptions) && rawOptions.claim === false)
         const tabs =
           typeof terminalId === 'string'
-            ? deps.terminal.switchTerminal(scope, terminalId)
+            ? deps.terminal.switchTerminal(scope, terminalId, { claim })
             : deps.terminal.getTabs(scope)
         return { ...tabs, scopeId: scope }
       },
@@ -1819,7 +1817,6 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       handler: (sender, terminalId, cols, rows, rawScope) => {
         // `typeof NaN === 'number'`, and the downstream `cols <= 0` guard is
         // false for NaN, so an unfinite value reached pty.resize() intact.
-        // Matches the clamping terminal:start already applies to these fields.
         if (typeof terminalId !== 'string') return
         if (!isPositiveFinite(cols) || !isPositiveFinite(rows)) return
         const scope = rendererScope(terminalScopeBySender, sender as WebContents, rawScope)
@@ -1863,8 +1860,13 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   const senderAllowed = (event: IpcMainEvent | IpcMainInvokeEvent, gate: ChannelGate): boolean => {
     if (gate === 'any') return true
     if (gate === 'app-origin') return isAppOriginSender(event, deps.appOrigin())
+    if (gate === 'app-or-local-page') {
+      return (
+        isAppOriginSender(event, deps.appOrigin()) || isLocalPageSender(event, deps.isLocalPageUrl)
+      )
+    }
     if (gate === 'browser-page') return isAgentWebContents(event.sender)
-    return isLocalPageSender(event, deps.localPagePaths)
+    return isLocalPageSender(event, deps.isLocalPageUrl)
   }
 
   const featureAllowed = (feature: ChannelFeature | undefined): boolean => {
@@ -1900,20 +1902,35 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         }
         let handlerArgs = args
         if (channel === 'browser-agent:execute-tool') {
+          const toolCallId = args[0]
           const requestedTool = args[1]
           const requestedScope = parseDesktopScope(args[3])
-          const authorizationBoundary = requestedScope
-            ? captureBrowserToolQueueBoundary(requestedScope)
-            : undefined
-          const authorization = await fetchDesktopToolAuthorization(event, deps, args[0])
+          if (
+            !isDesktopToolCallId(toolCallId) ||
+            typeof requestedTool !== 'string' ||
+            !isCurrentBrowserToolName(requestedTool) ||
+            !requestedScope
+          ) {
+            return {
+              ok: false,
+              error: 'This browser action is not an authorized pending Copilot tool call.',
+            }
+          }
+          const authorizationBoundary = captureBrowserToolQueueBoundary(requestedScope)
+          if (!authorizationBoundary) {
+            return {
+              ok: false,
+              error:
+                'Sim already has too many browser actions queued. Wait for earlier actions to finish.',
+            }
+          }
+          const authorization = await fetchDesktopToolAuthorization(event, deps, toolCallId)
           if (
             !authorization ||
-            !requestedScope ||
             authorization.chatId !== requestedScope ||
-            typeof requestedTool !== 'string' ||
-            authorization.toolName !== requestedTool ||
-            !isCurrentBrowserToolName(authorization.toolName)
+            authorization.toolName !== requestedTool
           ) {
+            releaseBrowserToolQueueBoundary(authorizationBoundary)
             return {
               ok: false,
               error: 'This browser action is not an authorized pending Copilot tool call.',
@@ -1921,7 +1938,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
           }
           handlerArgs = [
             authorization.chatId,
-            args[0],
+            toolCallId,
             authorization.toolName,
             authorization.args,
             authorizationBoundary,

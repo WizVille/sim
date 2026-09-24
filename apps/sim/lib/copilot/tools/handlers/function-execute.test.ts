@@ -112,13 +112,14 @@ vi.mock('@/lib/copilot/tools/secret-mount-materializer.server', () => ({
 vi.mock('@/lib/billing/core/subscription', () => ({
   hasWorkspaceSandboxAccess: mockHasWorkspaceSandboxAccess,
 }))
-vi.mock('@/lib/execution/remote-sandbox/workspace-sandboxes', () => ({
+vi.mock('@/lib/execution/remote-sandbox/entitlement', () => ({
   MAX_PLAN_REQUIRED: 'Sim sandboxes require an active Max or Enterprise plan.',
 }))
 
 import { projectToolResultForCopilot } from '@/lib/copilot/request/tools/resolved-secret-result'
 import { executeFunctionExecute } from '@/lib/copilot/tools/handlers/function-execute'
 import { executeRunCode } from '@/lib/copilot/tools/handlers/run-code'
+import { SNAPSHOT_MAX_BYTES } from '@/lib/table/snapshot-cache'
 import { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
 
 const table = {
@@ -188,6 +189,48 @@ describe('executeFunctionExecute trace-secret provenance', () => {
     mockMaterializeCopilotCodeSecrets.mockResolvedValue({ envVars: {}, catalogEntries: [] })
     mockHasWorkspaceSandboxAccess.mockResolvedValue(true)
     encryptionMockFns.mockDecryptSecret.mockResolvedValue({ decrypted: 'secret-value' })
+  })
+
+  it('runs Assistant compute without workspace secrets even if a caller supplies a secret actor', async () => {
+    await executeFunctionExecute(
+      { code: 'return 6 * 7', envVars: { LEAK: 'forged' } },
+      {
+        userId: 'u1',
+        workflowId: '',
+        workspaceId: 'ws_1',
+        requestMode: 'assistant',
+        secretActorUserId: 'u1',
+      }
+    )
+    expect(mockMaterializeCopilotCodeSecrets).not.toHaveBeenCalled()
+    expect(mockExecuteTool).toHaveBeenCalledWith(
+      'function_execute',
+      expect.objectContaining({ envVars: {}, mountedSecrets: [] }),
+      expect.anything()
+    )
+  })
+
+  it.each([
+    { secrets: ['API_KEY'] },
+    { inputTables: ['table'] },
+    { inputs: { tables: ['table'] } },
+    { outputTable: { name: 'output' } },
+    { code: 'return {{API_KEY}}' },
+  ])('refuses Assistant table and secret access before executing code: %j', async (params) => {
+    await expect(
+      executeFunctionExecute(
+        { code: 'return 1', ...params },
+        {
+          userId: 'u1',
+          workflowId: '',
+          workspaceId: 'ws_1',
+          requestMode: 'assistant',
+          secretActorUserId: 'u1',
+        }
+      )
+    ).rejects.toThrow()
+    expect(mockExecuteTool).not.toHaveBeenCalled()
+    expect(mockMaterializeCopilotCodeSecrets).not.toHaveBeenCalled()
   })
 
   it('mounts only explicit references and imports active provenance out of band', async () => {
@@ -595,6 +638,8 @@ describe('executeFunctionExecute table mounts', () => {
       type: 'url',
       path: '/home/user/tables/tbl_1.csv',
       url: 'https://s3.example/presigned?sig=abc',
+      // The snapshot's own ceiling, enforced on the bytes the sandbox pulls.
+      maxBytes: SNAPSHOT_MAX_BYTES,
     })
   })
 
@@ -764,6 +809,9 @@ describe('executeFunctionExecute file mounts', () => {
       type: 'url',
       path: '/home/user/files/data.csv',
       url: 'https://s3.example/file?sig=abc',
+      // Copilot's URL mounts share the transport, so each is granted exactly
+      // the size it was charged against the aggregate.
+      maxBytes: 100,
     })
   })
 
@@ -1025,6 +1073,9 @@ describe('executeFunctionExecute file mounts', () => {
       type: 'url',
       path: '/home/user/files/Reports/q1.csv',
       url: 'https://s3.example/file?sig=abc',
+      // Copilot's URL mounts share the transport, so each is granted exactly
+      // the size it was charged against the aggregate.
+      maxBytes: 100,
     })
   })
 

@@ -96,7 +96,9 @@ describe('resolveServableDocBytes', () => {
     expect(mockLoadCompiledDoc).toHaveBeenCalledWith(
       WORKSPACE_ID,
       PDF_SOURCE.toString('utf-8'),
-      'pdf'
+      'pdf',
+      undefined,
+      { maxBytes: undefined, signal: undefined }
     )
     expect(mockLoadCompiledDoc).toHaveBeenCalledTimes(1)
   })
@@ -123,7 +125,9 @@ describe('resolveServableDocBytes', () => {
     expect(mockLoadCompiledDoc).toHaveBeenCalledWith(
       WORKSPACE_ID,
       PDF_SOURCE.toString('utf-8'),
-      'pdf'
+      'pdf',
+      undefined,
+      { maxBytes: undefined, signal: undefined }
     )
   })
 
@@ -164,6 +168,7 @@ describe('resolveServableDocBytes', () => {
     expect(result).toEqual({
       buffer: Buffer.from('%PDF-rebuilt'),
       contentType: 'application/pdf',
+      dependsOnReferencedFiles: true,
       contributingFiles: [
         {
           fileId: 'reference-1',
@@ -202,7 +207,13 @@ describe('resolveServableDocBytes', () => {
       buffer: legacyArtifact,
       contentType: 'application/pdf',
     })
-    expect(mockLoadCompiledDoc).toHaveBeenCalledWith(WORKSPACE_ID, source.toString('utf-8'), 'pdf')
+    expect(mockLoadCompiledDoc).toHaveBeenCalledWith(
+      WORKSPACE_ID,
+      source.toString('utf-8'),
+      'pdf',
+      undefined,
+      { maxBytes: undefined, signal: undefined }
+    )
     expect(mockReadWorkspaceFileMetadata).not.toHaveBeenCalled()
     expect(mockExecuteInSandbox).not.toHaveBeenCalled()
     expect(mockStoreCompiledDoc).not.toHaveBeenCalled()
@@ -221,7 +232,8 @@ describe('resolveServableDocBytes', () => {
     expect(mockLoadPublishedCompiledDoc).toHaveBeenCalledWith(
       WORKSPACE_ID,
       source.toString('utf-8'),
-      'pdf'
+      'pdf',
+      { maxBytes: undefined, signal: undefined }
     )
     expect(mockLoadCompiledDoc).not.toHaveBeenCalled()
     expect(mockReadWorkspaceFileMetadata).not.toHaveBeenCalled()
@@ -242,7 +254,8 @@ describe('resolveServableDocBytes', () => {
     expect(mockLoadPublishedCompiledDoc).toHaveBeenCalledWith(
       WORKSPACE_ID,
       source.toString('utf-8'),
-      'pdf'
+      'pdf',
+      { maxBytes: undefined, signal: undefined }
     )
     expect(mockLoadCompiledDoc).not.toHaveBeenCalled()
   })
@@ -261,6 +274,7 @@ describe('resolveServableDocBytes', () => {
     ).resolves.toEqual({
       buffer: publishedArtifact,
       contentType: 'application/pdf',
+      dependsOnReferencedFiles: true,
     })
     expect(mockReadWorkspaceFileMetadata).not.toHaveBeenCalled()
     expect(mockReadWorkspaceFileContent).not.toHaveBeenCalled()
@@ -307,7 +321,13 @@ describe('resolveServableDocBytes', () => {
       contentType: 'application/pdf',
     })
     expect(mockReadWorkspaceFileMetadata).not.toHaveBeenCalled()
-    expect(mockLoadCompiledDoc).toHaveBeenCalledWith(WORKSPACE_ID, source.toString('utf-8'), 'pdf')
+    expect(mockLoadCompiledDoc).toHaveBeenCalledWith(
+      WORKSPACE_ID,
+      source.toString('utf-8'),
+      'pdf',
+      undefined,
+      { maxBytes: undefined, signal: undefined }
+    )
     expect(mockExecuteInSandbox).not.toHaveBeenCalled()
   })
 
@@ -359,9 +379,47 @@ describe('resolveServableDocBytes', () => {
         fileName: 'report.pdf',
         workspaceId: WORKSPACE_ID,
       })
-    ).resolves.toEqual({ buffer: compiled, contentType: 'application/pdf' })
+    ).resolves.toEqual({
+      buffer: compiled,
+      contentType: 'application/pdf',
+      // The isolated-VM path, but this source references nothing and the compile touched
+      // nothing — so it stays cacheable. The flag tracks dependency, not which backend ran.
+      dependsOnReferencedFiles: false,
+    })
     expect(mockLoadCompiledDoc).not.toHaveBeenCalled()
     expect(mockStoreCompiledDoc).not.toHaveBeenCalled()
+  })
+
+  it('reports a reference dependency when the isolated-VM broker reads a workspace file', async () => {
+    /**
+     * The isolated-VM fallback returns before the static reference scan, so nothing about the
+     * SOURCE marks it as dependent — only the broker access does. Missing that is what let a
+     * versioned request take a one-year immutable lifetime for bytes that change when the
+     * referenced file changes.
+     */
+    const compiled = Buffer.from('%PDF-broker-read')
+    const contributor = {
+      fileId: 'broker-reference-1',
+      key: 'workspace/workspace-1/broker-reference-1.png',
+      context: 'workspace' as const,
+      contentUpdatedAt: new Date('2026-08-07T01:00:00.000Z'),
+    }
+    setEnvFlags({ isDocSandboxEnabled: false })
+    mockRunSandboxTask.mockImplementationOnce((...args: unknown[]) => {
+      const options = args[2] as {
+        onWorkspaceFileAccess?: (identity: typeof contributor) => void
+      }
+      options.onWorkspaceFileAccess?.(contributor)
+      return Promise.resolve(compiled)
+    })
+
+    const result = await resolveServableDocBytes({
+      rawBuffer: Buffer.from('const viaBroker = true'),
+      fileName: 'report.pdf',
+      workspaceId: WORKSPACE_ID,
+    })
+
+    expect(result.dependsOnReferencedFiles).toBe(true)
   })
 
   it('preserves contributor identities when a servable document hits the local compile cache', async () => {
@@ -393,6 +451,7 @@ describe('resolveServableDocBytes', () => {
     ).resolves.toEqual({
       buffer: compiled,
       contentType: 'application/pdf',
+      dependsOnReferencedFiles: true,
       contributingFiles: [contributor],
     })
 
@@ -405,6 +464,7 @@ describe('resolveServableDocBytes', () => {
     ).resolves.toEqual({
       buffer: compiled,
       contentType: 'application/pdf',
+      dependsOnReferencedFiles: true,
       contributingFiles: [contributor],
     })
     expect(mockRunSandboxTask).toHaveBeenCalledTimes(1)
@@ -423,7 +483,11 @@ describe('resolveServableDocBytes', () => {
       workspaceId: WORKSPACE_ID,
     })
 
-    expect(result).toEqual({ buffer: compiled, contentType: 'application/pdf' })
+    expect(result).toEqual({
+      buffer: compiled,
+      contentType: 'application/pdf',
+      dependsOnReferencedFiles: true,
+    })
     expect(mockExecuteInSandbox).not.toHaveBeenCalled()
     expect(mockRunSandboxTask).toHaveBeenCalledWith(
       'pdf-generate',
@@ -447,7 +511,11 @@ describe('resolveServableDocBytes', () => {
         fileName: 'report.pdf',
         workspaceId: WORKSPACE_ID,
       })
-    ).resolves.toEqual({ buffer: compiled, contentType: 'application/pdf' })
+    ).resolves.toEqual({
+      buffer: compiled,
+      contentType: 'application/pdf',
+      dependsOnReferencedFiles: true,
+    })
     expect(mockRunSandboxTask).toHaveBeenCalledTimes(1)
     expect(mockReadWorkspaceFileMetadata).not.toHaveBeenCalled()
     expect(mockStoreCompiledDoc).not.toHaveBeenCalled()

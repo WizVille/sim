@@ -19,6 +19,7 @@ export const app = {
   getPath: vi.fn(() => '/tmp/sim-desktop-test'),
   getAppPath: vi.fn(() => '/tmp/sim-desktop-test/app'),
   isReady: vi.fn(() => true),
+  isInApplicationsFolder: vi.fn(() => true),
   on: vi.fn(),
   once: vi.fn(),
   quit: vi.fn(),
@@ -32,6 +33,11 @@ export const app = {
   getLoginItemSettings: vi.fn(() => ({ openAtLogin: false })),
   setLoginItemSettings: vi.fn(),
   dock: { downloadFinished: vi.fn() },
+}
+
+/** Squirrel.Mac's native updater; tests replay its events through `on` calls. */
+export const autoUpdater = {
+  on: vi.fn(),
 }
 
 export const crashReporter = {
@@ -74,6 +80,12 @@ export const nativeTheme = {
   on: vi.fn(),
 }
 
+export const screen = {
+  getDisplayMatching: vi.fn(() => ({
+    workArea: { x: 0, y: 0, width: 1440, height: 900 },
+  })),
+}
+
 export const Menu = {
   buildFromTemplate: vi.fn((template: unknown[]) => ({ popup: vi.fn(), items: template })),
   setApplicationMenu: vi.fn(),
@@ -86,6 +98,12 @@ export const net = {
 
 export const session = {
   fromPartition: vi.fn(),
+}
+
+export const protocol = {
+  registerSchemesAsPrivileged: vi.fn(),
+  handle: vi.fn(),
+  isProtocolHandled: vi.fn(() => false),
 }
 
 export const ipcMain = {
@@ -156,9 +174,12 @@ function createWebContentsMock() {
     getTitle: vi.fn(() => 'Example'),
     loadURL: vi.fn(() => Promise.resolve()),
     reload: vi.fn(),
+    stop: vi.fn(),
     print: vi.fn(),
     focus: vi.fn(),
     invalidate: vi.fn(),
+    beginFrameSubscription: vi.fn(),
+    endFrameSubscription: vi.fn(),
     isFocused: vi.fn(() => false),
     close: vi.fn(),
     isDestroyed: vi.fn(() => false),
@@ -234,6 +255,8 @@ export class BrowserWindow {
     BrowserWindow.lastOptions = options
   }
   webContents = {
+    ipc: { on: vi.fn(), handle: vi.fn() },
+    mainFrame: { url: '' },
     on: vi.fn(),
     getURL: vi.fn(() => ''),
     loadURL: vi.fn(() => Promise.resolve()),
@@ -262,6 +285,7 @@ export class BrowserWindow {
   getNormalBounds = vi.fn(() => ({ x: 0, y: 0, width: 1360, height: 860 }))
   getBounds = vi.fn(() => ({ x: 1292, y: 41, width: 420, height: 150 }))
   setBounds = vi.fn()
+  setContentSize = vi.fn()
   loadURL = vi.fn(() => Promise.resolve())
   loadFile = vi.fn(() => Promise.resolve())
   focus = vi.fn()

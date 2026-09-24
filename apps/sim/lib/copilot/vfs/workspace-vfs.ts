@@ -18,6 +18,7 @@ import { and, desc, eq, inArray, isNotNull, isNull, or } from 'drizzle-orm'
 import { listApiKeys } from '@/lib/api-key/service'
 import { getAccountBillingSnapshot } from '@/lib/billing/core/account-billing-snapshot'
 import { hasWorkspaceSandboxAccess } from '@/lib/billing/core/subscription'
+import { createCopilotChatPrincipal } from '@/lib/copilot/auth/application-delegation'
 import {
   buildWorkspaceContextMd,
   buildWorkspaceMd,
@@ -78,10 +79,10 @@ import {
   serializeApiKeys,
   serializeBlockSchema,
   serializeBuiltinTriggerSchema,
+  serializeConnectedAccounts,
   serializeConnectorOverview,
   serializeConnectorSchema,
   serializeConnectors,
-  serializeCredentialGroups,
   serializeCredentials,
   serializeCustomTool,
   serializeDeployments,
@@ -115,8 +116,9 @@ import {
   isHosted,
 } from '@/lib/core/config/env-flags'
 import { isPayloadSizeLimitError } from '@/lib/core/utils/stream-limits'
-import { listCredentialGroupEnrollments } from '@/lib/credential-groups/enrollments'
-import { listCredentialGroups } from '@/lib/credential-groups/service'
+import type { CredentialGroupRecord } from '@/lib/credential-groups/types'
+import { CREDENTIAL_DELEGATION_AUDIENCE } from '@/lib/credentials/application/authorization'
+import { listPersonalCredentials } from '@/lib/credentials/application/personal-credentials'
 import {
   getAccessibleEnvCredentials,
   getAccessibleOAuthCredentials,
@@ -142,10 +144,11 @@ import {
 } from '@/lib/knowledge/application/knowledge-bases'
 import { validateMermaidSource } from '@/lib/mermaid/validate'
 import { isBlockTypeAccessControlExempt } from '@/lib/permission-groups/block-access'
+import { resolvePermissionGroupConfig } from '@/lib/permission-groups/config-scope.server'
 import { getActivePermissionGroupRestrictions } from '@/lib/permission-groups/features'
 import {
   intersectIntegrationAllowlists,
-  toAllowedIntegrationTypes,
+  toAccessControlAllowlist,
 } from '@/lib/permission-groups/integration-allowlist'
 import type { IsToolAllowed } from '@/lib/permission-groups/operation-access'
 import {
@@ -203,10 +206,7 @@ import { BLOCK_REGISTRY } from '@/blocks/registry-maps'
 import type { BlockConfig, BlockIcon } from '@/blocks/types'
 import { isHiddenUnder, overlayVisibility } from '@/blocks/visibility/context'
 import { CONNECTOR_REGISTRY } from '@/connectors/registry.server'
-import {
-  getUserPermissionConfig,
-  resolveVerifiedUserAccessControlContext,
-} from '@/ee/access-control/utils/permission-check'
+import { resolveVerifiedUserAccessControlContext } from '@/ee/access-control/utils/permission-check'
 import { isForkingAvailableForWorkspace } from '@/ee/workspace-forking/lib/lineage/authz'
 import { getForkChildren, getForkParent } from '@/ee/workspace-forking/lib/lineage/lineage'
 import { loadForkBlockMap } from '@/ee/workspace-forking/lib/mapping/block-map-store'
@@ -722,6 +722,7 @@ function getStaticComponentFiles(): Map<string, string> {
 export class WorkspaceVFS {
   private readonly filePrincipal?: Principal
   private readonly knowledgePrincipal?: Principal
+  private readonly loadConnectedAccounts?: () => Promise<CredentialGroupRecord | null>
   // Eagerly-materialized, cheap content (structure + metadata): folder markers,
   // per-resource meta.json, WORKSPACE.md/WORKSPACE_CONTEXT.md, static components.
   private files: Map<string, string> = new Map()
@@ -755,9 +756,14 @@ export class WorkspaceVFS {
    */
   private _customBlockTypes: Set<string> | null = null
 
-  constructor(filePrincipal?: Principal, knowledgePrincipal?: Principal) {
+  constructor(
+    filePrincipal?: Principal,
+    knowledgePrincipal?: Principal,
+    loadConnectedAccounts?: () => Promise<CredentialGroupRecord | null>
+  ) {
     this.filePrincipal = filePrincipal
     this.knowledgePrincipal = knowledgePrincipal
+    this.loadConnectedAccounts = loadConnectedAccounts
   }
 
   get workspaceId(): string {
@@ -941,7 +947,7 @@ export class WorkspaceVFS {
             const blockVisibility = overlayVisibility()
             const permissionConfigPromise = timed(
               'permissions',
-              getUserPermissionConfig(userId, workspaceId)
+              resolvePermissionGroupConfig(userId, workspaceId, undefined)
             )
             const sandboxEntitlementPromise = timed(
               'sandbox_entitlement',
@@ -2611,6 +2617,35 @@ export class WorkspaceVFS {
     }
   }
 
+  private materializeConnectedAccounts(
+    hostContext: Pick<
+      NonNullable<Awaited<ReturnType<typeof getWorkspaceHostContextForViewer>>>,
+      'features' | 'viewer'
+    >
+  ): boolean {
+    const loadConnectedAccounts = this.loadConnectedAccounts
+    if (
+      hostContext.features?.credentialGroups !== true ||
+      hostContext.viewer.permission !== 'admin' ||
+      !loadConnectedAccounts
+    ) {
+      return false
+    }
+    this.registerLazy('organization/connected-accounts.json', async () => {
+      try {
+        const accounts = await loadConnectedAccounts()
+        return accounts ? serializeConnectedAccounts(accounts) : null
+      } catch (err) {
+        logger.warn('Failed to load connected accounts', {
+          workspaceId: this._workspaceId,
+          error: toError(err).message,
+        })
+        return null
+      }
+    })
+    return true
+  }
+
   /**
    * Materialize `organization/` — org standing, the access-control rules that
    * actually bind this viewer, org-published block provenance, and fork
@@ -2761,61 +2796,7 @@ export class WorkspaceVFS {
         })
       }
 
-      const credentialGroupsAvailable = hostContext.features?.credentialGroups === true
-      if (credentialGroupsAvailable) {
-        const includeEmails = hostContext.viewer.permission === 'admin'
-        this.registerLazy('organization/credential-groups.json', async () => {
-          try {
-            const records = await listCredentialGroups(workspaceId)
-            if (records.length === 0) return null
-            const groups = await Promise.all(
-              records.map(async (record) => {
-                const enrollmentCounts: Record<string, number> = {}
-                let people: Array<{ email: string; status: string }> | undefined
-                let truncated = false
-                try {
-                  const page = await listCredentialGroupEnrollments(workspaceId, record.id, 100)
-                  truncated = page.nextCursor !== null
-                  for (const enrollment of page.enrollments) {
-                    enrollmentCounts[enrollment.status] =
-                      (enrollmentCounts[enrollment.status] ?? 0) + 1
-                  }
-                  if (includeEmails) {
-                    people = page.enrollments.map((enrollment) => ({
-                      email: enrollment.email,
-                      status: enrollment.status,
-                    }))
-                  }
-                } catch {
-                  // Counts degrade to empty; the group itself still lists.
-                }
-                return {
-                  id: record.id,
-                  name: record.name,
-                  description: record.description,
-                  status: record.status,
-                  options: record.options.map((option) => ({
-                    provider: option.provider,
-                    label: 'label' in option ? option.label : undefined,
-                    required: 'required' in option ? option.required : undefined,
-                    configurationStatus: option.configurationStatus,
-                  })),
-                  enrollmentCounts,
-                  enrollmentsTruncated: truncated,
-                  ...(people ? { people } : {}),
-                }
-              })
-            )
-            return serializeCredentialGroups(groups, { includeEmails })
-          } catch (err) {
-            logger.warn('Failed to load credential groups', {
-              workspaceId,
-              error: toError(err).message,
-            })
-            return null
-          }
-        })
-      }
+      const connectedAccountsAvailable = this.materializeConnectedAccounts(hostContext)
 
       const forksAvailable =
         hostContext.viewer.permission === 'admin' &&
@@ -2829,7 +2810,7 @@ export class WorkspaceVFS {
           customBlocks: orgBlocks,
           forksMounted: forksAvailable,
           permissionGroupsMounted: hostContext.viewer.isHostOrganizationAdmin,
-          credentialGroupsMounted: credentialGroupsAvailable,
+          connectedAccountsMounted: connectedAccountsAvailable,
         })
       )
 
@@ -3164,7 +3145,7 @@ export class WorkspaceVFS {
   private async materializeEnvironment(
     workspaceId: string,
     userId: string,
-    permissionConfigPromise: ReturnType<typeof getUserPermissionConfig>,
+    permissionConfigPromise: ReturnType<typeof resolvePermissionGroupConfig>,
     blockVisibility: BlockVisibilityState | null,
     secretMountPolicy?: SecretMountPolicy
   ): Promise<{
@@ -3176,13 +3157,32 @@ export class WorkspaceVFS {
       const [envCredentials, oauthCredentials, apiKeyRows, envData, permissionConfig] =
         await Promise.all([
           getAccessibleEnvCredentials(workspaceId, userId, { isWorkspaceAdmin }),
-          getAccessibleOAuthCredentials(workspaceId, userId, { isWorkspaceAdmin }),
+          getAccessibleOAuthCredentials(workspaceId, userId, { isWorkspaceAdmin }).then(
+            async (accessible) => [
+              ...accessible,
+              ...(
+                await listPersonalCredentials.execute({
+                  principal: createCopilotChatPrincipal(
+                    { workspaceId, userId },
+                    CREDENTIAL_DELEGATION_AUDIENCE
+                  ),
+                  input: { workspaceId },
+                })
+              ).credentials
+                .filter((entry) => entry.type === 'managed_oauth')
+                .map((entry) => ({
+                  ...entry,
+                  type: 'managed_oauth' as const,
+                  role: 'member' as const,
+                })),
+            ]
+          ),
           listApiKeys(workspaceId),
           getPersonalAndWorkspaceEnv(userId, workspaceId),
           permissionConfigPromise,
         ])
       const credentialVisibility = createIntegrationCredentialVisibility({
-        allowedIntegrationTypes: toAllowedIntegrationTypes(
+        allowedIntegrationTypes: toAccessControlAllowlist(
           intersectIntegrationAllowlists(
             permissionConfig?.allowedIntegrations ?? null,
             getAllowedIntegrationsFromEnv()
@@ -3283,10 +3283,15 @@ export async function getOrMaterializeVFS(
     secretMountPolicy?: SecretMountPolicy
     filePrincipal?: Principal
     knowledgePrincipal?: Principal
+    loadConnectedAccounts?: () => Promise<CredentialGroupRecord | null>
   }
 ): Promise<WorkspaceVFS> {
   await assertActiveWorkspaceAccess(workspaceId, userId)
-  const vfs = new WorkspaceVFS(options?.filePrincipal, options?.knowledgePrincipal)
+  const vfs = new WorkspaceVFS(
+    options?.filePrincipal,
+    options?.knowledgePrincipal,
+    options?.loadConnectedAccounts
+  )
   await vfs.materialize(workspaceId, userId, options)
   return vfs
 }

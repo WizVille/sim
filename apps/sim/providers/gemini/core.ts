@@ -16,6 +16,11 @@ import { getErrorMessage, toError } from '@sim/utils/errors'
 import { isRecordLike } from '@sim/utils/object'
 import type { IterationToolCall, NormalizedBlockOutput, StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
+import { prepareConversationGeneration } from '@/providers/conversation-generation'
+import {
+  captureProviderConversationStep,
+  recordProviderConversationToolError,
+} from '@/providers/conversation-history'
 import { createGeminiStreamingToolLoopStream } from '@/providers/gemini/streaming-tool-loop'
 import { priceGeminiTokens, splitGeminiTokens, splitGeminiUsage } from '@/providers/gemini/usage'
 import {
@@ -31,6 +36,7 @@ import {
   mapToThinkingLevel,
   supportsDisablingGemini25Thinking,
 } from '@/providers/google/utils'
+import { getModelCapabilities, isKnownModelId } from '@/providers/models'
 import { executeProviderTool } from '@/providers/runtime-context'
 import { createSettledAgentEventStream } from '@/providers/stream-events'
 import { createStreamingExecution } from '@/providers/streaming-execution'
@@ -99,7 +105,8 @@ async function executeToolCallsBatch(
   request: ProviderRequest,
   state: ExecutionState,
   forcedTools: string[],
-  logger: ReturnType<typeof createLogger>
+  logger: ReturnType<typeof createLogger>,
+  assistantContent: Content
 ): Promise<{ success: boolean; state: ExecutionState }> {
   if (functionCallParts.length === 0) {
     return { success: false, state }
@@ -113,6 +120,12 @@ async function executeToolCallsBatch(
 
     const tool = request.tools?.find((t) => t.id === toolName)
     if (!tool) {
+      await recordProviderConversationToolError(
+        request,
+        functionCall.id,
+        toolName,
+        `Tool ${toolName} not found`
+      )
       logger.warn(`Tool ${toolName} not found in registry, skipping`)
       return {
         success: false,
@@ -175,6 +188,12 @@ async function executeToolCallsBatch(
       if (isAbortError(error) || request.abortSignal?.aborted) {
         throw error
       }
+      await recordProviderConversationToolError(
+        request,
+        functionCall.id,
+        toolName,
+        getErrorMessage(error, 'Tool execution failed')
+      )
 
       const toolCallEndTime = Date.now()
       logger.error('Error processing function call:', {
@@ -210,17 +229,17 @@ async function executeToolCallsBatch(
   // Build batched messages per Gemini spec:
   // ONE model message with ALL function call parts
   // ONE user message with ALL function responses
-  const modelParts: Part[] = results.map((r) => r.part)
   const userParts: Part[] = results.map((r) => ({
     functionResponse: {
       name: r.toolName,
       response: 'modelResultContent' in r ? r.modelResultContent : r.resultContent,
+      ...(r.part.functionCall?.id ? { id: r.part.functionCall.id } : {}),
     },
   }))
 
   const updatedContents: Content[] = [
     ...state.contents,
-    { role: 'model', parts: modelParts },
+    assistantContent,
     { role: 'user', parts: userParts },
   ]
 
@@ -966,7 +985,10 @@ export async function executeGeminiRequest(
     if (request.abortSignal) {
       geminiConfig.abortSignal = request.abortSignal
     }
-    if (request.temperature !== undefined) {
+    if (
+      request.temperature !== undefined &&
+      (!isKnownModelId(request.model) || getModelCapabilities(request.model)?.temperature)
+    ) {
       geminiConfig.temperature = request.temperature
     }
     if (request.maxTokens != null) {
@@ -1126,11 +1148,13 @@ export async function executeGeminiRequest(
     if (shouldStream) {
       logger.info('Handling Gemini streaming response')
 
-      const streamGenerator = await ai.models.generateContentStream({
-        model,
-        contents,
-        config: geminiConfig,
-      })
+      const streamGenerator = await ai.models.generateContentStream(
+        await prepareConversationGeneration(request, 'gemini', {
+          model,
+          contents,
+          config: geminiConfig,
+        })
+      )
       const firstResponseTime = Date.now() - initialCallTime
 
       const streamingResult = createStreamingResult(
@@ -1148,7 +1172,7 @@ export async function executeGeminiRequest(
 
           streamingResult.execution.output.content = content
           streamingResult.execution.output.tokens = { ...split, total: usage.totalTokenCount }
-          streamingResult.execution.output.cost = priceGeminiTokens(model, split)
+          streamingResult.execution.output.cost = priceGeminiTokens(request.model, split)
 
           if (thinking) {
             const segment = streamingResult.execution.output.providerTiming?.timeSegments?.[0]
@@ -1170,14 +1194,29 @@ export async function executeGeminiRequest(
               segments[0].duration = streamEndTime - providerStartTime
             }
           }
-        }
+        },
+        request
       )
 
       return { ...streamingResult, stream, streamFormat: 'agent-events-v1' as const }
     }
 
     // Non-streaming request
-    const response = await ai.models.generateContent({ model, contents, config: geminiConfig })
+    const response = await ai.models.generateContent(
+      await prepareConversationGeneration(request, 'gemini', {
+        model,
+        contents,
+        config: geminiConfig,
+      })
+    )
+    if (!extractAllFunctionCallParts(response.candidates?.[0]).length) {
+      await captureProviderConversationStep(
+        request,
+        'gemini',
+        response.candidates?.[0]?.content,
+        splitGeminiUsage(convertUsageMetadata(response.usageMetadata))
+      )
+    }
     const firstResponseTime = Date.now() - initialCallTime
 
     // Check for UNEXPECTED_TOOL_CALL
@@ -1192,11 +1231,11 @@ export async function executeGeminiRequest(
       initialUsage,
       firstResponseTime,
       initialCallTime,
-      model,
+      request.model,
       toolConfig
     )
     enrichLastModelSegmentFromGeminiResponse(state.timeSegments, response, {
-      model,
+      model: request.model,
     })
     const forcedTools = preparedTools?.forcedTools ?? []
 
@@ -1217,20 +1256,30 @@ export async function executeGeminiRequest(
       }
 
       const finalStartTime = Date.now()
-      const finalResponse = await ai.models.generateContent({
-        model,
-        contents: currentState.contents,
-        config: finalConfig,
-      })
+      const finalResponse = await ai.models.generateContent(
+        await prepareConversationGeneration(request, 'gemini', {
+          model,
+          contents: currentState.contents,
+          config: finalConfig,
+        })
+      )
+      if (!extractAllFunctionCallParts(finalResponse.candidates?.[0]).length) {
+        await captureProviderConversationStep(
+          request,
+          'gemini',
+          finalResponse.candidates?.[0]?.content,
+          splitGeminiUsage(convertUsageMetadata(finalResponse.usageMetadata))
+        )
+      }
       const finalState = updateStateWithResponse(
         currentState,
         finalResponse,
-        model,
+        request.model,
         finalStartTime,
         Date.now()
       )
       enrichLastModelSegmentFromGeminiResponse(finalState.timeSegments, finalResponse, {
-        model,
+        model: request.model,
       })
       return { state: finalState, response: finalResponse }
     }
@@ -1301,13 +1350,20 @@ export async function executeGeminiRequest(
           `Processing ${functionCallParts.length} function call(s): ${callNames} (iteration ${state.iterationCount + 1})`
         )
 
+        await captureProviderConversationStep(
+          request,
+          'gemini',
+          currentResponse.candidates?.[0]?.content,
+          splitGeminiUsage(convertUsageMetadata(currentResponse.usageMetadata))
+        )
         // Execute ALL function calls in this batch
         const { success, state: updatedState } = await executeToolCallsBatch(
           functionCallParts,
           request,
           state,
           forcedTools,
-          logger
+          logger,
+          currentResponse.candidates?.[0]?.content ?? { role: 'model', parts: functionCallParts }
         )
         if (!success) {
           content = extractTextContent(currentResponse.candidates?.[0])
@@ -1319,14 +1375,30 @@ export async function executeGeminiRequest(
 
         /** Resolve the final turn, then project its settled answer when streaming was requested. */
         const nextModelStartTime = Date.now()
-        const nextResponse = await ai.models.generateContent({
-          model,
-          contents: state.contents,
-          config: nextConfig,
-        })
-        state = updateStateWithResponse(state, nextResponse, model, nextModelStartTime, Date.now())
+        const nextResponse = await ai.models.generateContent(
+          await prepareConversationGeneration(request, 'gemini', {
+            model,
+            contents: state.contents,
+            config: nextConfig,
+          })
+        )
+        if (!extractAllFunctionCallParts(nextResponse.candidates?.[0]).length) {
+          await captureProviderConversationStep(
+            request,
+            'gemini',
+            nextResponse.candidates?.[0]?.content,
+            splitGeminiUsage(convertUsageMetadata(nextResponse.usageMetadata))
+          )
+        }
+        state = updateStateWithResponse(
+          state,
+          nextResponse,
+          request.model,
+          nextModelStartTime,
+          Date.now()
+        )
         enrichLastModelSegmentFromGeminiResponse(state.timeSegments, nextResponse, {
-          model,
+          model: request.model,
         })
         currentResponse = nextResponse
 

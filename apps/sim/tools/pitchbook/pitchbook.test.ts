@@ -1,15 +1,26 @@
 /**
  * @vitest-environment node
  */
+import { inputValidationMock, inputValidationMockFns } from '@sim/testing'
 import { describe, expect, it, vi } from 'vitest'
 
-vi.unmock('@/tools/registry')
+vi.mock('@/lib/core/security/input-validation.server', () => inputValidationMock)
+
+/**
+ * Only this service's configs are needed; the full registry is ~6,000 modules.
+ * Registration is asserted through the generated `@/tools/tool-ids`.
+ */
+vi.mock('@/tools/registry', async () => {
+  const { partialToolRegistry } = await import('@sim/testing/mocks/tool-registry.mock')
+  return { tools: partialToolRegistry(await import('@/tools/pitchbook')) }
+})
 
 import { PitchBookBlock } from '@/blocks/blocks/pitchbook'
 import { ErrorExtractorId, extractErrorMessage, redactErrorData } from '@/tools/error-extractors'
 import { executeTool } from '@/tools/index'
 import RECORDED from '@/tools/pitchbook/__fixtures__/recorded-responses.json'
 import { tools } from '@/tools/registry'
+import { hasToolId } from '@/tools/tool-ids'
 
 /**
  * The registry is typed `Record<string, ToolConfig>`, so a tool's `url`/`headers`/
@@ -48,7 +59,7 @@ describe('pitchbook wiring', () => {
 
   it('registry keys match each tool id', () => {
     for (const id of access) {
-      expect(tools[id], `missing registry entry ${id}`).toBeDefined()
+      expect(hasToolId(id), `missing registry entry ${id}`).toBe(true)
       expect(tools[id].id).toBe(id)
     }
   })
@@ -476,28 +487,42 @@ describe('pitchbook error extraction', () => {
    * not appear anywhere in the tool result, message or retained body.
    */
   it('keeps the rejected key out of the whole failed tool result', async () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          reason: 'UNAUTHORIZED',
-          message: `Active API key ${SUBMITTED_KEY} not found`,
-        }),
-        { status: 401, headers: { 'content-type': 'application/json' } }
-      )
+    const response = new Response(
+      JSON.stringify({
+        reason: 'UNAUTHORIZED',
+        message: `Active API key ${SUBMITTED_KEY} not found`,
+      }),
+      { status: 401, headers: { 'content-type': 'application/json' } }
     )
+    inputValidationMockFns.mockValidateUrlWithDNS.mockResolvedValueOnce({
+      isValid: true,
+      resolvedIP: '93.184.216.34',
+    })
+    inputValidationMockFns.mockSecureFetchWithPinnedIP.mockResolvedValueOnce({
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      headers: {
+        get: (name: string) => response.headers.get(name),
+        toRecord: () => Object.fromEntries(response.headers.entries()),
+      },
+      body: response.body,
+      text: () => response.text(),
+      json: () => response.json(),
+      arrayBuffer: () => response.arrayBuffer(),
+    })
 
-    try {
-      const result = await executeTool('pitchbook_company_bio', {
-        apiKey: SUBMITTED_KEY,
-        pbId: '10618-03',
-      })
+    const result = await executeTool('pitchbook_company_bio', {
+      apiKey: SUBMITTED_KEY,
+      pbId: '10618-03',
+    })
 
-      expect(result.success).toBe(false)
-      expect(JSON.stringify(result.output ?? {})).not.toContain(SUBMITTED_KEY)
-      expect(result.error ?? '').not.toContain(SUBMITTED_KEY)
-    } finally {
-      fetchSpy.mockRestore()
-    }
+    expect(inputValidationMockFns.mockSecureFetchWithPinnedIP).toHaveBeenCalledOnce()
+    expect(result.success).toBe(false)
+    expect(result.error).toBe(
+      'PitchBook rejected the API key. Check that the key is active and has API access.'
+    )
+    expect(JSON.stringify(result)).not.toContain(SUBMITTED_KEY)
   })
 
   it('routes every pitchbook tool through the scrubbing extractor', () => {

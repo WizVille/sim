@@ -5,7 +5,7 @@ import { Chip, toast } from '@sim/emcn'
 import { Workflow } from '@sim/emcn/icons'
 import { getErrorMessage } from '@sim/utils/errors'
 import type { CredentialGroupAccessResponse } from '@/lib/api/contracts/credential-groups'
-import { CREDENTIAL_GROUP_WORKFLOW_ACCESS_LIMIT } from '@/lib/credential-groups/workflow-access-limits'
+import { CREDENTIAL_GROUP_WORKFLOW_ACCESS_LIMIT } from '@/lib/credential-groups/limits'
 import { RowActionsMenu } from '@/app/workspace/[workspaceId]/settings/components/row-actions-menu'
 import { SettingsEmptyState } from '@/app/workspace/[workspaceId]/settings/components/settings-empty-state'
 import {
@@ -13,7 +13,7 @@ import {
   SettingsResourceRow,
 } from '@/app/workspace/[workspaceId]/settings/components/settings-resource-row'
 import { SettingsSection } from '@/app/workspace/[workspaceId]/settings/components/settings-section/settings-section'
-import { CredentialGroupAddWorkflowModal } from '@/ee/credential-groups/components/credential-group-add-workflow-modal'
+import { CredentialGroupAddResourceModal } from '@/ee/credential-groups/components/credential-group-add-resource-modal'
 import {
   useCredentialGroupAccess,
   useUpdateCredentialGroupAccess,
@@ -221,7 +221,6 @@ export function CredentialGroupAccess({
 
   const sectionAction = (
     <Chip
-      variant='primary'
       onClick={() => setShowAddWorkflow(true)}
       disabled={
         saving ||
@@ -275,10 +274,14 @@ export function CredentialGroupAccess({
       </SettingsSection>
 
       {showAddWorkflow && (
-        <CredentialGroupAddWorkflowModal
-          workflows={availableWorkflows}
+        <CredentialGroupAddResourceModal
+          resourceType='workflow'
+          resources={availableWorkflows}
           disabled={saving}
-          onAdd={addWorkflow}
+          onAdd={(id) => {
+            addWorkflow(id)
+            setShowAddWorkflow(false)
+          }}
           onClose={() => setShowAddWorkflow(false)}
         />
       )}

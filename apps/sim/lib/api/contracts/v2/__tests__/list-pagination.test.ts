@@ -45,6 +45,21 @@ import {
 
 /** Lists that accept `limit` + `cursor` and can return a non-null `nextCursor`. */
 const PAGED_LISTS = [
+  'GET /api/v2/organizations/[organizationId]/usage/events',
+  'GET /api/v2/organizations/[organizationId]/invitations/[invitationId]/workspaces',
+  'GET /api/v2/organizations/[organizationId]/access-requests',
+  'GET /api/v2/organizations/[organizationId]/access-requests/mine',
+  'GET /api/v2/workspaces/[workspaceId]/access-requests',
+  'GET /api/v2/organizations/[organizationId]/access-requests/discovery',
+  'GET /api/v2/workspaces/[workspaceId]/access-requests/discovery',
+
+  'GET /api/v2/organizations',
+  'GET /api/v2/organizations/[organizationId]/members',
+  'GET /api/v2/organizations/[organizationId]/invitations',
+  'GET /api/v2/organizations/[organizationId]/workspaces',
+  'GET /api/v2/organizations/[organizationId]/permission-groups',
+  'GET /api/v2/organizations/[organizationId]/permission-groups/[groupId]/members',
+
   'GET /api/v2/audit-logs',
   'GET /api/v2/billing/logs',
   'GET /api/v2/blocks',
@@ -52,6 +67,7 @@ const PAGED_LISTS = [
   'GET /api/v2/credentials',
   'GET /api/v2/custom-tools',
   'GET /api/v2/files',
+  'GET /api/v2/files/[fileId]/versions',
   'GET /api/v2/knowledge',
   'GET /api/v2/knowledge/[knowledgeBaseId]/connectors',
   'GET /api/v2/knowledge/[knowledgeBaseId]/connectors/[connectorId]/documents',
@@ -59,6 +75,7 @@ const PAGED_LISTS = [
   'GET /api/v2/knowledge/[knowledgeBaseId]/documents/[documentId]/chunks',
   'GET /api/v2/logs',
   'GET /api/v2/mcp-servers',
+  'GET /api/v2/sandboxes',
   'GET /api/v2/secrets',
   'GET /api/v2/skills',
   'GET /api/v2/skills/[skillId]/editors',
@@ -71,6 +88,11 @@ const PAGED_LISTS = [
   'GET /api/v2/workflows/[workflowId]/versions',
   'GET /api/v2/workflow-mcp-servers',
   'GET /api/v2/workspaces/[workspaceId]/members',
+  'GET /api/v2/workspaces/[workspaceId]/fork/children',
+  'GET /api/v2/workspaces/[workspaceId]/fork/mappings',
+  'GET /api/v2/workspaces/[workspaceId]/fork/resources',
+  'GET /api/v2/workspaces/[workspaceId]/operations',
+  'POST /api/v2/selectors/list',
   'GET /api/v2/workspaces',
 ] as const
 
@@ -140,6 +162,62 @@ const FULL_SET_LISTS = [
  * therefore fails here until someone decides whether the cursor is bound to it.
  */
 const CURSOR_BINDINGS: Record<string, readonly string[]> = {
+  'GET /api/v2/organizations/[organizationId]/usage/events': [
+    'preset',
+    'startDate',
+    'endDate',
+    'timezone',
+    'source',
+    'sortBy',
+    'sortOrder',
+  ],
+  'GET /api/v2/organizations/[organizationId]/invitations/[invitationId]/workspaces': [
+    'search',
+    'sortBy',
+    'sortOrder',
+  ],
+  'GET /api/v2/organizations/[organizationId]/access-requests': [
+    'status',
+    'search',
+    'sortBy',
+    'sortOrder',
+  ],
+  'GET /api/v2/organizations/[organizationId]/access-requests/mine': [
+    'status',
+    'sortBy',
+    'sortOrder',
+  ],
+  'GET /api/v2/workspaces/[workspaceId]/access-requests': ['status', 'sortBy', 'sortOrder'],
+  'GET /api/v2/organizations/[organizationId]/access-requests/discovery': [
+    'search',
+    'targetKind',
+    'state',
+    'sortBy',
+    'sortOrder',
+  ],
+  'GET /api/v2/workspaces/[workspaceId]/access-requests/discovery': [
+    'search',
+    'targetKind',
+    'state',
+    'sortBy',
+    'sortOrder',
+  ],
+
+  'GET /api/v2/organizations': ['search', 'sortBy', 'sortOrder'],
+  'GET /api/v2/organizations/[organizationId]/members': ['search', 'sortBy', 'sortOrder'],
+  'GET /api/v2/organizations/[organizationId]/invitations': [
+    'search',
+    'status',
+    'sortBy',
+    'sortOrder',
+  ],
+  'GET /api/v2/organizations/[organizationId]/workspaces': ['search', 'sortBy', 'sortOrder'],
+  'GET /api/v2/organizations/[organizationId]/permission-groups': ['search', 'sortBy', 'sortOrder'],
+  'GET /api/v2/organizations/[organizationId]/permission-groups/[groupId]/members': [
+    'sortBy',
+    'sortOrder',
+  ],
+
   'GET /api/v2/audit-logs': [
     'includeDeparted',
     'action',
@@ -172,6 +250,7 @@ const CURSOR_BINDINGS: Record<string, readonly string[]> = {
     /** Decides whether `folderPath` covers one folder or its whole subtree. */
     'recursive',
   ],
+  'GET /api/v2/files/[fileId]/versions': ['sortBy', 'sortOrder'],
   'GET /api/v2/knowledge': ['workspaceId', 'scope', 'folderPath', 'search', 'sortBy', 'sortOrder'],
   'GET /api/v2/knowledge/[knowledgeBaseId]/connectors': ['workspaceId', 'sortBy', 'sortOrder'],
   'GET /api/v2/knowledge/[knowledgeBaseId]/connectors/[connectorId]/documents': [
@@ -218,6 +297,7 @@ const CURSOR_BINDINGS: Record<string, readonly string[]> = {
     'includeJobRuns',
   ],
   'GET /api/v2/mcp-servers': ['workspaceId', 'search', 'sortBy', 'sortOrder'],
+  'GET /api/v2/sandboxes': ['workspaceId', 'search', 'sortBy', 'sortOrder'],
   'GET /api/v2/secrets': ['workspaceId', 'scope', 'search', 'sortBy', 'sortOrder'],
   'GET /api/v2/skills': ['workspaceId', 'search', 'sortBy', 'sortOrder'],
   'GET /api/v2/tables': ['workspaceId', 'scope', 'folderPath', 'search', 'sortBy', 'sortOrder'],
@@ -246,6 +326,16 @@ const CURSOR_BINDINGS: Record<string, readonly string[]> = {
   'GET /api/v2/workflow-mcp-servers': ['workspaceId', 'sortBy', 'sortOrder'],
   'GET /api/v2/chat-deployments': ['workspaceId', 'workflowId', 'isActive', 'sortBy', 'sortOrder'],
   'GET /api/v2/workspaces/[workspaceId]/members': [],
+  'GET /api/v2/workspaces/[workspaceId]/fork/children': ['sortBy', 'sortOrder'],
+  'GET /api/v2/workspaces/[workspaceId]/fork/mappings': [
+    'otherWorkspaceId',
+    'direction',
+    'sortBy',
+    'sortOrder',
+  ],
+  'GET /api/v2/workspaces/[workspaceId]/fork/resources': ['kind', 'sortBy', 'sortOrder'],
+  'GET /api/v2/workspaces/[workspaceId]/operations': ['requestId'],
+  'POST /api/v2/selectors/list': ['workspaceId', 'selectorKey', 'context', 'search'],
   'GET /api/v2/workspaces': ['sortBy', 'sortOrder'],
 }
 
@@ -270,6 +360,27 @@ const CURSOR_BINDINGS: Record<string, readonly string[]> = {
  * resolves the path before fingerprinting it.
  */
 const CURSOR_BOUND_PATH_PARAMS: Record<string, readonly string[]> = {
+  'GET /api/v2/organizations/[organizationId]/invitations/[invitationId]/workspaces': [
+    'organizationId',
+    'invitationId',
+  ],
+  'GET /api/v2/organizations/[organizationId]/access-requests': ['organizationId'],
+  'GET /api/v2/organizations/[organizationId]/access-requests/mine': ['organizationId'],
+  'GET /api/v2/workspaces/[workspaceId]/access-requests': ['workspaceId'],
+  'GET /api/v2/organizations/[organizationId]/access-requests/discovery': ['organizationId'],
+  'GET /api/v2/workspaces/[workspaceId]/access-requests/discovery': ['workspaceId'],
+  'GET /api/v2/organizations/[organizationId]/usage/events': ['organizationId'],
+
+  'GET /api/v2/organizations/[organizationId]/members': ['organizationId'],
+  'GET /api/v2/organizations/[organizationId]/invitations': ['organizationId'],
+  'GET /api/v2/organizations/[organizationId]/workspaces': ['organizationId'],
+  'GET /api/v2/organizations/[organizationId]/permission-groups': ['organizationId'],
+  'GET /api/v2/organizations/[organizationId]/permission-groups/[groupId]/members': [
+    'organizationId',
+    'groupId',
+  ],
+
+  'GET /api/v2/files/[fileId]/versions': ['fileId'],
   'GET /api/v2/knowledge/[knowledgeBaseId]/connectors': ['knowledgeBaseId'],
   'GET /api/v2/knowledge/[knowledgeBaseId]/connectors/[connectorId]/documents': [
     'knowledgeBaseId',
@@ -286,6 +397,10 @@ const CURSOR_BOUND_PATH_PARAMS: Record<string, readonly string[]> = {
   'GET /api/v2/workflows/[workflowId]/runs': ['workflowId'],
   'GET /api/v2/workflows/[workflowId]/versions': ['workflowId'],
   'GET /api/v2/workspaces/[workspaceId]/members': ['workspaceId'],
+  'GET /api/v2/workspaces/[workspaceId]/fork/children': ['workspaceId'],
+  'GET /api/v2/workspaces/[workspaceId]/fork/mappings': ['workspaceId'],
+  'GET /api/v2/workspaces/[workspaceId]/fork/resources': ['workspaceId'],
+  'GET /api/v2/workspaces/[workspaceId]/operations': ['workspaceId'],
 }
 
 /**
@@ -299,6 +414,10 @@ const CURSOR_BOUND_PATH_PARAMS: Record<string, readonly string[]> = {
  * correctness gain.
  */
 const UNBOUND_PARAMS: Record<string, Record<string, string>> = {
+  'GET /api/v2/files/[fileId]/versions': {
+    workspaceId:
+      'Asserted scope, not a filter: the sequence is one file, named by the path. A mismatched workspace is refused by authorization before paging.',
+  },
   'GET /api/v2/audit-logs': {
     organizationId:
       'Asserted scope, not a filter: an account belongs to at most one organization, so naming it and omitting it select the same sequence. The resolved id is decided inside the application use case, so the route cannot stamp it without resolving an authorization decision itself.',

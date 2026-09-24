@@ -78,13 +78,11 @@ const STATIC_SCRIPT_SRC = [
     ? [
         'https://www.googletagmanager.com',
         'https://www.google-analytics.com',
+        // Google Ads conversion tag — gtag.js pulls conversion_async.js from
+        // googleadservices and the remarketing tag from googleads.doubleclick
+        'https://www.googleadservices.com',
+        'https://googleads.g.doubleclick.net',
         'https://analytics.ahrefs.com',
-        // HubSpot tracking (landing pages) — loader plus the
-        // analytics/form-tracking/banner scripts it injects as <script> tags
-        'https://*.hs-scripts.com',
-        'https://*.hs-analytics.net',
-        'https://*.hscollectedforms.net',
-        'https://*.hs-banner.com',
         // X (Twitter) conversion pixel (landing pages) — the base code injects
         // uwt.js as a <script> tag from static.ads-twitter.com
         'https://static.ads-twitter.com',
@@ -128,10 +126,8 @@ const STATIC_CONNECT_SRC = [
         'https://www.google.com',
         'https://analytics.ahrefs.com',
         'https://*.g.doubleclick.net',
-        // HubSpot tracking — form-tracking API (hscollectedforms.js).
-        // The visitor beacon itself is an image pixel (img-src, already
-        // permitted below), not a connect-src request.
-        'https://*.hscollectedforms.net',
+        // Google Ads conversion tag — conversion beacons
+        'https://www.googleadservices.com',
         // X (Twitter) conversion pixel — uwt.js sends conversion beacons here
         // via fetch/sendBeacon. The t.co image-pixel fallback is already
         // covered by the `https:` wildcard in img-src.
@@ -150,6 +146,12 @@ const STATIC_FRAME_SRC = [
   'https://drive.google.com',
   'https://docs.google.com',
   'https://*.google.com',
+  // Google Ads conversion tag — the conversion linker writes its cookie from
+  // a hidden iframe on these origins; without them the ping still fires but
+  // cross-domain click attribution silently drops. Hosted-only, like the
+  // script-src and connect-src entries: the consent provider that loads the
+  // tag never mounts off hosted, so nothing self-hosted can frame these.
+  ...(isHosted ? ['https://td.doubleclick.net', 'https://www.googleadservices.com'] : []),
   'https://www.youtube.com',
   'https://player.vimeo.com',
   'https://www.dailymotion.com',

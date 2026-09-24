@@ -90,7 +90,9 @@ vi.mock('@sim/audit', () => auditMock)
 
 import {
   acceptInvitation,
+  getInvitationById,
   rejectInvitation,
+  resolveInvitationAdmissionOrganizationId,
   revokeInvitationAsAdmin,
   updateInvitation,
 } from '@/lib/invitations/core'
@@ -126,6 +128,39 @@ function executedSqlContaining(substring: string): boolean {
 }
 
 afterAll(resetEnvFlagsMock)
+
+describe('invitation workspace identity', () => {
+  it('hydrates uploaded logos and workspaces without a logo in the grant query', async () => {
+    resetDbChainMock()
+    queueWhereResponses([
+      [{ id: 'invitation', organizationId: null, inviterId: 'inviter' }],
+      [
+        {
+          id: 'grant-one',
+          workspaceId: 'one',
+          workspaceName: 'Design',
+          workspaceLogoUrl: 'https://example.com/design.png',
+          permission: 'read',
+        },
+        {
+          id: 'grant-two',
+          workspaceId: 'two',
+          workspaceName: 'Engineering',
+          workspaceLogoUrl: null,
+          permission: 'write',
+        },
+      ],
+      [{ name: 'Inviter', email: 'inviter@example.com' }],
+    ])
+
+    const result = await getInvitationById('invitation')
+
+    expect(result?.grants.map((grant) => grant.workspaceLogoUrl)).toEqual([
+      'https://example.com/design.png',
+      null,
+    ])
+  })
+})
 
 describe('acceptInvitation', () => {
   beforeEach(() => {
@@ -1584,6 +1619,61 @@ describe('acceptInvitation', () => {
     }
   })
 
+  it('accepts an organization-only invitation without creating workspace grants and lands in org Home', async () => {
+    mockEnsureTeamOrganizationForAcceptance.mockResolvedValueOnce({
+      success: true,
+      organizationId: 'org-1',
+      fixedSeats: false,
+    })
+    queueWhereResponses([
+      [
+        {
+          id: 'inv-org-only',
+          kind: 'organization',
+          email: 'invitee@example.com',
+          organizationId: 'org-1',
+          membershipIntent: 'internal',
+          inviterId: 'owner-1',
+          role: 'member',
+          status: 'pending',
+          token: 'tok-1',
+          expiresAt: new Date(Date.now() + 60_000),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
+      [],
+      [{ name: 'Acme' }],
+      [{ name: 'Owner', email: 'owner@example.com' }],
+      [],
+      [],
+      [{ id: 'member-1' }],
+      [],
+    ])
+    const result = await acceptInvitation({
+      userId: 'invitee-user',
+      userEmail: 'invitee@example.com',
+      invitationId: 'inv-org-only',
+      token: 'tok-1',
+      disclosedWorkspaceIds: [],
+      disclosedOutcome: 'will-join',
+    })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.redirectPath).toBe('/o/org-1/home')
+      expect(result.acceptedWorkspaceIds).toEqual([])
+    }
+    expect(mockEnsureUserInOrganization).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        userId: 'invitee-user',
+        organizationId: 'org-1',
+        role: 'member',
+      })
+    )
+    expect(mockGetWorkspaceWithOwner).not.toHaveBeenCalled()
+  })
+
   it('does not record an ORG_MEMBER_ADDED audit for a user who is already a member', async () => {
     mockGetWorkspaceWithOwner.mockResolvedValue({
       id: 'workspace-1',
@@ -2141,6 +2231,36 @@ describe('locked invitation mutations', () => {
     )
   })
 
+  it.each([undefined, 'workspace-1'])(
+    'DELETE refuses expiry while waiting for authority locks (scope %s)',
+    async (workspaceId) => {
+      const now = Date.now()
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(now)
+      try {
+        queueWhereResponses([
+          ...invitationHydrationRows(),
+          ...invitationHydrationRows(),
+          [{ id: 'member-1', role: 'admin' }],
+        ])
+        dbChainMockFns.for.mockImplementationOnce(() => {
+          clock.mockReturnValue(now + 120_000)
+          return dbChainMock
+        })
+        await expect(
+          revokeInvitationAsAdmin({
+            actorId: 'admin-1',
+            invitationId: 'inv-1',
+            workspaceId,
+          })
+        ).resolves.toEqual({ success: false, kind: 'not-pending' })
+        expect(dbChainMockFns.set).not.toHaveBeenCalled()
+        expect(dbChainMockFns.delete).not.toHaveBeenCalled()
+      } finally {
+        clock.mockRestore()
+      }
+    }
+  )
+
   it('PATCH role update observes an organization-admin demotion before mutating', async () => {
     queueWhereResponses([
       ...invitationHydrationRows(),
@@ -2179,5 +2299,130 @@ describe('locked invitation mutations', () => {
     })
     expect(dbChainMockFns.for).toHaveBeenCalledWith('update')
     expect(dbChainMockFns.set).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * What an invitation ADMITS TO, which is not its `kind`. The send-capability
+ * gates read this so they cannot let an invitation carry a member into an
+ * organization whose group withholds invitations, and so they cannot demand an
+ * organization's permission for an invitation that joins nobody to it.
+ */
+describe('resolveInvitationAdmissionOrganizationId', () => {
+  const invitation = {
+    id: 'invitation-1',
+    kind: 'workspace' as const,
+    email: 'invitee@example.com',
+    organizationId: 'organization-1',
+    membershipIntent: 'internal' as const,
+    inviterId: 'inviter-1',
+    role: 'member',
+    status: 'pending' as const,
+    token: 'token-1',
+    expiresAt: new Date('2026-12-01T00:00:00.000Z'),
+    createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+    grants: [
+      {
+        id: 'grant-1',
+        workspaceId: 'workspace-1',
+        permission: 'read' as const,
+        workspaceName: 'Workspace',
+      },
+    ],
+    organizationName: null,
+    inviterName: null,
+    inviterEmail: null,
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetDbChainMock()
+    mockGetUserOrganization.mockResolvedValue(null)
+    mockGetWorkspaceWithOwner.mockResolvedValue({
+      id: 'workspace-1',
+      organizationId: 'organization-1',
+      billedAccountUserId: 'owner-1',
+    })
+  })
+
+  it('names the organization a granted workspace belongs to, for a workspace invitation', async () => {
+    expect(await resolveInvitationAdmissionOrganizationId(invitation)).toBe('organization-1')
+  })
+
+  it('names nobody when the granted workspace belongs to no organization', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValue({
+      id: 'workspace-1',
+      organizationId: null,
+      billedAccountUserId: 'owner-1',
+    })
+
+    expect(await resolveInvitationAdmissionOrganizationId(invitation)).toBeNull()
+  })
+
+  /**
+   * The workspace moved after the invite went out. Acceptance escalates into the
+   * new organization only when the inviter currently holds admin standing there,
+   * so the gate has to ask the same question of the same organization.
+   */
+  it('follows a moved workspace into its live organization when the inviter may escalate', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValue({
+      id: 'workspace-1',
+      organizationId: 'organization-2',
+      billedAccountUserId: 'owner-1',
+    })
+    mockGetUserOrganization.mockResolvedValue({
+      organizationId: 'organization-2',
+      role: 'admin',
+    })
+
+    expect(await resolveInvitationAdmissionOrganizationId(invitation)).toBe('organization-2')
+  })
+
+  it('names nobody when the escalation acceptance would refuse is the only join on offer', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValue({
+      id: 'workspace-1',
+      organizationId: 'organization-2',
+      billedAccountUserId: 'owner-1',
+    })
+    mockGetUserOrganization.mockResolvedValue({
+      organizationId: 'organization-2',
+      role: 'member',
+    })
+
+    expect(await resolveInvitationAdmissionOrganizationId(invitation)).toBeNull()
+  })
+
+  /**
+   * An organization invitation joins its STAMPED organization whatever its
+   * granted workspaces do — the join target is never re-derived from a workspace
+   * whose organization can change after send.
+   */
+  it('keeps an organization invitation on its stamped organization', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValue({
+      id: 'workspace-1',
+      organizationId: 'organization-2',
+      billedAccountUserId: 'owner-1',
+    })
+
+    expect(
+      await resolveInvitationAdmissionOrganizationId({ ...invitation, kind: 'organization' })
+    ).toBe('organization-1')
+  })
+
+  it('names nobody for an external invitation, which creates no membership', async () => {
+    expect(
+      await resolveInvitationAdmissionOrganizationId({
+        ...invitation,
+        membershipIntent: 'external',
+      })
+    ).toBeNull()
+    expect(mockGetWorkspaceWithOwner).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the stamped organization for an invitation with no grants', async () => {
+    expect(await resolveInvitationAdmissionOrganizationId({ ...invitation, grants: [] })).toBe(
+      'organization-1'
+    )
   })
 })

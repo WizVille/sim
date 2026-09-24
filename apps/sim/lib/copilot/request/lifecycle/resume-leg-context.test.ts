@@ -1,6 +1,18 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { MothershipStreamV1CompletionStatus } from '@/lib/copilot/generated/mothership-stream-v1'
 import { createStreamingContext } from '@/lib/copilot/request/context/request-context'
+import {
+  createProviderToolCallIdentity,
+  restoreProviderToolCallId,
+  scopeProviderToolCallId,
+} from '@/lib/copilot/request/go/tool-call-identity'
+
+/** Table side effects are not exercised here, and the real module loads the table application layer. */
+vi.mock('@/lib/copilot/request/tools/tables', () => ({
+  maybeWriteOutputToTable: vi.fn(async (_toolName, _params, result) => result),
+  maybeWriteReadCsvToTable: vi.fn(async (_toolName, _params, result) => result),
+}))
+
 import { makeResumeLegContext, mergeResumeLegOutputs } from '@/lib/copilot/request/lifecycle/run'
 
 // Guards the makeResumeLegContext / mergeResumeLegOutputs contract: the two MUST
@@ -14,6 +26,22 @@ import { makeResumeLegContext, mergeResumeLegOutputs } from '@/lib/copilot/reque
 // reset per leg but folded back only for a turn-level abort, because a fanout
 // cancelling its own lanes must not mark the shared turn aborted.
 describe('resume leg context isolate/merge contract', () => {
+  it('shares provider identity mappings across sibling legs and retries', () => {
+    const identity = createProviderToolCallIdentity('run-1')
+    const base = createStreamingContext({ providerToolCallIdentity: identity })
+    const first = makeResumeLegContext(base)
+    const second = makeResumeLegContext(base)
+    const canonicalId = scopeProviderToolCallId('child-call', identity)
+
+    expect(first.providerToolCallIdentity).toBe(identity)
+    expect(second.providerToolCallIdentity).toBe(identity)
+    expect(restoreProviderToolCallId(canonicalId, second.providerToolCallIdentity)).toBe(
+      'child-call'
+    )
+    expect(scopeProviderToolCallId('child-call', identity)).toBe(canonicalId)
+    expect(makeResumeLegContext(createStreamingContext()).providerToolCallIdentity).toBeUndefined()
+  })
+
   it('isolates the per-leg scalars while sharing the heavy accumulators by reference', () => {
     const base = createStreamingContext({
       accumulatedContent: 'PRE',

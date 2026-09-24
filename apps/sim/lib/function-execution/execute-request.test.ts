@@ -6,11 +6,14 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import {
   createMockRequest,
+  dbChainMockFns,
   envFlagsMock,
   hybridAuthMockFns,
+  resetDbChainMock,
   resetEnvFlagsMock,
   workflowsUtilsMock,
 } from '@sim/testing'
+import JSZip from 'jszip'
 import { NextRequest } from 'next/server'
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { functionExecuteBodySchema } from '@/lib/api/contracts'
@@ -23,6 +26,7 @@ import {
   PRIVATE_SECRET_PROVENANCE_HEADER,
 } from '@/lib/execution/private-tool-metadata'
 import {
+  attachTrustedSandboxOutputCost,
   MAX_SANDBOX_OUTPUT_BYTES,
   SandboxOutputFileError,
   SandboxOutputLimitError,
@@ -41,6 +45,9 @@ const {
   mockUploadFile,
   mockValidateWorkspaceFileWriteTarget,
   mockWriteWorkspaceFileByPath,
+  mockUploadExecutionFile,
+  mockMountContributors,
+  mockRenderedMountContributors,
 } = vi.hoisted(() => ({
   mockExecuteInSandbox: vi.fn(),
   mockExecuteInIsolatedVM: vi.fn(),
@@ -59,6 +66,9 @@ const {
   mockUploadFile: vi.fn(),
   mockValidateWorkspaceFileWriteTarget: vi.fn(),
   mockWriteWorkspaceFileByPath: vi.fn(),
+  mockUploadExecutionFile: vi.fn(),
+  mockMountContributors: vi.fn(),
+  mockRenderedMountContributors: vi.fn(),
 }))
 
 vi.mock('@/lib/core/security/encryption', () => ({
@@ -84,7 +94,11 @@ vi.mock('@/lib/copilot/request/tools/files', () => ({
     md: 'text/markdown',
     html: 'text/html',
   },
-  normalizeOutputWorkspaceFileName: vi.fn((p: string) => p.replace(/^files\//, '')),
+  normalizeOutputWorkspaceFileName: vi.fn((p: string) => {
+    const normalized = p.trim().replace(/^\/+|\/+$/g, '')
+    if (!normalized) throw new Error('Output path must include a file name')
+    return normalized.replace(/^files\//, '')
+  }),
   resolveOutputFormat: vi.fn(() => 'json'),
   getOutputFileDeclarations: vi.fn((params: Record<string, any>) => {
     if (Array.isArray(params.outputs?.files)) {
@@ -141,15 +155,54 @@ vi.mock('@/lib/uploads', () => ({
   },
 }))
 
+vi.mock('@/lib/uploads/contexts/execution/execution-file-manager', () => ({
+  uploadExecutionFile: mockUploadExecutionFile,
+}))
+
 vi.mock('@/lib/workflows/utils', () => workflowsUtilsMock)
 
-import { validateProxyUrl } from '@/lib/core/security/input-validation'
+/**
+ * Only the I/O half is stubbed. Path naming, transports, ceilings and
+ * authorization are covered against the real implementation in
+ * `sandbox-mounts.test.ts`; what matters here is the wiring — that a marker
+ * becomes a mount and that the context variable ends up holding the path.
+ */
+vi.mock('@/lib/function-execution/sandbox-mounts', () => ({
+  planUserFileMounts: (files: Array<{ key: string; name: string }>) =>
+    files.map((userFile) => ({ userFile, mountPath: `/tmp/sim/inputs/${userFile.name}` })),
+  resolveUserFileMounts: async ({
+    planned,
+  }: {
+    planned: Array<{ userFile: { name: string }; mountPath: string }>
+  }) => ({
+    contributingFiles: mockMountContributors(),
+    renderedContributingFiles: mockRenderedMountContributors(),
+    sandboxFiles: planned.map(({ mountPath }) => ({
+      type: 'url' as const,
+      path: mountPath,
+      url: 'https://presigned.example/object',
+    })),
+    manifest: planned.map(({ userFile, mountPath }) => ({
+      name: userFile.name,
+      path: mountPath,
+      size: 1,
+      type: 'application/pdf',
+    })),
+  }),
+}))
+
+import { validateExternalUrl } from '@/lib/core/security/input-validation'
 import { clearLargeValueCacheForTests } from '@/lib/execution/payloads/cache'
 import { isLargeArrayManifest } from '@/lib/execution/payloads/large-array-manifest-metadata'
 import { isLargeValueRef } from '@/lib/execution/payloads/large-value-ref'
+import * as fileMaterialization from '@/lib/execution/payloads/materialization.server'
 import { executeFunctionRequest } from '@/lib/function-execution/execute-request'
+import { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
 
-async function POST(request: NextRequest): Promise<Response> {
+async function POST(
+  request: NextRequest,
+  resolvedSecretTraceRegistry?: ResolvedSecretTraceRegistry
+): Promise<Response> {
   const auth = await hybridAuthMockFns.mockCheckInternalAuth(request)
   if (!auth.success || !auth.userId) {
     return Response.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
@@ -171,6 +224,7 @@ async function POST(request: NextRequest): Promise<Response> {
 
   return executeFunctionRequest({ headers: request.headers, signal: request.signal }, parsed.data, {
     attributedUserId: auth.userId,
+    resolvedSecretTraceRegistry,
     principal: {
       kind: 'delegated',
       serviceId: 'executor',
@@ -192,9 +246,40 @@ async function POST(request: NextRequest): Promise<Response> {
 
 afterAll(resetEnvFlagsMock)
 
+/**
+ * A `<block.file.path>` reference as it reaches the function runtime: the resolver
+ * leaves a mount marker in the context variables, which is what asks this run for a
+ * sandbox filesystem.
+ */
+const MOUNT_REF = {
+  __simSandboxFileMount: true,
+  version: 1,
+  file: {
+    id: 'file_1',
+    name: 'doc.pdf',
+    url: 'https://storage.example/doc.pdf',
+    size: 12,
+    type: 'application/pdf',
+    key: 'execution/workspace-1/wf-1/exec-1/abc/doc.pdf',
+    context: 'execution',
+  },
+}
+
 describe('Function execution request', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
+    mockMountContributors.mockReturnValue(undefined)
+    mockRenderedMountContributors.mockReturnValue(undefined)
+    mockUploadExecutionFile.mockImplementation(async (context, buffer, name, type) => ({
+      id: 'execution-file-1',
+      key: `execution/${context.workspaceId}/${context.workflowId}/${context.executionId}/file/${name}`,
+      context: 'execution',
+      name,
+      type,
+      size: buffer.length,
+      url: 'https://presigned.example/output',
+    }))
     envFlagsMock.isRemoteSandboxEnabled = false
     envFlagsMock.isMothershipSandboxEnabled = false
 
@@ -281,6 +366,7 @@ describe('Function execution request', () => {
         result: 'done',
         stdout: 'ok',
         sandboxId: 'sandbox-123',
+        cost: { input: 0, output: 0, total: 0.00012345 },
         exportedFiles: { '/tmp/out.txt': 'owned by attacker' },
       })
       mockWriteWorkspaceFileByPath.mockRejectedValueOnce(
@@ -291,6 +377,8 @@ describe('Function execution request', () => {
         code: 'print("done")',
         language: 'python',
         workspaceId: 'workspace-victim',
+        workflowId: 'workflow-1',
+        executionId: 'execution-1',
         outputs: {
           files: [{ path: 'files/README.md', mode: 'overwrite', sandboxPath: '/tmp/out.txt' }],
         },
@@ -301,6 +389,7 @@ describe('Function execution request', () => {
 
       expect(response.status).toBe(403)
       expect(data).toHaveProperty('error', 'Insufficient workspace permissions')
+      expect(data.output.cost).toEqual({ input: 0, output: 0, total: 0.00012345 })
       expect(mockWriteWorkspaceFileByPath).toHaveBeenCalledTimes(1)
     })
 
@@ -318,6 +407,113 @@ describe('Function execution request', () => {
       expect(mockExecuteInIsolatedVM).toHaveBeenCalledTimes(1)
       expect(mockExecuteInSandbox).not.toHaveBeenCalled()
       expect(mockExecuteShellInSandbox).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      { language: 'python', code: 'return 42', kind: 'code' },
+      { language: 'shell', code: 'echo ready', kind: 'shell' },
+    ])(
+      'meters a standard workflow Function $kind sandbox and preserves its cost',
+      async ({ language, code, kind }) => {
+        envFlagsMock.isRemoteSandboxEnabled = true
+        const cost = { input: 0, output: 0, total: 0.00012345 }
+        const executeSandbox = kind === 'shell' ? mockExecuteShellInSandbox : mockExecuteInSandbox
+        executeSandbox.mockResolvedValueOnce({
+          result: 42,
+          stdout: 'ready',
+          sandboxId: `sandbox-${kind}`,
+          cost,
+        })
+
+        const response = await POST(
+          createMockRequest('POST', {
+            code,
+            language,
+            workflowId: 'workflow-1',
+            workspaceId: 'workspace-1',
+            executionId: 'execution-1',
+          })
+        )
+        const data = await response.json()
+
+        expect(response.status).toBe(200)
+        expect(executeSandbox).toHaveBeenCalledWith(expect.objectContaining({ meterUsage: true }))
+        expect(data.output.cost).toEqual(cost)
+      }
+    )
+
+    it.each([
+      {
+        language: 'javascript',
+        code: 'import "node:path"\nthrow new Error("boom")',
+        kind: 'code',
+      },
+      { language: 'python', code: 'raise ValueError("boom")', kind: 'code' },
+      { language: 'shell', code: 'exit 1', kind: 'shell' },
+    ])(
+      'preserves sandbox cost in a failed remote $language Function response',
+      async ({ language, code, kind }) => {
+        envFlagsMock.isRemoteSandboxEnabled = true
+        const cost = { input: 0, output: 0, total: 0.00012345 }
+        const executeSandbox = kind === 'shell' ? mockExecuteShellInSandbox : mockExecuteInSandbox
+        executeSandbox.mockResolvedValueOnce({
+          result: null,
+          stdout: 'boom',
+          error: 'boom',
+          sandboxId: `sandbox-${language}`,
+          cost,
+        })
+
+        const response = await POST(
+          createMockRequest('POST', {
+            code,
+            language,
+            workflowId: 'workflow-1',
+            workspaceId: 'workspace-1',
+            executionId: 'execution-1',
+          })
+        )
+        const data = await response.json()
+
+        expect(response.status).toBe(422)
+        expect(executeSandbox).toHaveBeenCalledWith(expect.objectContaining({ meterUsage: true }))
+        expect(data.output.cost).toEqual(cost)
+      }
+    )
+
+    it('does not meter a non-workflow remote Function call', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+
+      const response = await POST(
+        createMockRequest('POST', {
+          code: 'import path from "node:path"\nreturn path.sep',
+          language: 'javascript',
+        })
+      )
+
+      expect(response.status).toBe(200)
+      expect(mockExecuteInSandbox).toHaveBeenCalledWith(
+        expect.objectContaining({ meterUsage: false })
+      )
+    })
+
+    it('keeps a custom Function tool local even when workflow context is present', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+
+      const response = await POST(
+        createMockRequest('POST', {
+          code: 'return 42',
+          language: 'python',
+          workflowId: 'workflow-1',
+          workspaceId: 'workspace-1',
+          executionId: 'execution-1',
+          isCustomTool: true,
+        })
+      )
+
+      expect(response.status).toBe(200)
+      expect(mockExecuteInIsolatedVM).toHaveBeenCalledOnce()
+      expect(mockExecuteInSandbox).not.toHaveBeenCalled()
     })
 
     it('does not accept a Mothership sandbox profile from the request body', async () => {
@@ -375,6 +571,7 @@ describe('Function execution request', () => {
           expect.objectContaining({
             language,
             sandboxKind: 'mothership',
+            meterUsage: false,
           })
         )
         expect(mockExecuteInIsolatedVM).not.toHaveBeenCalled()
@@ -396,7 +593,7 @@ describe('Function execution request', () => {
 
       expect(response.status).toBe(200)
       expect(mockExecuteShellInSandbox).toHaveBeenCalledWith(
-        expect.objectContaining({ sandboxKind: 'mothership' })
+        expect.objectContaining({ sandboxKind: 'mothership', meterUsage: false })
       )
     })
 
@@ -576,23 +773,25 @@ describe('Function execution request', () => {
       expect(data.output.result).toBe('undefined')
     })
 
+    const proxyTarget = (url: string) => validateExternalUrl(url, 'url', 'proxy')
+
     it.concurrent('should block SSRF attacks through secure fetch wrapper', async () => {
-      expect(validateProxyUrl('http://169.254.169.254/latest/meta-data/').isValid).toBe(false)
-      expect(validateProxyUrl('http://127.0.0.1:8080/admin').isValid).toBe(true)
-      expect(validateProxyUrl('http://192.168.1.1/config').isValid).toBe(false)
-      expect(validateProxyUrl('http://10.0.0.1/internal').isValid).toBe(false)
+      expect(proxyTarget('http://169.254.169.254/latest/meta-data/').isValid).toBe(false)
+      expect(proxyTarget('http://127.0.0.1:8080/admin').isValid).toBe(false)
+      expect(proxyTarget('http://192.168.1.1/config').isValid).toBe(false)
+      expect(proxyTarget('http://10.0.0.1/internal').isValid).toBe(false)
     })
 
     it.concurrent('should allow legitimate external URLs', async () => {
-      expect(validateProxyUrl('https://api.github.com/user').isValid).toBe(true)
-      expect(validateProxyUrl('https://httpbin.org/get').isValid).toBe(true)
-      expect(validateProxyUrl('https://example.com/api').isValid).toBe(true)
+      expect(proxyTarget('https://api.github.com/user').isValid).toBe(true)
+      expect(proxyTarget('https://httpbin.org/get').isValid).toBe(true)
+      expect(proxyTarget('https://example.com/api').isValid).toBe(true)
     })
 
     it.concurrent('should block dangerous protocols', async () => {
-      expect(validateProxyUrl('file:///etc/passwd').isValid).toBe(false)
-      expect(validateProxyUrl('ftp://internal.server/files').isValid).toBe(false)
-      expect(validateProxyUrl('gopher://old.server/menu').isValid).toBe(false)
+      expect(proxyTarget('file:///etc/passwd').isValid).toBe(false)
+      expect(proxyTarget('ftp://internal.server/files').isValid).toBe(false)
+      expect(proxyTarget('gopher://old.server/menu').isValid).toBe(false)
     })
   })
 
@@ -697,6 +896,7 @@ describe('Function execution request', () => {
         result: 'done',
         stdout: 'ok',
         sandboxId: 'sandbox-123',
+        cost: { input: 0, output: 0, total: 0.00023456 },
         exportedFiles: {
           '/home/user/chart.png': 'iVBORw0KGgo=',
           '/home/user/summary.json': '{"ok":true}',
@@ -707,6 +907,8 @@ describe('Function execution request', () => {
         code: 'print("done")',
         language: 'python',
         workspaceId: 'workspace-1',
+        workflowId: 'workflow-1',
+        executionId: 'execution-1',
         outputs: {
           files: [
             {
@@ -753,6 +955,7 @@ describe('Function execution request', () => {
         })
       )
       expect(data.output.result.files).toHaveLength(2)
+      expect(data.output.cost).toEqual({ input: 0, output: 0, total: 0.00023456 })
       expect(data.resources).toEqual([
         expect.objectContaining({ path: 'files/reports/chart.png' }),
         expect.objectContaining({ path: 'files/reports/summary.json' }),
@@ -806,6 +1009,67 @@ describe('Function execution request', () => {
               {
                 name: 'API_KEY',
                 encryptedValue: 'encrypted:secret-value',
+                sourceUserId: 'user-123',
+                sourceWorkspaceId: 'workspace-1',
+              },
+            ],
+          },
+        })
+      )
+    })
+
+    it('excludes short compiled plaintext before JSON escaping even with a protected secret in scope', async () => {
+      const shortValue = '""""'
+      envFlagsMock.isRemoteSandboxEnabled = true
+      mockExecuteInSandbox.mockResolvedValueOnce({
+        result: 'done',
+        stdout: '',
+        sandboxId: 'sandbox-123',
+        exportedFiles: {
+          '/home/user/short.json': JSON.stringify({ value: shortValue }),
+          '/home/user/protected.txt': 'hunter22',
+        },
+      })
+
+      const response = await POST(
+        createMockRequest('POST', {
+          code: 'print({{SHORT_VALUE}}, {{API_KEY}})',
+          language: 'python',
+          workspaceId: 'workspace-1',
+          envVars: { SHORT_VALUE: shortValue, API_KEY: 'hunter22' },
+          outputs: {
+            files: [
+              {
+                path: 'files/short.json',
+                sandboxPath: '/home/user/short.json',
+                mimeType: 'application/json',
+              },
+              {
+                path: 'files/protected.txt',
+                sandboxPath: '/home/user/protected.txt',
+                mimeType: 'text/plain',
+              },
+            ],
+          },
+        })
+      )
+
+      expect(response.status).toBe(200)
+      expect(mockWriteWorkspaceFileByPath).toHaveBeenCalledWith(
+        expect.objectContaining({
+          target: expect.objectContaining({ path: 'files/short.json' }),
+          secretProvenance: { status: 'exact', entries: [] },
+        })
+      )
+      expect(mockWriteWorkspaceFileByPath).toHaveBeenCalledWith(
+        expect.objectContaining({
+          target: expect.objectContaining({ path: 'files/protected.txt' }),
+          secretProvenance: {
+            status: 'exact',
+            entries: [
+              {
+                name: 'API_KEY',
+                encryptedValue: 'encrypted:hunter22',
                 sourceUserId: 'user-123',
                 sourceWorkspaceId: 'workspace-1',
               },
@@ -1166,58 +1430,69 @@ describe('Function execution request', () => {
       )
     })
 
-    it('keeps a binary export unknown when a mounted input file carried a secret', async () => {
-      envFlagsMock.isRemoteSandboxEnabled = true
-      mockExecuteInSandbox.mockResolvedValueOnce({
-        result: 'done',
-        stdout: '',
-        sandboxId: 'sandbox-123',
-        exportedFiles: { '/home/user/small.jpg': '/9j/4AAQ' },
-      })
+    it.each([
+      { plaintext: 'mounted-secret', expectedStatus: 'unknown' },
+      { plaintext: 'false', expectedStatus: 'exact' },
+      { plaintext: '""""', expectedStatus: 'exact' },
+    ])(
+      'classifies binary exports $expectedStatus with mounted plaintext $plaintext',
+      async ({ plaintext, expectedStatus }) => {
+        mockDecryptSecret.mockResolvedValueOnce({ decrypted: plaintext })
+        envFlagsMock.isRemoteSandboxEnabled = true
+        mockExecuteInSandbox.mockResolvedValueOnce({
+          result: 'done',
+          stdout: '',
+          sandboxId: 'sandbox-123',
+          exportedFiles: { '/home/user/small.jpg': '/9j/4AAQ' },
+        })
 
-      const response = await POST(
-        createMockRequest(
-          'POST',
-          {
-            code: 'print("done")',
-            language: 'python',
-            workspaceId: 'workspace-1',
-            outputs: {
-              files: [
-                {
-                  path: 'files/small.jpg',
-                  sandboxPath: '/home/user/small.jpg',
-                  mimeType: 'image/jpeg',
-                },
-              ],
-            },
-            [PRIVATE_SECRET_PROVENANCE_FIELD]: {
-              version: 1,
-              complete: true,
-              selections: [
-                {
-                  key: MOUNTED_WORKSPACE_FILES_PROVENANCE_KEY,
-                  provenance: {
-                    version: 1,
-                    complete: true,
-                    entries: [{ encryptedValue: 'encrypted:mounted-secret' }],
-                    scope: { userId: 'user-123', workspaceId: 'workspace-1' },
+        const response = await POST(
+          createMockRequest(
+            'POST',
+            {
+              code: 'print("done")',
+              language: 'python',
+              workspaceId: 'workspace-1',
+              outputs: {
+                files: [
+                  {
+                    path: 'files/small.jpg',
+                    sandboxPath: '/home/user/small.jpg',
+                    mimeType: 'image/jpeg',
                   },
-                },
-              ],
+                ],
+              },
+              [PRIVATE_SECRET_PROVENANCE_FIELD]: {
+                version: 1,
+                complete: true,
+                selections: [
+                  {
+                    key: MOUNTED_WORKSPACE_FILES_PROVENANCE_KEY,
+                    provenance: {
+                      version: 1,
+                      complete: true,
+                      entries: [{ encryptedValue: 'encrypted:mounted-secret' }],
+                      scope: { userId: 'user-123', workspaceId: 'workspace-1' },
+                    },
+                  },
+                ],
+              },
             },
-          },
-          {
-            [PRIVATE_SECRET_PROVENANCE_HEADER]: PRIVATE_SECRET_PROVENANCE_BUNDLE_V1,
-          }
+            {
+              [PRIVATE_SECRET_PROVENANCE_HEADER]: PRIVATE_SECRET_PROVENANCE_BUNDLE_V1,
+            }
+          )
         )
-      )
 
-      expect(response.status).toBe(200)
-      expect(mockWriteWorkspaceFileByPath).toHaveBeenCalledWith(
-        expect.objectContaining({ secretProvenance: { status: 'unknown' } })
-      )
-    })
+        expect(response.status).toBe(200)
+        expect(mockWriteWorkspaceFileByPath).toHaveBeenCalledWith(
+          expect.objectContaining({
+            secretProvenance:
+              expectedStatus === 'exact' ? { status: 'exact', entries: [] } : { status: 'unknown' },
+          })
+        )
+      }
+    )
 
     it('marks binary exports unknown without failing the Function execution', async () => {
       envFlagsMock.isRemoteSandboxEnabled = true
@@ -1331,9 +1606,10 @@ describe('Function execution request', () => {
 
     it('preserves output-limit classification from provider-side size inspection', async () => {
       envFlagsMock.isRemoteSandboxEnabled = true
-      mockExecuteInSandbox.mockRejectedValueOnce(
-        new SandboxOutputLimitError(MAX_SANDBOX_OUTPUT_BYTES + 1)
-      )
+      const error = new SandboxOutputLimitError(MAX_SANDBOX_OUTPUT_BYTES + 1)
+      const cost = { input: 0, output: 0, total: 0.00023456 }
+      attachTrustedSandboxOutputCost(error, cost)
+      mockExecuteInSandbox.mockRejectedValueOnce(error)
 
       const req = createMockRequest('POST', {
         code: 'print("done")',
@@ -1354,6 +1630,7 @@ describe('Function execution request', () => {
 
       expect(response.status).toBe(400)
       expect(data.error).toBe(`Sandbox output files exceed ${MAX_SANDBOX_OUTPUT_BYTES} bytes total`)
+      expect(data.output.cost).toEqual(cost)
       expect(mockWriteWorkspaceFileByPath).not.toHaveBeenCalled()
     })
 
@@ -1375,8 +1652,33 @@ describe('Function execution request', () => {
 
       expect(response.status).toBe(400)
       expect(data.error).toContain('must reference a regular file')
+      expect(data.output.cost).toBeUndefined()
       expect(mockWriteWorkspaceFileByPath).not.toHaveBeenCalled()
     })
+
+    it.each(['/', '///', ' / '])(
+      'rejects malformed workspace output destination %j before sandbox execution',
+      async (path) => {
+        envFlagsMock.isRemoteSandboxEnabled = true
+
+        const response = await POST(
+          createMockRequest('POST', {
+            code: 'print("done")',
+            language: 'python',
+            workspaceId: 'workspace-1',
+            outputs: {
+              files: [{ path, sandboxPath: '/out/report.json' }],
+            },
+          })
+        )
+        const data = await response.json()
+
+        expect(response.status).toBe(400)
+        expect(data.error).toBe('Output path must include a file name')
+        expect(mockExecuteInSandbox).not.toHaveBeenCalled()
+        expect(mockExecuteShellInSandbox).not.toHaveBeenCalled()
+      }
+    )
 
     it('prevalidates all sandbox output destinations before writing any files', async () => {
       envFlagsMock.isRemoteSandboxEnabled = true
@@ -1384,6 +1686,7 @@ describe('Function execution request', () => {
         result: 'done',
         stdout: 'ok',
         sandboxId: 'sandbox-123',
+        cost: { input: 0, output: 0, total: 0.00023456 },
         exportedFiles: {
           '/home/user/first.json': '{"first":true}',
           '/home/user/second.json': '{"second":true}',
@@ -1397,6 +1700,8 @@ describe('Function execution request', () => {
         code: 'print("done")',
         language: 'python',
         workspaceId: 'workspace-1',
+        workflowId: 'workflow-1',
+        executionId: 'execution-1',
         outputs: {
           files: [
             {
@@ -1419,6 +1724,7 @@ describe('Function execution request', () => {
       expect(response.status).toBe(400)
       expect(data.success).toBe(false)
       expect(data.error).toContain('Directory not yet created')
+      expect(data.output.cost).toEqual({ input: 0, output: 0, total: 0.00023456 })
       expect(mockWriteWorkspaceFileByPath).not.toHaveBeenCalled()
     })
 
@@ -1500,7 +1806,7 @@ describe('Function execution request', () => {
       expect(mockWriteWorkspaceFileByPath).not.toHaveBeenCalled()
     })
 
-    it('rejects sandboxPath outputs when the call would run in isolated-vm (E2B enabled, JS without imports)', async () => {
+    it('routes plain JavaScript to the remote sandbox when it declares a sandboxPath output', async () => {
       envFlagsMock.isRemoteSandboxEnabled = true
 
       const req = createMockRequest('POST', {
@@ -1518,6 +1824,25 @@ describe('Function execution request', () => {
         },
       })
 
+      await POST(req)
+
+      // Needing a sandbox filesystem selects the remote runtime the same way a
+      // selected sandbox image does. Refusing here instead would dead-end the
+      // caller: "add an import" is not a fix anyone should have to discover.
+      expect(mockExecuteInSandbox).toHaveBeenCalled()
+      expect(mockExecuteInIsolatedVM).not.toHaveBeenCalled()
+    })
+
+    it('refuses sandbox file inputs/outputs when no remote sandbox is configured', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = false
+
+      const req = createMockRequest('POST', {
+        code: 'return "content"',
+        language: 'javascript',
+        workspaceId: 'workspace-1',
+        contextVariables: { doc: MOUNT_REF },
+      })
+
       const response = await POST(req)
       const data = await response.json()
 
@@ -1527,6 +1852,570 @@ describe('Function execution request', () => {
       expect(mockExecuteInIsolatedVM).not.toHaveBeenCalled()
       expect(mockExecuteInSandbox).not.toHaveBeenCalled()
       expect(mockWriteWorkspaceFileByPath).not.toHaveBeenCalled()
+    })
+
+    it('refuses sandbox file inputs/outputs for a custom tool, which always runs in isolated-vm', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+
+      const req = createMockRequest('POST', {
+        code: 'return "content"',
+        language: 'javascript',
+        workspaceId: 'workspace-1',
+        isCustomTool: true,
+        contextVariables: { doc: MOUNT_REF },
+      })
+
+      const response = await POST(req)
+      const data = await response.json()
+
+      expect(response.status).toBe(422)
+      expect(data.success).toBe(false)
+      expect(data.error).toContain('custom tools always run in the isolated JavaScript VM')
+      expect(mockExecuteInSandbox).not.toHaveBeenCalled()
+    })
+
+    it('reports a harvest the sandbox refused as a 400 carrying its reason', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+      mockExecuteInSandbox.mockRejectedValueOnce(
+        Object.assign(new Error('Sandbox produced 21 files in /tmp/sim/outputs'), {
+          code: 'sandbox_output_not_exportable',
+        })
+      )
+
+      const req = createMockRequest('POST', {
+        code: 'x',
+        language: 'python',
+        workspaceId: 'workspace-1',
+      })
+
+      const response = await POST(req)
+      const data = await response.json()
+
+      // Writing too many files is the caller's to fix, so it must not surface
+      // as an opaque 500 that hides the count and the remedy.
+      expect(response.status).toBe(400)
+      expect(data.error).toContain('21 files')
+    })
+
+    it.each([
+      { name: 'report.zip', secret: undefined, expectedStatus: 'exact' },
+      { name: 'report.zip', secret: 'super-secret-value', expectedStatus: 'unknown' },
+      { name: 'report.txt', secret: 'super-secret-value', expectedStatus: 'unknown' },
+    ])(
+      'preserves binary provenance for harvested $name with secret=$secret',
+      async ({ name, secret, expectedStatus }) => {
+        envFlagsMock.isRemoteSandboxEnabled = true
+        const zip = new JSZip()
+        zip.file('report.txt', secret ?? 'ordinary report')
+        const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' })
+        expect(buffer.includes('super-secret-value')).toBe(false)
+        mockExecuteInSandbox.mockResolvedValueOnce({
+          result: null,
+          stdout: '',
+          sandboxId: 'sbx',
+          collectedFiles: [
+            {
+              relativePath: name,
+              path: `/tmp/sim/outputs/${name}`,
+              contentBase64: buffer.toString('base64'),
+              byteLength: buffer.length,
+            },
+          ],
+        })
+
+        const response = await POST(
+          createMockRequest('POST', {
+            code: secret ? 'token = {{MY_SECRET}}' : 'x = 1',
+            language: 'python',
+            workspaceId: 'workspace-1',
+            workflowId: 'workflow-1',
+            executionId: 'execution-1',
+            ...(secret ? { envVars: { MY_SECRET: secret } } : {}),
+          })
+        )
+
+        expect(response.status).toBe(200)
+        expect(mockUploadExecutionFile).toHaveBeenCalledWith(
+          expect.any(Object),
+          buffer,
+          name,
+          expect.any(String),
+          'user-123',
+          expectedStatus === 'exact' ? { status: 'exact', entries: [] } : { status: 'unknown' }
+        )
+        const data = await response.json()
+        expect(data.output.files[0]).not.toHaveProperty('secretProvenance')
+      }
+    )
+
+    it('keeps text-looking bytes opaque when their declared format is an archive', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+      const buffer = Buffer.from('ASCII archive placeholder')
+      mockExecuteInSandbox.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        sandboxId: 'sbx',
+        collectedFiles: [
+          {
+            relativePath: 'report.zip',
+            path: '/tmp/sim/outputs/report.zip',
+            contentBase64: buffer.toString('base64'),
+            byteLength: buffer.length,
+          },
+        ],
+      })
+      const response = await POST(
+        createMockRequest('POST', {
+          code: 'token = {{MY_SECRET}}',
+          language: 'python',
+          workspaceId: 'workspace-1',
+          workflowId: 'workflow-1',
+          executionId: 'execution-1',
+          envVars: { MY_SECRET: 'super-secret-value' },
+        })
+      )
+      expect(response.status).toBe(200)
+      expect(mockUploadExecutionFile.mock.calls[0][5]).toEqual({ status: 'unknown' })
+    })
+
+    it('refuses an unknown tracked execution mount before running code', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+      const updatedAt = new Date('2026-01-01T00:00:00Z')
+      mockMountContributors.mockReturnValue([
+        {
+          fileId: 'execution-file-1',
+          key: 'execution/workspace-1/workflow-1/execution-1/a/input.zip',
+          context: 'execution',
+          contentUpdatedAt: updatedAt,
+        },
+      ])
+      dbChainMockFns.limit.mockResolvedValue([
+        {
+          fileContentUpdatedAt: updatedAt,
+          secretProvenanceVersion: 1,
+          provenanceContentUpdatedAt: updatedAt,
+          status: 'unknown',
+          entries: [],
+        },
+      ])
+
+      const response = await POST(
+        createMockRequest('POST', {
+          code: 'x = 1',
+          language: 'python',
+          workspaceId: 'workspace-1',
+          workflowId: 'workflow-1',
+          executionId: 'execution-1',
+        })
+      )
+      expect(response.status).toBe(400)
+      expect((await response.json()).error).toContain('File secret provenance is unavailable')
+      expect(mockExecuteInSandbox).not.toHaveBeenCalled()
+      expect(mockUploadExecutionFile).not.toHaveBeenCalled()
+    })
+
+    it('imports exact mount secrets into the trusted result registry and binary export classifier', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+      const updatedAt = new Date('2026-01-01T00:00:00Z')
+      const registry = new ResolvedSecretTraceRegistry([], {
+        userId: 'user-123',
+        workspaceId: 'workspace-1',
+      })
+      const completePending = registry.beginPendingActivation()
+      mockMountContributors.mockReturnValue([
+        {
+          fileId: 'execution-file-1',
+          key: 'execution/workspace-1/workflow-1/execution-1/a/input.txt',
+          context: 'execution',
+          contentUpdatedAt: updatedAt,
+        },
+      ])
+      dbChainMockFns.limit.mockResolvedValue([
+        {
+          fileContentUpdatedAt: updatedAt,
+          secretProvenanceVersion: 1,
+          provenanceContentUpdatedAt: updatedAt,
+          status: 'exact',
+          entries: [
+            {
+              name: 'API_KEY',
+              encryptedValue: 'encrypted:mounted-secret',
+              sourceUserId: 'user-123',
+              sourceWorkspaceId: 'workspace-1',
+            },
+          ],
+        },
+      ])
+      const zip = new JSZip()
+      zip.file('result.txt', 'mounted-secret')
+      const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' })
+      mockExecuteInSandbox.mockResolvedValueOnce({
+        result: 'mounted-secret',
+        stdout: '',
+        sandboxId: 'sbx',
+        collectedFiles: [
+          {
+            relativePath: 'result.zip',
+            path: '/tmp/sim/outputs/result.zip',
+            contentBase64: buffer.toString('base64'),
+            byteLength: buffer.length,
+          },
+        ],
+      })
+      const response = await POST(
+        createMockRequest('POST', {
+          code: 'x = 1',
+          language: 'python',
+          workspaceId: 'workspace-1',
+          workflowId: 'workflow-1',
+          executionId: 'execution-1',
+        }),
+        registry
+      )
+      completePending()
+      expect(response.status).toBe(200)
+      expect(registry.exportProvenance().entries).toEqual([
+        expect.objectContaining({ encryptedValue: 'encrypted:mounted-secret' }),
+      ])
+      expect(mockUploadExecutionFile.mock.calls[0][5]).toEqual({ status: 'unknown' })
+    })
+
+    it.each([
+      { input: 'contextVariables', archive: true, unredacted: false },
+      { input: 'params', archive: true, unredacted: false },
+      { input: 'contextVariables', archive: false, unredacted: false },
+      { input: 'contextVariables', archive: true, unredacted: true },
+    ] as const)(
+      'classifies secret-bearing $input with archive=$archive and unredacted=$unredacted',
+      async ({ input, archive, unredacted }) => {
+        envFlagsMock.isRemoteSandboxEnabled = true
+        const plaintext = 'table-input-secret-value'
+        const registry = new ResolvedSecretTraceRegistry(
+          [
+            {
+              name: 'API_KEY',
+              plaintext,
+              encryptedValue: plaintext,
+              scope: 'workspace',
+              ...(unredacted ? { unredacted: true as const } : {}),
+            },
+          ],
+          { userId: 'user-123', workspaceId: 'workspace-1' }
+        )
+        registry.recordResolvedAtInputPath('API_KEY', plaintext, [input, 'token'])
+        const zip = new JSZip()
+        zip.file('report.txt', plaintext)
+        const buffer = archive
+          ? await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' })
+          : Buffer.from(plaintext)
+        const name = archive ? 'report.zip' : 'report.txt'
+        mockExecuteInSandbox.mockResolvedValueOnce({
+          result: null,
+          stdout: '',
+          sandboxId: 'sbx',
+          collectedFiles: [
+            {
+              relativePath: name,
+              path: `/tmp/sim/outputs/${name}`,
+              contentBase64: buffer.toString('base64'),
+              byteLength: buffer.length,
+            },
+          ],
+        })
+
+        const response = await POST(
+          createMockRequest('POST', {
+            code: input === 'params' ? "x = params['token']" : 'x = token',
+            language: 'python',
+            workspaceId: 'workspace-1',
+            workflowId: 'workflow-1',
+            executionId: 'execution-1',
+            [input]: { token: plaintext },
+          }),
+          registry
+        )
+
+        expect(response.status).toBe(archive || unredacted ? 200 : 400)
+        if (archive) {
+          expect(mockUploadExecutionFile.mock.calls[0][5]).toEqual(
+            unredacted ? { status: 'exact', entries: [] } : { status: 'unknown' }
+          )
+        } else {
+          expect(mockUploadExecutionFile).not.toHaveBeenCalled()
+        }
+      }
+    )
+
+    it.each([
+      { reason: 'source-provenance-incomplete', status: 200 },
+      { reason: 'entry-decrypt-failed', status: 400 },
+    ] as const)(
+      'distinguishes historical absence from provenance faults: $reason',
+      async ({ reason, status }) => {
+        envFlagsMock.isRemoteSandboxEnabled = true
+        const registry = new ResolvedSecretTraceRegistry([], {
+          userId: 'user-123',
+          workspaceId: 'workspace-1',
+        })
+        registry.markIncomplete(reason)
+        const contentUpdatedAt = new Date('2026-01-01T00:00:00Z')
+        mockMountContributors.mockReturnValue([
+          {
+            fileId: 'legacy-file',
+            key: 'execution/workspace-1/workflow-1/execution-1/a/input.txt',
+            context: 'execution',
+            contentUpdatedAt,
+          },
+        ])
+        dbChainMockFns.limit.mockResolvedValue([
+          {
+            fileContentUpdatedAt: contentUpdatedAt,
+            secretProvenanceVersion: null,
+            provenanceContentUpdatedAt: null,
+            status: null,
+            entries: null,
+          },
+        ])
+        const buffer = Buffer.from('ordinary file')
+        mockExecuteInSandbox.mockResolvedValueOnce({
+          result: null,
+          stdout: '',
+          sandboxId: 'sbx',
+          collectedFiles: [
+            {
+              relativePath: 'report.zip',
+              path: '/tmp/sim/outputs/report.zip',
+              contentBase64: buffer.toString('base64'),
+              byteLength: buffer.length,
+            },
+          ],
+        })
+        const response = await POST(
+          createMockRequest('POST', {
+            code: 'x = 1',
+            language: 'python',
+            workspaceId: 'workspace-1',
+            workflowId: 'workflow-1',
+            executionId: 'execution-1',
+          }),
+          registry
+        )
+        expect(response.status).toBe(status)
+        if (status === 200)
+          expect(mockUploadExecutionFile.mock.calls[0][5]).toEqual({ status: 'unrecorded' })
+        else expect(mockUploadExecutionFile).not.toHaveBeenCalled()
+      }
+    )
+
+    it('does not taint a secret-free mounted file with unrelated secrets from an earlier block', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+      const updatedAt = new Date('2026-01-01T00:00:00Z')
+      const scope = { userId: 'user-123', workspaceId: 'workspace-1' }
+      const registry = new ResolvedSecretTraceRegistry([], scope)
+      await registry.importProvenance(
+        {
+          version: 1,
+          complete: true,
+          scope,
+          entries: [{ name: 'OTHER_SECRET', encryptedValue: 'unrelated-secret-value' }],
+        },
+        { trusted: true }
+      )
+      mockMountContributors.mockReturnValue([
+        {
+          fileId: 'execution-file-1',
+          key: 'execution/workspace-1/workflow-1/execution-1/a/input.txt',
+          context: 'execution',
+          contentUpdatedAt: updatedAt,
+        },
+      ])
+      dbChainMockFns.limit.mockResolvedValue([
+        {
+          fileContentUpdatedAt: updatedAt,
+          secretProvenanceVersion: 1,
+          provenanceContentUpdatedAt: updatedAt,
+          status: 'exact',
+          entries: [],
+        },
+      ])
+      const buffer = Buffer.from('archive without secret inputs')
+      mockExecuteInSandbox.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        sandboxId: 'sbx',
+        collectedFiles: [
+          {
+            relativePath: 'result.zip',
+            path: '/tmp/sim/outputs/result.zip',
+            contentBase64: buffer.toString('base64'),
+            byteLength: buffer.length,
+          },
+        ],
+      })
+      const response = await POST(
+        createMockRequest('POST', {
+          code: 'x = 1',
+          language: 'python',
+          workspaceId: 'workspace-1',
+          workflowId: 'workflow-1',
+          executionId: 'execution-1',
+        }),
+        registry
+      )
+      expect(response.status).toBe(200)
+      expect(mockUploadExecutionFile.mock.calls[0][5]).toEqual({ status: 'exact', entries: [] })
+    })
+
+    it('scans a harvested plaintext secret even under a binary file name', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+      mockExecuteInSandbox.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        sandboxId: 'sbx',
+        collectedFiles: [
+          {
+            path: '/tmp/sim/outputs/leak.png',
+            relativePath: 'leak.png',
+            // Valid UTF-8 carrying the resolved secret, named as an image.
+            contentBase64: Buffer.from('token=super-secret-value').toString('base64'),
+            byteLength: 24,
+          },
+        ],
+      })
+
+      const req = createMockRequest('POST', {
+        // The placeholder has to be in the code: compiling it is what puts the
+        // resolved value in scope for the output scan.
+        code: 'token = {{MY_SECRET}}',
+        language: 'python',
+        workspaceId: 'workspace-1',
+        workflowId: 'workflow-1',
+        executionId: 'execution-1',
+        envVars: { MY_SECRET: 'super-secret-value' },
+      })
+
+      const response = await POST(req)
+      const data = await response.json()
+
+      // Classifying by file name let a secret written as plaintext under a
+      // binary extension skip the only provenance guard and be returned with a
+      // downloadable URL. Content decides now, so the name cannot dodge it.
+      expect(response.status).toBe(400)
+      expect(data.error).toContain('leak.png')
+      expect(data.error).toContain('resolved secret')
+    })
+
+    it('scans a harvested secret even when one invalid byte makes it non-UTF-8', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+      mockExecuteInSandbox.mockResolvedValueOnce({
+        result: null,
+        stdout: '',
+        sandboxId: 'sbx',
+        collectedFiles: [
+          {
+            path: '/tmp/sim/outputs/mixed.bin',
+            relativePath: 'mixed.bin',
+            // Literal secret plus one invalid byte, so the buffer is not valid
+            // UTF-8 — which used to be enough to skip the scan entirely.
+            contentBase64: Buffer.concat([
+              Buffer.from('token=super-secret-value'),
+              Buffer.from([0xff]),
+            ]).toString('base64'),
+            byteLength: 25,
+          },
+        ],
+      })
+
+      const req = createMockRequest('POST', {
+        code: 'token = {{MY_SECRET}}',
+        language: 'python',
+        workspaceId: 'workspace-1',
+        workflowId: 'workflow-1',
+        executionId: 'execution-1',
+        envVars: { MY_SECRET: 'super-secret-value' },
+      })
+
+      const response = await POST(req)
+      const data = await response.json()
+
+      // A lossy UTF-8 decode keeps ASCII runs intact, so the literal is still
+      // there to find — appending a byte must not buy an exemption.
+      expect(response.status).toBe(400)
+      expect(data.error).toContain('mixed.bin')
+      expect(data.error).toContain('resolved secret')
+    })
+
+    it('mounts a <block.file.path> reference and hands the code its path', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+
+      const req = createMockRequest('POST', {
+        code: 'x',
+        language: 'python',
+        workspaceId: 'workspace-1',
+        workflowId: 'workflow-1',
+        executionId: 'execution-1',
+        contextVariables: { doc: MOUNT_REF },
+      })
+
+      await POST(req)
+
+      const call = mockExecuteInSandbox.mock.calls[0]?.[0]
+      expect(call.sandboxFiles).toEqual([
+        { type: 'url', path: '/tmp/sim/inputs/doc.pdf', url: 'https://presigned.example/object' },
+      ])
+      // The marker must not survive into the code's view of the variable — the
+      // whole point is that every language sees a plain path string.
+      const runtimePayload = call.privateInputs
+        .map((input: { content: string }) => input.content)
+        .find((content: string) => content.includes('contextVariables'))
+      expect(runtimePayload).toContain('/tmp/sim/inputs/doc.pdf')
+      expect(runtimePayload).not.toContain('__simSandboxFileMount')
+    })
+
+    it('harvests the output directory on every remote run, with no toggle', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+
+      const req = createMockRequest('POST', {
+        code: 'x',
+        language: 'python',
+        workspaceId: 'workspace-1',
+      })
+
+      await POST(req)
+
+      expect(mockExecuteInSandbox.mock.calls[0]?.[0].outputSandboxDir).toBe('/tmp/sim/outputs')
+    })
+
+    it('does not ask for an output directory on an isolate run', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+
+      const req = createMockRequest('POST', {
+        code: 'return 1',
+        language: 'javascript',
+        workspaceId: 'workspace-1',
+      })
+
+      await POST(req)
+
+      // Harvesting is free only because it rides an existing sandbox; an
+      // isolate run must not gain one just to look for files.
+      expect(mockExecuteInSandbox).not.toHaveBeenCalled()
+      expect(mockExecuteInIsolatedVM).toHaveBeenCalled()
+    })
+
+    it('leaves a plain JavaScript call with no file inputs or outputs in isolated-vm', async () => {
+      envFlagsMock.isRemoteSandboxEnabled = true
+
+      const req = createMockRequest('POST', {
+        code: 'return "content"',
+        language: 'javascript',
+        workspaceId: 'workspace-1',
+      })
+
+      await POST(req)
+
+      expect(mockExecuteInIsolatedVM).toHaveBeenCalled()
+      expect(mockExecuteInSandbox).not.toHaveBeenCalled()
     })
 
     it('rejects sandbox file mounts when the call would run in isolated-vm', async () => {
@@ -1725,6 +2614,7 @@ describe('Function execution request', () => {
         result: null,
         stdout: 'generated 1 preview',
         sandboxId: 'sandbox-123',
+        cost: { input: 0, output: 0, total: 0.00034567 },
         exportedFiles: { '/tmp/fellows-previews.zip': archiveBase64 },
       })
 
@@ -1733,6 +2623,8 @@ describe('Function execution request', () => {
           code: source,
           language: 'python',
           workspaceId: 'workspace-1',
+          workflowId: 'workflow-1',
+          executionId: 'execution-1',
           sandboxId: 'fellows-sandbox',
           envVars: {
             AIRTABLE_PAT: 'stub-airtable-token',
@@ -1754,6 +2646,9 @@ describe('Function execution request', () => {
       )
 
       expect(response.status).toBe(200)
+      await expect(response.clone().json()).resolves.toMatchObject({
+        output: { cost: { input: 0, output: 0, total: 0.00034567 } },
+      })
       const sandboxRequest = mockExecuteInSandbox.mock.calls[0][0]
       expect(sandboxRequest.code).toContain("['bq', 'query'")
       expect(sandboxRequest.code).toContain('__sim_exec_globals__["__name__"] = "__main__"')
@@ -2057,6 +2952,112 @@ describe('Function execution request', () => {
       expect(response.status).toBe(200)
       expect(data.success).toBe(true)
       expect(options?.brokers).toHaveProperty('sim.values.readArray')
+    })
+
+    it.each([
+      { status: 'exact', version: 1, secret: true, safe: false },
+      { status: 'unknown', version: 1, secret: false, safe: false },
+      { status: 'exact', version: 1, secret: false, safe: true },
+      { status: null, version: null, secret: false, safe: true },
+    ])(
+      'applies rendered asset policy at Function admission while retaining legacy compatibility: %j',
+      async ({ status, version, secret, safe }) => {
+        const contentUpdatedAt = new Date('2026-01-01T00:00:00Z')
+        const identity = {
+          fileId: 'image-1',
+          key: 'workspace/workspace-1/image.png',
+          context: 'workspace' as const,
+          contentUpdatedAt,
+        }
+        const materialized = {
+          content: '<img src="data:image/png;base64,c2VjcmV0">',
+          contributingFiles: [identity],
+          renderedContributingFiles: [identity],
+        }
+        const read = vi
+          .spyOn(fileMaterialization, 'readUserFileContentWithContributors')
+          .mockResolvedValue(materialized)
+        dbChainMockFns.limit.mockResolvedValue([
+          {
+            fileContentUpdatedAt: contentUpdatedAt,
+            provenanceContentUpdatedAt: contentUpdatedAt,
+            secretProvenanceVersion: version,
+            status,
+            entries: secret
+              ? [{ name: 'TOKEN', encryptedValue: 'ciphertext', sourceUserId: 'user-1' }]
+              : [],
+          },
+        ])
+        mockExecuteInIsolatedVM.mockImplementationOnce(async (_input, options) => ({
+          result: await options.brokers['sim.files.readText']({ file: MOUNT_REF.file }),
+          stdout: '',
+        }))
+        const request = {
+          code: 'return 1',
+          language: 'javascript',
+          workspaceId: 'workspace-1',
+          workflowId: 'workflow-1',
+          executionId: 'execution-1',
+        }
+        try {
+          const brokerResponse = await POST(createMockRequest('POST', request))
+          const brokerBody = await brokerResponse.json()
+          expect(brokerBody.success).toBe(safe)
+          if (!safe) expect(JSON.stringify(brokerBody)).not.toContain(materialized.content)
+
+          mockMountContributors.mockReturnValue([identity])
+          mockRenderedMountContributors.mockReturnValue([identity])
+          const mountResponse = await POST(createMockRequest('POST', request))
+          expect(mountResponse.status).toBe(safe ? 200 : 400)
+          expect((await mountResponse.json()).success).toBe(safe)
+        } finally {
+          read.mockRestore()
+        }
+      }
+    )
+
+    it('refuses unknown execution provenance returned by the runtime file broker', async () => {
+      const contentUpdatedAt = new Date('2026-01-01T00:00:00Z')
+      vi.spyOn(fileMaterialization, 'readUserFileContentWithContributors').mockResolvedValueOnce({
+        content: 'private file content',
+        contributingFiles: [
+          {
+            fileId: 'execution-file-1',
+            key: 'execution/workspace-1/workflow-1/execution-1/a/input.txt',
+            context: 'execution',
+            contentUpdatedAt,
+          },
+        ],
+      })
+      dbChainMockFns.limit.mockResolvedValue([
+        {
+          fileContentUpdatedAt: contentUpdatedAt,
+          secretProvenanceVersion: 1,
+          provenanceContentUpdatedAt: contentUpdatedAt,
+          status: 'unknown',
+          entries: [],
+        },
+      ])
+      mockExecuteInIsolatedVM.mockImplementationOnce(async (_input, options) => ({
+        result: await options.brokers['sim.files.readText']({ file: MOUNT_REF.file }),
+        stdout: '',
+      }))
+
+      const response = await POST(
+        createMockRequest('POST', {
+          code: 'return 1',
+          language: 'javascript',
+          workspaceId: 'workspace-1',
+          workflowId: 'workflow-1',
+          executionId: 'execution-1',
+        })
+      )
+
+      expect(response.status).toBe(500)
+      const data = await response.json()
+      expect(data.success).toBe(false)
+      expect(data.error).toContain('File secret provenance is unavailable')
+      expect(JSON.stringify(data)).not.toContain('private file content')
     })
   })
 

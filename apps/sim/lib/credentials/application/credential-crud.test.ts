@@ -1,7 +1,12 @@
 /**
  * @vitest-environment node
  */
-import { auditMock, auditMockFns } from '@sim/testing'
+import {
+  auditMock,
+  auditMockFns,
+  permissionGroupScopeMock,
+  permissionGroupScopeMockFns,
+} from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -11,7 +16,12 @@ const mocks = vi.hoisted(() => ({
   getCredentialById: vi.fn(),
   getActor: vi.fn(),
   updateRecord: vi.fn(),
+  createRecord: vi.fn(),
+  personalAccounts: vi.fn(),
+  createPersonalToken: vi.fn(),
 }))
+
+const resolveGroupConfigMock = permissionGroupScopeMockFns.mockResolvePermissionGroupConfig
 
 vi.mock('@sim/audit', () => auditMock)
 vi.mock('@/lib/workspaces/application/workspace-context', () => ({
@@ -29,20 +39,38 @@ vi.mock('@/lib/credentials/queries', () => ({
 vi.mock('@/lib/credentials/access', () => ({
   getCredentialActorContext: mocks.getActor,
   canUseCredential: () => true,
+  requireOrdinaryCredentialType: (type: string) => type,
 }))
 vi.mock('@/lib/credentials/orchestration', () => ({
   updateCredentialRecord: mocks.updateRecord,
-  createCredentialRecord: vi.fn(),
+  createCredentialRecord: mocks.createRecord,
   isProviderOutageCode: () => false,
 }))
+vi.mock('@/lib/credentials/application/workspace-personal-accounts', () => ({
+  requireWorkspacePersonalAccounts: mocks.personalAccounts,
+}))
+vi.mock('@/lib/credentials/personal-tokens', () => ({
+  createPersonalTokenCredential: mocks.createPersonalToken,
+  updatePersonalTokenCredential: vi.fn(),
+}))
+vi.mock('@/lib/core/config/block-visibility', () => ({ getBlockVisibility: vi.fn() }))
+vi.mock('@/lib/integrations/principal-scope.server', () => ({ allowedIntegrationTypes: vi.fn() }))
+vi.mock('@/lib/integrations/credential-visibility.server', () => ({
+  createIntegrationCredentialVisibility: () => ({ isCredentialVisible: () => true }),
+}))
+vi.mock('@/lib/permission-groups/config-scope.server', () => permissionGroupScopeMock)
 vi.mock('@/lib/credentials/oauth', () => ({ syncWorkspaceOAuthCredentialsForUser: vi.fn() }))
 vi.mock('@/lib/posthog/server', () => ({ captureServerEvent: vi.fn() }))
 vi.mock('@/lib/workspaces/permissions/utils', () => ({ checkWorkspaceAccess: vi.fn() }))
 
+import { PermissionGroupCapabilityError } from '@/lib/core/application'
 import {
   CredentialProviderOperationError,
+  createWorkspaceCredential,
   updateWorkspaceCredentialUseCase,
 } from '@/lib/credentials/application/credential-crud'
+import { credentialOperations } from '@/lib/credentials/application/operations'
+import { DEFAULT_PERMISSION_GROUP_CONFIG } from '@/lib/permission-groups/fields'
 
 const WORKSPACE_ID = 'workspace-1'
 const OTHER_WORKSPACE_ID = 'workspace-2'
@@ -297,5 +325,156 @@ describe('updateWorkspaceCredentialUseCase', () => {
 
     expect(error.providerUnavailable).toBe(true)
     expect(error.code).toBe('validation')
+  })
+})
+
+describe('personal-credential capability', () => {
+  const ORGANIZATION_ID = 'organization-1'
+  const governedWorkspace = { ...workspace, workspaceOrganizationId: ORGANIZATION_ID }
+
+  function createdCredential(type: 'env_personal' | 'env_workspace') {
+    return { ...credential, type, envKey: 'OPENAI_API_KEY', encryptedServiceAccountKey: null }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.loadWorkspace.mockResolvedValue(governedWorkspace)
+    mocks.resolvePermission.mockResolvedValue('admin')
+    resolveGroupConfigMock.mockResolvedValue({
+      ...DEFAULT_PERMISSION_GROUP_CONFIG,
+      disablePersonalCredentials: true,
+    })
+  })
+
+  /**
+   * A connection operation takes a target, not a scope: the same operation
+   * connects an account and re-authorizes a workspace-shared credential.
+   * `credentials.personal` belongs to the first branch only and is asserted
+   * there; the operation carries the capability that governs both. Pinned
+   * because declaring the narrower one here compiles just as well, and it
+   * refused the shared credentials that setting exists to mandate.
+   */
+  it.each(['createConnection', 'prepareConnection', 'launchConnection'] as const)(
+    'declares the capability on %s that governs both of its targets',
+    (operationName) => {
+      expect(credentialOperations[operationName].capability).toBe('integrations.manage')
+    }
+  )
+
+  it('refuses a personal environment secret before it reaches the manager', async () => {
+    await expect(
+      createWorkspaceCredential.execute({
+        principal: sessionPrincipal,
+        input: {
+          workspaceId: WORKSPACE_ID,
+          type: 'env_personal',
+          displayName: 'My OpenAI key',
+          envKey: 'OPENAI_API_KEY',
+        },
+      })
+    ).rejects.toBeInstanceOf(PermissionGroupCapabilityError)
+
+    expect(mocks.createRecord).not.toHaveBeenCalled()
+  })
+
+  /**
+   * Scope is the request's `type`, so the same operation must still serve the
+   * workspace-shared secret the organization is steering members toward.
+   */
+  it('still creates a workspace-shared secret under the same restriction', async () => {
+    const created = createdCredential('env_workspace')
+    mocks.createRecord.mockResolvedValue({ success: true, created: true, credential: created })
+    mocks.getActor.mockResolvedValue({
+      credential: created,
+      member: { role: 'admin', status: 'active' },
+      hasWorkspaceAccess: true,
+      isAdmin: true,
+    })
+
+    const result = await createWorkspaceCredential.execute({
+      principal: sessionPrincipal,
+      input: {
+        workspaceId: WORKSPACE_ID,
+        type: 'env_workspace',
+        displayName: 'Shared OpenAI key',
+        envKey: 'OPENAI_API_KEY',
+      },
+    })
+
+    expect(result.credential).toEqual(created)
+  })
+
+  it('creates the personal secret when no group withholds it', async () => {
+    resolveGroupConfigMock.mockResolvedValue(null)
+    const created = createdCredential('env_personal')
+    mocks.createRecord.mockResolvedValue({ success: true, created: true, credential: created })
+    mocks.getActor.mockResolvedValue({
+      credential: created,
+      member: { role: 'admin', status: 'active' },
+      hasWorkspaceAccess: true,
+      isAdmin: true,
+    })
+
+    const result = await createWorkspaceCredential.execute({
+      principal: sessionPrincipal,
+      input: {
+        workspaceId: WORKSPACE_ID,
+        type: 'env_personal',
+        displayName: 'My OpenAI key',
+        envKey: 'OPENAI_API_KEY',
+      },
+    })
+
+    expect(result.credential).toEqual(created)
+  })
+})
+
+describe('personal-token organization enrollment', () => {
+  const accounts = { organizationId: 'organization', credentialGroupId: 'organization-group' }
+  const tokenInput = {
+    workspaceId: WORKSPACE_ID,
+    type: 'personal_token' as const,
+    providerId: 'gitlab',
+    displayName: 'My GitLab',
+    apiToken: 'personal-token',
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resolveGroupConfigMock.mockResolvedValue(null)
+    mocks.loadWorkspace.mockResolvedValue({ ...workspace, workspaceOrganizationId: 'organization' })
+    mocks.resolvePermission.mockResolvedValue('write')
+    mocks.personalAccounts.mockResolvedValue(accounts)
+  })
+
+  it('passes the authorized organization group into token creation', async () => {
+    const created = { ...credential, type: 'personal_token', providerId: 'gitlab' }
+    mocks.createPersonalToken.mockResolvedValue({
+      success: true,
+      created: true,
+      credential: created,
+    })
+    mocks.getActor.mockResolvedValue({ credential: created, isAdmin: true })
+    await createWorkspaceCredential.execute({ principal: sessionPrincipal, input: tokenInput })
+    expect(mocks.personalAccounts).toHaveBeenCalledWith(
+      sessionPrincipal,
+      expect.objectContaining({ workspaceOrganizationId: 'organization' })
+    )
+    expect(mocks.createPersonalToken).toHaveBeenCalledWith({
+      ...tokenInput,
+      userId: 'user-1',
+      accounts,
+    })
+    expect(mocks.createRecord).not.toHaveBeenCalled()
+  })
+
+  it('refuses unapproved organization access before verifying or storing a token', async () => {
+    mocks.personalAccounts.mockRejectedValueOnce(new Error('Organization accounts unavailable'))
+    await expect(
+      createWorkspaceCredential.execute({ principal: sessionPrincipal, input: tokenInput })
+    ).rejects.toThrow('Organization accounts unavailable')
+    expect(mocks.createPersonalToken).not.toHaveBeenCalled()
+    expect(mocks.createRecord).not.toHaveBeenCalled()
+    expect(auditMockFns.mockRecordAudit).not.toHaveBeenCalled()
   })
 })

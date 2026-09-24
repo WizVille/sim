@@ -25,25 +25,31 @@ export const CURRENT_BROWSER_TOOL_NAMES = [
   'browser_open_url',
   'browser_go_back',
   'browser_go_forward',
+  'browser_reload',
   'browser_open_tab',
   'browser_switch_tab',
   'browser_close_tab',
   'browser_list_tabs',
   'browser_list_sessions',
+  'browser_list_downloads',
   'browser_wait_for',
   'browser_snapshot',
+  'browser_find',
   'browser_read_text',
   'browser_screenshot',
   'browser_extract',
   'browser_click',
   'browser_click_at',
   'browser_type',
+  'browser_fill_form',
   'browser_insert_text',
   'browser_press_key',
   'browser_scroll',
   'browser_select_option',
+  'browser_set_checked',
   'browser_hover',
   'browser_drag',
+  'browser_zoom',
 ] as const
 
 export type CurrentBrowserToolName = (typeof CURRENT_BROWSER_TOOL_NAMES)[number]
@@ -60,6 +66,15 @@ export type BrowserToolName = (typeof BROWSER_TOOL_NAMES)[number]
 export const BROWSER_WAIT_FOR_DEFAULT_TIMEOUT_MS = 10_000
 export const BROWSER_WAIT_FOR_MAX_TIMEOUT_MS = 120_000
 export const BROWSER_WAIT_FOR_RENDERER_GRACE_MS = 15_000
+export const BROWSER_TOOL_AUTHORIZATION_TIMEOUT_MS = 8_000
+export const BROWSER_NAVIGATION_NATIVE_WATCHDOG_MS = 60_000
+export const BROWSER_TOOL_QUEUE_WAIT_TIMEOUT_MS = BROWSER_NAVIGATION_NATIVE_WATCHDOG_MS
+const BROWSER_RENDERER_TRANSPORT_GRACE_MS = 2_000
+export const BROWSER_NAVIGATION_RENDERER_TIMEOUT_MS =
+  BROWSER_TOOL_AUTHORIZATION_TIMEOUT_MS +
+  BROWSER_TOOL_QUEUE_WAIT_TIMEOUT_MS +
+  BROWSER_NAVIGATION_NATIVE_WATCHDOG_MS +
+  BROWSER_RENDERER_TRANSPORT_GRACE_MS
 
 /**
  * Normalizes the model-visible `browser_wait_for.timeoutMs` consistently in
@@ -74,6 +89,31 @@ export function normalizeBrowserWaitForTimeoutMs(value: unknown): number {
         : Number.NaN
   if (!Number.isFinite(parsed) || parsed <= 0) return BROWSER_WAIT_FOR_DEFAULT_TIMEOUT_MS
   return Math.min(parsed, BROWSER_WAIT_FOR_MAX_TIMEOUT_MS)
+}
+
+/** Client execution budget, including authorization, native queueing, and result delivery. */
+export function browserToolRendererTimeoutMs(
+  tool: CurrentBrowserToolName,
+  params: Record<string, unknown> = {}
+): number {
+  switch (tool) {
+    case 'browser_navigate':
+    case 'browser_open_url':
+    case 'browser_go_back':
+    case 'browser_go_forward':
+    case 'browser_reload':
+    case 'browser_open_tab':
+    case 'browser_switch_tab':
+      return BROWSER_NAVIGATION_RENDERER_TIMEOUT_MS
+    case 'browser_wait_for':
+      return (
+        BROWSER_TOOL_QUEUE_WAIT_TIMEOUT_MS +
+        normalizeBrowserWaitForTimeoutMs(params.timeoutMs) +
+        BROWSER_WAIT_FOR_RENDERER_GRACE_MS
+      )
+    default:
+      return BROWSER_TOOL_QUEUE_WAIT_TIMEOUT_MS + 30_000
+  }
 }
 
 export const BROWSER_THEMES = ['system', 'light', 'dark'] as const
@@ -175,10 +215,11 @@ export interface BrowserPanelSnapshot {
 
 /**
  * Browser-chrome commands from the panel header (URL bar, back/forward,
- * reload) plus the legacy `takeover-done` action retained for persisted
- * `browser_request_takeover` cards. Page interactions need no protocol — the
- * user acts on the real embedded page directly, and its right-click menu is
- * native and lives entirely in the shell.
+ * reload), the resource tab strip (`switch-tab`, `close-tab`), plus the legacy
+ * `takeover-done` action retained for persisted `browser_request_takeover`
+ * cards. Page interactions need no protocol — the user acts on the real
+ * embedded page directly, and its right-click menu is native and lives
+ * entirely in the shell.
  */
 export interface BrowserPanelAction {
   action:
@@ -186,8 +227,8 @@ export interface BrowserPanelAction {
     | 'reload'
     | 'back'
     | 'forward'
+    /** Fallback for installed shells that predate the acknowledged `openTab` bridge call. */
     | 'new-tab'
-    | 'duplicate-tab'
     | 'switch-tab'
     | 'close-tab'
     | 'print'
@@ -195,16 +236,24 @@ export interface BrowserPanelAction {
     | 'zoom-out'
     | 'zoom-reset'
     | 'respond-media-permission'
+    /** Compatibility response for installed shells with the retired navigation gate. */
+    | 'respond-site-permission'
     | 'takeover-done'
   /** Absolute URL for `navigate` (typed into the panel's URL bar). */
   url?: string
-  /** Stable tab id for `duplicate-tab`, `switch-tab`, and `close-tab`. */
+  /** Stable tab id for `switch-tab` and `close-tab`. */
   tabId?: string
+  /**
+   * `switch-tab` only: false when the switch mirrors a selection made outside
+   * the page (the resource strip), so it must not count as the user claiming
+   * the page from the agent. Older shells treat every switch as a claim.
+   */
+  claim?: boolean
   /** Optional free-text instruction submitted with `takeover-done`. */
   takeoverResponse?: string
-  /** Exact pending media request being answered. */
+  /** Exact pending permission request being answered. */
   requestId?: string
-  /** User decision for `respond-media-permission`. */
+  /** User decision for a permission response. */
   allowed?: boolean
 }
 
@@ -215,6 +264,15 @@ export interface BrowserMediaPermissionRequest {
   requestId: string
   origin: string
   devices: BrowserMediaDevice[]
+}
+
+/** Legacy navigation request emitted only by installed shells with per-task site consent. */
+export interface BrowserSitePermissionRequest {
+  requestId: string
+  /** Exact tab whose suspended request will be resumed or cancelled. */
+  tabId: string
+  /** Destination origin only; credentials, paths, query strings, and fragments are excluded. */
+  origin: string
 }
 
 /** Live state of the active page, pushed to the panel header. */
@@ -231,6 +289,8 @@ export interface BrowserPageState {
   issue?: BrowserPageIssue
   /** Main-frame media request awaiting a renderer-owned permission prompt. */
   mediaPermissionRequest?: BrowserMediaPermissionRequest
+  /** Legacy request from installed shells that still require a site-origin prompt. */
+  sitePermissionRequest?: BrowserSitePermissionRequest
 }
 
 /** A recoverable top-level page problem rendered by Sim instead of a blank native view. */
@@ -299,8 +359,6 @@ export interface BrowserTabState {
   active: boolean
   /** Recoverable problem currently replacing this tab's native page surface. */
   issue?: BrowserPageIssue
-  /** Pinned tabs are ordered before regular tabs and cannot be closed. */
-  pinned: boolean
 }
 
 /** Complete live tab list pushed by the desktop shell. */

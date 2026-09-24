@@ -3,6 +3,7 @@ import { createLogger } from '@sim/logger'
 import { sha256Hex } from '@sim/security/hash'
 import { DocCompileUserError } from '@/lib/copilot/tools/server/files/doc-compile-error'
 import {
+  type CompiledDocReadOptions,
   loadCompiledDoc,
   loadPublishedCompiledDoc,
   publishCompiledDocArtifact,
@@ -146,6 +147,29 @@ export interface CompiledDocResult {
   buffer: Buffer
   contentType: string
   contributingFiles?: readonly WorkspaceFileSecretProvenanceIdentity[]
+  /**
+   * The artifact was resolved against OTHER files' current content, so these bytes are not a
+   * function of this file's stored source alone: the same storage key compiles to different bytes
+   * once a referenced file changes, with nothing about this file changing. A caller that assigns
+   * the response a cache lifetime must not promise immutability for it.
+   *
+   * Required, so a compile path added or changed later cannot omit it and silently inherit a
+   * cacheable-forever answer — which is exactly what the isolated-VM fallback did while this was
+   * optional, despite reading workspace files live through its broker.
+   */
+  dependsOnReferencedFiles: boolean
+}
+
+/**
+ * Whether a compile result must be treated as resolved against other files.
+ *
+ * The union of what the source ASKS for and what the compile actually TOUCHED. Neither alone is
+ * sufficient: a statically detectable reference whose read failed records no access, and the
+ * isolated-VM broker reaches files the static scan cannot see. Either one means these bytes can
+ * change while this file's own stored source does not.
+ */
+function touchesReferencedFiles(source: string, accessedCount: number): boolean {
+  return accessedCount > 0 || collectReferencedFileIds(source).size > 0
 }
 
 function referencedImageIdentities(
@@ -566,6 +590,7 @@ async function buildCompiledDoc(
   return {
     buffer,
     contentType: fmt.contentType,
+    dependsOnReferencedFiles: touchesReferencedFiles(args.source, contributingFiles.length),
     ...(contributingFiles.length > 0 ? { contributingFiles } : {}),
   }
 }
@@ -656,6 +681,10 @@ async function compileDocInLegacySandbox(
     return {
       buffer: cached.buffer,
       contentType: fmt.contentType,
+      dependsOnReferencedFiles: touchesReferencedFiles(
+        args.source,
+        cached.contributingFiles?.length ?? 0
+      ),
       ...(cached.contributingFiles && cached.contributingFiles.length > 0
         ? { contributingFiles: cached.contributingFiles }
         : {}),
@@ -678,6 +707,7 @@ async function compileDocInLegacySandbox(
   return {
     buffer,
     contentType: fmt.contentType,
+    dependsOnReferencedFiles: touchesReferencedFiles(args.source, contributingFiles.size),
     ...(contributingFiles.size > 0 ? { contributingFiles: [...contributingFiles.values()] } : {}),
   }
 }
@@ -721,6 +751,7 @@ export async function compileDoc(args: CompileArgs): Promise<CompiledDocResult> 
     return {
       buffer: existing,
       contentType: fmt.contentType,
+      dependsOnReferencedFiles: touchesReferencedFiles(source, contributingFiles.length),
       ...(contributingFiles.length > 0 ? { contributingFiles } : {}),
     }
   }
@@ -736,7 +767,7 @@ export async function loadCompiledDocByExt(
   workspaceId: string,
   source: string,
   ext: string,
-  options: {
+  options: CompiledDocReadOptions & {
     allowLegacyReferencedArtifact?: boolean
     allowPublishedReferencedArtifact?: boolean
     filePrincipal?: Principal
@@ -744,18 +775,24 @@ export async function loadCompiledDocByExt(
 ): Promise<{ buffer: Buffer; contentType: string } | null> {
   const fmt = await getE2BDocFormat(`x.${ext}`)
   if (!fmt) return null
+  const readOptions: CompiledDocReadOptions = { maxBytes: options.maxBytes, signal: options.signal }
   const referencedFileIds = collectReferencedFileIds(source)
   if (!options.filePrincipal) {
     if (referencedFileIds.size === 0) {
-      const buffer = await loadCompiledDoc(workspaceId, source, fmt.ext)
+      const buffer = await loadCompiledDoc(workspaceId, source, fmt.ext, undefined, readOptions)
       return buffer ? { buffer, contentType: fmt.contentType } : null
     }
     if (options.allowPublishedReferencedArtifact) {
-      const publishedBuffer = await loadPublishedCompiledDoc(workspaceId, source, fmt.ext)
+      const publishedBuffer = await loadPublishedCompiledDoc(
+        workspaceId,
+        source,
+        fmt.ext,
+        readOptions
+      )
       if (publishedBuffer) return { buffer: publishedBuffer, contentType: fmt.contentType }
     }
     if (!options.allowLegacyReferencedArtifact) return null
-    const legacyBuffer = await loadCompiledDoc(workspaceId, source, fmt.ext)
+    const legacyBuffer = await loadCompiledDoc(workspaceId, source, fmt.ext, undefined, readOptions)
     return legacyBuffer ? { buffer: legacyBuffer, contentType: fmt.contentType } : null
   }
   const referencedImages = await resolveReferencedImages(
@@ -768,11 +805,12 @@ export async function loadCompiledDocByExt(
     workspaceId,
     source,
     fmt.ext,
-    referencedImages.artifactIdentity
+    referencedImages.artifactIdentity,
+    readOptions
   )
   if (buffer) return { buffer, contentType: fmt.contentType }
   if (referencedImages.artifactIdentity && options.allowLegacyReferencedArtifact) {
-    const legacyBuffer = await loadCompiledDoc(workspaceId, source, fmt.ext)
+    const legacyBuffer = await loadCompiledDoc(workspaceId, source, fmt.ext, undefined, readOptions)
     if (legacyBuffer) return { buffer: legacyBuffer, contentType: fmt.contentType }
   }
   return null
@@ -799,7 +837,8 @@ export type ServableDoc =
 export async function resolveServableDoc(
   workspaceId: string,
   storedBytes: Buffer,
-  fileName: string
+  fileName: string,
+  options: CompiledDocReadOptions = {}
 ): Promise<ServableDoc> {
   const fmt = await getE2BDocFormat(fileName)
   if (!fmt) return { kind: 'passthrough' }
@@ -810,7 +849,7 @@ export async function resolveServableDoc(
       workspaceId,
       storedBytes.toString('utf-8'),
       fmt.ext,
-      { allowLegacyReferencedArtifact: true, allowPublishedReferencedArtifact: true }
+      { ...options, allowLegacyReferencedArtifact: true, allowPublishedReferencedArtifact: true }
     )
     return artifact ? { kind: 'artifact', ...artifact } : { kind: 'unavailable' }
   } catch (error) {
@@ -882,11 +921,19 @@ export async function resolveServableDocBytes(args: {
   // explicitly alongside the table-driven formats.
   const magic = format?.magic ?? (extNoDot === 'xlsx' ? ZIP_MAGIC : undefined)
   if (magic && bufferStartsWith(rawBuffer, magic)) {
-    return { buffer: rawBuffer, contentType: getContentType(fileName) }
+    return {
+      buffer: rawBuffer,
+      contentType: getContentType(fileName),
+      dependsOnReferencedFiles: false,
+    }
   }
 
   if (!format && extNoDot !== 'xlsx') {
-    return { buffer: rawBuffer, contentType: getContentType(fileName) }
+    return {
+      buffer: rawBuffer,
+      contentType: getContentType(fileName),
+      dependsOnReferencedFiles: false,
+    }
   }
 
   const source = rawBuffer.toString('utf-8')
@@ -903,7 +950,7 @@ export async function resolveServableDocBytes(args: {
         const published = await loadCompiledDocByExt(workspaceId, source, extNoDot, {
           allowPublishedReferencedArtifact: true,
         })
-        if (published) return published
+        if (published) return { ...published, dependsOnReferencedFiles: true }
         throw new Error(
           'Referenced document resolution requires an authorized workspace file principal'
         )
@@ -914,7 +961,9 @@ export async function resolveServableDocBytes(args: {
       allowLegacyReferencedArtifact: true,
       filePrincipal,
     })
-    if (stored) return stored
+    // Reached only where the source references nothing, so the artifact is keyed by the source
+    // alone and cannot change while that source does not.
+    if (stored) return { ...stored, dependsOnReferencedFiles: false }
     throw new DocCompileUserError('Document is still being generated', { pending: true })
   }
 
@@ -928,6 +977,12 @@ export async function resolveServableDocBytes(args: {
     return {
       buffer: cached.buffer,
       contentType: format.contentType,
+      // The process-local cache is shared with compiles that DID carry a workspace, so a cached
+      // entry can hold contributor identities even though this call passed none.
+      dependsOnReferencedFiles: touchesReferencedFiles(
+        source,
+        cached.contributingFiles?.length ?? 0
+      ),
       ...(cached.contributingFiles && cached.contributingFiles.length > 0
         ? { contributingFiles: cached.contributingFiles }
         : {}),
@@ -940,5 +995,9 @@ export async function resolveServableDocBytes(args: {
     { ownerKey, signal }
   )
   compiledCacheSet(cacheKey, compiled)
-  return { buffer: compiled, contentType: format.contentType }
+  return {
+    buffer: compiled,
+    contentType: format.contentType,
+    dependsOnReferencedFiles: touchesReferencedFiles(source, 0),
+  }
 }

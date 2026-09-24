@@ -1,7 +1,6 @@
 import { ChipLink } from '@sim/emcn'
-import { truncate } from '@sim/utils/string'
+import { escapeRegExp, truncate } from '@sim/utils/string'
 import type { Metadata } from 'next'
-import Image from 'next/image'
 import Link from 'next/link'
 import { notFound } from 'next/navigation'
 import { SITE_URL } from '@/lib/core/utils/urls'
@@ -18,6 +17,7 @@ import { BackLink } from '@/app/(landing)/components'
 import { JsonLd } from '@/app/(landing)/components/json-ld'
 import { LandingFAQ } from '@/app/(landing)/components/landing-faq'
 import { ShareButton } from '@/app/(landing)/components/share-button'
+import { IntegrationComparisonSection } from '@/app/(landing)/integrations/(shell)/[slug]/components/integration-comparison-section/integration-comparison-section'
 import { IntegrationCtaButton } from '@/app/(landing)/integrations/(shell)/[slug]/components/integration-cta-button'
 import { TemplateCardButton } from '@/app/(landing)/integrations/(shell)/[slug]/components/template-card-button'
 import { IntegrationIcon } from '@/app/(landing)/integrations/components/integration-icon'
@@ -48,7 +48,8 @@ const MAX_TEMPLATES_SHOWN = 12
 const bySlug = new Map(allIntegrations.map((i) => [i.slug, i]))
 const byType = new Map(allIntegrations.map((i) => [i.type, i]))
 
-export const dynamicParams = false
+/** Unknown slugs reach the section 404 while known pages remain pre-rendered. */
+export const dynamicParams = true
 
 /**
  * Returns up to `limit` related integration slugs.
@@ -126,10 +127,6 @@ function sentenceWithTerminalPunctuation(value: string): string {
   return /[.!?]$/.test(trimmedValue) ? trimmedValue : `${trimmedValue}.`
 }
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
 /**
  * Server-side rewrite of bare integration names in a curated template prompt
  * to `@`-mention form (`Slack` → `@Slack`) so the prompt chips with brand
@@ -151,7 +148,7 @@ function mentionifyPromptForNames(prompt: string, names: readonly string[]): str
   )
   if (unique.length === 0) return prompt
   const regex = new RegExp(
-    `(?<![A-Za-z0-9_@])(${unique.map(escapeRegex).join('|')})(?![A-Za-z0-9_])`,
+    `(?<![A-Za-z0-9_@])(${unique.map(escapeRegExp).join('|')})(?![A-Za-z0-9_])`,
     'gi'
   )
   return prompt.replace(regex, (match) => `@${match}`)
@@ -391,10 +388,12 @@ export default async function IntegrationPage({ params }: { params: Promise<{ sl
   const relatedIntegrations = relatedSlugs
     .map((s) => bySlug.get(s))
     .filter((i): i is Integration => i !== undefined)
-  const faqs = buildFAQs(
-    integration,
-    relatedIntegrations.map((i) => i.name)
-  )
+  const faqs =
+    seo?.faqs ??
+    buildFAQs(
+      integration,
+      relatedIntegrations.map((i) => i.name)
+    )
   const matchingTemplates = getTemplatesForBlock(integration.type)
     .sort(
       (a, b) =>
@@ -452,7 +451,7 @@ export default async function IntegrationPage({ params }: { params: Promise<{ sl
       <JsonLd data={faqJsonLd} />
 
       {/* Hero */}
-      <div className='mx-auto w-full max-w-[1460px] px-20 pt-[112px] max-sm:px-5 max-sm:pt-20 max-lg:px-8'>
+      <div className='mx-auto w-full max-w-[1728px] px-10 pt-[112px] max-sm:pt-20 max-md:px-7 max-lg:px-8 max-xl:px-9'>
         <div className='mb-6'>
           <BackLink href='/integrations' label='Back to Integrations' />
         </div>
@@ -529,7 +528,7 @@ export default async function IntegrationPage({ params }: { params: Promise<{ sl
       <div className='mt-8 h-px w-full bg-[var(--border)]' />
 
       {/* Border-railed content */}
-      <div className='mx-20 max-w-[1300px] border-[var(--border)] border-x max-sm:mx-5 max-lg:mx-8 min-[1460px]:mx-auto'>
+      <div className='mx-10 max-w-[1648px] border-[var(--border)] border-x max-md:mx-7 max-lg:mx-8 max-xl:mx-9 min-[1728px]:mx-auto'>
         {/* Overview */}
         {overviewBody && (
           <>
@@ -684,6 +683,13 @@ export default async function IntegrationPage({ params }: { params: Promise<{ sl
         </section>
 
         <div className='h-px w-full bg-[var(--border)]' />
+
+        {seo?.comparison && (
+          <>
+            <IntegrationComparisonSection comparison={seo.comparison} />
+            <div className='h-px w-full bg-[var(--border)]' />
+          </>
+        )}
 
         {/* Triggers - rows */}
         {triggers.length > 0 && (
@@ -883,6 +889,34 @@ export default async function IntegrationPage({ params }: { params: Promise<{ sl
           </section>
         )}
 
+        {seo?.narrativeComparison && (
+          <>
+            <section
+              id={seo.narrativeComparison.id}
+              aria-labelledby={`${seo.narrativeComparison.id}-heading`}
+              className='px-6 py-10'
+            >
+              <h2
+                id={`${seo.narrativeComparison.id}-heading`}
+                className='mb-4 text-[var(--text-primary)] text-xl leading-[100%] tracking-[-0.02em]'
+              >
+                {seo.narrativeComparison.heading}
+              </h2>
+              <div className='max-w-[900px] space-y-4'>
+                {seo.narrativeComparison.paragraphs.map((paragraph) => (
+                  <p
+                    key={paragraph}
+                    className='text-[var(--text-body)] text-sm leading-[150%] tracking-[0.02em]'
+                  >
+                    {paragraph}
+                  </p>
+                ))}
+              </div>
+            </section>
+            <div className='h-px w-full bg-[var(--border)]' />
+          </>
+        )}
+
         {/* FAQ - full width */}
         <section aria-labelledby='faq-heading' className='px-6 py-10'>
           <h2
@@ -928,60 +962,6 @@ export default async function IntegrationPage({ params }: { params: Promise<{ sl
             <div className='h-px w-full bg-[var(--border)]' />
           </>
         )}
-
-        {/* Bottom CTA */}
-        <section aria-labelledby='cta-heading' className='px-6 py-16 text-center'>
-          <div className='mx-auto mb-6 flex items-center justify-center gap-3'>
-            <Image
-              src='/brandbook/logo/small.png'
-              alt='Sim'
-              width={56}
-              height={56}
-              className='shrink-0 rounded-xl'
-              unoptimized
-            />
-            <div className='flex items-center gap-2'>
-              <span className='h-px w-5 bg-[var(--border-1)]' aria-hidden='true' />
-              <span
-                className='flex size-7 items-center justify-center rounded-full border border-[var(--border-1)]'
-                aria-hidden='true'
-              >
-                <svg
-                  className='size-3.5 text-[var(--text-muted)]'
-                  viewBox='0 0 24 24'
-                  fill='none'
-                  stroke='currentColor'
-                  strokeWidth={2}
-                  strokeLinecap='round'
-                >
-                  <path d='M5 12h14' />
-                  <path d='M12 5v14' />
-                </svg>
-              </span>
-              <span className='h-px w-5 bg-[var(--border-1)]' aria-hidden='true' />
-            </div>
-            <IntegrationIcon
-              bgColor={bgColor}
-              name={name}
-              Icon={IconComponent}
-              className='size-14 rounded-xl'
-              iconClassName='size-7'
-              fallbackClassName='text-[22px]'
-              aria-hidden='true'
-            />
-          </div>
-          <h2
-            id='cta-heading'
-            className='mb-3 text-[28px] text-[var(--text-primary)] leading-[100%] tracking-[-0.02em] sm:text-[34px]'
-          >
-            Start automating {name} today
-          </h2>
-          <p className='mx-auto mb-8 max-w-[480px] text-[var(--text-body)] text-base leading-[150%] tracking-[0.02em]'>
-            Build your first AI agent with {name} in minutes. Connect to every tool your team uses.
-            Free to start, no credit card required.
-          </p>
-          <IntegrationCtaButton label='Build for free'>Build for free</IntegrationCtaButton>
-        </section>
       </div>
 
       {/* Closing full-width divider */}

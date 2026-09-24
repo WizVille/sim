@@ -11,6 +11,7 @@ import { circlebackHandler } from '@/lib/webhooks/providers/circleback'
 import { clerkHandler } from '@/lib/webhooks/providers/clerk'
 import { clickupHandler } from '@/lib/webhooks/providers/clickup'
 import { confluenceHandler } from '@/lib/webhooks/providers/confluence'
+import { credentialGroupProviderHandler } from '@/lib/webhooks/providers/credential-group'
 import { emailBisonHandler } from '@/lib/webhooks/providers/emailbison'
 import { fathomHandler } from '@/lib/webhooks/providers/fathom'
 import { firefliesHandler } from '@/lib/webhooks/providers/fireflies'
@@ -39,6 +40,7 @@ import { mondayHandler } from '@/lib/webhooks/providers/monday'
 import { notionHandler } from '@/lib/webhooks/providers/notion'
 import { outlookHandler } from '@/lib/webhooks/providers/outlook'
 import { pagerdutyHandler } from '@/lib/webhooks/providers/pagerduty'
+import { quickBooksHandler } from '@/lib/webhooks/providers/quickbooks'
 import { resendHandler } from '@/lib/webhooks/providers/resend'
 import { revenueCatHandler } from '@/lib/webhooks/providers/revenuecat'
 import { rootlyHandler } from '@/lib/webhooks/providers/rootly'
@@ -78,6 +80,7 @@ const PROVIDER_HANDLERS: Record<string, WebhookProviderHandler> = {
   clerk: clerkHandler,
   clickup: clickupHandler,
   confluence: confluenceHandler,
+  'credential-group': credentialGroupProviderHandler,
   emailbison: emailBisonHandler,
   fireflies: firefliesHandler,
   generic: genericHandler,
@@ -110,6 +113,7 @@ const PROVIDER_HANDLERS: Record<string, WebhookProviderHandler> = {
   notion: notionHandler,
   outlook: outlookHandler,
   pagerduty: pagerdutyHandler,
+  quickbooks: quickBooksHandler,
   rss: rssHandler,
   salesforce: salesforceHandler,
   sendblue: sendblueHandler,

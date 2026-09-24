@@ -1,8 +1,6 @@
 import { useCallback, useMemo, useRef } from 'react'
-import {
-  escapeRegex,
-  SKILL_CHIP_TRIGGER,
-} from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/copilot/components/user-input/utils'
+import { escapeRegExp } from '@sim/utils/string'
+import { SKILL_CHIP_TRIGGER } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/copilot/components/user-input/utils'
 import type { McpServer } from '@/hooks/queries/mcp'
 import type { SkillDefinition } from '@/hooks/queries/skills'
 import type { ChatContext } from '@/stores/panel'
@@ -89,7 +87,12 @@ export function useSkillAutoMention({
     for (const server of mcpServers) {
       const key = server.name.toLowerCase()
       if (!byName.has(key)) {
-        byName.set(key, { kind: 'mcp', serverId: server.id, label: server.name })
+        byName.set(key, {
+          kind: 'mcp',
+          serverId: server.id,
+          label: server.name,
+          ...(server.managedConnectorId ? { managedConnectorId: server.managedConnectorId } : {}),
+        })
       }
     }
     const names = [...byName.values()]
@@ -99,8 +102,8 @@ export function useSkillAutoMention({
     // Match either trigger: the typed '/' or the stored sentinel, so both fresh
     // input and pasted/restored chips resolve. The trigger group is the match's
     // first char (`text[match.index]`); group 1 is the skill name.
-    const trigger = `(?:/|${escapeRegex(SKILL_CHIP_TRIGGER)})`
-    const pattern = `${trigger}(${names.map(escapeRegex).join('|')})(?![A-Za-z0-9_-])`
+    const trigger = `(?:/|${escapeRegExp(SKILL_CHIP_TRIGGER)})`
+    const pattern = `${trigger}(${names.map(escapeRegExp).join('|')})(?![A-Za-z0-9_-])`
     return { regex: new RegExp(pattern, 'gi'), byName }
   }, [skills, mcpServers])
 

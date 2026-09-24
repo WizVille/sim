@@ -29,11 +29,14 @@ import {
 } from '@/lib/workflows/triggers/run-options'
 import type { SerializableExecutionState } from '@/executor/execution/types'
 import type { ExecutionResult } from '@/executor/types'
-import { attachAttemptedExecutionId } from '@/executor/utils/errors'
+import { attachAttemptedExecutionId, hasExecutionResult } from '@/executor/utils/errors'
 
 const logger = createLogger('CopilotWorkflowRun')
 
-import type { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
+import {
+  emptyResolvedSecretTraceProvenance,
+  type ResolvedSecretTraceRegistry,
+} from '@/executor/utils/resolved-secret-trace-registry'
 
 export interface CopilotWorkflowRunLifecycle {
   billingAttribution?: BillingAttributionSnapshot
@@ -226,7 +229,11 @@ async function executeCopilotRun(params: {
   }
 }): Promise<ExecutionResult> {
   if (
+    params.principal.kind === 'organization_delegated' ||
+    params.principal.kind === 'slack_app' ||
+    params.principal.kind === 'slack_installation' ||
     params.principal.kind === 'credential_group_enrollment' ||
+    params.principal.kind === 'scim_connection' ||
     (params.principal.kind === 'delegated' && params.principal.serviceId === 'executor')
   ) {
     throw new Error('The principal cannot start a Copilot workflow execution')
@@ -250,6 +257,13 @@ async function executeCopilotRun(params: {
     params.executionInput
   )
   const completePendingActivation = registry?.beginPendingActivation()
+  /**
+   * The run's own result, once the executor returns it. The post-run crossing below is inside the
+   * same `try`, so its failure reaches the catch carrying nothing — and on that evidence alone it
+   * is indistinguishable from a run that never started. Holding the result here keeps the real
+   * envelope available to describe content that certainly exists.
+   */
+  let runResult: ExecutionResult | undefined
   /**
    * The executor call is the first statement of this `try`, so everything caught below is
    * post-dispatch by construction, while authorization, admission and provenance export all
@@ -302,6 +316,7 @@ async function executeCopilotRun(params: {
       },
       childExecutionId
     )
+    runResult = result
     if (registry) {
       await registry.importCrossingProvenance(
         result.executionState?.resolvedSecretTraceProvenance,
@@ -325,16 +340,23 @@ async function executeCopilotRun(params: {
      * as never started and invite the duplicate this id exists to prevent.
      */
     if (registry) {
-      const executionResult =
-        typeof error === 'object' &&
-        error !== null &&
-        'executionResult' in error &&
-        typeof error.executionResult === 'object'
-          ? (error.executionResult as ExecutionResult)
-          : undefined
+      /**
+       * Either source counts as proof a run exists: the error carries the result when the run or
+       * its post-execution work threw, and `runResult` holds it when the failure came later still
+       * — from the crossing below, after the executor had already returned.
+       */
+      const executionResult = hasExecutionResult(error) ? error.executionResult : runResult
       try {
+        /**
+         * Only a failure with no result from either source can claim nothing ran, and saying so
+         * keeps the caller's failure reason instead of reducing the tool result to "result
+         * unavailable" for a message that named no secret because none had been resolved yet.
+         * Every other failure hands back the envelope it has, and an incomplete one still latches.
+         */
         await registry.importCrossingProvenance(
-          executionResult?.executionState?.resolvedSecretTraceProvenance,
+          executionResult
+            ? executionResult.executionState?.resolvedSecretTraceProvenance
+            : emptyResolvedSecretTraceProvenance(),
           {
             output: executionResult?.output,
             logs: executionResult?.logs,

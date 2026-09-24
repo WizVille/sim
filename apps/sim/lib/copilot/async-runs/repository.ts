@@ -11,6 +11,7 @@ import { createLogger } from '@sim/logger'
 import { filterUndefined } from '@sim/utils/object'
 import { sanitizeValueForJsonb } from '@sim/utils/string'
 import { and, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm'
+import { AsyncToolCallOwnershipError } from '@/lib/copilot/async-runs/errors'
 import { TraceAttr } from '@/lib/copilot/generated/trace-attributes-v1'
 import { TraceSpan } from '@/lib/copilot/generated/trace-spans-v1'
 import { markSpanForError } from '@/lib/copilot/request/otel'
@@ -187,6 +188,8 @@ export async function getRunSegment(runId: string) {
           workflowId: copilotRuns.workflowId,
           // Needed to scope an "allow for this chat" decision to its chat.
           chatId: copilotRuns.chatId,
+          // Needed to resolve the deciding user's permission group.
+          workspaceId: copilotRuns.workspaceId,
         })
         .from(copilotRuns)
         .where(eq(copilotRuns.id, runId))
@@ -217,7 +220,12 @@ export async function upsertAsyncToolCall(input: {
     },
     async () => {
       const existing = await getAsyncToolCall(input.toolCallId)
-      if (existing) return existing
+      if (existing) {
+        if (input.runId && existing.runId !== input.runId) {
+          throw new AsyncToolCallOwnershipError()
+        }
+        return existing
+      }
 
       const incomingStatus = input.status ?? 'pending'
       const effectiveRunId = input.runId ?? null
@@ -248,7 +256,11 @@ export async function upsertAsyncToolCall(input: {
         .onConflictDoNothing()
         .returning()
 
-      return row ?? getAsyncToolCall(input.toolCallId)
+      const persisted = row ?? (await getAsyncToolCall(input.toolCallId))
+      if (persisted && persisted.runId !== effectiveRunId) {
+        throw new AsyncToolCallOwnershipError()
+      }
+      return persisted
     }
   )
 }

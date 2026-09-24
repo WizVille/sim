@@ -1,11 +1,13 @@
 /**
  * @vitest-environment node
  */
+import { DrizzleQueryError } from 'drizzle-orm/errors'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
   mockAssertBillingAttributionSnapshot,
   mockProcessDocumentAsync,
+  mockQueue,
   mockResolveTriggerRegion,
   mockTask,
   mockTrigger,
@@ -13,11 +15,16 @@ const {
   mockAssertBillingAttributionSnapshot: vi.fn(),
   mockProcessDocumentAsync: vi.fn(),
   mockResolveTriggerRegion: vi.fn(),
+  mockQueue: vi.fn((config) => config),
   mockTask: vi.fn((config) => config),
   mockTrigger: vi.fn(),
 }))
 
-vi.mock('@trigger.dev/sdk', () => ({ task: mockTask, tasks: { trigger: mockTrigger } }))
+vi.mock('@trigger.dev/sdk', () => ({
+  queue: mockQueue,
+  task: mockTask,
+  tasks: { trigger: mockTrigger },
+}))
 vi.mock('@/lib/core/async-jobs/region', () => ({ resolveTriggerRegion: mockResolveTriggerRegion }))
 vi.mock('@/lib/billing/core/billing-attribution', () => ({
   assertBillingAttributionSnapshot: mockAssertBillingAttributionSnapshot,
@@ -26,14 +33,23 @@ vi.mock('@/lib/knowledge/documents/service', () => ({
   processDocumentAsync: mockProcessDocumentAsync,
 }))
 
-import { EmbeddingAPIError, EmbeddingQuotaExhaustedError } from '@/lib/embeddings/client'
+import { ProviderCapacityDeferredError } from '@/lib/core/rate-limiter/provider-capacity-error'
+import { EmbeddingAPIError } from '@/lib/embeddings/api-error'
+import { EmbeddingQuotaExhaustedError } from '@/lib/embeddings/client'
 import { EMBEDDING_QUOTA_CIRCUIT_TTL_MS } from '@/lib/embeddings/quota-circuit'
 import {
+  OcrRequestRejectedError,
   PermanentDocumentProcessingError,
   UsageLimitDocumentProcessingError,
 } from '@/lib/knowledge/documents/document-processing-error'
+import { MAX_PROVIDER_CONTINUATION_ATTEMPTS } from '@/lib/knowledge/documents/processing-provider-continuation'
 import { MAX_QUOTA_CONTINUATION_ATTEMPTS } from '@/lib/knowledge/documents/processing-quota-continuation'
+import type { DocumentProcessingAttemptContext } from '@/lib/knowledge/documents/service'
 import {
+  DOCUMENT_PROCESSING_RETRY_POLICY,
+  DocumentProcessingDatabaseRetryError,
+  getDocumentProcessingRetry,
+  processDocument,
   resolveQuotaContinuationDelayMs,
   runDocumentProcessing,
 } from '@/background/knowledge-processing'
@@ -73,10 +89,25 @@ const WORKSPACE_PAYLOAD = {
   billingAttribution: BILLING_ATTRIBUTION,
 }
 
+const ORGANIZATION_PAYLOAD = {
+  ...BASE_PAYLOAD,
+  billingScope: 'organization' as const,
+  actorUserId: 'organization-member',
+  workspaceId: null,
+  organizationId: 'organization-1',
+  billingAttribution: {
+    ...BILLING_ATTRIBUTION,
+    actorUserId: 'organization-member',
+    workspaceId: null,
+    organizationId: 'organization-1',
+    billingEntity: { type: 'organization' as const, id: 'organization-1' },
+  },
+}
+
 function mockQuotaExhaustion(error: EmbeddingQuotaExhaustedError): void {
   mockProcessDocumentAsync.mockImplementation(async (...args: unknown[]) => {
     const attemptContext = args[6] as {
-      scheduleQuotaContinuation?: () => Promise<Date>
+      scheduleQuotaContinuation?: () => Promise<unknown>
     }
     await attemptContext.scheduleQuotaContinuation?.()
     throw error
@@ -92,7 +123,7 @@ describe('knowledge processing worker', () => {
       }
       return value
     })
-    mockProcessDocumentAsync.mockResolvedValue(undefined)
+    mockProcessDocumentAsync.mockResolvedValue({ outcome: 'indexed' })
     mockResolveTriggerRegion.mockResolvedValue('us-east-1')
     mockTrigger.mockResolvedValue({ id: 'quota-continuation-run' })
   })
@@ -100,6 +131,27 @@ describe('knowledge processing worker', () => {
   afterEach(() => {
     vi.restoreAllMocks()
   })
+
+  it('reports indexed only when the document service committed the index', async () => {
+    expect(await runDocumentProcessing(WORKSPACE_PAYLOAD)).toMatchObject({
+      success: true,
+      outcome: 'indexed',
+      documentId: WORKSPACE_PAYLOAD.documentId,
+    })
+  })
+
+  it.each(['unavailable', 'not_claimed', 'superseded'] as const)(
+    'reports a harmless %s skip without turning it into a task failure or an indexed success',
+    async (reason) => {
+      mockProcessDocumentAsync.mockResolvedValue({ outcome: 'skipped', reason })
+      expect(await runDocumentProcessing(WORKSPACE_PAYLOAD)).toMatchObject({
+        success: false,
+        outcome: 'skipped',
+        reason,
+      })
+      expect(mockTrigger).not.toHaveBeenCalled()
+    }
+  )
 
   it('rejects workspace work without attribution before document processing starts', async () => {
     await expect(
@@ -229,6 +281,36 @@ describe('knowledge processing worker', () => {
     )
   })
 
+  it('preserves organization ownership and billing attribution in the worker', async () => {
+    await runDocumentProcessing(structuredClone(ORGANIZATION_PAYLOAD))
+
+    expect(mockProcessDocumentAsync).toHaveBeenCalledWith(
+      BASE_PAYLOAD.knowledgeBaseId,
+      BASE_PAYLOAD.documentId,
+      BASE_PAYLOAD.docData,
+      BASE_PAYLOAD.processingOptions,
+      {
+        billingScope: 'organization',
+        actorUserId: ORGANIZATION_PAYLOAD.actorUserId,
+        workspaceId: null,
+        organizationId: ORGANIZATION_PAYLOAD.organizationId,
+        billingAttribution: ORGANIZATION_PAYLOAD.billingAttribution,
+      },
+      BASE_PAYLOAD.requestId,
+      expect.objectContaining({
+        chargedAtDispatch: true,
+        processingQueuedAt: new Date(BASE_PAYLOAD.processingQueuedAt),
+      })
+    )
+  })
+
+  it('rejects an organization mismatch before document processing starts', async () => {
+    await expect(
+      runDocumentProcessing({ ...ORGANIZATION_PAYLOAD, organizationId: 'organization-2' })
+    ).rejects.toThrow('Document processing organization does not match billing attribution')
+    expect(mockProcessDocumentAsync).not.toHaveBeenCalled()
+  })
+
   it('rejects an actor mismatch before document processing starts', async () => {
     await expect(
       runDocumentProcessing({
@@ -276,6 +358,39 @@ describe('knowledge processing worker', () => {
     )
   })
 
+  it('carries the actual parent admission flag when Trigger attempt two hands off quickly', async () => {
+    const error = new ProviderCapacityDeferredError('rate_limit')
+    mockProcessDocumentAsync.mockImplementation(async (...args: unknown[]) => {
+      const context = args[6] as {
+        scheduleProviderContinuation: (error: ProviderCapacityDeferredError) => Promise<unknown>
+      }
+      await context.scheduleProviderContinuation(error)
+      throw error
+    })
+    await runDocumentProcessing(
+      { ...WORKSPACE_PAYLOAD, processingQueueToken: 'request-1', chargedAtDispatch: true },
+      2
+    )
+    expect(mockTrigger.mock.calls[0][1]).toMatchObject({
+      processingPredecessorToken: 'request-1',
+      processingPredecessorCharged: false,
+    })
+  })
+
+  it('does not refund the original dispatch again when a healthy processing slice resumes', async () => {
+    await runDocumentProcessing({
+      ...WORKSPACE_PAYLOAD,
+      processingQueueToken: 'knowledge-slice-document-1-request-1-1',
+      processingSliceCount: 1,
+      providerRetryStartedAt: new Date().toISOString(),
+      chargedAtDispatch: true,
+    })
+    expect(mockProcessDocumentAsync.mock.calls[0][6]).toMatchObject({
+      chargedAtDispatch: false,
+      processingQueueToken: 'knowledge-slice-document-1-request-1-1',
+    })
+  })
+
   it('reports elapsed processing time rather than an epoch timestamp', async () => {
     vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_125)
 
@@ -309,6 +424,29 @@ describe('knowledge processing worker', () => {
       outcome: 'permanent_failure',
       code: 'archive_safety_limit',
       error: 'This file expands beyond the safe processing limit.',
+    })
+  })
+
+  it('completes provider-rejected OCR runs without requesting futile Trigger retries', async () => {
+    mockProcessDocumentAsync.mockRejectedValue(
+      new Error('OCR chunk batch failed', {
+        cause: new AggregateError([
+          new OcrRequestRejectedError(400),
+          new ProviderCapacityDeferredError('rate_limit'),
+        ]),
+      })
+    )
+    await expect(
+      runDocumentProcessing({
+        ...BASE_PAYLOAD,
+        billingScope: 'non-workspace',
+        actorUserId: 'legacy-owner',
+        workspaceId: null,
+      })
+    ).resolves.toMatchObject({
+      success: false,
+      outcome: 'provider_request_rejected',
+      code: 'ocr_request_rejected',
     })
   })
 
@@ -385,7 +523,8 @@ describe('knowledge processing worker', () => {
       expect.objectContaining({
         documentId: 'document-1',
         requestId: 'request-1',
-        processingQueuedAt: BASE_PAYLOAD.processingQueuedAt,
+        processingQueueToken: 'knowledge-quota-document-1-request-1-1',
+        processingQueuedAt: expect.any(String),
         quotaRetryCount: 1,
       }),
       expect.objectContaining({
@@ -397,6 +536,167 @@ describe('knowledge processing worker', () => {
     const delay = mockTrigger.mock.calls[0]?.[2]?.delay as Date
     expect(delay.getTime()).toBeGreaterThanOrEqual(1_000 + EMBEDDING_QUOTA_CIRCUIT_TTL_MS * 0.8)
     expect(delay.getTime()).toBeLessThanOrEqual(1_000 + EMBEDDING_QUOTA_CIRCUIT_TTL_MS * 1.2)
+  })
+
+  it('continues provider pressure beyond the task retry budget without admitting another pass', async () => {
+    const error = new ProviderCapacityDeferredError('rate_limit', { retryAfterMs: 600_000 })
+    mockProcessDocumentAsync.mockImplementation(async (...args: unknown[]) => {
+      await (args[6] as DocumentProcessingAttemptContext).scheduleProviderContinuation!(error)
+      throw error
+    })
+    const now = Date.now()
+    await expect(
+      runDocumentProcessing(
+        {
+          ...WORKSPACE_PAYLOAD,
+          processingQueueToken: 'request-1',
+          providerRetryCount: 3,
+          providerRetryStartedAt: new Date(now).toISOString(),
+        },
+        3
+      )
+    ).resolves.toMatchObject({ outcome: 'provider_deferred' })
+    expect(mockProcessDocumentAsync).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      'request-1',
+      expect.objectContaining({ chargedAtDispatch: false, processingQueueToken: 'request-1' })
+    )
+    expect(mockTrigger).toHaveBeenCalledWith(
+      'knowledge-process-document',
+      expect.objectContaining({
+        requestId: 'request-1',
+        processingQueueToken: 'knowledge-provider-document-1-request-1-4',
+        providerRetryCount: 4,
+        billingAttribution: BILLING_ATTRIBUTION,
+      }),
+      expect.objectContaining({ idempotencyKey: 'knowledge-provider-document-1-request-1-4' })
+    )
+    expect((mockTrigger.mock.calls[0][2].delay as Date).getTime()).toBeGreaterThanOrEqual(
+      now + 600_000
+    )
+  })
+
+  it('reports provider recovery exhaustion as an actionable terminal outcome', async () => {
+    mockProcessDocumentAsync.mockImplementation(async (...args: unknown[]) => {
+      await (args[6] as DocumentProcessingAttemptContext).scheduleProviderContinuation!(
+        new ProviderCapacityDeferredError('rate_limit')
+      )
+    })
+    await expect(
+      runDocumentProcessing({
+        ...WORKSPACE_PAYLOAD,
+        providerRetryCount: MAX_PROVIDER_CONTINUATION_ATTEMPTS,
+        providerRetryStartedAt: new Date().toISOString(),
+      })
+    ).resolves.toMatchObject({
+      outcome: 'provider_exhausted',
+      error: expect.stringContaining('then retry this document'),
+    })
+    expect(mockTrigger).not.toHaveBeenCalled()
+  })
+
+  it('keeps database failures retryable without sending SQL or parameters to Trigger', async () => {
+    const error = new DrizzleQueryError(
+      'insert private SQL',
+      ['private bound content'],
+      Object.assign(new Error('private database detail'), { code: '57014' })
+    )
+    mockProcessDocumentAsync.mockRejectedValueOnce(error)
+    const failure = await runDocumentProcessing(WORKSPACE_PAYLOAD).catch(
+      (caught: unknown) => caught
+    )
+    expect(failure).toBeInstanceOf(Error)
+    expect(failure).toMatchObject({ message: 'Database request failed (SQLSTATE 57014).' })
+    /** Trigger records only the name, message and stack; the cause stays for classification. */
+    expect((failure as Error).cause).toBe(error)
+    expect((failure as Error).stack).not.toContain('private')
+    expect(JSON.stringify(failure)).not.toContain('private')
+  })
+
+  describe('transient database failures', () => {
+    const MINUTE = 60 * 1000
+    const statementTimeout = () =>
+      new DrizzleQueryError(
+        'insert private SQL',
+        ['private bound content'],
+        Object.assign(new Error('canceling statement due to statement timeout'), {
+          code: '57014',
+        })
+      )
+
+    /** A service failure that asks the worker whether to schedule a database retry, as the service does. */
+    function failProcessingWith(error: Error): { scheduled: Array<Date | null> } {
+      const scheduled: Array<Date | null> = []
+      mockProcessDocumentAsync.mockImplementation(async (...args: unknown[]) => {
+        const context = args[6] as DocumentProcessingAttemptContext
+        scheduled.push(context.scheduleDatabaseRetry?.(error) ?? null)
+        throw error
+      })
+      return { scheduled }
+    }
+
+    it('schedules a minute-scale retry and hands Trigger the same time the document records', async () => {
+      const error = statementTimeout()
+      const { scheduled } = failProcessingWith(error)
+      const startedAt = Date.now()
+
+      const failure = await runDocumentProcessing(WORKSPACE_PAYLOAD, 1).catch(
+        (caught: unknown) => caught
+      )
+
+      expect(failure).toBeInstanceOf(DocumentProcessingDatabaseRetryError)
+      expect(failure).toMatchObject({ message: 'Database request failed (SQLSTATE 57014).' })
+      expect((failure as Error).cause).toBe(error)
+      expect((failure as Error).stack).not.toContain('private')
+      const retryAt = scheduled[0]
+      expect(retryAt).toBeInstanceOf(Date)
+      expect(retryAt!.getTime() - startedAt).toBeGreaterThanOrEqual(2 * MINUTE * 0.8)
+      expect(retryAt!.getTime() - startedAt).toBeLessThanOrEqual(2 * MINUTE * 1.2 + 1000)
+      expect(getDocumentProcessingRetry(failure, 1)).toEqual({ retryAt })
+    })
+
+    it('records the failure and stops once the database attempts are spent', async () => {
+      const error = statementTimeout()
+      const { scheduled } = failProcessingWith(error)
+      const lastAttempt = DOCUMENT_PROCESSING_RETRY_POLICY.database.maxAttempts
+
+      const failure = await runDocumentProcessing(WORKSPACE_PAYLOAD, lastAttempt).catch(
+        (caught: unknown) => caught
+      )
+
+      expect(scheduled).toEqual([null])
+      expect(failure).not.toBeInstanceOf(DocumentProcessingDatabaseRetryError)
+      expect((failure as Error).cause).toBe(error)
+      expect(getDocumentProcessingRetry(failure, lastAttempt)).toEqual({ skipRetrying: true })
+    })
+
+    it('leaves other failures on the task retry settings and attempt count', async () => {
+      const error = new Error('Storage request timed out')
+      const { scheduled } = failProcessingWith(error)
+
+      await expect(runDocumentProcessing(WORKSPACE_PAYLOAD, 1)).rejects.toBe(error)
+
+      expect(scheduled).toEqual([null])
+      expect(getDocumentProcessingRetry(error, 1)).toBeUndefined()
+      expect(
+        getDocumentProcessingRetry(error, DOCUMENT_PROCESSING_RETRY_POLICY.maxAttempts)
+      ).toEqual({ skipRetrying: true })
+    })
+  })
+
+  it('retries failed provider continuation dispatch instead of reporting a successful deferral', async () => {
+    const error = new Error('Trigger dispatch unavailable')
+    mockTrigger.mockRejectedValue(error)
+    mockProcessDocumentAsync.mockImplementation(async (...args: unknown[]) => {
+      await (args[6] as DocumentProcessingAttemptContext).scheduleProviderContinuation!(
+        new ProviderCapacityDeferredError('rate_limit')
+      )
+    })
+    await expect(runDocumentProcessing(WORKSPACE_PAYLOAD)).rejects.toBe(error)
   })
 
   it('ends a quota chain after the bounded continuation horizon', async () => {
@@ -522,9 +822,27 @@ describe('knowledge-process-document task configuration', () => {
    * `attempt_count = 1`, so each was left `failed` having never been retried.
    */
   it('escalates to a larger machine on an out-of-memory kill', async () => {
-    const { processDocument } = await import('@/background/knowledge-processing')
-
     expect(processDocument.retry?.outOfMemory?.machine).toBe('large-2x')
+  })
+
+  it('declares enough attempts for database retries and routes failures through catchError', async () => {
+    expect(processDocument.retry?.maxAttempts).toBe(
+      Math.max(
+        DOCUMENT_PROCESSING_RETRY_POLICY.maxAttempts,
+        DOCUMENT_PROCESSING_RETRY_POLICY.database.maxAttempts
+      )
+    )
+    const retryAt = new Date('2026-01-01T00:02:00.000Z')
+    const scheduled = new DocumentProcessingDatabaseRetryError(
+      'Database request failed.',
+      retryAt,
+      {
+        cause: new Error('private'),
+      }
+    )
+    await expect(
+      processDocument.catchError?.({ error: scheduled, ctx: { attempt: { number: 1 } } } as never)
+    ).resolves.toEqual({ retryAt })
   })
 
   it('backs durable quota continuations off to a bounded polling interval', () => {

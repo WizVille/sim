@@ -7,6 +7,9 @@ import {
   normalizeBlockRetryWaitMs,
 } from '@sim/workflow-types/workflow'
 import { isIntegrationDeploymentAvailableForVisibility } from '@/lib/integrations/availability.server'
+import { MCP_SERVER_ADVANCED_TOOL_TYPE } from '@/lib/mcp/shared'
+import { capabilityDeniedBy } from '@/lib/permission-groups/capability-assertions'
+import type { PermissionGroupConfig } from '@/lib/permission-groups/fields'
 import { createModelAccessGate } from '@/lib/permission-groups/model-access'
 import {
   createToolAccessGate,
@@ -14,7 +17,6 @@ import {
   MODEL_SUBBLOCK_ID,
   OPERATION_SUBBLOCK_ID,
 } from '@/lib/permission-groups/operation-access'
-import type { PermissionGroupConfig } from '@/lib/permission-groups/types'
 import { getEffectiveBlockOutputs } from '@/lib/workflows/blocks/block-outputs'
 import { isRetryEligibleBlock } from '@/lib/workflows/blocks/retry-eligibility'
 import {
@@ -22,6 +24,7 @@ import {
   buildDefaultCanonicalModes,
   isCanonicalPair,
 } from '@/lib/workflows/subblocks/visibility'
+import { applyAgentToolUsageControlModes } from '@/lib/workflows/tool-input/usage-control'
 import { hasTriggerCapability } from '@/lib/workflows/triggers/trigger-utils'
 import { getBlock } from '@/blocks/registry'
 import type { BlockConfig } from '@/blocks/types'
@@ -249,6 +252,13 @@ export function createBlockFromParams(
 
     if (validatedInputs) {
       updateCanonicalModesForInputs(blockState, Object.keys(validatedInputs), blockConfig)
+      const tools = blockState.subBlocks.tools?.value
+      if (params.type === 'agent' && Array.isArray(tools)) {
+        blockState.data = {
+          ...blockState.data,
+          canonicalModes: applyAgentToolUsageControlModes(tools, blockState.data?.canonicalModes),
+        }
+      }
     }
   }
 
@@ -319,7 +329,9 @@ export function normalizeTools(tools: any[]): any[] {
         return {
           type: tool.type,
           customToolId: tool.customToolId,
-          usageControl: tool.usageControl || 'auto',
+          usageControl:
+            tool.usageControl || (tool.usageControlExpression === undefined ? 'auto' : undefined),
+          usageControlExpression: tool.usageControlExpression,
           isExpanded: tool.isExpanded ?? true,
         }
       }
@@ -790,7 +802,7 @@ export function filterDisallowedTools(
   const isToolAllowed = createToolAccessGate(permissionConfig.deniedTools)
   const allowedTools: any[] = []
   for (const tool of deploymentAvailableTools) {
-    if (tool.type === 'custom-tool' && permissionConfig.disableCustomTools) {
+    if (tool.type === 'custom-tool' && capabilityDeniedBy('custom_tools.use', permissionConfig)) {
       logSkippedItem(skippedItems, {
         type: 'tool_not_allowed',
         operationType: 'add',
@@ -800,13 +812,16 @@ export function filterDisallowedTools(
       })
       continue
     }
-    if (tool.type === 'mcp' && permissionConfig.disableMcpTools) {
+    if (
+      (tool.type === 'mcp' || tool.type === MCP_SERVER_ADVANCED_TOOL_TYPE) &&
+      capabilityDeniedBy('mcp_tools.use', permissionConfig)
+    ) {
       logSkippedItem(skippedItems, {
         type: 'tool_not_allowed',
         operationType: 'add',
         blockId,
         reason: `MCP tool "${tool.title || 'unknown'}" is not allowed by permission group - tool not added`,
-        details: { toolType: 'mcp', serverId: tool.params?.serverId },
+        details: { toolType: tool.type, serverId: tool.params?.serverId },
       })
       continue
     }

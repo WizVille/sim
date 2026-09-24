@@ -2,7 +2,7 @@
  * @vitest-environment node
  */
 import { PDFDocument, StandardFonts } from 'pdf-lib'
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { PermanentDocumentProcessingError } from '@/lib/knowledge/documents/document-processing-error'
 import type { OcrRequestPolicy } from '@/lib/knowledge/documents/ocr-request-policy'
 import { buildLargestFittingPdfChunk } from '@/lib/knowledge/documents/pdf-ocr-chunking'
@@ -27,6 +27,30 @@ function policy(overrides: Partial<OcrRequestPolicy> = {}): OcrRequestPolicy {
 }
 
 describe('buildLargestFittingPdfChunk', () => {
+  /**
+   * pdf-lib stamps the modification date into every save and the object streams are deflated,
+   * so two builds of the same pages a second apart can differ by a byte. The byte budgets below
+   * are derived from one build and applied to another; a pinned clock keeps them comparable.
+   */
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'))
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('serializes a fitting page range once', async () => {
+    const source = await createSourcePdf(20)
+    const save = vi.spyOn(PDFDocument.prototype, 'save')
+
+    const chunk = await buildLargestFittingPdfChunk(source, 0, 20, policy())
+
+    expect(chunk.endPage).toBe(19)
+    expect(save).toHaveBeenCalledOnce()
+  })
+
   it('obeys the page ceiling while retaining a contiguous range', async () => {
     const source = await createSourcePdf(5)
 
@@ -47,6 +71,30 @@ describe('buildLargestFittingPdfChunk', () => {
 
     expect(chunk.buffer.length).toBeLessThanOrEqual(maxBytes)
     expect(chunk.endPage).toBeLessThan(2)
+  })
+
+  it('returns the fitting serialized candidate without rebuilding it', async () => {
+    const source = await createSourcePdf(4)
+    const threePages = await buildLargestFittingPdfChunk(source, 0, 4, policy({ maxPages: 3 }))
+    const originalSave = PDFDocument.prototype.save
+    const serializedPages: number[] = []
+    vi.spyOn(PDFDocument.prototype, 'save').mockImplementation(function (
+      this: PDFDocument,
+      options
+    ) {
+      serializedPages.push(this.getPageCount())
+      return originalSave.call(this, options)
+    })
+
+    const chunk = await buildLargestFittingPdfChunk(
+      source,
+      0,
+      4,
+      policy({ maxBytes: threePages.buffer.length - 1 })
+    )
+
+    expect(chunk.endPage).toBe(1)
+    expect(serializedPages).toEqual([4, 2, 3])
   })
 
   it('permanently rejects a page that cannot fit by itself', async () => {

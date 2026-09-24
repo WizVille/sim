@@ -1,10 +1,11 @@
 import type { Context } from '@opentelemetry/api'
 import { createLogger } from '@sim/logger'
 import type { PermissionType } from '@sim/platform-authz/workspace'
-import { toError } from '@sim/utils/errors'
+import { getErrorMessage, toError } from '@sim/utils/errors'
 import { interruptibleSleep, sleep } from '@sim/utils/helpers'
 import { generateId } from '@sim/utils/id'
-import { omit } from '@sim/utils/object'
+import { isPlainRecord, omit } from '@sim/utils/object'
+import { workspaceSearchFiltersSchema } from '@/lib/api/contracts/knowledge/search'
 import {
   type AttributedBillingRequestEnvelope,
   assertBillingAttributionSnapshot,
@@ -12,6 +13,7 @@ import {
   createAttributedBillingRequestEnvelope,
 } from '@/lib/billing/core/billing-attribution'
 import { isWorkspaceOnEnterprisePlan } from '@/lib/billing/core/subscription'
+import { loadCopilotSearchIntegrations } from '@/lib/copilot/application/load-search-integrations'
 import type { AsyncCompletionSignal } from '@/lib/copilot/async-runs/lifecycle'
 import { createRunSegment, updateRunStatus } from '@/lib/copilot/async-runs/repository'
 import { SIM_AGENT_VERSION, TOOL_WATCHDOG_RESUME_GRACE_MS } from '@/lib/copilot/constants'
@@ -35,6 +37,10 @@ import {
   runStreamLoop,
   StreamEndedWithoutTerminalError,
 } from '@/lib/copilot/request/go/stream'
+import {
+  createProviderToolCallIdentity,
+  restoreProviderToolCallId,
+} from '@/lib/copilot/request/go/tool-call-identity'
 import { recordDegraded } from '@/lib/copilot/request/metrics'
 import { AbortReason } from '@/lib/copilot/request/session/abort-reason'
 import {
@@ -64,7 +70,10 @@ import { getMothershipBaseURL, getMothershipSourceEnvHeaders } from '@/lib/copil
 import { prepareExecutionContext } from '@/lib/copilot/tools/handlers/context'
 import { env } from '@/lib/core/config/env'
 import { isCopilotToolPermissionsEnabled, isHosted } from '@/lib/core/config/env-flags'
+import { isWorkspaceCapabilityWithheld } from '@/lib/permission-groups/capability-assertions'
 import { filterModelSafeWorkspaceFileAttachments } from '@/lib/uploads/contexts/workspace/workspace-file-secret-provenance'
+import { appendUnavailableAttachmentNotice } from '@/lib/uploads/utils/model-input'
+import type { ExecutorDelegationOrigin } from '@/executor/types'
 import { refuseResolvedSecretProjection } from '@/executor/utils/resolved-secret-projection-refusal'
 import type { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
 
@@ -87,11 +96,12 @@ class CopilotModelContentProjectionError extends Error {
   }
 }
 
-async function omitUnsafeInitialCopilotAttachments(
+async function prepareInitialCopilotAttachmentsForModel(
   payload: Record<string, unknown>,
   workspaceId?: string
 ): Promise<Record<string, unknown>> {
   let projected = payload
+  let omittedCount = 0
   for (const key of ['attachments', 'fileAttachments'] as const) {
     if (!Object.hasOwn(projected, key)) continue
     const attachments = projected[key]
@@ -121,6 +131,7 @@ async function omitUnsafeInitialCopilotAttachments(
     }
 
     if (safeAttachments.length === attachments.length) continue
+    omittedCount += attachments.length - safeAttachments.length
     logger.warn('Omitting Copilot attachments with unsafe secret provenance', {
       attachmentCount: attachments.length,
       omittedCount: attachments.length - safeAttachments.length,
@@ -128,14 +139,36 @@ async function omitUnsafeInitialCopilotAttachments(
     projected =
       safeAttachments.length > 0 ? { ...projected, [key]: safeAttachments } : omit(projected, [key])
   }
-  return projected
-}
+  if (omittedCount === 0) return projected
 
-async function filterInitialCopilotAttachmentsForModel(
-  payload: Record<string, unknown>,
-  workspaceId?: string
-): Promise<Record<string, unknown>> {
-  return omitUnsafeInitialCopilotAttachments(payload, workspaceId)
+  if (typeof projected.message === 'string') {
+    projected = {
+      ...projected,
+      message: appendUnavailableAttachmentNotice(projected.message, omittedCount),
+    }
+  }
+  if (Array.isArray(projected.messages)) {
+    const messages: unknown[] = [...projected.messages]
+    let notified = false
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]
+      if (!isPlainRecord(message) || message.role !== 'user' || typeof message.content !== 'string')
+        continue
+      messages[index] = {
+        ...message,
+        content: appendUnavailableAttachmentNotice(message.content, omittedCount),
+      }
+      notified = true
+      break
+    }
+    if (!notified) {
+      messages.push({ role: 'user', content: appendUnavailableAttachmentNotice('', omittedCount) })
+    }
+    projected = { ...projected, messages }
+  } else if (typeof projected.message !== 'string') {
+    projected = { ...projected, message: appendUnavailableAttachmentNotice('', omittedCount) }
+  }
+  return projected
 }
 
 async function ensureModelEgressRegistry(
@@ -146,7 +179,9 @@ async function ensureModelEgressRegistry(
   if (!registry) {
     const environmentContext =
       options.environmentContext ??
-      (await prepareCopilotEnvironmentContext(options.userId, options.workspaceId))
+      (await prepareCopilotEnvironmentContext(options.userId, options.workspaceId, {
+        includeSecrets: execContext.requestMode !== 'assistant',
+      }))
     registry = environmentContext.resolvedSecretTraceRegistry
     execContext.resolvedSecretTraceRegistry = registry
   }
@@ -167,9 +202,14 @@ function resultContent(context: StreamingContext, options: CopilotLifecycleOptio
 }
 
 export interface CopilotLifecycleOptions extends OrchestratorOptions {
+  /** Trusted entry point for Search metering; never read from model arguments. */
+  searchSurface?: 'copilot' | 'slack'
+  mcpBlockId?: string
+  executorDelegationOrigin?: ExecutorDelegationOrigin
   userId: string
   workflowId?: string
   workspaceId?: string
+  organizationId?: string
   chatId?: string
   executionId?: string
   runId?: string
@@ -206,8 +246,45 @@ async function resolveToolPermissions(
     isCopilotToolPermissionsEnabled &&
     options.interactive !== false &&
     (options.goRoute ?? '').startsWith('/api/mothership')
-  if (!enabled) return { enabled: false, autoAllowed: new Set() }
-  return { enabled: true, autoAllowed: await getAutoAllowedTools(options.userId, options.chatId) }
+  if (!enabled) return { enabled: false, autoAllowed: new Set(), autoAllowPermitted: true }
+
+  /**
+   * permission-group-enforced: copilot.tool_auto_approval — read at the point
+   * the decision is made, not only where one is saved. A member who clicked
+   * "always allow" before the key was set would otherwise keep the prompt
+   * silenced forever, so the stored list is not even loaded once the group
+   * withholds the capability.
+   *
+   * A failed lookup reads as withheld, matching the decision endpoint: letting
+   * it reject would abort the whole turn here, before any card is drawn, over a
+   * database hiccup — the turn is interactive by construction at this point, so
+   * there is a human to ask. Withholding keeps the capability fail-closed
+   * without wedging the turn: no stored always-allow is loaded, nothing durable
+   * is remembered, and every gated call still asks its one-time question.
+   */
+  const withheld =
+    options.userId && options.workspaceId
+      ? await isWorkspaceCapabilityWithheld(
+          options.userId,
+          options.workspaceId,
+          'copilot.tool_auto_approval'
+        ).catch((error) => {
+          logger.warn('Could not resolve the tool auto-approval capability; prompting every time', {
+            workspaceId: options.workspaceId,
+            error: getErrorMessage(error),
+          })
+          return true
+        })
+      : false
+  if (withheld) {
+    return { enabled: true, autoAllowed: new Set(), autoAllowPermitted: false }
+  }
+
+  return {
+    enabled: true,
+    autoAllowed: await getAutoAllowedTools(options.userId, options.chatId),
+    autoAllowPermitted: true,
+  }
 }
 
 export async function runCopilotLifecycle(
@@ -218,11 +295,17 @@ export async function runCopilotLifecycle(
     userId,
     workflowId,
     workspaceId,
+    organizationId,
     chatId,
     executionId,
     runId,
     goRoute = '/api/copilot',
   } = options
+  if (organizationId && (workspaceId || workflowId || requestPayload.mode !== 'assistant')) {
+    throw new Error(
+      'Organization conversations require Assistant mode without workspace or workflow scope'
+    )
+  }
   const payloadMsgId =
     typeof requestPayload?.messageId === 'string' ? requestPayload.messageId : generateId()
   const runIdentity = await ensureHeadlessRunIdentity({
@@ -270,6 +353,7 @@ export async function runCopilotLifecycle(
       userId,
       workflowId,
       workspaceId,
+      organizationId,
       chatId,
       executionId: resolvedExecutionId,
       runId: resolvedRunId,
@@ -281,6 +365,18 @@ export async function runCopilotLifecycle(
       secretMountPolicy: lifecycleOptions.secretMountPolicy,
       secretActorUserId: lifecycleOptions.secretActorUserId,
     }))
+  execContext.searchSurface = lifecycleOptions.searchSurface ?? 'copilot'
+  if (lifecycleOptions.mcpBlockId) {
+    execContext.mcpBlockId = lifecycleOptions.mcpBlockId
+    execContext.executorDelegationOrigin = lifecycleOptions.executorDelegationOrigin
+  }
+  if (typeof requestPayload.mode === 'string') execContext.requestMode = requestPayload.mode
+  if (execContext.requestMode === 'assistant') {
+    execContext.assistantSearch = workspaceSearchFiltersSchema.parse(
+      requestPayload.assistantSearch ?? {}
+    )
+    execContext.secretActorUserId = null
+  }
   execContext.copilotInteractionMode =
     lifecycleOptions.interactive === true ? 'interactive' : 'headless'
   if (goRoute && MOTHERSHIP_CODE_TOOL_ROUTES.has(goRoute)) {
@@ -288,7 +384,10 @@ export async function runCopilotLifecycle(
   } else {
     execContext.sandboxProfile = undefined
   }
-  if (isHosted && (!execContext.workspaceId || !execContext.billingAttribution)) {
+  if (
+    isHosted &&
+    (!(execContext.workspaceId || execContext.organizationId) || !execContext.billingAttribution)
+  ) {
     throw new Error('Billing attribution is required for hosted Copilot execution')
   }
   let hostedBillingRequest: AttributedBillingRequestEnvelope | undefined
@@ -296,7 +395,9 @@ export async function runCopilotLifecycle(
     const billingAttribution = assertBillingAttributionSnapshot(execContext.billingAttribution)
     if (
       billingAttribution.actorUserId !== execContext.userId ||
-      billingAttribution.workspaceId !== execContext.workspaceId
+      billingAttribution.workspaceId !== (execContext.workspaceId ?? null) ||
+      (execContext.organizationId !== undefined &&
+        billingAttribution.organizationId !== execContext.organizationId)
     ) {
       throw new Error('Copilot billing attribution does not match its actor and workspace')
     }
@@ -312,6 +413,10 @@ export async function runCopilotLifecycle(
     executionId: resolvedExecutionId,
     runId: resolvedRunId,
     messageId: payloadMsgId,
+    providerToolCallIdentity:
+      goRoute === '/api/tools/resume'
+        ? undefined
+        : createProviderToolCallIdentity(resolvedRunId ?? generateId()),
     toolPermissions: await resolveToolPermissions(lifecycleOptions),
     ...(lifecycleOptions.trace ? { trace: lifecycleOptions.trace } : {}),
   })
@@ -319,7 +424,20 @@ export async function runCopilotLifecycle(
 
   try {
     await ensureModelEgressRegistry(execContext, lifecycleOptions)
-    const modelSafeRequestPayload = await filterInitialCopilotAttachmentsForModel(
+    if (organizationId && goRoute !== '/api/tools/resume') {
+      if (!chatId) throw new Error('Search integration context requires a private chat ID')
+      requestPayload = {
+        ...requestPayload,
+        workspaceContext: await loadCopilotSearchIntegrations({
+          userId,
+          organizationId,
+          chatId,
+          messageId: payloadMsgId,
+          signal: lifecycleOptions.abortSignal,
+        }),
+      }
+    }
+    const modelSafeRequestPayload = await prepareInitialCopilotAttachmentsForModel(
       requestPayload,
       lifecycleOptions.workspaceId
     )
@@ -592,6 +710,7 @@ function buildResumeToolResult(
   checkpointId: string | undefined
 ): ResumeToolResult {
   const tool = context.toolCalls.get(toolCallId)
+  const providerToolCallId = restoreProviderToolCallId(toolCallId, context.providerToolCallIdentity)
   if (!tool || !tool.result) {
     recordDegraded(CopilotDegradedReason.MissingToolResult)
     logger.error('Missing tool result for pending tool call; synthesizing a failure', {
@@ -603,14 +722,14 @@ function buildResumeToolResult(
       hasPendingPromise: context.pendingToolPromises.has(toolCallId),
     })
     return {
-      callId: toolCallId,
+      callId: providerToolCallId,
       name: tool?.name || '',
       data: { error: `no result was returned for tool call ${toolCallId}` },
       success: false,
     }
   }
   return {
-    callId: toolCallId,
+    callId: providerToolCallId,
     name: tool.name || '',
     data: getToolCallTerminalData(tool),
     success: requireToolCallStateResult(tool).success,
@@ -734,6 +853,9 @@ async function driveOneChildChain(
         checkpointId,
         userId: options.userId,
         ...(workspaceId ? { workspaceId } : {}),
+        ...(execContext.organizationId
+          ? { organizationId: execContext.organizationId, chatId: execContext.chatId }
+          : {}),
         results,
       },
       leg,
@@ -857,6 +979,7 @@ async function runCheckpointLoop(
   const callerOnEvent = options.onEvent
   const mothershipBaseURL = await getMothershipBaseURL({ userId: options.userId })
   const lifecycleWorkspaceId = nonBlankString(options.workspaceId)
+  const lifecycleOrganizationId = nonBlankString(execContext.organizationId)
   const mothershipRequestId = nonBlankString(options.simRequestId) ?? generateId()
   if (!options.simRequestId) {
     options = { ...options, simRequestId: mothershipRequestId }
@@ -867,13 +990,28 @@ async function runCheckpointLoop(
     payload = { ...payload, systemPromptOverride }
   }
 
-  // Go's auth middleware re-validates every Sim -> Go request by reading
-  // workspaceId from the JSON body and forwarding it to Sim's validate route,
-  // where it is required for the per-member usage gate. Normalize the initial
-  // leg from the lifecycle option so callers that only set the option (not the
-  // raw payload) still send it on the first request.
+  /**
+   * The initial turn needs its workspace for pooled and member spend admission.
+   * Resumes authenticate again, then Go rechecks current access using the
+   * checkpoint's original scope and payer without repeating spend admission.
+   */
   if (lifecycleWorkspaceId && !nonBlankString(payload.workspaceId)) {
     payload = { ...payload, workspaceId: lifecycleWorkspaceId }
+  }
+
+  if (lifecycleOrganizationId) {
+    if (
+      lifecycleWorkspaceId ||
+      execContext.workspaceId ||
+      execContext.workflowId ||
+      payload.mode !== 'assistant' ||
+      !execContext.chatId ||
+      nonBlankString(payload.workspaceId) ||
+      (nonBlankString(payload.organizationId) && payload.organizationId !== lifecycleOrganizationId)
+    ) {
+      throw new Error('Organization execution scope does not match the request')
+    }
+    payload = { ...payload, organizationId: lifecycleOrganizationId, chatId: execContext.chatId }
   }
 
   // Enterprise BYOK eligibility hint: set once on the initial mothership request
@@ -1122,11 +1260,7 @@ async function runCheckpointLoop(
                   waitBudgetMs: watchdog.waitBudgetMs,
                 }
               )
-              await forceFailHungToolCall(
-                toolCallId,
-                context,
-                'Tool execution hung on the Sim executor and was abandoned so the conversation could continue.'
-              )
+              await forceFailHungToolCall(toolCallId, context, execContext)
               if (context.pendingToolPromises.get(toolCallId) === watchdog.promise) {
                 context.pendingToolPromises.delete(toolCallId)
               }
@@ -1248,6 +1382,9 @@ async function runCheckpointLoop(
       checkpointId: continuation.checkpointId,
       userId: options.userId,
       ...(lifecycleWorkspaceId ? { workspaceId: lifecycleWorkspaceId } : {}),
+      ...(lifecycleOrganizationId
+        ? { organizationId: lifecycleOrganizationId, chatId: execContext.chatId }
+        : {}),
       results,
     }
 
@@ -1274,6 +1411,7 @@ async function buildExecutionContext(
     userId: string
     workflowId?: string
     workspaceId?: string
+    organizationId?: string
     chatId?: string
     executionId?: string
     runId?: string
@@ -1290,6 +1428,7 @@ async function buildExecutionContext(
     userId,
     workflowId,
     workspaceId,
+    organizationId,
     chatId,
     executionId,
     runId,
@@ -1306,7 +1445,7 @@ async function buildExecutionContext(
   const requestMode = typeof requestPayload?.mode === 'string' ? requestPayload.mode : undefined
 
   let execContext: ExecutionContext
-  if (workflowId) {
+  if (workflowId && requestMode !== 'assistant') {
     execContext = await prepareExecutionContext(userId, workflowId, chatId, {
       workspaceId,
       billingAttribution,
@@ -1314,11 +1453,15 @@ async function buildExecutionContext(
     })
   } else {
     const activeEnvironmentContext =
-      environmentContext ?? (await prepareCopilotEnvironmentContext(userId, workspaceId))
+      environmentContext ??
+      (await prepareCopilotEnvironmentContext(userId, workspaceId, {
+        includeSecrets: requestMode !== 'assistant',
+      }))
     execContext = {
       userId,
       workflowId: '',
       workspaceId,
+      organizationId,
       chatId,
       ...activeEnvironmentContext,
       billingAttribution,
@@ -1328,6 +1471,12 @@ async function buildExecutionContext(
   if (userTimezone) execContext.userTimezone = userTimezone
   execContext.copilotToolExecution = true
   if (requestMode) execContext.requestMode = requestMode
+  if (requestMode === 'assistant') {
+    execContext.assistantSearch = workspaceSearchFiltersSchema.parse(
+      requestPayload?.assistantSearch ?? {}
+    )
+    execContext.secretActorUserId = null
+  }
   if (userPermission) execContext.userPermission = userPermission
   execContext.messageId =
     typeof requestPayload?.messageId === 'string' ? requestPayload.messageId : undefined

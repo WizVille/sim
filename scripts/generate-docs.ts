@@ -3,9 +3,16 @@ import fs from 'fs'
 import path from 'path'
 import { fileURLToPath, pathToFileURL } from 'url'
 import { isVersionedType, stripVersionSuffix } from '@sim/utils/string'
+import ts from '@typescript/typescript6'
 import { glob } from 'glob'
+import remarkGfm from 'remark-gfm'
+import remarkParse from 'remark-parse'
+import { unified } from 'unified'
+import { visit } from 'unist-util-visit'
 import type { BlockCategory } from '../apps/sim/blocks/types'
 import { IntegrationType } from '../apps/sim/blocks/types'
+import type { ToolOutputProperty } from '../apps/sim/tools/types'
+import { formatGeneratedSource } from './format-generated-source'
 
 /**
  * Cache for resolved const definitions from types files.
@@ -41,42 +48,122 @@ const LANDING_INTEGRATIONS_DATA_PATH = path.join(
   'apps/sim/app/(landing)/integrations/data'
 )
 const TRIGGERS_PATH = path.join(rootDir, 'apps/sim/triggers')
+const sourceFileCache = new Map<string, string>()
+const sourceGlobCache = new Map<string, Promise<string[]>>()
+const blockConfigCache = new Map<string, ReturnType<typeof extractAllBlockConfigs>>()
+
+interface SourceObjectDeclaration {
+  name: string
+  start: number
+  end: number
+  content: string
+  satisfies: boolean
+  blockConfig: boolean
+}
+
+const sourceObjectCache = new Map<string, SourceObjectDeclaration[]>()
+
+/** Type assertions and satisfies checks do not change an initializer's runtime value. */
+function unwrapExpression(expression: ts.Expression): {
+  expression: ts.Expression
+  satisfies: boolean
+} {
+  let current = expression
+  let satisfies = false
+  while (
+    ts.isAsExpression(current) ||
+    ts.isSatisfiesExpression(current) ||
+    ts.isParenthesizedExpression(current) ||
+    ts.isTypeAssertionExpression(current)
+  ) {
+    satisfies ||= ts.isSatisfiesExpression(current)
+    current = current.expression
+  }
+  return { expression: current, satisfies }
+}
+
+/** Reads exported object initializers without executing integration modules. */
+function sourceObjectDeclarations(content: string): SourceObjectDeclaration[] {
+  const cached = sourceObjectCache.get(content)
+  if (cached) return cached
+  const source = ts.createSourceFile('integration.ts', content, ts.ScriptTarget.Latest, true)
+  const declarations: SourceObjectDeclaration[] = []
+  for (const statement of source.statements) {
+    if (
+      !ts.isVariableStatement(statement) ||
+      !statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
+    )
+      continue
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || !declaration.initializer) continue
+      const { expression: initializer, satisfies } = unwrapExpression(declaration.initializer)
+      if (!ts.isObjectLiteralExpression(initializer)) continue
+      const start = initializer.getStart(source)
+      const end = initializer.getEnd()
+      declarations.push({
+        name: declaration.name.text,
+        start,
+        end,
+        content: content.slice(start, end),
+        satisfies,
+        blockConfig:
+          /^BlockConfig\b/.test(declaration.type?.getText(source) ?? '') ||
+          /\bsatisfies\s+BlockConfig\b/.test(content.slice(end, declaration.getEnd())),
+      })
+    }
+  }
+  sourceObjectCache.set(content, declarations)
+  return declarations
+}
+
+function blockDeclarations(content: string): SourceObjectDeclaration[] {
+  return sourceObjectDeclarations(content).filter(
+    (declaration) => declaration.name.endsWith('Block') && declaration.blockConfig
+  )
+}
+
+function readSourceFile(filePath: string): string {
+  const cached = sourceFileCache.get(filePath)
+  if (cached !== undefined) return cached
+  const source = fs.readFileSync(filePath, 'utf-8')
+  sourceFileCache.set(filePath, source)
+  return source
+}
+
+async function sourceGlob(pattern: string): Promise<string[]> {
+  let pending = sourceGlobCache.get(pattern)
+  if (!pending) {
+    pending = glob(pattern)
+    sourceGlobCache.set(pattern, pending)
+  }
+  return [...(await pending)]
+}
+
+function blockConfigsForFile(filePath: string): ReturnType<typeof extractAllBlockConfigs> {
+  const cached = blockConfigCache.get(filePath)
+  if (cached) return cached
+  const configs = extractAllBlockConfigs(readSourceFile(filePath))
+  blockConfigCache.set(filePath, configs)
+  return configs
+}
 // Integration triggers are merged into the same per-service page as the service's
 // actions (one block per integration: actions + an optional Trigger).
 const TRIGGER_DOCS_OUTPUT_PATH = DOCS_OUTPUT_PATH
 
+const integrationNavigation = JSON.parse(
+  fs.readFileSync(path.join(rootDir, 'apps/docs/content/integration-navigation.json'), 'utf-8')
+) as { guides: Record<string, unknown>; redirects: Record<string, string> }
+
 /**
  * Hand-written integration pages in DOCS_OUTPUT_PATH that the generator must
- * never clobber. Every hand-authored `*-service-account` credential guide has
- * to be listed here — these pages carry no `MANUAL-CONTENT` markers and no
+ * never clobber. Hand-authored credential guides are registered in the shared
+ * docs navigation file — these pages carry no `MANUAL-CONTENT` markers and no
  * backing block, so the stale-doc cleanup deletes any that go unregistered.
  */
 const HANDWRITTEN_INTEGRATION_DOCS = new Set([
   'index',
   'a2a',
-  'airtable-service-account',
-  'asana-service-account',
-  'atlassian-service-account',
-  'attio-service-account',
-  'box-service-account',
-  'calcom-service-account',
-  'clickup-service-account',
-  'google-service-account',
-  'hubspot-service-account',
-  'hubspot-setup',
-  'linear-service-account',
-  'monday-service-account',
-  'netsuite-service-account',
-  'notion-service-account',
-  'pipedrive-service-account',
-  'salesforce-service-account',
-  'shopify-service-account',
-  'snowflake-service-account',
-  'trello-service-account',
-  'wealthbox-service-account',
-  'webflow-service-account',
-  'zoho-desk-service-account',
-  'zoom-service-account',
+  ...Object.keys(integrationNavigation.guides),
 ])
 
 /**
@@ -286,10 +373,17 @@ interface RegistrySubBlock {
   placeholder?: unknown
   /** `true`, or a condition object making the field required only for some configurations. */
   required?: unknown
+  hidden?: boolean
   readOnly?: boolean
 }
 
 interface RegistryTrigger {
+  id?: string
+  name?: string
+  provider?: string
+  description?: string
+  polling?: boolean
+  deprecated?: boolean
   subBlocks?: RegistrySubBlock[]
   outputs?: Record<string, any>
 }
@@ -333,6 +427,16 @@ async function loadToolMetadata(): Promise<Record<string, ToolMetadataEntry>> {
   const module = await import(path.join(rootDir, 'apps/sim/tools/generated/tool-metadata.ts'))
   toolMetadata = module.default as Record<string, ToolMetadataEntry>
   return toolMetadata
+}
+
+/** Evaluated tool output schemas, keyed by tool id and kept in sync with the registry by CI. */
+let toolOutputs: Record<string, Record<string, ToolOutputProperty>> | null = null
+
+async function loadToolOutputs(): Promise<Record<string, Record<string, ToolOutputProperty>>> {
+  if (toolOutputs) return toolOutputs
+  const module = await import(path.join(rootDir, 'apps/sim/tools/generated/tool-outputs.ts'))
+  toolOutputs = module.default as Record<string, Record<string, ToolOutputProperty>>
+  return toolOutputs
 }
 
 /** Human-facing tool names, keyed by tool id. Kept in sync with the registry by CI. */
@@ -462,7 +566,7 @@ function copyIconsFile(): void {
       return
     }
 
-    const iconsContent = fs.readFileSync(ICONS_PATH, 'utf-8')
+    const iconsContent = readSourceFile(ICONS_PATH)
     emitGeneratedFile(DOCS_ICONS_PATH, iconsContent)
 
     if (!CHECK_ONLY) console.log('✓ Icons successfully copied to docs app')
@@ -478,12 +582,16 @@ function copyIconsFile(): void {
  * instead of the two-letter fallback. Never overwrites a block-derived entry —
  * the block is the canonical icon source when one exists.
  */
-async function addTriggerProviderIcons(iconMapping: Record<string, IconRef>): Promise<void> {
-  const triggerFiles = (await glob(`${TRIGGERS_PATH}/**/*.ts`)).filter((f) => !f.includes('.test.'))
+async function addTriggerProviderIcons(
+  iconMappings: readonly Record<string, IconRef>[]
+): Promise<void> {
+  const triggerFiles = (await sourceGlob(`${TRIGGERS_PATH}/**/*.ts`)).filter(
+    (f) => !f.includes('.test.')
+  )
   const previewOnly = await collectPreviewOnlyTriggerIds()
 
   for (const file of triggerFiles) {
-    const fileContent = fs.readFileSync(file, 'utf-8')
+    const fileContent = readSourceFile(file)
     const source = stripSourceComments(fileContent)
 
     // Pair each trigger's `id` with the `provider` that follows it in the same
@@ -494,7 +602,7 @@ async function addTriggerProviderIcons(iconMapping: Record<string, IconRef>): Pr
 
     for (const match of source.matchAll(configRegex)) {
       const [, triggerId, provider] = match
-      if (iconMapping[provider]) continue
+      if (iconMappings.every((iconMapping) => iconMapping[provider])) continue
 
       // Preview-only triggers get no page, so they need no provider icon.
       if (previewOnly.has(triggerId)) continue
@@ -502,7 +610,10 @@ async function addTriggerProviderIcons(iconMapping: Record<string, IconRef>): Pr
       const iconName = extractIconNameFromContent(source.slice(match.index))
       if (!iconName) continue
 
-      iconMapping[provider] = { name: iconName, source: resolveIconSource(fileContent, iconName) }
+      const iconRef = { name: iconName, source: resolveIconSource(fileContent, iconName) }
+      for (const iconMapping of iconMappings) {
+        if (!iconMapping[provider]) iconMapping[provider] = iconRef
+      }
     }
   }
 }
@@ -512,31 +623,31 @@ async function addTriggerProviderIcons(iconMapping: Record<string, IconRef>): Pr
  * Docs need hidden historical version keys so old BlockInfoCard references and
  * versioned docs links still render icons, while landing only needs visible blocks.
  */
-async function generateIconMapping(options: {
-  includeHidden: boolean
-}): Promise<Record<string, IconRef>> {
+export async function generateIconMappings(): Promise<{
+  docs: Record<string, IconRef>
+  visible: Record<string, IconRef>
+  coreBlockTypes: string[]
+}> {
   try {
     console.log('Generating icon mapping from block definitions...')
 
-    const iconMapping: Record<string, IconRef> = {}
-    const blockFiles = (await glob(`${BLOCKS_PATH}/*.ts`)).sort()
+    const docs: Record<string, IconRef> = {}
+    const visible: Record<string, IconRef> = {}
+    const coreBlockTypes = new Set<string>()
+    const blockFiles = (await sourceGlob(`${BLOCKS_PATH}/*.ts`)).sort()
 
     for (const blockFile of blockFiles) {
-      const fileContent = fs.readFileSync(blockFile, 'utf-8')
+      const fileContent = readSourceFile(blockFile)
 
       // For icon mapping, we need ALL blocks including hidden ones
       // because V2 blocks inherit icons from legacy blocks via spread
       // First, extract the primary icon from the file (usually the legacy block's icon)
       const primaryIcon = extractIconNameFromContent(fileContent)
 
-      const exportRegex = /export\s+const\s+(\w+)Block\s*:\s*BlockConfig[^=]*=\s*\{/g
-      let match
-
-      while ((match = exportRegex.exec(fileContent)) !== null) {
-        const blockName = match[1]
-        const startIndex = match.index + match[0].length - 1
-
-        const endIndex = findMatchingClose(fileContent, startIndex)
+      for (const declaration of blockDeclarations(fileContent)) {
+        const blockName = declaration.name.replace(/Block$/, '')
+        const startIndex = declaration.start
+        const endIndex = declaration.end
 
         if (endIndex !== -1) {
           const blockContent = fileContent.substring(startIndex, endIndex)
@@ -560,6 +671,18 @@ async function generateIconMapping(options: {
             continue
           }
 
+          const category = extractStringPropertyFromContent(blockContent, 'category') || 'misc'
+          const iconRef = {
+            name: iconName,
+            source: resolveIconSource(fileContent, iconName),
+          }
+          /** Core reference previews share the registry's glyphs without entering the integration catalog. */
+          const inheritedCategory = extractInheritedBlockCategory(blockContent, fileContent)
+          if (inheritedCategory === 'blocks' || inheritedCategory === 'triggers') {
+            docs[blockType] = iconRef
+            coreBlockTypes.add(blockType)
+          }
+
           if (
             blockType.includes('_trigger') ||
             blockType.includes('_webhook') ||
@@ -567,8 +690,6 @@ async function generateIconMapping(options: {
           ) {
             continue
           }
-
-          const category = extractStringPropertyFromContent(blockContent, 'category') || 'misc'
 
           // Exclude first-party `blocks`-category primitives (except the native
           // resource blocks that still get a generated docs page) and
@@ -592,26 +713,26 @@ async function generateIconMapping(options: {
            * hidden versioned block. Without this it renders as a text tile.
            */
           const isSunsetBlockType = /sunset\s*:\s*\{/.test(stripSourceComments(blockContent))
-          if (
-            !hideFromToolbar ||
-            (options.includeHidden && (isVersionedBlockType || isSunsetBlockType))
-          ) {
-            iconMapping[blockType] = {
-              name: iconName,
-              source: resolveIconSource(fileContent, iconName),
-            }
+          if (!hideFromToolbar) {
+            docs[blockType] = iconRef
+            visible[blockType] = iconRef
+          } else if (isVersionedBlockType || isSunsetBlockType) {
+            docs[blockType] = iconRef
           }
         }
       }
     }
 
-    await addTriggerProviderIcons(iconMapping)
+    await addTriggerProviderIcons([docs, visible])
 
-    console.log(`✓ Generated icon mapping for ${Object.keys(iconMapping).length} blocks`)
-    return iconMapping
+    console.log(
+      `✓ Generated icon mappings for ${Object.keys(docs).length} docs blocks and ` +
+        `${Object.keys(visible).length} visible blocks`
+    )
+    return { docs, visible, coreBlockTypes: [...coreBlockTypes].sort() }
   } catch (error) {
     console.error('Error generating icon mapping:', error)
-    return {}
+    return { docs: {}, visible: {}, coreBlockTypes: [] }
   }
 }
 
@@ -634,7 +755,7 @@ function biomeSortCompare(a: string, b: string): number {
   return a.length - b.length
 }
 
-function writeIconMapping(iconMapping: Record<string, IconRef>): void {
+function writeIconMapping(iconMapping: Record<string, IconRef>, coreBlockTypes: string[]): void {
   try {
     const iconMappingPath = path.join(rootDir, 'apps/docs/components/ui/icon-mapping.ts')
 
@@ -649,6 +770,7 @@ function writeIconMapping(iconMapping: Record<string, IconRef>): void {
     }
 
     const imports = renderIconImports(Object.values(withAliases))
+    const coreTypeEntries = coreBlockTypes.map((type) => `  '${type}',`).join('\n')
 
     // Generate mapping with direct references (no dynamic access for tree shaking)
     const mappingEntries = Object.entries(withAliases)
@@ -668,6 +790,10 @@ type IconComponent = ComponentType<SVGProps<SVGSVGElement>>
 export const blockTypeToIconMap: Record<string, IconComponent> = {
 ${mappingEntries}
 }
+
+export const coreBlockTypes = new Set([
+${coreTypeEntries}
+])
 `
 
     emitGeneratedFile(iconMappingPath, content)
@@ -1216,11 +1342,11 @@ async function buildToolDescriptionMap(): Promise<ToolMaps> {
   const desc = new Map<string, string>()
   const name = new Map<string, string>()
   try {
-    const toolFiles = await glob(`${toolsDir}/**/*.ts`)
+    const toolFiles = await sourceGlob(`${toolsDir}/**/*.ts`)
     for (const file of toolFiles) {
       const basename = path.basename(file)
       if (basename === 'index.ts' || basename === 'types.ts') continue
-      const content = fs.readFileSync(file, 'utf-8')
+      const content = readSourceFile(file)
 
       // Find every `id: 'tool_id'` occurrence in the file. For each, search
       // the next ~600 characters for `name:` and `description:` fields, cutting
@@ -1679,13 +1805,13 @@ async function buildTriggerRegistry(): Promise<Map<string, TriggerInfo>> {
   const registry = new Map<string, TriggerInfo>()
   const SKIP = new Set(['index.ts', 'registry.ts', 'types.ts', 'constants.ts', 'utils.ts'])
 
-  const triggerFiles = (await glob(`${TRIGGERS_PATH}/**/*.ts`)).filter(
+  const triggerFiles = (await sourceGlob(`${TRIGGERS_PATH}/**/*.ts`)).filter(
     (f) => !SKIP.has(path.basename(f)) && !f.includes('.test.')
   )
 
   for (const file of triggerFiles) {
     try {
-      const content = fs.readFileSync(file, 'utf-8')
+      const content = readSourceFile(file)
 
       // A file may export multiple TriggerConfig objects (e.g. v1 + v2 in
       // the same file). Extract all exported configs by splitting on the
@@ -1720,6 +1846,23 @@ async function buildTriggerRegistry(): Promise<Map<string, TriggerInfo>> {
             description: descMatch?.[1] ?? '',
           })
         }
+      }
+
+      const evaluatedTriggers = await loadTriggerRegistry()
+      const factoryExportRegex =
+        /export\s+const\s+\w+(?:\s*:\s*TriggerConfig)?\s*=\s*\w+\s*\(\s*['"]([^'"]+)['"]/g
+      let factoryExportMatch: RegExpExecArray | null
+      while ((factoryExportMatch = factoryExportRegex.exec(content)) !== null) {
+        const trigger = evaluatedTriggers[factoryExportMatch[1]]
+        if (!trigger?.id || !trigger.name || trigger.deprecated || registry.has(trigger.id)) {
+          continue
+        }
+
+        registry.set(trigger.id, {
+          id: trigger.id,
+          name: trigger.name,
+          description: trigger.description ?? '',
+        })
       }
     } catch {
       // skip unreadable files silently
@@ -1799,12 +1942,12 @@ async function writeIntegrationsJson(iconMapping: Record<string, IconRef>): Prom
 
     const integrations: IntegrationEntry[] = []
     const seenBaseTypes = new Set<string>()
-    const blockFiles = (await glob(`${BLOCKS_PATH}/*.ts`)).sort()
+    const blockFiles = (await sourceGlob(`${BLOCKS_PATH}/*.ts`)).sort()
 
     for (const blockFile of blockFiles) {
-      const fileContent = fs.readFileSync(blockFile, 'utf-8')
+      const fileContent = readSourceFile(blockFile)
       const switchCaseMap = extractSwitchCaseToolMapping(fileContent)
-      const configs = extractAllBlockConfigs(fileContent)
+      const configs = blockConfigsForFile(blockFile)
 
       for (const config of configs) {
         const blockType = config.type
@@ -1924,6 +2067,42 @@ async function writeIntegrationsJson(iconMapping: Record<string, IconRef>): Prom
 
     integrations.sort((a, b) => compareCatalogNames(a.name, b.name))
 
+    const metadataPath = path.join(INTEGRATIONS_CATALOG_PATH, 'integration-metadata.ts')
+    const metadata = integrations.map(
+      ({ type, slug, name, authType, oauthServiceId, bgColor, integrationType }) => ({
+        type,
+        slug,
+        name,
+        authType,
+        ...(oauthServiceId ? { oauthServiceId } : {}),
+        bgColor,
+        integrationType,
+      })
+    )
+    emitGeneratedFile(
+      metadataPath,
+      formatGeneratedSource(
+        `/**
+ * Generated by scripts/generate-docs.ts from the public integration catalog.
+ * Identity and authentication metadata without descriptions, operations, or icons.
+ */
+export interface IntegrationMetadata {
+  type: string
+  slug: string
+  name: string
+  authType: 'oauth' | 'api-key' | 'none'
+  oauthServiceId?: string
+  bgColor: string
+  integrationType: string
+}
+
+export const INTEGRATION_METADATA: readonly IntegrationMetadata[] = JSON.parse(${JSON.stringify(JSON.stringify(metadata))})
+`,
+        metadataPath,
+        rootDir
+      )
+    )
+
     const jsonPath = path.join(INTEGRATIONS_CATALOG_PATH, 'integrations.json')
     // `JSON.stringify` always expands every array across multiple lines, but Biome's
     // JSON formatter inlines short arrays of primitive strings. Pre-collapse those
@@ -1974,14 +2153,10 @@ export function extractAllBlockConfigs(fileContent: string): BlockConfig[] {
   // First, extract the primary icon from the file (for V2 blocks that inherit via spread)
   const primaryIcon = extractIconNameFromContent(fileContent)
 
-  const exportRegex = /export\s+const\s+(\w+)Block\s*:\s*BlockConfig[^=]*=\s*\{/g
-  let match
-
-  while ((match = exportRegex.exec(fileContent)) !== null) {
-    const blockName = match[1]
-    const startIndex = match.index + match[0].length - 1 // Position of opening brace
-
-    const endIndex = findMatchingClose(fileContent, startIndex)
+  for (const declaration of blockDeclarations(fileContent)) {
+    const blockName = declaration.name.replace(/Block$/, '')
+    const startIndex = declaration.start
+    const endIndex = declaration.end
 
     if (endIndex !== -1) {
       const blockContent = fileContent.substring(startIndex, endIndex)
@@ -2022,6 +2197,25 @@ function extractSpreadBase(blockContent: string): string | null {
   return spreadMatch ? spreadMatch[1] : null
 }
 
+/** Resolves a block's category through local spread ancestry without loading its registry. */
+export function extractInheritedBlockCategory(
+  blockContent: string,
+  fileContent: string
+): string | null {
+  const visited = new Set<string>()
+  let current = blockContent
+  while (true) {
+    const category = extractStringPropertyFromContent(current, 'category', true)
+    if (category) return category
+    const base = extractSpreadBase(current)
+    if (!base || visited.has(base)) return null
+    visited.add(base)
+    const declaration = blockDeclarations(fileContent).find((candidate) => candidate.name === base)
+    if (!declaration) return null
+    current = declaration.content
+  }
+}
+
 /**
  * Extract block config from a specific block's content
  * If the block uses spread inheritance (e.g., ...GitHubBlock), attempts to resolve
@@ -2037,24 +2231,14 @@ function extractBlockConfigFromContent(
     let baseConfig: BlockConfig | null = null
 
     if (spreadBase && fileContent) {
-      const baseBlockRegex = new RegExp(
-        `export\\s+const\\s+${spreadBase}\\s*:\\s*BlockConfig[^=]*=\\s*\\{`,
-        'g'
+      const declaration = blockDeclarations(fileContent).find(
+        (candidate) => candidate.name === spreadBase
       )
-      const baseMatch = baseBlockRegex.exec(fileContent)
-
-      if (baseMatch) {
-        const startIndex = baseMatch.index + baseMatch[0].length - 1
-        const endIndex = findMatchingClose(fileContent, startIndex)
-
-        if (endIndex !== -1) {
-          const baseBlockContent = fileContent.substring(startIndex, endIndex)
-          // Recursively extract base config (but don't pass fileContent to avoid infinite loops)
-          baseConfig = extractBlockConfigFromContent(
-            baseBlockContent,
-            spreadBase.replace('Block', '')
-          )
-        }
+      if (declaration) {
+        baseConfig = extractBlockConfigFromContent(
+          declaration.content,
+          spreadBase.replace(/Block$/, '')
+        )
       }
     }
 
@@ -2081,7 +2265,14 @@ function extractBlockConfigFromContent(
       '#F5F5F5'
     const iconName = extractIconNameFromContent(blockContent) || (baseConfig as any)?.iconName || ''
 
-    const outputs = extractOutputsFromContent(blockContent)
+    const ownOutputs = extractOutputsFromContent(blockContent)
+    const inheritsOutputs = /\boutputs\s*:\s*\{\s*\.\.\.\w+Block\.outputs\b/.test(blockContent)
+    const omittedOutputs = extractOmittedOutputs(blockContent, baseConfig?.outputs)
+    const outputs = omittedOutputs
+      ? { ...omittedOutputs, ...ownOutputs }
+      : inheritsOutputs
+        ? { ...baseConfig?.outputs, ...ownOutputs }
+        : ownOutputs
     const toolsAccess = extractToolsAccessFromContent(blockContent)
 
     // For tools.access, if not found directly, check if it's derived from base via map
@@ -2095,6 +2286,14 @@ function extractBlockConfigFromContent(
       if (mapMatch) {
         const versionSuffix = `_v${mapMatch[1]}`
         finalToolsAccess = baseConfig.tools.access.map((tool) => `${tool}${versionSuffix}`)
+      }
+      const replacement = blockContent.match(
+        /access\s*:\s*\w+Block\.tools\.access\.map\s*\(\s*\(\s*(\w+)\s*\)\s*=>\s*\1\s*===\s*['"]([^'"]+)['"]\s*\?\s*['"]([^'"]+)['"]\s*:\s*\1\s*\)/
+      )
+      if (replacement) {
+        finalToolsAccess = baseConfig.tools.access.map((tool) =>
+          tool === replacement[2] ? replacement[3] : tool
+        )
       }
     }
 
@@ -2472,8 +2671,30 @@ function extractOutputsFromContent(content: string): Record<string, any> {
   return outputs
 }
 
+/** Resolves a version's explicit removal of inherited output fields. */
+function extractOmittedOutputs<T>(
+  content: string,
+  inherited: Record<string, T> | undefined
+): Record<string, T> | null {
+  const omission = content.match(
+    /\boutputs\s*:\s*(?:\{\s*\.\.\.\s*)?omit\(\s*\w+\.outputs!?\s*,\s*\[([^\]]*)\]\s*\)/
+  )
+  if (!omission || !inherited) return null
+  const outputs = { ...inherited }
+  for (const [, key] of omission[1].matchAll(/['"]([^'"]+)['"]/g)) delete outputs[key]
+  return outputs
+}
+
 function extractToolsAccessFromContent(content: string): string[] {
-  const accessMatch = content.match(/access\s*:\s*\[\s*([^\]]+)\s*\]/)
+  const toolsMatch = /\btools\s*:\s*\{/.exec(content)
+  if (!toolsMatch) return []
+
+  const toolsStart = toolsMatch.index + toolsMatch[0].lastIndexOf('{')
+  const toolsEnd = findMatchingClose(content, toolsStart)
+  if (toolsEnd === -1) return []
+
+  const toolsContent = content.substring(toolsStart, toolsEnd)
+  const accessMatch = toolsContent.match(/access\s*:\s*\[\s*([^\]]+)\s*\]/)
   if (!accessMatch) return []
   return [...accessMatch[1].matchAll(/['"]([^'"]+)['"]/g)].map((m) => m[1])
 }
@@ -2526,7 +2747,7 @@ function resolveConstReference(
     return null
   }
 
-  const typesContent = fs.readFileSync(typesFilePath, 'utf-8')
+  const typesContent = readSourceFile(typesFilePath)
 
   // Find the const definition
   // Pattern: export const CONST_NAME = { ... } as const
@@ -2917,7 +3138,7 @@ function resolveFactorySource(fileContent: string, toolFilePath: string, rootDir
     : path.resolve(path.dirname(toolFilePath), specifier)
 
   for (const candidate of [`${resolved}.ts`, path.join(resolved, 'index.ts')]) {
-    if (fs.existsSync(candidate)) return fs.readFileSync(candidate, 'utf-8')
+    if (fs.existsSync(candidate)) return readSourceFile(candidate)
   }
   return ''
 }
@@ -2947,7 +3168,7 @@ function readImportedModuleSource(
   if (!resolved) return ''
 
   for (const candidate of [`${resolved}.ts`, path.join(resolved, 'index.ts')]) {
-    if (fs.existsSync(candidate)) return fs.readFileSync(candidate, 'utf-8')
+    if (fs.existsSync(candidate)) return readSourceFile(candidate)
   }
   return ''
 }
@@ -3008,9 +3229,38 @@ export function extractToolInfo(
 ): {
   description: string
   params: Array<{ name: string; type: string; required: boolean; description: string }>
-  outputs: Record<string, any>
+  outputs: Record<string, ToolOutputProperty>
 } | null {
   try {
+    const declarations = sourceObjectDeclarations(fileContent)
+    const declaration = declarations.find(
+      (candidate) => extractStringPropertyFromContent(candidate.content, 'id', true) === toolName
+    )
+    const omittedBase = declaration?.content.match(/\boutputs\s*:\s*omit\(\s*(\w+)\.outputs!?\s*,/)
+    const baseDeclaration =
+      omittedBase && declarations.find((candidate) => candidate.name === omittedBase[1])
+    const baseId =
+      baseDeclaration && extractStringPropertyFromContent(baseDeclaration.content, 'id', true)
+    if (declaration && baseId && baseId !== toolName) {
+      const baseInfo = extractToolInfo(
+        baseId,
+        baseDeclaration.content,
+        factorySource,
+        toolFilePath,
+        rootDir,
+        userSettableParamIdSet
+      )
+      const outputs = extractOmittedOutputs(declaration.content, baseInfo?.outputs)
+      if (baseInfo && outputs) {
+        return {
+          ...baseInfo,
+          description:
+            extractStringPropertyFromContent(declaration.content, 'description', true) ||
+            baseInfo.description,
+          outputs,
+        }
+      }
+    }
     // First, try to find the specific tool definition by its ID
     // Look for: id: 'toolName' or id: "toolName"
     const toolIdRegex = new RegExp(`id:\\s*['"]${toolName}['"]`)
@@ -3775,6 +4025,18 @@ export function parsePropertiesContent(
   return properties
 }
 
+/** Wrapped tool declarations use the canonical evaluated output metadata. */
+function hasWrappedToolBase(toolName: string, content: string): boolean {
+  const declarations = sourceObjectDeclarations(content)
+  const declaration = declarations.find(
+    (candidate) => extractStringPropertyFromContent(candidate.content, 'id', true) === toolName
+  )
+  if (!declaration) return false
+  const baseName = declaration.content.match(/^\s*\.\.\.(\w+)\s*,/m)?.[1]
+  const base = declarations.find((candidate) => candidate.name === baseName)
+  return base?.satisfies === true
+}
+
 export async function getToolInfo(
   toolName: string,
   userSettableParamIds: readonly string[] | null = null
@@ -3788,6 +4050,7 @@ export async function getToolInfo(
 
   try {
     const metadata = (await loadToolMetadata())[toolName]
+    const generatedOutputs = (await loadToolOutputs())[toolName]
     const parts = toolName.split('_')
 
     let toolPrefix = ''
@@ -3855,7 +4118,7 @@ export async function getToolInfo(
 
     for (const location of possibleLocations) {
       if (fs.existsSync(location.path)) {
-        const content = fs.readFileSync(location.path, 'utf-8')
+        const content = readSourceFile(location.path)
 
         const toolIdRegex = new RegExp(`id:\\s*['"]${toolName}['"]`)
         if (toolIdRegex.test(content)) {
@@ -3880,11 +4143,11 @@ export async function getToolInfo(
     if (!foundExactId) {
       const prefixDir = path.join(rootDir, `apps/sim/tools/${toolPrefix}`)
       if (fs.existsSync(prefixDir)) {
-        const dirFiles = await glob(`${prefixDir}/**/*.ts`)
+        const dirFiles = await sourceGlob(`${prefixDir}/**/*.ts`)
         const toolIdRegex = new RegExp(`id:\\s*['"]${toolName}['"]`)
         for (const dirFile of dirFiles) {
           if (dirFile.endsWith('.test.ts')) continue
-          const content = fs.readFileSync(dirFile, 'utf-8')
+          const content = readSourceFile(dirFile)
           if (toolIdRegex.test(content)) {
             toolFileContent = content
             foundFile = dirFile
@@ -3899,7 +4162,7 @@ export async function getToolInfo(
     if (!toolFileContent) {
       for (const location of possibleLocations) {
         if (fs.existsSync(location.path)) {
-          toolFileContent = fs.readFileSync(location.path, 'utf-8')
+          toolFileContent = readSourceFile(location.path)
           foundFile = location.path
           break
         }
@@ -3948,7 +4211,12 @@ export async function getToolInfo(
     return {
       description: metadata.description ?? sourceInfo?.description ?? 'No description available',
       params,
-      outputs: sourceInfo?.outputs ?? {},
+      outputs:
+        toolPrefix === 'sailpoint' ||
+        toolName === 'file_edit' ||
+        hasWrappedToolBase(toolName, toolFileContent)
+          ? (generatedOutputs ?? sourceInfo?.outputs ?? {})
+          : (sourceInfo?.outputs ?? generatedOutputs ?? {}),
     }
   } catch (error) {
     console.error(`Error getting info for tool ${toolName}:`, error)
@@ -4023,10 +4291,10 @@ async function generateBlockDoc(blockPath: string) {
       return
     }
 
-    const fileContent = fs.readFileSync(blockPath, 'utf-8')
+    const fileContent = readSourceFile(blockPath)
 
     // Extract ALL block configs from the file (already filters out hideFromToolbar: true)
-    const blockConfigs = extractAllBlockConfigs(fileContent)
+    const blockConfigs = blockConfigsForFile(blockPath)
 
     if (blockConfigs.length === 0) {
       console.warn(`Skipping ${blockFileName} - no valid block configs found`)
@@ -4264,11 +4532,10 @@ ${toolsSection}
  */
 async function getCanonicalToolDocNames(): Promise<Set<string>> {
   const validToolDocs = new Set<string>()
-  const blockFiles = (await glob(`${BLOCKS_PATH}/*.ts`)).sort()
+  const blockFiles = (await sourceGlob(`${BLOCKS_PATH}/*.ts`)).sort()
 
   for (const blockFile of blockFiles) {
-    const fileContent = fs.readFileSync(blockFile, 'utf-8')
-    const configs = extractAllBlockConfigs(fileContent)
+    const configs = blockConfigsForFile(blockFile)
 
     for (const config of configs) {
       // Match the writer filter: integration blocks, the documented
@@ -4363,9 +4630,6 @@ function formatTriggerProviderName(provider: string): string {
 }
 
 /**
- * Escape text for use inside an MDX table cell.
- */
-/**
  * Escapes MDX-hostile characters in text emitted as a paragraph rather than a table cell.
  *
  * MDX reads `{` as an expression and `<` as the start of a JSX tag, so a tool description
@@ -4382,8 +4646,11 @@ function escapeMdxProse(text: string): string {
     .replace(/>/g, '&gt;')
 }
 
-function escapeMdxCell(text: string): string {
-  return text
+const markdownCellParser = unified().use(remarkParse).use(remarkGfm)
+
+/** Escape literal reference text without inserting backslashes into GFM autolinks. */
+export function escapeMdxCell(text: string): string {
+  const escaped = text
     .replace(/\|/g, '\\|')
     .replace(/\{/g, '\\{')
     .replace(/\}/g, '\\}')
@@ -4393,6 +4660,23 @@ function escapeMdxCell(text: string): string {
     .replace(/\]/g, '\\]')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
+
+  if (!/(?:https?:\/\/|www\.)/i.test(escaped) || !/\\[()[\]]/.test(escaped)) {
+    return escaped
+  }
+
+  const autolinkRanges: Array<{ start: number; end: number }> = []
+  visit(markdownCellParser.parse(escaped), 'link', ({ position }) => {
+    const start = position?.start.offset
+    const end = position?.end.offset
+    if (start !== undefined && end !== undefined) autolinkRanges.push({ start, end })
+  })
+
+  return escaped.replace(/\\[()[\]]/g, (escapedCharacter: string, offset: number) =>
+    autolinkRanges.some(({ start, end }) => offset >= start && offset < end)
+      ? escapedCharacter.slice(1)
+      : escapedCharacter
+  )
 }
 
 /**
@@ -4521,7 +4805,7 @@ function normalizeTriggerOutputNode(node: Record<string, any>): Record<string, a
 function triggerConfigFields(trigger: RegistryTrigger | undefined): TriggerConfigField[] {
   const fields: TriggerConfigField[] = []
   for (const subBlock of trigger?.subBlocks ?? []) {
-    if (!subBlock.id || TRIGGER_UI_ONLY_IDS.has(subBlock.id)) continue
+    if (!subBlock.id || subBlock.hidden === true || TRIGGER_UI_ONLY_IDS.has(subBlock.id)) continue
     if (subBlock.type === 'text' || subBlock.readOnly === true) continue
     fields.push({
       id: subBlock.id,
@@ -4548,14 +4832,14 @@ async function buildFullTriggerRegistry(): Promise<Map<string, TriggerFullInfo>>
   const registry = new Map<string, TriggerFullInfo>()
   const SKIP = new Set(['index.ts', 'registry.ts', 'types.ts', 'constants.ts', 'utils.ts'])
 
-  const triggerFiles = (await glob(`${TRIGGERS_PATH}/**/*.ts`)).filter(
+  const triggerFiles = (await sourceGlob(`${TRIGGERS_PATH}/**/*.ts`)).filter(
     (f) => !SKIP.has(path.basename(f)) && !f.includes('.test.')
   )
   const registryTriggers = await loadTriggerRegistry()
 
   for (const file of triggerFiles) {
     try {
-      const content = fs.readFileSync(file, 'utf-8')
+      const content = readSourceFile(file)
 
       const exportRegex = /export\s+const\s+\w+\s*:\s*TriggerConfig\s*=\s*\{/g
       let exportMatch: RegExpExecArray | null
@@ -4592,6 +4876,32 @@ async function buildFullTriggerRegistry(): Promise<Map<string, TriggerFullInfo>>
           polling,
           outputs: normalizeTriggerOutputs(registryTrigger?.outputs ?? {}),
           configFields: triggerConfigFields(registryTrigger),
+        })
+      }
+
+      const factoryExportRegex =
+        /export\s+const\s+\w+(?:\s*:\s*TriggerConfig)?\s*=\s*\w+\s*\(\s*['"]([^'"]+)['"]/g
+      let factoryExportMatch: RegExpExecArray | null
+      while ((factoryExportMatch = factoryExportRegex.exec(content)) !== null) {
+        const trigger = registryTriggers[factoryExportMatch[1]]
+        if (
+          !trigger?.id ||
+          !trigger.name ||
+          !trigger.provider ||
+          trigger.deprecated ||
+          registry.has(trigger.id)
+        ) {
+          continue
+        }
+
+        registry.set(trigger.id, {
+          id: trigger.id,
+          name: trigger.name,
+          description: trigger.description ?? '',
+          provider: trigger.provider,
+          polling: trigger.polling === true,
+          outputs: normalizeTriggerOutputs(trigger.outputs ?? {}),
+          configFields: triggerConfigFields(trigger),
         })
       }
     } catch {
@@ -4656,6 +4966,7 @@ const SUBBLOCK_TYPE_TO_SEMANTIC: Record<string, string> = {
   'oauth-input': 'string',
   code: 'string',
   'file-upload': 'string',
+  'model-fallback-list': 'json',
   text: 'string',
 }
 
@@ -4757,11 +5068,10 @@ ${buildTriggersSection(triggers)}`
  */
 async function buildProviderColorMap(): Promise<Map<string, string>> {
   const colorMap = new Map<string, string>()
-  const blockFiles = (await glob(`${BLOCKS_PATH}/*.ts`)).sort()
+  const blockFiles = (await sourceGlob(`${BLOCKS_PATH}/*.ts`)).sort()
 
   for (const blockFile of blockFiles) {
-    const fileContent = fs.readFileSync(blockFile, 'utf-8')
-    const configs = extractAllBlockConfigs(fileContent)
+    const configs = blockConfigsForFile(blockFile)
     for (const config of configs) {
       if (config.bgColor && config.type) {
         const baseType = stripVersionSuffix(config.type)
@@ -4789,15 +5099,12 @@ async function collectPreviewOnlyTriggerIds(): Promise<Set<string>> {
   const listedByReleased = new Set<string>()
   const listedByPreview = new Set<string>()
 
-  const blockFiles = (await glob(`${BLOCKS_PATH}/*.ts`)).sort()
+  const blockFiles = (await sourceGlob(`${BLOCKS_PATH}/*.ts`)).sort()
   for (const blockFile of blockFiles) {
-    const fileContent = fs.readFileSync(blockFile, 'utf-8')
-    const exportRegex = /export\s+const\s+(\w+)Block\s*:\s*BlockConfig[^=]*=\s*\{/g
-    let match: RegExpExecArray | null
-
-    while ((match = exportRegex.exec(fileContent)) !== null) {
-      const startIndex = match.index + match[0].length - 1
-      const endIndex = findMatchingClose(fileContent, startIndex)
+    const fileContent = readSourceFile(blockFile)
+    for (const declaration of blockDeclarations(fileContent)) {
+      const startIndex = declaration.start
+      const endIndex = declaration.end
       if (endIndex === -1) continue
 
       const blockContent = fileContent.substring(startIndex, endIndex)
@@ -4898,13 +5205,16 @@ async function generateAllTriggerDocs(): Promise<void> {
 
 async function generateAllBlockDocs() {
   try {
-    const blockFiles = (await glob(`${BLOCKS_PATH}/*.ts`)).sort()
+    const blockFiles = (await sourceGlob(`${BLOCKS_PATH}/*.ts`)).sort()
 
     copyIconsFile()
 
-    const docsIconMapping = await generateIconMapping({ includeHidden: true })
-    const visibleIconMapping = await generateIconMapping({ includeHidden: false })
-    writeIconMapping(docsIconMapping)
+    const {
+      docs: docsIconMapping,
+      visible: visibleIconMapping,
+      coreBlockTypes,
+    } = await generateIconMappings()
+    writeIconMapping(docsIconMapping, coreBlockTypes)
 
     await writeIntegrationsJson(visibleIconMapping)
     writeIntegrationsIconMapping(visibleIconMapping)
@@ -4939,10 +5249,10 @@ function updateMetaJson() {
     .filter((file: string) => file.endsWith('.mdx'))
     .map((file: string) => path.basename(file, '.mdx'))
 
-  const items = [
-    ...(blockFiles.includes('index') ? ['index'] : []),
-    ...blockFiles.filter((file: string) => file !== 'index').sort(),
-  ]
+  /** Fumadocs uses an unlisted index as the folder link; listing it creates a duplicate child. */
+  const items = blockFiles
+    .filter((file: string) => file !== 'index' && !(file in integrationNavigation.redirects))
+    .sort()
 
   const metaJson = {
     pages: items,

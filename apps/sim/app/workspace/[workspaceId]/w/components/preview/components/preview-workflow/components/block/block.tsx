@@ -10,7 +10,7 @@ import {
   WorkflowTypeTag,
 } from '@sim/workflow-renderer'
 import { WORKFLOW_SOURCE_HANDLE_ID, WORKFLOW_TARGET_HANDLE_ID } from '@sim/workflow-types/workflow'
-import { Handle, type NodeProps, Position } from 'reactflow'
+import { Handle, type Node, type NodeProps, Position } from '@xyflow/react'
 import { resolveCanvasBlockPresentation } from '@/lib/workflows/blocks/canvas-presentation'
 import {
   type CardSelector,
@@ -23,6 +23,8 @@ import {
   getDisplayValue,
   hasDisplayableRowValue,
   resolveDropdownLabel,
+  resolveFallbackModelsLabel,
+  resolveFolderPathLabel,
   resolveSkillsLabel,
   resolveToolsLabel,
   resolveVariablesLabel,
@@ -56,11 +58,11 @@ interface SubBlockValueEntry {
  * Extracted to avoid recreating style objects on each render.
  */
 const HANDLE_STYLES = {
-  horizontal: '!border-none !bg-[var(--surface-7)] !h-5 !w-[7px] !rounded-xs',
+  horizontal: 'border-none! bg-[var(--surface-7)]! h-5! w-[7px]! rounded-xs!',
   right:
-    '!z-[10] !border-none !bg-[var(--workflow-edge)] !h-5 !w-[7px] !rounded-r-[2px] !rounded-l-none',
+    'z-[10]! border-none! bg-[var(--workflow-edge)]! h-5! w-[7px]! rounded-r-[2px]! rounded-l-none!',
   error:
-    '!z-[10] !border-none !bg-[var(--text-error)] !h-[7px] !w-6 !rounded-b-[2px] !rounded-t-none',
+    'z-[10]! border-none! bg-[var(--text-error)]! h-[7px]! w-6! rounded-b-[2px]! rounded-t-none!',
 } as const
 
 /** Reusable style object for error handles positioned at bottom-right */
@@ -72,7 +74,7 @@ const ERROR_HANDLE_STYLE: CSSProperties = {
   transform: 'translateX(-50%)',
 }
 
-interface WorkflowPreviewBlockData {
+interface WorkflowPreviewBlockData extends Record<string, unknown> {
   type: string
   name: string
   workflowMap?: Record<string, WorkflowMetadata>
@@ -150,6 +152,7 @@ function resolvePreviewDisplayValue(
   // schema/registry fallbacks rather than the API.
   const toolsDisplay = resolveToolsLabel(subBlock, rawValue, [])
   const skillsDisplay = resolveSkillsLabel(subBlock, rawValue, [])
+  const fallbackModelsDisplay = resolveFallbackModelsLabel(subBlock, rawValue)
   const workflowName = resolveWorkflowSelectionLabel(subBlock, rawValue, workflowLookup)
   const workflowMultiSelectionNames = resolveWorkflowMultiSelectLabel(
     subBlock,
@@ -164,8 +167,16 @@ function resolvePreviewDisplayValue(
     variablesDisplay ||
     toolsDisplay ||
     skillsDisplay ||
+    fallbackModelsDisplay ||
     workflowName ||
-    workflowMultiSelectionNames
+    workflowMultiSelectionNames ||
+    /*
+     * A type in SELECTOR_TYPES_HYDRATION_REQUIRED with no resolver here falls to
+     * the placeholder below, so a picked folder read as "you picked nothing".
+     * Same decode the canvas card and the workflow diff use, and it needs no
+     * hook or fetch, which is what lets it sit in this hook-free resolver.
+     */
+    resolveFolderPathLabel(subBlock, rawValue)
 
   return maskedValue || hydratedName || (isSelectorType && value ? '-' : value)
 }
@@ -215,7 +226,9 @@ const SubBlockRow = memo(function SubBlockRow({
  * hooks, store subscriptions, or interactive features.
  * Matches the visual structure of WorkflowBlock exactly.
  */
-function WorkflowPreviewBlockInner({ data }: NodeProps<WorkflowPreviewBlockData>) {
+type WorkflowPreviewBlockNode = Node<WorkflowPreviewBlockData, 'workflowBlock' | 'noteBlock'>
+
+function WorkflowPreviewBlockInner({ data }: NodeProps<WorkflowPreviewBlockNode>) {
   const {
     type,
     name,
@@ -681,8 +694,8 @@ function WorkflowPreviewBlockInner({ data }: NodeProps<WorkflowPreviewBlockData>
  * @returns True if render should be skipped (props are equal)
  */
 function shouldSkipPreviewBlockRender(
-  prevProps: NodeProps<WorkflowPreviewBlockData>,
-  nextProps: NodeProps<WorkflowPreviewBlockData>
+  prevProps: NodeProps<WorkflowPreviewBlockNode>,
+  nextProps: NodeProps<WorkflowPreviewBlockNode>
 ): boolean {
   if (
     prevProps.id !== nextProps.id ||

@@ -77,10 +77,10 @@ describe('capability setup configuration', () => {
     )
   })
 
-  it('offers OpenAI first for fresh knowledge embedding setup', () => {
+  it('offers OpenAI first for fresh knowledge embedding setup, then every other family', () => {
     expect(
       getCapabilitySetupOptions(KNOWLEDGE_EMBEDDINGS_SETUP).map((option) => option.id)
-    ).toEqual(['openai', 'azure-openai', 'openrouter'])
+    ).toEqual(['openai', 'azure-openai', 'gemini', 'ollama', 'openrouter'])
   })
 
   it('maps every OAuth runtime field to a CLI input mode in runtime order', () => {
@@ -91,5 +91,12 @@ describe('capability setup configuration', () => {
         OAUTH_CLIENT_CAPABILITIES[id]
       )
     }
+  })
+
+  it('configures GitHub Search with dedicated App credentials', () => {
+    expect(getOAuthClientSetupFields('github-repositories')).toEqual([
+      { key: 'GITHUB_APP_CLIENT_ID', input: 'text' },
+      { key: 'GITHUB_APP_CLIENT_SECRET', input: 'secret' },
+    ])
   })
 })

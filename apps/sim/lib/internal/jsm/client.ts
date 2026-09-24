@@ -1,7 +1,5 @@
-import {
-  validateAssetsWorkspaceId,
-  validateJiraCloudId,
-} from '@/lib/core/security/input-validation'
+import { toArray } from '@sim/utils/object'
+import { validateJiraCloudId } from '@/lib/core/security/input-validation'
 import { JsmOperationError } from '@/lib/internal/jsm/errors'
 import { getJiraCloudId, parseAtlassianErrorMessage } from '@/tools/jira/utils'
 import { resolveAssetsContext } from '@/tools/jsm/utils'
@@ -23,7 +21,7 @@ export function asObject(value: unknown): JsonObject {
 }
 
 export function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : []
+  return toArray(value)
 }
 
 export function nested(object: JsonObject, ...keys: string[]): unknown {
@@ -175,7 +173,7 @@ export async function createJsmAssetsClient(
   signal?.throwIfAborted()
   const cloudId = validateJiraCloudId(context.cloudId, 'cloudId')
   if (!cloudId.isValid) throw new JsmOperationError(cloudId.error || 'Invalid cloudId', 400)
-  const workspaceId = validateAssetsWorkspaceId(context.workspaceId, 'workspaceId')
+  const workspaceId = validateJiraCloudId(context.workspaceId, 'workspaceId')
   if (!workspaceId.isValid) {
     throw new JsmOperationError(workspaceId.error || 'Invalid workspaceId', 400)
   }

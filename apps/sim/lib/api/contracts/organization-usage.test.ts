@@ -2,7 +2,10 @@
  * @vitest-environment node
  */
 import { describe, expect, it } from 'vitest'
-import { organizationUsageEventsQuerySchema } from '@/lib/api/contracts/organization-usage'
+import {
+  organizationUsageBreakdownQuerySchema,
+  organizationUsageEventsQuerySchema,
+} from '@/lib/api/contracts/organization-usage'
 
 /** The shared window fields every usage contract extends, exercised through one of them. */
 function parseWindow(input: Record<string, unknown>) {
@@ -18,6 +21,23 @@ describe('organization usage window contract', () => {
     // `Date.parse` accepts this and rolls it forward to March 2, so a request for
     // February would otherwise be answered about March without saying so.
     expect(parseWindow({ startDate: '2026-02-30' }).success).toBe(false)
+  })
+
+  /**
+   * Out of calendar range but well-formed enough to reach the old hand-rolled refinement, which
+   * called `toISOString` on an Invalid Date. Zod does not wrap refinements, so the RangeError
+   * escaped `safeParse` itself and every usage route answered a malformed query string with a 500.
+   */
+  it.each(['2026-13-01', '2026-00-01', '2026-01-32', '2026-01-00', '9999-99-99'])(
+    'refuses %s without throwing out of safeParse',
+    (startDate) => {
+      expect(parseWindow({ startDate }).success).toBe(false)
+    }
+  )
+
+  it('refuses February 29 in a non-leap year', () => {
+    expect(parseWindow({ startDate: '2026-02-29' }).success).toBe(false)
+    expect(parseWindow({ startDate: '2024-02-29' }).success).toBe(true)
   })
 
   it('refuses a parseable non-date such as a bare month', () => {
@@ -66,5 +86,22 @@ describe('organization usage window contract', () => {
 
   it('refuses a timezone the runtime does not recognize', () => {
     expect(parseWindow({ timezone: 'Mars/Olympus_Mons' }).success).toBe(false)
+  })
+})
+
+describe('organization usage breakdown contract', () => {
+  const baseQuery = { dimension: 'workspace' as const }
+
+  it('defaults to 50 rows', () => {
+    expect(organizationUsageBreakdownQuerySchema.parse(baseQuery).limit).toBe(50)
+  })
+
+  it('allows expansion to 100 rows and refuses larger requests', () => {
+    expect(
+      organizationUsageBreakdownQuerySchema.safeParse({ ...baseQuery, limit: 100 }).success
+    ).toBe(true)
+    expect(
+      organizationUsageBreakdownQuerySchema.safeParse({ ...baseQuery, limit: 101 }).success
+    ).toBe(false)
   })
 })

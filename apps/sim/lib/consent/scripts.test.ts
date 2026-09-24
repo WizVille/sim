@@ -1,11 +1,16 @@
 /**
  * @vitest-environment jsdom
  */
-import type { ScriptCallbackInfo } from 'c15t'
 import { afterEach, describe, expect, it } from 'vitest'
-import { GLOBAL_CONSENT_SCRIPTS, HUBSPOT_SCRIPT, X_PIXEL_SCRIPT } from '@/lib/consent/scripts'
+import {
+  type ConsentScriptCallbackInfo,
+  GLOBAL_CONSENT_SCRIPTS,
+  GOOGLE_ADS_ID,
+  GOOGLE_ANALYTICS_ID,
+  X_PIXEL_SCRIPT,
+} from '@/lib/consent/scripts'
 
-const CALLBACK_INFO: ScriptCallbackInfo = {
+const CALLBACK_INFO: ConsentScriptCallbackInfo = {
   id: 'test-script',
   elementId: 'test-script',
   hasConsent: false,
@@ -21,7 +26,6 @@ const CALLBACK_INFO: ScriptCallbackInfo = {
 afterEach(() => {
   window.dataLayer = []
   window.gtag = undefined
-  window._hsq = []
   window.history.replaceState({}, '', '/')
 })
 
@@ -43,8 +47,7 @@ describe('consent scripts', () => {
     ])
   })
 
-  it('keeps landing vendors in separate consent categories', () => {
-    expect(HUBSPOT_SCRIPT).toMatchObject({ id: 'hubspot', category: 'measurement' })
+  it('gates the landing conversion pixel on marketing consent', () => {
     expect(X_PIXEL_SCRIPT).toMatchObject({
       id: 'x-pixel',
       category: 'marketing',
@@ -65,12 +68,19 @@ describe('consent scripts', () => {
     ])
   })
 
-  it('gives HubSpot a query-free path before its automatic first page view', () => {
-    window.history.replaceState({}, '', '/demo?email=private@example.com#booking')
-    window._hsq = []
+  it('configures Google Ads on the GA4 loader instead of a second gtag script', () => {
+    window.dataLayer = []
+    window.gtag = undefined
 
-    HUBSPOT_SCRIPT.onBeforeLoad()
+    GLOBAL_CONSENT_SCRIPTS[0].onBeforeLoad?.(CALLBACK_INFO)
 
-    expect(window._hsq).toEqual([['setPath', '/demo']])
+    const configuredIds = window.dataLayer
+      .filter((entry): entry is [string, string] => Array.isArray(entry) && entry[0] === 'config')
+      .map(([, id]) => id)
+
+    expect(configuredIds).toEqual([GOOGLE_ANALYTICS_ID, GOOGLE_ADS_ID])
+    expect(GLOBAL_CONSENT_SCRIPTS.map((script) => script.src)).not.toContain(
+      `https://www.googletagmanager.com/gtag/js?id=${GOOGLE_ADS_ID}`
+    )
   })
 })

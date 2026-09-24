@@ -1,3 +1,5 @@
+import { describePrincipalAuth } from '@sim/auth/principal'
+import { setRequestAuth } from '@sim/logger'
 import type { NextRequest } from 'next/server'
 import { NextResponse } from 'next/server'
 import { recordRateLimitSnapshot } from '@/lib/api/server/rate-limit-context'
@@ -15,13 +17,25 @@ import {
   authenticateV2ApiKey,
   type V2ApiKeyAuthContext,
   V2ApiKeyUnauthenticatedError,
+  type V2CredentialType,
 } from '@/lib/api/server/routes/v2-api-key-auth'
+import {
+  hasV2Credential,
+  readV2CredentialHeaders,
+} from '@/lib/api/server/routes/v2-credential-headers'
 import {
   type ParsedRequest,
   type ParseRequestOptions,
   parseRequest,
 } from '@/lib/api/server/validation'
-import type { ApplicationOperation, OperationUseCase } from '@/lib/core/application'
+import { getOAuthAccessTokenAudience } from '@/lib/auth/oauth-access-token'
+import {
+  type ApplicationOperation,
+  InsufficientScopeError,
+  OAuthAccessTokenExpiredError,
+  type OperationUseCase,
+  requireOAuthOperationScope,
+} from '@/lib/core/application'
 import { getRateLimit, RateLimiter, type SubscriptionPlan } from '@/lib/core/rate-limiter'
 import { getClientIp } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
@@ -48,9 +62,16 @@ export class V2RouteInfrastructureError extends Error {
   }
 }
 
+/**
+ * The v2 credential policy: an API key in `x-api-key`, or a Sim OAuth access
+ * token as `Authorization: Bearer`.
+ */
 export const v2ApiKeyAuth = {
   authenticate(request: NextRequest) {
-    return authenticateV2ApiKey(request.headers.get('x-api-key'))
+    return authenticateV2ApiKey(
+      readV2CredentialHeaders(request.headers),
+      getOAuthAccessTokenAudience()
+    )
   },
 } as const
 
@@ -313,9 +334,25 @@ async function admitAuthenticatedV2Request(
     auth = await authPolicy.authenticate(request)
   } catch (error) {
     if (error instanceof V2ApiKeyUnauthenticatedError) {
-      return { success: false, response: v2Error('UNAUTHORIZED', error.message) }
+      return {
+        success: false,
+        response: v2Error('UNAUTHORIZED', error.message, {
+          authChallenge: error.challenge,
+        }),
+      }
     }
     throw new V2RouteInfrastructureError('authentication', error)
+  }
+  setRequestAuth(describePrincipalAuth(auth.principal))
+
+  try {
+    requireOAuthOperationScope(auth.principal, operation)
+  } catch (error) {
+    if (error instanceof InsufficientScopeError || error instanceof OAuthAccessTokenExpiredError) {
+      const response = v2CaughtOrchestrationError(error)
+      if (response) return { success: false, response }
+    }
+    throw error
   }
 
   const limited = await rateLimitPolicy.enforce(request, auth, operation)
@@ -357,7 +394,7 @@ export async function admitOptionalV2Request(
 > {
   const preAuthResponse = await enforceV2PreAuthIpLimit(request)
   if (preAuthResponse) return { success: false, response: preAuthResponse }
-  if (!request.headers.has('x-api-key')) return { success: true }
+  if (!hasV2Credential(request.headers)) return { success: true }
   return admitAuthenticatedV2Request(request, operation, authPolicy, rateLimitPolicy)
 }
 
@@ -372,7 +409,7 @@ export async function admitOptionalV2Request(
  * One route reads it: `GET /api/v2/meta`, whose resource *is* the calling key.
  */
 export interface V2CredentialFacts {
-  readonly keyType: 'personal' | 'workspace'
+  readonly keyType: V2CredentialType
   readonly keyExpiresAt: Date | null
 }
 
@@ -413,6 +450,18 @@ interface V2JsonRouteOptions<C extends JsonApiRouteContract, O extends Applicati
   statusForResult?(result: NoInfer<R>): number
 }
 
+/**
+ * The operation each v2 JSON route handler serves, so another transport for
+ * the same route (the Sim MCP server) can read its policy, such as the OAuth
+ * scope, without restating it. Keys are the module-level handlers.
+ */
+const routeOperations = new WeakMap<object, ApplicationOperation>()
+
+/** The operation a loaded v2 route handler serves, or `null` for a raw route. */
+export function v2RouteOperation(handler: unknown): ApplicationOperation | null {
+  return typeof handler === 'function' ? (routeOperations.get(handler) ?? null) : null
+}
+
 export function defineV2JsonRoute<
   C extends JsonApiRouteContract,
   O extends ApplicationOperation,
@@ -425,7 +474,6 @@ export function defineV2JsonRoute<
     options.useCase.operation
   )
   requireHeadAuthorizableUseCase(options.contract, options.headSafe, options.useCase)
-
   const wrapped = withRouteHandler<JsonRouteContext | undefined>(
     async (request, context) => {
       if (!methodMatchesContract(request.method, options.contract.method)) {
@@ -446,7 +494,11 @@ export function defineV2JsonRoute<
       if (options.beforeParse) {
         const rawParams = context?.params ? await context.params : {}
         try {
-          await options.beforeParse({ request, principal: auth.principal, params: rawParams })
+          await options.beforeParse({
+            request,
+            principal: auth.principal,
+            params: rawParams,
+          })
         } catch (error) {
           const response = options.errorPolicy.render(error)
           if (response) return response
@@ -525,5 +577,7 @@ export function defineV2JsonRoute<
     }
   )
 
-  return async (request, context) => wrapped(request, context)
+  const route: JsonNextRouteHandler = async (request, context) => wrapped(request, context)
+  routeOperations.set(route, options.operation)
+  return route
 }

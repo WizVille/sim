@@ -22,7 +22,7 @@ vi.mock('@/lib/oauth/credential-service', () => authOAuthUtilsMock)
 vi.mock('@/lib/core/security/encryption', () => encryptionMock)
 
 vi.mock('@/executor/utils/credential-token', () => ({
-  fetchCredentialAccessToken: vi.fn().mockResolvedValue('mock-access-token'),
+  resolveExecutorCredentialToken: vi.fn().mockResolvedValue({ accessToken: 'mock-access-token' }),
 }))
 
 vi.mock('@/lib/credentials/access', () => ({
@@ -185,6 +185,27 @@ describe('RouterBlockHandler', () => {
       metadata: { id: 'other' },
     }
     expect(handler.canHandle(nonRouterBlock)).toBe(false)
+  })
+
+  it('selects the same legacy destination when a fallback provider answers', async () => {
+    mockExecuteProviderRequest
+      .mockRejectedValueOnce(new Error('overloaded'))
+      .mockResolvedValueOnce({
+        content: 'target-block-1',
+        model: 'claude-sonnet-5',
+        tokens: { input: 10, output: 2, total: 12 },
+        cost: 0.001,
+      })
+    const output = await handler.execute(mockContext, mockBlock, {
+      prompt: 'Pick a destination',
+      model: 'gpt-4o',
+      fallbackModels: [{ model: 'claude-sonnet-5' }],
+    })
+    expect(output).toMatchObject({
+      model: 'claude-sonnet-5',
+      selectedPath: { blockId: 'target-block-1' },
+    })
+    expect(mockExecuteProviderRequest).toHaveBeenCalledTimes(2)
   })
 
   it('should execute router block correctly and select a path', async () => {
@@ -438,14 +459,114 @@ describe('RouterBlockHandler', () => {
     expect(mockExecuteProviderRequest).not.toHaveBeenCalled()
   })
 
-  it('should throw error if target block is missing', async () => {
-    const inputs = { prompt: 'Test' }
-    mockContext.workflow!.blocks = [mockBlock, mockTargetBlock2]
+  it.each([true, false])(
+    'rejects a missing target before choosing another route when an enabled sibling exists: %s',
+    async (hasEnabledSibling) => {
+      mockContext.workflow!.blocks = hasEnabledSibling ? [mockBlock, mockTargetBlock2] : [mockBlock]
 
-    await expect(handler.execute(mockContext, mockBlock, inputs)).rejects.toThrow(
-      'Target block target-block-1 not found'
-    )
-    expect(mockExecuteProviderRequest).not.toHaveBeenCalled()
+      await expect(
+        handler.execute(mockContext, mockBlock, { prompt: 'Test', model: 'sim-auto' })
+      ).rejects.toThrow('Target block target-block-1 not found')
+      expect(mockGenerateRouterPrompt).not.toHaveBeenCalled()
+      expect(mockResolveAutoModel).not.toHaveBeenCalled()
+      expect(mockExecuteProviderRequest).not.toHaveBeenCalled()
+    }
+  )
+
+  it('keeps targets enabled by default for older serialized workflows', async () => {
+    Reflect.deleteProperty(mockTargetBlock1, 'enabled')
+
+    const result = await handler.execute(mockContext, mockBlock, { prompt: 'Test' })
+
+    expect(mockGenerateRouterPrompt).toHaveBeenCalledWith('Test', [
+      expect.objectContaining({ id: 'target-block-1' }),
+      expect.objectContaining({ id: 'target-block-2' }),
+    ])
+    expect(result).toMatchObject({ selectedRoute: 'target-block-1' })
+  })
+
+  it('preserves existing error-edge routing candidates and decisions', async () => {
+    mockContext.workflow!.connections = [
+      { source: mockBlock.id, target: mockTargetBlock1.id, sourceHandle: 'source-right' },
+      { source: mockBlock.id, target: mockTargetBlock2.id, sourceHandle: 'error' },
+    ]
+    mockExecuteProviderRequest.mockResolvedValueOnce({
+      content: 'target-block-2',
+      model: 'mock-model',
+    })
+
+    const result = await handler.execute(mockContext, mockBlock, { prompt: 'Test' })
+
+    expect(mockGenerateRouterPrompt).toHaveBeenCalledWith('Test', [
+      expect.objectContaining({ id: 'target-block-1' }),
+      expect.objectContaining({ id: 'target-block-2' }),
+    ])
+    expect(result).toMatchObject({
+      selectedRoute: 'target-block-2',
+      selectedPath: {
+        blockId: 'target-block-2',
+        blockType: 'target',
+        blockTitle: 'Option B',
+      },
+    })
+  })
+
+  it.each([true, false])(
+    'preserves a disabled routing decision when the other target enabled state is %s',
+    async (otherTargetEnabled) => {
+      mockTargetBlock1.enabled = false
+      mockTargetBlock2.enabled = otherTargetEnabled
+
+      const result = await handler.execute(mockContext, mockBlock, { prompt: 'Test' })
+
+      expect(mockGenerateRouterPrompt).toHaveBeenCalledWith('Test', [
+        expect.objectContaining({ id: 'target-block-1' }),
+        expect.objectContaining({ id: 'target-block-2' }),
+      ])
+      expect(result).toMatchObject({
+        selectedRoute: 'target-block-1',
+        selectedPath: {
+          blockId: 'target-block-1',
+          blockType: 'target',
+          blockTitle: 'Option A',
+        },
+      })
+      expect(result).not.toHaveProperty('error')
+      expect(mockExecuteProviderRequest).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  it('resolves sim-auto and preserves provider billing with existing routing candidates', async () => {
+    mockExecuteProviderRequest.mockResolvedValueOnce({
+      content: 'target-block-2',
+      model: 'fireworks/glm-5.2',
+      tokens: { input: 100, output: 20, total: 120 },
+      cost: { input: 0.001, output: 0.0005, total: 0.0015 },
+    })
+
+    const result = await handler.execute(mockContext, mockBlock, {
+      prompt: 'Choose the best option.',
+      model: 'sim-auto',
+    })
+
+    expect(mockResolveAutoModel).toHaveBeenCalledWith({
+      ctx: mockContext,
+      blockId: mockBlock.id,
+      signals: expect.objectContaining({
+        lastMessage: 'Choose the best option.',
+        hasResponseFormat: false,
+      }),
+      fallbackModel: 'claude-sonnet-5',
+    })
+    expect(providerRequestBody()).toMatchObject({
+      model: 'fireworks/glm-5.2',
+      systemPrompt: 'Sim auto system preamble\n\nGenerated System Prompt',
+    })
+    expect(result).toMatchObject({
+      model: 'sim-auto',
+      selectedRoute: 'target-block-2',
+      cost: { input: 0.001, output: 0.0005, routing: 0.002, total: 0.0035 },
+    })
   })
 
   it('should throw error if LLM response is not a valid target block ID', async () => {
@@ -686,6 +807,69 @@ describe('RouterBlockHandler V2', () => {
 
   it('should handle router_v2 blocks', () => {
     expect(handler.canHandle(mockRouterV2Block)).toBe(true)
+  })
+
+  it('preserves route selection and reasoning when an Auto request falls back', async () => {
+    mockExecuteProviderRequest
+      .mockRejectedValueOnce(new Error('overloaded'))
+      .mockResolvedValueOnce({
+        content: '{"route":"route-support","reasoning":"Needs assistance"}',
+        model: 'claude-sonnet-5',
+        tokens: { input: 10, output: 2, total: 12 },
+        cost: { input: 0.0008, output: 0.0002, total: 0.001 },
+      })
+    const output = await handler.execute(mockContext, mockRouterV2Block, {
+      context: 'Help me',
+      model: 'sim-auto',
+      routes: [{ id: 'route-support', title: 'Support', value: 'Needs help' }],
+      fallbackModels: [{ model: 'claude-sonnet-5' }],
+    })
+    expect(output).toMatchObject({
+      model: 'claude-sonnet-5',
+      selectedRoute: 'route-support',
+      reasoning: 'Needs assistance',
+      cost: { total: 0.003 },
+    })
+    expect(mockExecuteProviderRequest.mock.calls[1][1].systemPrompt).toBe(
+      'Generated V2 System Prompt'
+    )
+    expect(mockExecuteProviderRequest.mock.calls[1][1].responseFormat).toEqual(
+      mockExecuteProviderRequest.mock.calls[0][1].responseFormat
+    )
+  })
+
+  it('waits for the final retry before using a Router V2 fallback', async () => {
+    mockExecuteProviderRequest.mockRejectedValueOnce(new Error('overloaded'))
+    await expect(
+      handler.execute(
+        mockContext,
+        mockRouterV2Block,
+        {
+          context: 'Help me',
+          model: 'gpt-4o',
+          routes: [{ id: 'route-support', title: 'Support', value: 'Needs help' }],
+          fallbackModels: [{ model: 'claude-sonnet-5' }],
+        },
+        { nodeId: mockRouterV2Block.id, retry: { attempt: 1, maxTries: 2, isFinalTry: false } }
+      )
+    ).rejects.toThrow('overloaded')
+    expect(mockExecuteProviderRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not ask a fallback to override a NO_MATCH decision', async () => {
+    mockExecuteProviderRequest.mockResolvedValueOnce({
+      content: '{"route":"NO_MATCH","reasoning":"Unrelated"}',
+      model: 'gpt-4o',
+    })
+    await expect(
+      handler.execute(mockContext, mockRouterV2Block, {
+        context: 'Unrelated',
+        model: 'gpt-4o',
+        routes: [{ id: 'route-support', title: 'Support', value: 'Needs help' }],
+        fallbackModels: [{ model: 'claude-sonnet-5' }],
+      })
+    ).rejects.toThrow('Router could not determine a matching route')
+    expect(mockExecuteProviderRequest).toHaveBeenCalledTimes(1)
   })
 
   it('should execute router V2 and return reasoning', async () => {

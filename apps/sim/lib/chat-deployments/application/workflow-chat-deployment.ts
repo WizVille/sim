@@ -25,13 +25,10 @@ import {
   getLiveChatDeploymentForWorkflow,
 } from '@/lib/chat-deployments/queries'
 import { buildChatDeploymentUrl } from '@/lib/chat-deployments/urls'
-import { defineAuthorizedWorkspaceUseCase, ForbiddenOperationError } from '@/lib/core/application'
+import { defineAuthorizedWorkspaceUseCase } from '@/lib/core/application'
 import { OrchestrationError } from '@/lib/core/orchestration/types'
 import { performChatDeploy, performChatUndeploy } from '@/lib/workflows/orchestration'
-import {
-  ChatDeployAuthNotAllowedError,
-  validateChatDeployAuth,
-} from '@/ee/access-control/utils/permission-check'
+import { validateChatDeployAuth } from '@/ee/access-control/utils/permission-check'
 
 /**
  * The chat singleton of a workflow.
@@ -107,6 +104,44 @@ export const readWorkflowChatDeployment = defineAuthorizedWorkspaceUseCase({
   },
 })
 
+export interface WorkflowChatDeploymentStatus {
+  isDeployed: boolean
+  /** Enough to address the deployment, and nothing the detail read gates. */
+  deployment: { id: string; identifier: string } | null
+}
+
+/**
+ * Whether the workflow publishes a chat, for the editor's deploy affordance.
+ *
+ * Bound to `chat_deployments.list`, not `chat_deployments.read`, and narrowed
+ * here in the use case rather than in the adapter. The editor needs to know a
+ * chat exists and which one it is so it can then fetch the detail; everything
+ * `V2_CHAT_DEPLOYMENT_GATED_FIELDS` withholds from the `read`-level list —
+ * `allowedEmails`, `hasPassword`, `customizations` — is absent for the same
+ * reason, so this cannot be used to route around the admin-gated detail read.
+ * The `deploy.chat` capability comes with `list`: a group with the chat
+ * deployment surface withheld should not still be told what is published.
+ *
+ * `isDeployed` is the chat row's own `isActive`, deliberately not
+ * {@link toEffectiveChatDeploymentView}'s "chat and workflow both live" rule.
+ * This answers "does this workflow already have a chat to update", which stays
+ * true while the workflow is undeployed — the editor would otherwise offer to
+ * launch a chat that already exists.
+ */
+export const readWorkflowChatDeploymentStatus = defineAuthorizedWorkspaceUseCase({
+  operation: chatDeploymentOperations.list,
+  resolveContext,
+  authorizationOptions: {},
+  async execute({ context }): Promise<WorkflowChatDeploymentStatus> {
+    const deployment = context.chatDeployment
+    if (!deployment) return { isDeployed: false, deployment: null }
+    return {
+      isDeployed: deployment.isActive,
+      deployment: { id: deployment.id, identifier: deployment.identifier },
+    }
+  },
+})
+
 /**
  * The permission group's auth-mode allow-list, applied only when the mode
  * actually changes.
@@ -121,18 +156,11 @@ async function assertAuthModePermitted(
   authType: ChatAuthType
 ): Promise<void> {
   if (authType === context.chatDeployment?.authType) return
-  try {
-    await validateChatDeployAuth(
-      requirePrincipalSubjectUserId(principal),
-      context.workspaceId,
-      authType
-    )
-  } catch (error) {
-    if (error instanceof ChatDeployAuthNotAllowedError) {
-      throw new ForbiddenOperationError('CHAT_AUTH_MODE_NOT_PERMITTED', error.message)
-    }
-    throw error
-  }
+  await validateChatDeployAuth(
+    requirePrincipalSubjectUserId(principal),
+    context.workspaceId,
+    authType
+  )
 }
 
 /**

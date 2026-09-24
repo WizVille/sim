@@ -3,9 +3,11 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
+  getValueAtPath,
   isPlainRecord,
   isRecordLike,
   sortObjectKeysDeep,
+  toArray,
   toRecord,
   toRecordOrNull,
 } from './object.js'
@@ -13,6 +15,27 @@ import {
 class Sample {
   value = 1
 }
+
+describe('getValueAtPath', () => {
+  const source = { items: [{ name: 'first', active: false, count: 0 }], empty: null }
+
+  it.each([
+    ['items[0].name', 'first'],
+    ['items.0.active', false],
+    ['items[0].count', 0],
+    ['items[1].name', undefined],
+    ['items[0].name.missing', undefined],
+    ['empty.missing', undefined],
+  ])('reads %s without confusing missing and falsy values', (path, expected) => {
+    expect(getValueAtPath(source, path)).toBe(expected)
+  })
+
+  it('preserves an empty path and nullish roots', () => {
+    expect(getValueAtPath(source, '')).toBe(source)
+    expect(getValueAtPath(null, 'items')).toBeNull()
+    expect(getValueAtPath(undefined, 'items')).toBeUndefined()
+  })
+})
 
 describe('isRecordLike', () => {
   it('returns true for plain objects, Date, and class instances', () => {
@@ -100,5 +123,23 @@ describe('sortObjectKeysDeep', () => {
         { c: 4, d: 3 },
       ])
     )
+  })
+})
+
+describe('toArray', () => {
+  it('returns the original array on a hit, not a copy', () => {
+    const items = [1, 2]
+    expect(toArray(items)).toBe(items)
+  })
+
+  it('falls back to an empty array for a non-array', () => {
+    expect(toArray(undefined)).toEqual([])
+    expect(toArray(null)).toEqual([])
+    expect(toArray('nope')).toEqual([])
+    expect(toArray({ length: 2 })).toEqual([])
+  })
+
+  it('returns a fresh array on every miss, so callers cannot share one', () => {
+    expect(toArray(null)).not.toBe(toArray(null))
   })
 })

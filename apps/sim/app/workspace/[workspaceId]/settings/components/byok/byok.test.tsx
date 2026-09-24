@@ -2,8 +2,9 @@
  * @vitest-environment jsdom
  */
 import { act, type ReactNode } from 'react'
+import { resetEnvFlagsMock, setEnvFlags } from '@sim/testing'
 import { createRoot, type Root } from 'react-dom/client'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -31,6 +32,7 @@ const mocks = vi.hoisted(() => ({
         entitled: true,
       },
       isLoading: false,
+      error: undefined as Error | undefined,
     },
   },
   inheritedStatusError: { current: false },
@@ -60,7 +62,9 @@ vi.mock('@/components/settings/navigation', () => ({
   canMutateWorkspaceSettingsSection: () => mocks.canManageWorkspace.current,
 }))
 
-vi.mock('@/lib/core/config/env-flags', () => ({ isHosted: true }))
+/** Hosted-only scope switching; read through the deployment shape at render time. */
+beforeAll(() => setEnvFlags({ isHosted: true }))
+afterAll(resetEnvFlagsMock)
 
 vi.mock('@/app/workspace/[workspaceId]/providers/workspace-host-provider', () => ({
   useWorkspaceHostContext: () => mocks.hostContext.current,
@@ -184,6 +188,7 @@ describe('BYOK scope access', () => {
     mocks.hostContext.current.viewer.isHostOrganizationAdmin = true
     mocks.canManageWorkspace.current = true
     mocks.organizationResult.current.data.entitled = true
+    mocks.organizationResult.current.error = undefined
     mocks.inheritedStatusError.current = false
 
     container = document.createElement('div')
@@ -263,5 +268,16 @@ describe('BYOK scope access', () => {
       'data-capabilities',
       'true:true:true'
     )
+  })
+
+  it('keeps cached organization keys visible when a background refresh fails', () => {
+    mocks.scope.current = 'organization'
+    mocks.organizationResult.current.error = new Error('Temporary failure')
+
+    act(() => root.render(<BYOK />))
+
+    expect(container.textContent).toContain('Sensitive organization key sk-org-secret')
+    expect(container.querySelector('[aria-label="BYOK manager"]')).not.toBeNull()
+    expect(container.textContent).not.toContain('Failed to load provider keys')
   })
 })

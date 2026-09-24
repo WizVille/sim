@@ -1,11 +1,12 @@
 /**
  * @vitest-environment node
  */
+import { load } from 'js-yaml'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CLI_CONTRACT } from '../contract/commands'
 import type { CommandSpec } from '../contract/types'
 import { encodeFolderPath } from './request'
-import { decodeFolderPath, renderPage, renderResult } from './result'
+import { decodeFolderPath, foldPageEnvelope, renderPage, renderResult } from './result'
 
 let logged: string[]
 
@@ -70,7 +71,7 @@ describe('inferred cells pick a format from the key shape', () => {
   })
 
   it('de-camelCases inferred table headers', () => {
-    renderPage('table', [row], {})
+    renderPage('table', { data: [row], nextCursor: null }, {})
     expect(tableLines()[0].split(/\s{2,}/)).toEqual([
       'CREATED AT',
       'DURATION',
@@ -103,7 +104,7 @@ describe('inferred cells pick a format from the key shape', () => {
     const spec: CommandSpec = {
       columns: [{ header: 'size', format: 'auto' }],
     }
-    renderPage('text', [{ size: 3000000 }], spec)
+    renderPage('text', { data: [{ size: 3000000 }], nextCursor: null }, spec)
     expect(logged[0]).toBe('3000000')
   })
 })
@@ -116,12 +117,12 @@ describe('cells the user named, not the API', () => {
   const spec: CommandSpec = { expand: 'data' }
 
   it('leaves a user column named like an API field alone', () => {
-    renderPage('text', rows, spec)
+    renderPage('text', { data: rows, nextCursor: null }, spec)
     expect(logged[0]).toBe('row_1\t3\t5\t30\ttrue')
   })
 
   it('heads each one with the name the user has to type back into --filter', () => {
-    renderPage('table', rows, spec)
+    renderPage('table', { data: rows, nextCursor: null }, spec)
     expect(tableLines()[0].split(/\s{2,}/)).toEqual([
       'ID',
       'SCORE',
@@ -196,6 +197,95 @@ describe('a similarity score, at a width a person can read', () => {
   })
 })
 
+describe('file version authors and reverts', () => {
+  const version = {
+    fileId: 'f_1',
+    version: 4,
+    isCurrent: true,
+    size: 42,
+    contentType: 'text/markdown',
+    source: 'revert',
+    authors: [
+      { id: 'usr_1', email: 'ada@example.com' },
+      { id: 'usr_gone', email: null },
+    ],
+    restoredFromVersion: 1,
+    createdAt: '2026-09-19T17:20:39.920Z',
+    updatedAt: '2026-09-19T17:20:39.920Z',
+    supersededAt: null,
+  }
+
+  it('lists authors by email, keeping the id of an account that is gone', () => {
+    renderPage(
+      'table',
+      { data: [version], nextCursor: null },
+      CLI_CONTRACT.listFileVersions as CommandSpec
+    )
+    const [header, row] = tableLines()
+    expect(header).toContain('AUTHORS')
+    expect(row).toContain('ada@example.com, usr_gone')
+  })
+
+  it('names the authors in a version record', () => {
+    renderResult('getFileVersion', 'text', version, CLI_CONTRACT.getFileVersion as CommandSpec)
+    expect(logged).toContain('authors\tada@example.com, usr_gone')
+  })
+
+  it('shows a version with no recorded author as empty', () => {
+    renderResult(
+      'getFileVersion',
+      'text',
+      { ...version, authors: [] },
+      CLI_CONTRACT.getFileVersion as CommandSpec
+    )
+    expect(logged).toContain('authors\t')
+  })
+
+  it('prints a revert as fields rather than the nested objects as JSON', () => {
+    renderResult(
+      'revertFileVersion',
+      'text',
+      { reverted: true, file: { id: 'f_1', name: 'notes.md' }, version },
+      CLI_CONTRACT.revertFileVersion as CommandSpec
+    )
+    expect(logged).toEqual(
+      expect.arrayContaining([
+        'reverted\tyes',
+        'file\tf_1',
+        'name\tnotes.md',
+        'version\t4',
+        'source\trevert',
+        'restored from\t1',
+        'authors\tada@example.com, usr_gone',
+      ])
+    )
+    expect(logged.join('\n')).not.toContain('{')
+  })
+
+  it('keeps the raw authors in json', () => {
+    renderResult('getFileVersion', 'json', version, CLI_CONTRACT.getFileVersion as CommandSpec)
+    expect(JSON.parse(logged[0]).authors).toEqual(version.authors)
+  })
+})
+
+describe('file-content search results', () => {
+  const response = {
+    results: [{ fileId: 'file_1', lineNumber: 7, text: 'quarterly revenue' }],
+    total: 1,
+  }
+  const spec = CLI_CONTRACT.searchFileContent as CommandSpec
+
+  it('renders result rows instead of the response envelope', () => {
+    renderResult('searchFileContent', 'text', response, spec)
+    expect(logged).toEqual(['file_1\t7\tquarterly revenue'])
+  })
+
+  it('preserves the response envelope for json output', () => {
+    renderResult('searchFileContent', 'json', response, spec)
+    expect(JSON.parse(logged[0])).toEqual(response)
+  })
+})
+
 describe('folder paths are shown by name, but piped in wire form', () => {
   const folders = [
     {
@@ -208,24 +298,24 @@ describe('folder paths are shown by name, but piped in wire form', () => {
   const spec = CLI_CONTRACT.listTableFolders as CommandSpec
 
   it('decodes the path in the table, which held it next to the decoded name', () => {
-    renderPage('table', folders, spec)
+    renderPage('table', { data: folders, nextCursor: null }, spec)
     const [, row] = tableLines()
     expect(row).toContain('/cli-test-a/nested one')
     expect(row).not.toContain('%20')
   })
 
   it('decodes the path in text, the format shell plumbing reads', () => {
-    renderPage('text', folders, spec)
+    renderPage('text', { data: folders, nextCursor: null }, spec)
     expect(logged[0].split('\t')[0]).toBe('/cli-test-a/nested one')
   })
 
   it('keeps the wire form in json, so a path fed back still resolves', () => {
-    renderPage('json', folders, spec)
-    expect(JSON.parse(logged[0])[0].path).toBe('/cli-test-a/nested%20one')
+    renderPage('json', { data: folders, nextCursor: null }, spec)
+    expect(JSON.parse(logged[0]).data[0].path).toBe('/cli-test-a/nested%20one')
   })
 
   it('keeps the wire form in yaml for the same reason', () => {
-    renderPage('yaml', folders, spec)
+    renderPage('yaml', { data: folders, nextCursor: null }, spec)
     expect(logged[0]).toContain('/cli-test-a/nested%20one')
   })
 
@@ -269,10 +359,10 @@ describe('folder paths are shown by name, but piped in wire form', () => {
     ]
 
     it('keeps it distinguishable from a genuinely nested folder in the table', () => {
-      renderPage('table', slashNamed, spec)
+      renderPage('table', { data: slashNamed, nextCursor: null }, spec)
       const [, slashRow] = tableLines()
       logged = []
-      renderPage('table', nested, spec)
+      renderPage('table', { data: nested, nextCursor: null }, spec)
       const [, nestedRow] = tableLines()
 
       expect(slashRow).toContain('%2F')
@@ -280,7 +370,7 @@ describe('folder paths are shown by name, but piped in wire form', () => {
     })
 
     it('prints the wire form in text, which is what a script pipes back', () => {
-      renderPage('text', slashNamed, spec)
+      renderPage('text', { data: slashNamed, nextCursor: null }, spec)
       expect(logged[0].split('\t')[0]).toBe('/cli-test-a%2Fenc')
     })
 
@@ -290,22 +380,96 @@ describe('folder paths are shown by name, but piped in wire form', () => {
   })
 
   it('shows an undecodable path as it arrived rather than dropping it', () => {
-    renderPage('text', [{ path: '/100%zz', name: 'x', parentPath: '/', updatedAt: null }], spec)
+    renderPage(
+      'text',
+      {
+        data: [{ path: '/100%zz', name: 'x', parentPath: '/', updatedAt: null }],
+        nextCursor: null,
+      },
+      spec
+    )
     expect(logged[0].split('\t')[0]).toBe('/100%zz')
   })
 })
 
-describe('a truncation note', () => {
-  /** The note is stderr in every format; stdout stays exactly the rows. */
-  it('leaves the machine formats a bare array', () => {
-    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+describe('paginated JSON output', () => {
+  it.each([
+    { format: 'json', truncated: true },
+    { format: 'json', truncated: false },
+    { format: 'yaml', truncated: true },
+    { format: 'yaml', truncated: false },
+  ] as const)(
+    'preserves truncated=$truncated in $format without carrying stale page data',
+    ({ format, truncated }) => {
+      vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+      const page = { data: [{ id: 'a' }, { id: 'b' }], nextCursor: null }
+      renderPage(format, page, {}, { data: [{ id: 'a' }], nextCursor: 'stale', truncated })
 
-    renderPage('json', [{ id: 'a' }], {}, { truncated: true }, { truncated: true })
+      const result = format === 'json' ? JSON.parse(logged.join('\n')) : load(logged.join('\n'))
+      expect(result).toEqual({ ...page, truncated })
+    }
+  )
 
-    expect(JSON.parse(logged.join('\n'))).toEqual([{ id: 'a' }])
-    expect(stderr.mock.calls.map(([chunk]) => String(chunk)).join('')).toContain(
-      'more results exist'
+  it.each([
+    { first: false, last: true },
+    { first: true, last: false },
+    { first: undefined, last: false },
+  ])('preserves truncation across pages with first=$first and last=$last', ({ first, last }) => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    const envelope = foldPageEnvelope(
+      {
+        data: [{ id: 'a' }],
+        nextCursor: 'next',
+        ...(first === undefined ? {} : { toolNamesTruncated: first }),
+      },
+      { data: [{ id: 'b' }], nextCursor: null, toolNamesTruncated: last }
     )
+    const page = { data: [{ id: 'a' }, { id: 'b' }], nextCursor: null }
+    renderPage('json', page, {}, envelope)
+
+    expect(JSON.parse(logged.join('\n'))).toEqual({
+      ...page,
+      toolNamesTruncated: first === true || last,
+    })
+  })
+
+  it('projects only boolean truncation metadata from the envelope', () => {
+    const page = { data: [{ id: 'a' }], nextCursor: null }
+    renderPage(
+      'json',
+      page,
+      {},
+      {
+        truncated: 'true',
+        notTruncated: true,
+        isNotTruncated: true,
+        nested: { truncated: true },
+        scope: 'unrelated metadata',
+      }
+    )
+    expect(JSON.parse(logged.join('\n'))).toEqual(page)
+  })
+
+  it('includes the cursor without a pagination notice', () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    const page = { data: [{ id: 'a' }], nextCursor: 'c1' }
+
+    renderPage('json', page, {})
+
+    expect(JSON.parse(logged.join('\n'))).toEqual(page)
+    expect(stderr).not.toHaveBeenCalled()
+  })
+
+  it('includes a null cursor for an empty result', () => {
+    renderPage('json', { data: [], nextCursor: null }, {})
+
+    expect(JSON.parse(logged.join('\n'))).toEqual({ data: [], nextCursor: null })
+  })
+
+  it('includes the same pagination fields in YAML', () => {
+    renderPage('yaml', { data: [{ id: 'a' }], nextCursor: 'c1' }, {})
+
+    expect(logged.join('\n')).toBe('data:\n  - id: a\nnextCursor: c1')
   })
 })
 
@@ -338,7 +502,12 @@ describe('a truncation the response states inside its payload', () => {
   it('names the tool names, not the servers, on the server list', () => {
     const read = captureStderr()
 
-    renderPage('json', [{ id: 'srv_1' }], {}, { data: [], toolNamesTruncated: true })
+    renderPage(
+      'json',
+      { data: [{ id: 'srv_1' }], nextCursor: null },
+      {},
+      { data: [], toolNamesTruncated: true }
+    )
 
     expect(read()).toContain('the server clipped the tool names it returned')
   })
@@ -420,10 +589,10 @@ describe('a truncation the response states inside its payload', () => {
     const read = captureStderr()
     const rows = [{ id: 'a', truncated: true }]
 
-    renderPage('json', rows, {}, { data: rows })
+    renderPage('json', { data: rows, nextCursor: null }, {}, { data: rows })
 
     expect(read()).toBe('')
-    expect(JSON.parse(logged.join('\n'))).toEqual(rows)
+    expect(JSON.parse(logged.join('\n'))).toEqual({ data: rows, nextCursor: null })
   })
 
   /**
@@ -439,10 +608,10 @@ describe('a truncation the response states inside its payload', () => {
     expect(read()).toBe('')
   })
 
-  it('leaves yaml a bare payload, with the note on stderr', () => {
+  it('keeps the server truncation note on stderr in YAML', () => {
     const read = captureStderr()
 
-    renderPage('yaml', [{ id: 'a' }], {}, { data: [], truncated: true })
+    renderPage('yaml', { data: [{ id: 'a' }], nextCursor: null }, {}, { data: [], truncated: true })
 
     expect(logged.join('\n')).not.toContain('clipped')
     expect(read()).toContain('the server clipped this result')

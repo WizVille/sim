@@ -18,6 +18,8 @@ import { useParams } from 'next/navigation'
 import { usePostHog } from 'posthog-js/react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStoreWithEqualityFn } from 'zustand/traditional'
+import { isMcpRuntimeReference } from '@/lib/mcp/operation-policy'
+import { resolveMcpBlockConfig } from '@/lib/mcp/workflow-config'
 import { captureEvent } from '@/lib/posthog/client'
 import { isRetryEligibleBlock } from '@/lib/workflows/blocks/retry-eligibility'
 import {
@@ -258,6 +260,7 @@ export function Editor() {
 
   const {
     collaborativeSetBlockCanonicalMode,
+    collaborativeSetSubblockValue,
     collaborativeUpdateBlockName,
     collaborativeSetBlockRetry,
     collaborativeBatchToggleLocked,
@@ -421,7 +424,7 @@ export function Editor() {
     <ActiveSearchTargetProvider value={activeSearchTargetForCurrentBlock}>
       <div className='flex h-full flex-col'>
         {/* Header */}
-        <div className='mx-[-1px] flex flex-shrink-0 items-center justify-between rounded-none border border-[var(--border)] bg-[var(--surface-4)] px-3 py-1.5'>
+        <div className='mx-[-1px] flex shrink-0 items-center justify-between rounded-none border border-[var(--border)] bg-[var(--surface-4)] px-3 py-1.5'>
           <div className='flex min-w-0 flex-1 items-center gap-2'>
             {currentBlock && (blockConfig || isSubflow) && (
               <BlockTile blockType={currentBlock.type} size='lg' />
@@ -440,7 +443,7 @@ export function Editor() {
                     handleCancelRename()
                   }
                 }}
-                className='min-w-0 flex-1 truncate bg-transparent pr-2 text-[var(--text-primary)] text-sm outline-none'
+                className='min-w-0 flex-1 truncate bg-transparent pr-2 text-[var(--text-primary)] text-sm outline-hidden'
               />
             ) : (
               <h2
@@ -589,7 +592,7 @@ export function Editor() {
                           </div>
                         ) : childWorkflowState ? (
                           <>
-                            <div className='[&_*:active]:!cursor-grabbing [&_*]:!cursor-grab [&_.react-flow__handle]:!hidden h-full w-full'>
+                            <div className='[&_.react-flow__handle]:hidden! h-full w-full [&_*:active]:cursor-grabbing! [&_*]:cursor-grab!'>
                               <PreviewWorkflow
                                 workflowState={childWorkflowState}
                                 height={160}
@@ -604,6 +607,7 @@ export function Editor() {
                             <Tooltip.Root>
                               <Tooltip.Trigger asChild>
                                 <Button
+                                  aria-label='Open workflow'
                                   type='button'
                                   variant='ghost'
                                   onClick={handleOpenChildWorkflow}
@@ -670,7 +674,16 @@ export function Editor() {
                               isCanonicalSwap && canonicalMode && canonicalId
                                 ? {
                                     mode: canonicalMode,
-                                    disabled: !canEditBlock,
+                                    disabled:
+                                      !canEditBlock ||
+                                      (currentBlock?.type === 'mcp' &&
+                                        canonicalId === 'tool' &&
+                                        isMcpRuntimeReference(
+                                          resolveMcpBlockConfig(
+                                            blockSubBlockValues,
+                                            canonicalModeOverrides
+                                          ).server
+                                        )),
                                     onToggle: () => {
                                       if (!currentBlockId) return
                                       const nextMode =
@@ -680,6 +693,35 @@ export function Editor() {
                                         canonicalId,
                                         nextMode
                                       )
+                                      if (
+                                        currentBlock?.type === 'mcp' &&
+                                        canonicalId === 'server'
+                                      ) {
+                                        collaborativeSetSubblockValue(
+                                          currentBlockId,
+                                          '_toolSchema',
+                                          null
+                                        )
+                                        const next = resolveMcpBlockConfig(blockSubBlockValues, {
+                                          ...canonicalModeOverrides,
+                                          server: nextMode,
+                                        })
+                                        if (
+                                          isMcpRuntimeReference(next.server) &&
+                                          canonicalModeOverrides?.tool !== 'advanced'
+                                        ) {
+                                          collaborativeSetSubblockValue(
+                                            currentBlockId,
+                                            'toolReference',
+                                            blockSubBlockValues.toolSelector ?? ''
+                                          )
+                                          collaborativeSetBlockCanonicalMode(
+                                            currentBlockId,
+                                            'tool',
+                                            'advanced'
+                                          )
+                                        }
+                                      }
                                     },
                                   }
                                 : undefined
@@ -760,6 +802,7 @@ export function Editor() {
 
                     {showRetrySettings && (
                       <RetrySettings
+                        blockId={currentBlockId}
                         retry={currentBlock?.retry}
                         disabled={!canEditBlock}
                         onChange={handleChangeRetry}
@@ -774,7 +817,7 @@ export function Editor() {
             {hasIncomingConnections && (
               <div
                 className={
-                  'connections-section flex flex-shrink-0 flex-col overflow-hidden border-[var(--border)] border-t' +
+                  'connections-section flex shrink-0 flex-col overflow-hidden border-[var(--border)] border-t' +
                   (!isResizing ? ' transition-[height] duration-100 ease-out' : '')
                 }
                 style={{ height: `${connectionsHeight}px` }}
@@ -791,7 +834,7 @@ export function Editor() {
 
                 {/* Connections Header with Chevron */}
                 <div
-                  className='flex flex-shrink-0 cursor-pointer items-center gap-2 px-2.5 pt-[5px] pb-[5px]'
+                  className='flex shrink-0 cursor-pointer items-center gap-2 px-2.5 pt-[5px] pb-[5px]'
                   onClick={toggleConnectionsCollapsed}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {

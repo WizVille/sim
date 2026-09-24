@@ -1,18 +1,9 @@
-import { loggerMock } from '@sim/testing'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { loggerMock, queueTableRows, resetDbChainMock, schemaMock } from '@sim/testing'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockDecryptSecret, mockRedactObjectStrings, mockIsEnforced, mockReportUnrecorded } =
-  vi.hoisted(() => ({
-    mockDecryptSecret: vi.fn(),
-    mockRedactObjectStrings: vi.fn(async (value: unknown) => value),
-    mockIsEnforced: vi.fn(() => false),
-    mockReportUnrecorded: vi.fn(),
-  }))
-
-vi.mock('@/lib/execution/durable-secret-provenance-enforcement', () => ({
-  DURABLE_SECRET_PROVENANCE_SURFACES: ['memory', 'table-row', 'knowledge'],
-  isDurableSecretProvenanceEnforced: mockIsEnforced,
-  reportUnrecordedDurableProvenance: mockReportUnrecorded,
+const { mockDecryptSecret, mockRedactObjectStrings } = vi.hoisted(() => ({
+  mockDecryptSecret: vi.fn(),
+  mockRedactObjectStrings: vi.fn(async (value: unknown) => value),
 }))
 
 vi.mock('@/lib/core/security/encryption', () => ({
@@ -23,11 +14,28 @@ vi.mock('@/lib/logs/execution/pii-redaction', () => ({
   redactObjectStrings: mockRedactObjectStrings,
 }))
 
+import { OrchestrationError } from '@/lib/core/orchestration/types'
 import { hashDurableSecretProvenanceValue } from '@/lib/execution/durable-secret-provenance'
-import { MEMORY } from '@/executor/constants'
+import { assertUserFileContentAccess } from '@/lib/execution/payloads/materialization.server'
+import { MEMORY } from '@/lib/memory/constants'
+import * as conversationStore from '@/lib/memory/conversation-store'
+import {
+  selectConversationMessageWindow,
+  selectConversationTokenWindow,
+} from '@/lib/memory/history-window'
 import { Memory } from '@/executor/handlers/agent/memory'
 import type { Message } from '@/executor/handlers/agent/types'
+import type { ExecutionContext, UserFile } from '@/executor/types'
 import { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
+import {
+  buildAnthropicMessageContent,
+  buildBedrockMessageContent,
+  buildGeminiMessageParts,
+  buildOpenAICompatibleChatContent,
+  buildOpenAIMessageContent,
+  buildOpenRouterMessageContent,
+  prepareProviderAttachments,
+} from '@/providers/attachments'
 
 const mockMemoryLogger = vi.mocked(loggerMock.createLogger).mock.results[
   vi.mocked(loggerMock.createLogger).mock.calls.findIndex(([name]) => name === 'Memory')
@@ -44,14 +52,71 @@ describe('Memory', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
-    mockIsEnforced.mockReturnValue(false)
+    resetDbChainMock()
     mockDecryptSecret.mockImplementation(async (encryptedValue: string) => ({
       decrypted: `decrypted:${encryptedValue}`,
     }))
     memoryService = new Memory()
   })
 
-  describe('applyWindow (message-based)', () => {
+  describe('optional durable storage', () => {
+    const ctx = { workspaceId: 'workspace-1' } as ExecutionContext
+    const inputs = { memoryType: 'conversation' as const, conversationId: 'conversation-1' }
+
+    afterEach(() => vi.restoreAllMocks())
+
+    it('keeps the plain compatibility view when rich capture is disabled', async () => {
+      const prefix: Message[] = [{ role: 'user', content: 'Previous question' }]
+      const tail: Message[] = [{ role: 'assistant', content: 'Previous answer' }]
+      queueTableRows(schemaMock.memory, [
+        { id: 'memory-1', storageVersion: 2, data: prefix, secretProvenanceVersion: null },
+      ])
+      const readPlain = vi.spyOn(conversationStore, 'readPlainMemoryTail').mockResolvedValue({
+        messages: tail,
+        provenance: { status: 'exact', entries: [] },
+      })
+      await expect(
+        memoryService.fetchMemoryMessages(ctx, inputs, undefined, { richHistory: false })
+      ).resolves.toEqual([...prefix, ...tail])
+      expect(readPlain).toHaveBeenCalledWith('memory-1', 'workspace-1')
+    })
+
+    function rejectRead(error: Error) {
+      vi.spyOn(
+        memoryService as unknown as { fetchMemory: () => Promise<unknown> },
+        'fetchMemory'
+      ).mockRejectedValue(error)
+    }
+
+    it.each(['ECONNREFUSED', '42P01', '23514'])(
+      'degrades rich history on storage failure %s while preserving ordinary read errors',
+      async (code) => {
+        const error = Object.assign(new Error('Storage unavailable'), { code })
+        rejectRead(error)
+        await expect(
+          memoryService.fetchMemoryMessages(ctx, inputs, undefined, { richHistory: true })
+        ).resolves.toEqual([])
+        await expect(memoryService.fetchMemoryMessages(ctx, inputs)).rejects.toBe(error)
+        expect(mockMemoryLogger.warn).toHaveBeenCalledWith(
+          'Agent durable memory read is unavailable',
+          { workspaceId: 'workspace-1' }
+        )
+      }
+    )
+
+    it.each(['forbidden', 'unauthorized', 'validation', 'conflict'] as const)(
+      'propagates application %s failures even for optional rich history',
+      async (code) => {
+        const error = new OrchestrationError(code, 'Memory access refused')
+        rejectRead(error)
+        await expect(
+          memoryService.fetchMemoryMessages(ctx, inputs, undefined, { richHistory: true })
+        ).rejects.toBe(error)
+      }
+    )
+  })
+
+  describe('message window', () => {
     it('should keep last N messages', () => {
       const messages: Message[] = [
         { role: 'user', content: 'Message 1' },
@@ -62,7 +127,7 @@ describe('Memory', () => {
         { role: 'assistant', content: 'Response 3' },
       ]
 
-      const result = (memoryService as any).applyWindow(messages, 4)
+      const result = selectConversationMessageWindow(messages, 4)
 
       expect(result.length).toBe(4)
       expect(result[0].content).toBe('Message 2')
@@ -75,26 +140,26 @@ describe('Memory', () => {
         { role: 'assistant', content: 'Response' },
       ]
 
-      const result = (memoryService as any).applyWindow(messages, 10)
+      const result = selectConversationMessageWindow(messages, 10)
       expect(result.length).toBe(2)
     })
 
     it('should handle invalid window size', () => {
       const messages: Message[] = [{ role: 'user', content: 'Test' }]
 
-      const result = (memoryService as any).applyWindow(messages, Number.NaN)
+      const result = selectConversationMessageWindow(messages, Number.NaN)
       expect(result).toEqual(messages)
     })
 
     it('should handle zero limit', () => {
       const messages: Message[] = [{ role: 'user', content: 'Test' }]
 
-      const result = (memoryService as any).applyWindow(messages, 0)
+      const result = selectConversationMessageWindow(messages, 0)
       expect(result).toEqual(messages)
     })
   })
 
-  describe('applyTokenWindow (token-based)', () => {
+  describe('token window', () => {
     it('should keep messages within token limit', () => {
       const messages: Message[] = [
         { role: 'user', content: 'Short' },
@@ -103,7 +168,7 @@ describe('Memory', () => {
         { role: 'assistant', content: 'Final response' },
       ]
 
-      const result = (memoryService as any).applyTokenWindow(messages, 15, 'gpt-4o')
+      const result = selectConversationTokenWindow(messages, 15, 'gpt-4o')
 
       expect(result.length).toBeGreaterThan(0)
       expect(result.length).toBeLessThan(messages.length)
@@ -119,7 +184,7 @@ describe('Memory', () => {
         },
       ]
 
-      const result = (memoryService as any).applyTokenWindow(messages, 5, 'gpt-4o')
+      const result = selectConversationTokenWindow(messages, 5, 'gpt-4o')
 
       expect(result.length).toBe(1)
       expect(result[0].content).toBe(messages[0].content)
@@ -133,7 +198,7 @@ describe('Memory', () => {
         { role: 'assistant', content: 'New response' },
       ]
 
-      const result = (memoryService as any).applyTokenWindow(messages, 10, 'gpt-4o')
+      const result = selectConversationTokenWindow(messages, 10, 'gpt-4o')
 
       expect(result[result.length - 1].content).toBe('New response')
     })
@@ -141,31 +206,31 @@ describe('Memory', () => {
     it('should handle invalid token limit', () => {
       const messages: Message[] = [{ role: 'user', content: 'Test' }]
 
-      const result = (memoryService as any).applyTokenWindow(messages, Number.NaN, 'gpt-4o')
+      const result = selectConversationTokenWindow(messages, Number.NaN, 'gpt-4o')
       expect(result).toEqual(messages)
     })
 
     it('should handle zero or negative token limit', () => {
       const messages: Message[] = [{ role: 'user', content: 'Test' }]
 
-      const result1 = (memoryService as any).applyTokenWindow(messages, 0, 'gpt-4o')
+      const result1 = selectConversationTokenWindow(messages, 0, 'gpt-4o')
       expect(result1).toEqual(messages)
 
-      const result2 = (memoryService as any).applyTokenWindow(messages, -5, 'gpt-4o')
+      const result2 = selectConversationTokenWindow(messages, -5, 'gpt-4o')
       expect(result2).toEqual(messages)
     })
 
     it('should work without model specified', () => {
       const messages: Message[] = [{ role: 'user', content: 'Test message' }]
 
-      const result = (memoryService as any).applyTokenWindow(messages, 100, undefined)
+      const result = selectConversationTokenWindow(messages, 100, undefined)
       expect(result.length).toBe(1)
     })
 
     it('should handle empty messages array', () => {
       const messages: Message[] = []
 
-      const result = (memoryService as any).applyTokenWindow(messages, 100, 'gpt-4o')
+      const result = selectConversationTokenWindow(messages, 100, 'gpt-4o')
       expect(result).toEqual([])
     })
   })
@@ -214,7 +279,7 @@ describe('Memory', () => {
   })
 
   describe('sanitizeMessageForStorage', () => {
-    it('should strip file payloads but preserve tool-call fields before memory persistence', () => {
+    it('preserves storage references and tool calls without file payloads or provider handles', () => {
       const message: Message = {
         role: 'user',
         content: 'Analyze this file',
@@ -228,6 +293,9 @@ describe('Memory', () => {
             size: 128,
             type: 'image/png',
             base64: 'iVBORw0KGgo=',
+            providerFileId: 'expired-provider-file',
+            providerFileUri: 'expired-provider-uri',
+            remoteUrl: 'https://storage.example.com/expired',
           },
         ],
         tool_calls: [{ id: 'call-1' }],
@@ -237,8 +305,177 @@ describe('Memory', () => {
         role: 'user',
         content: 'Analyze this file',
         executionId: 'exec-1',
+        files: [
+          {
+            id: 'file-1',
+            key: 'workspace/ws-1/example.png',
+            name: 'example.png',
+            url: '',
+            size: 128,
+            type: 'image/png',
+          },
+        ],
         tool_calls: [{ id: 'call-1' }],
       })
+    })
+  })
+
+  describe('provider-independent file references', () => {
+    const storedFile: UserFile = {
+      id: 'file-1',
+      key: 'workspace/workspace-1/image.png',
+      name: 'image.png',
+      url: '',
+      type: 'image/png',
+      size: 8,
+      context: 'workspace',
+    }
+    const bytes = 'iVBORw0KGgo='
+    const renderers: Array<{
+      providers: string[]
+      render: (content: string, files: UserFile[], provider: string) => unknown
+    }> = [
+      { providers: ['openai', 'azure-openai'], render: buildOpenAIMessageContent },
+      { providers: ['anthropic', 'azure-anthropic'], render: buildAnthropicMessageContent },
+      { providers: ['google', 'vertex'], render: buildGeminiMessageParts },
+      { providers: ['bedrock'], render: buildBedrockMessageContent },
+      { providers: ['openrouter'], render: buildOpenRouterMessageContent },
+      {
+        providers: [
+          'mistral',
+          'groq',
+          'fireworks',
+          'together',
+          'baseten',
+          'ollama',
+          'ollama-cloud',
+          'vllm',
+          'litellm',
+          'xai',
+          'kimi',
+        ],
+        render: buildOpenAICompatibleChatContent,
+      },
+    ]
+    const providers = renderers.flatMap(({ providers, render }) =>
+      providers.map((provider) => ({ provider, render }))
+    )
+
+    it.each(providers)(
+      'keeps the same attachment wire content for $provider',
+      async ({ provider, render }) => {
+        queueTableRows(schemaMock.memory, [
+          {
+            secretProvenanceVersion: null,
+            data: [
+              {
+                role: 'user',
+                content: 'Describe the image',
+                files: [
+                  {
+                    ...storedFile,
+                    url: 'https://expired.example/file',
+                    base64: 'stale-bytes',
+                    providerFileId: 'stale-id',
+                    providerFileUri: 'stale-uri',
+                    remoteUrl: 'https://expired.example/provider-file',
+                  },
+                ],
+              },
+            ],
+          },
+        ])
+        const [message] = await memoryService.fetchMemoryMessages(
+          { workspaceId: 'workspace-1' } as ExecutionContext,
+          { memoryType: 'conversation', conversationId: 'conversation-1' }
+        )
+        expect(message.files).toEqual([storedFile])
+        const hydrated = message.files!.map((file) => ({ ...file, base64: bytes }))
+        expect(render(message.content, hydrated, provider)).toEqual(
+          render('Describe the image', [{ ...storedFile, base64: bytes }], provider)
+        )
+      }
+    )
+
+    it.each(['deepseek', 'cerebras', 'sakana', 'nvidia', 'meta', 'zai'])(
+      'keeps the explicit unsupported-attachment error for %s',
+      (provider) => {
+        expect(() =>
+          prepareProviderAttachments([{ ...storedFile, base64: bytes }], provider)
+        ).toThrow('File attachments are not supported')
+      }
+    )
+
+    it('admits only the remembered execution file and preserves workspace and workflow scope', async () => {
+      const file = {
+        ...storedFile,
+        key: 'execution/workspace-1/workflow-1/exec-1/image.png',
+        context: 'execution',
+      }
+      queueTableRows(schemaMock.memory, [
+        { secretProvenanceVersion: null, data: [{ role: 'user', content: 'File', files: [file] }] },
+      ])
+      const context = {
+        workspaceId: 'workspace-1',
+        workflowId: 'workflow-1',
+        executionId: 'exec-2',
+      } as ExecutionContext
+      await memoryService.fetchMemoryMessages(context, {
+        memoryType: 'conversation',
+        conversationId: 'conversation-1',
+      })
+      await expect(assertUserFileContentAccess(file, context)).resolves.toBeUndefined()
+      await expect(
+        assertUserFileContentAccess(
+          { ...file, key: 'execution/workspace-1/workflow-1/exec-1/other.png' },
+          context
+        )
+      ).rejects.toThrow('File is not available')
+      await expect(
+        assertUserFileContentAccess(file, { ...context, workspaceId: 'workspace-2' })
+      ).rejects.toThrow('File is not available')
+      await expect(
+        assertUserFileContentAccess(file, { ...context, workflowId: 'workflow-2' })
+      ).rejects.toThrow('File is not available')
+    })
+
+    it('bounds historical file loading even when the messages contain no text', async () => {
+      queueTableRows(schemaMock.memory, [
+        {
+          secretProvenanceVersion: null,
+          data: Array.from({ length: MEMORY.MAX_REPLAY_FILE_REFERENCES + 1 }, () => ({
+            role: 'user',
+            content: '',
+            files: [storedFile],
+          })),
+        },
+      ])
+      await expect(
+        memoryService.fetchMemoryMessages({ workspaceId: 'workspace-1' } as ExecutionContext, {
+          memoryType: 'conversation',
+          conversationId: 'conversation-1',
+        })
+      ).rejects.toThrow('Use a smaller memory window')
+    })
+
+    it('does not carry inline-only or malformed file objects into a later turn', async () => {
+      queueTableRows(schemaMock.memory, [
+        {
+          secretProvenanceVersion: null,
+          data: [
+            {
+              role: 'user',
+              content: '',
+              files: [null, { name: 'invalid.png' }, { ...storedFile, key: '', base64: bytes }],
+            },
+          ],
+        },
+      ])
+      const messages = await memoryService.fetchMemoryMessages(
+        { workspaceId: 'workspace-1' } as ExecutionContext,
+        { memoryType: 'conversation', conversationId: 'conversation-1' }
+      )
+      expect(messages).toEqual([{ role: 'user', content: '' }])
     })
   })
 
@@ -280,14 +517,17 @@ describe('Memory', () => {
       const registry = new ResolvedSecretTraceRegistry()
       registry.markIncomplete('unspecified')
       const appendMessage = vi
-        .spyOn(memoryService as any, 'appendMessage')
+        .spyOn(conversationStore, 'appendMemoryMessages')
         .mockResolvedValue(undefined)
 
       const message = { role: 'user' as const, content: 'possibly secret' }
       await memoryService.appendToMemory(createContext(registry) as never, inputs, message)
 
-      expect(appendMessage).toHaveBeenCalledWith('workspace-1', 'conversation-1', message, {
-        status: 'unknown',
+      expect(appendMessage).toHaveBeenCalledWith({
+        workspaceId: 'workspace-1',
+        key: 'conversation-1',
+        messages: [message],
+        provenance: { status: 'unknown' },
       })
     })
 
@@ -295,14 +535,17 @@ describe('Memory', () => {
       const registry = new ResolvedSecretTraceRegistry()
       registry.markIncomplete('unspecified')
       const seedMemoryRecord = vi
-        .spyOn(memoryService as any, 'seedMemoryRecord')
+        .spyOn(conversationStore, 'seedMemoryMessages')
         .mockResolvedValue(undefined)
       const message = { role: 'assistant' as const, content: 'possibly secret' }
 
       await memoryService.seedMemory(createContext(registry) as never, inputs, [message])
 
-      expect(seedMemoryRecord).toHaveBeenCalledWith('workspace-1', 'conversation-1', [message], {
-        status: 'unknown',
+      expect(seedMemoryRecord).toHaveBeenCalledWith({
+        workspaceId: 'workspace-1',
+        key: 'conversation-1',
+        messages: [message],
+        provenance: { status: 'unknown' },
       })
     })
 
@@ -398,10 +641,10 @@ describe('Memory', () => {
         })
 
         const appendMessage = vi
-          .spyOn(memoryService as any, 'appendMessage')
+          .spyOn(conversationStore, 'appendMemoryMessages')
           .mockResolvedValue(undefined)
         await memoryService.appendToMemory(createContext(registry) as never, inputs, message)
-        const stored = appendMessage.mock.calls.at(-1)?.[2] as Message
+        const stored = appendMessage.mock.calls.at(-1)?.[0].messages[0] as Message
         expect(JSON.parse(stored.function_call?.arguments ?? '')).toEqual({
           value: secret,
           converted,
@@ -514,33 +757,7 @@ describe('Memory', () => {
       expect(mockDecryptSecret).not.toHaveBeenCalled()
     })
 
-    /** Trace 2's shape: a stored memory a previous run could not vouch for. */
-    it('reads a memory with unrecorded provenance while the surface stays open', async () => {
-      const registry = new ResolvedSecretTraceRegistry([], {
-        userId: 'user-1',
-        workspaceId: 'workspace-1',
-      })
-      vi.spyOn(memoryService as any, 'fetchMemory').mockResolvedValueOnce({
-        messages: [{ role: 'user', content: 'how do i see my tickets?' }],
-        provenance: { status: 'unknown' },
-      })
-
-      const messages = await memoryService.fetchMemoryMessages(
-        createContext(registry) as never,
-        inputs
-      )
-
-      expect(messages).toEqual([{ role: 'user', content: 'how do i see my tickets?' }])
-      expect(registry.isPermanentlyIncomplete()).toBe(false)
-      expect(mockReportUnrecorded).toHaveBeenCalledWith({
-        surface: 'memory',
-        cause: 'stored-memory-provenance-unknown',
-        workspaceId: 'workspace-1',
-      })
-    })
-
-    it('refuses that same memory once the memory surface is closed', async () => {
-      mockIsEnforced.mockReturnValue(true)
+    it('refuses tracked memory with unknown provenance', async () => {
       const registry = new ResolvedSecretTraceRegistry([], {
         userId: 'user-1',
         workspaceId: 'workspace-1',
@@ -553,7 +770,6 @@ describe('Memory', () => {
       await expect(
         memoryService.fetchMemoryMessages(createContext(registry) as never, inputs)
       ).rejects.toThrow()
-      expect(mockReportUnrecorded).not.toHaveBeenCalled()
     })
   })
 
@@ -574,9 +790,7 @@ describe('Memory', () => {
         memoryType: 'conversation' as const,
         conversationId: 'conversation-secret __var_TOKEN __sim_runtime_test_1',
       }
-      vi.spyOn(memoryService as never, 'appendMessage' as never).mockResolvedValue(
-        undefined as never
-      )
+      vi.spyOn(conversationStore, 'appendMemoryMessages').mockResolvedValue(undefined)
 
       await memoryService.appendToMemory(ctx as never, inputs, {
         role: 'user',
@@ -593,9 +807,7 @@ describe('Memory', () => {
       expect(serializedCalls).not.toContain('__sim_')
 
       mockMemoryLogger.debug.mockClear()
-      vi.spyOn(memoryService as never, 'seedMemoryRecord' as never).mockResolvedValue(
-        undefined as never
-      )
+      vi.spyOn(conversationStore, 'seedMemoryMessages').mockResolvedValue(undefined)
 
       await memoryService.seedMemory(ctx as never, inputs, [
         { role: 'assistant', content: 'ordinary response' },
@@ -623,10 +835,10 @@ describe('Memory', () => {
         { role: 'user', content: 'B' },
       ]
 
-      const messageResult = (memoryService as any).applyWindow(messages, 2)
+      const messageResult = selectConversationMessageWindow(messages, 2)
       expect(messageResult.length).toBe(2)
 
-      const tokenResult = (memoryService as any).applyTokenWindow(messages, 10, 'gpt-4o')
+      const tokenResult = selectConversationTokenWindow(messages, 10, 'gpt-4o')
       expect(tokenResult.length).toBeGreaterThanOrEqual(1)
     })
   })

@@ -23,6 +23,7 @@ import type {
   ForkResourceUsage,
   ForkTriggerMapping,
 } from '@/lib/api/contracts/workspace-fork'
+import type { SelectorKey } from '@/lib/selectors/manifest'
 import { SettingsEmptyState } from '@/app/workspace/[workspaceId]/settings/components/settings-empty-state'
 import { SettingsSection } from '@/app/workspace/[workspaceId]/settings/components/settings-section/settings-section'
 import {
@@ -58,7 +59,6 @@ import type {
 } from '@/ee/workspace-forking/components/fork-sync/use-fork-sync'
 import type { ForkDirection } from '@/ee/workspace-forking/hooks/workspace-fork'
 import { forkSyncBlockerReasonFor } from '@/ee/workspace-forking/lib/promote/sync-blockers'
-import type { SelectorKey } from '@/hooks/selectors/types'
 import { buildWebhookTriggerUrl } from '@/triggers/webhook-url'
 
 /**
@@ -96,7 +96,7 @@ const NEW_TRIGGER_URL_VALUE = '__new_trigger_url__'
  * General). Wide enough to hold a full-length secret key - these are the longest labels the
  * picker shows, and clipping them is what makes two same-prefixed keys indistinguishable.
  */
-const MAPPING_TARGET_TRIGGER_CLASS = 'w-[380px] flex-shrink-0'
+const MAPPING_TARGET_TRIGGER_CLASS = 'w-[380px] shrink-0'
 
 interface DependentBlock {
   targetBlockId: string
@@ -291,11 +291,10 @@ function DependentSelector({
   return (
     <DependentFieldSelector
       selectorKey={field.selectorKey as SelectorKey}
+      workspaceId={copying ? sourceWorkspaceId : workspaceId}
       context={{
         ...field.context,
         ...providedValues,
-        // Owning workspace, for workspace-scoped selectors like table.columns.
-        workspaceId: copying ? sourceWorkspaceId : workspaceId,
         ...(field.parentContextKey ? { [field.parentContextKey]: parentValue } : {}),
       }}
       enabled={parentValue !== '' && ready}
@@ -1057,7 +1056,7 @@ export function ForkSyncView({ controller, onDirectionChange }: ForkSyncViewProp
                       {uses > 1 ? `Drop from ${uses} fields` : 'Drop'}
                     </Chip>
                   ) : (
-                    <span className='flex-shrink-0 text-[var(--text-muted)] text-caption'>
+                    <span className='shrink-0 text-[var(--text-muted)] text-caption'>
                       same reference
                     </span>
                   )}

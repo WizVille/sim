@@ -27,7 +27,11 @@ import { usePostHog } from 'posthog-js/react'
 import { getDocumentIcon } from '@/components/icons/document-icons'
 import { useLimitUpgradeToast } from '@/lib/billing/client'
 import { captureEvent } from '@/lib/posthog/client'
-import { triggerArchiveDownload, triggerFileDownload } from '@/lib/uploads/client/download'
+import {
+  type FileDownloadSource,
+  triggerArchiveDownload,
+  triggerFileDownload,
+} from '@/lib/uploads/client/download'
 import type { WorkspaceFileRecord } from '@/lib/uploads/contexts/workspace'
 import { MAX_WORKSPACE_FILE_SIZE } from '@/lib/uploads/shared/types'
 import {
@@ -115,9 +119,11 @@ import { FileDocRoomProvider } from '@/app/workspace/[workspaceId]/files/compone
 import { FilesListContextMenu } from '@/app/workspace/[workspaceId]/files/components/files-list-context-menu'
 import { ShareModal } from '@/app/workspace/[workspaceId]/files/components/share-modal'
 import { useWorkspaceFilesRoom } from '@/app/workspace/[workspaceId]/files/hooks/use-workspace-files-room'
+import FilesLoading from '@/app/workspace/[workspaceId]/files/loading'
 import {
   filesFilterParsers,
   filesFilterUrlKeys,
+  filesListPreferenceConfig,
   filesParsers,
   filesSortParams,
   filesUrlKeys,
@@ -130,6 +136,7 @@ import {
 } from '@/app/workspace/[workspaceId]/files/untitled-title'
 import { useRegisterGlobalCommands } from '@/app/workspace/[workspaceId]/providers/global-commands-provider'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
+import { PermissionAccessBoundary } from '@/ee/access-requests/components/permission-access-boundary'
 import { usePinItem, usePinnedIds, useUnpinItem } from '@/hooks/queries/pinned-items'
 import { useWorkspaceMembersQuery, type WorkspaceMember } from '@/hooks/queries/workspace'
 import {
@@ -152,8 +159,10 @@ import { useContextMenu } from '@/hooks/use-context-menu'
 import { useDebouncedSearchSetter } from '@/hooks/use-debounced-search-setter'
 import { useInlineRename } from '@/hooks/use-inline-rename'
 import { usePermissionConfig } from '@/hooks/use-permission-config'
+import { useResourceListPreferences } from '@/hooks/use-resource-list-preferences'
 import { useSearchFilterValue } from '@/hooks/use-search-filter-value'
 import { useUrlSort } from '@/hooks/use-url-sort'
+import type { ResourceListPreference } from '@/stores/resource-list-preferences'
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error'
 type FileResourceItem =
@@ -256,8 +265,17 @@ function formatFileType(storedType: string | null, filename: string): string {
 }
 
 export function Files() {
+  return (
+    <PermissionAccessBoundary configKey='hideFilesTab'>
+      <FilesContent />
+    </PermissionAccessBoundary>
+  )
+}
+
+function FilesContent() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const saveRef = useRef<(() => Promise<void>) | null>(null)
+  const downloadSourceRef = useRef<FileDownloadSource | null>(null)
   const discardRef = useRef<(() => void) | null>(null)
 
   const params = useParams()
@@ -420,21 +438,58 @@ export function Files() {
     sort: sortColumn,
     dir: sortDirection,
     activeSort,
-    onSort,
-    onClear,
+    onSort: applyUrlSort,
   } = useUrlSort(filesSortParams, filesFilterUrlKeys)
 
+  const currentListPreference = useMemo<ResourceListPreference>(
+    () => ({
+      sort: { column: sortColumn, direction: sortDirection },
+      filters: {
+        type: typeFilter,
+        size: sizeFilter,
+        uploadedBy: uploadedByFilter,
+      },
+    }),
+    [sortColumn, sortDirection, typeFilter, sizeFilter, uploadedByFilter]
+  )
+
+  const applyListPreference = useCallback(
+    (preference: ResourceListPreference) => {
+      void setFileFilters({
+        type: [...preference.filters.type],
+        size: [...preference.filters.size],
+        uploadedBy: [...preference.filters.uploadedBy],
+      })
+      applyUrlSort(preference.sort.column, preference.sort.direction)
+    },
+    [applyUrlSort, setFileFilters]
+  )
+
+  const {
+    isReady: isListPreferenceReady,
+    setFilter: setListFilter,
+    clearFilters: clearFileFilters,
+    setSort: setListSort,
+    clearSort: clearListSort,
+  } = useResourceListPreferences({
+    workspaceId,
+    config: filesListPreferenceConfig,
+    preference: currentListPreference,
+    applyPreference: applyListPreference,
+    enabled: fileIdFromRoute === null,
+  })
+
   const setTypeFilter = useCallback(
-    (next: string[]) => setFileFilters({ type: next }),
-    [setFileFilters]
+    (next: string[]) => setListFilter('type', next),
+    [setListFilter]
   )
   const setSizeFilter = useCallback(
-    (next: string[]) => setFileFilters({ size: next }),
-    [setFileFilters]
+    (next: string[]) => setListFilter('size', next),
+    [setListFilter]
   )
   const setUploadedByFilter = useCallback(
-    (next: string[]) => setFileFilters({ uploadedBy: next }),
-    [setFileFilters]
+    (next: string[]) => setListFilter('uploadedBy', next),
+    [setListFilter]
   )
 
   const [creatingFile, setCreatingFile] = useState(false)
@@ -1053,7 +1108,7 @@ export function Files() {
   const handleDownload = useCallback(
     async (file: WorkspaceFileRecord) => {
       try {
-        await triggerFileDownload(file)
+        await triggerFileDownload(file, downloadSourceRef.current)
         captureEvent(posthogRef.current, 'file_downloaded', {
           workspace_id: workspaceId,
           is_bulk: false,
@@ -1904,10 +1959,10 @@ export function Files() {
         { id: 'owner', label: 'Owner' },
       ],
       active: activeSort,
-      onSort,
-      onClear,
+      onSort: setListSort,
+      onClear: clearListSort,
     }),
-    [activeSort, onSort, onClear]
+    [activeSort, setListSort, clearListSort]
   )
 
   const hasActiveFilters =
@@ -2004,11 +2059,7 @@ export function Files() {
         {hasActiveFilters && (
           <Button
             variant='ghost'
-            onClick={() => {
-              setTypeFilter([])
-              setSizeFilter([])
-              setUploadedByFilter([])
-            }}
+            onClick={clearFileFilters}
             className='h-[32px] w-full text-caption hover-hover:bg-[var(--surface-active)]'
           >
             Clear all filters
@@ -2016,7 +2067,18 @@ export function Files() {
         )}
       </div>
     )
-  }, [typeFilter, sizeFilter, uploadedByFilter, memberOptions, membersById, hasActiveFilters])
+  }, [
+    typeFilter,
+    sizeFilter,
+    uploadedByFilter,
+    memberOptions,
+    membersById,
+    hasActiveFilters,
+    setTypeFilter,
+    setSizeFilter,
+    setUploadedByFilter,
+    clearFileFilters,
+  ])
 
   /** Stable identity so the memoized `Resource.Options` can bail; an inline object cannot. */
   const filterConfig = useMemo(() => ({ content: filterContent }), [filterContent])
@@ -2056,7 +2118,15 @@ export function Files() {
       tags.push({ label, onRemove: () => setUploadedByFilter([]) })
     }
     return tags
-  }, [typeFilter, sizeFilter, uploadedByFilter, membersById])
+  }, [
+    typeFilter,
+    sizeFilter,
+    uploadedByFilter,
+    membersById,
+    setTypeFilter,
+    setSizeFilter,
+    setUploadedByFilter,
+  ])
 
   const listState = resourceListState({
     rowCount: rows.length,
@@ -2071,8 +2141,10 @@ export function Files() {
 
   const clearSearchAndFilters = () => {
     setSearchTerm('')
-    void setFileFilters({ type: null, size: null, uploadedBy: null })
+    clearFileFilters()
   }
+
+  if (!isListPreferenceReady) return <FilesLoading />
 
   if (fileIdFromRoute && !selectedFile && isLoading) {
     return (
@@ -2109,6 +2181,7 @@ export function Files() {
               onDirtyChange={setIsDirty}
               onSaveStatusChange={handleSaveStatusChange}
               saveRef={saveRef}
+              downloadSourceRef={downloadSourceRef}
               discardRef={discardRef}
               collaborative
               onDeriveTitleFromHeading={handleDeriveTitleFromHeading}

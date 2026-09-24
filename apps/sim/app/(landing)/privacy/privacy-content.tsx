@@ -43,7 +43,7 @@ function richText(content: string): ReactNode {
 export const PRIVACY_CONFIG: LegalPageConfig = {
   title: 'Privacy Policy',
   description: 'Sim Studio, Inc. · Operating the Sim platform (sim.ai)',
-  lastUpdated: 'August 25, 2026',
+  lastUpdated: 'September 2, 2026',
   intro: [
     {
       kind: 'paragraph',
@@ -264,7 +264,7 @@ export const PRIVACY_CONFIG: LegalPageConfig = {
               'Behavioral remarketing',
               'Cookie and pixel identifiers, browser and Device data, campaign attribution, and website interaction data',
               'Consent — Article 6(1)(a)',
-              'Marketing technologies are disabled until the Marketing category is accepted. Consent may be changed or withdrawn through the cookie preferences link.',
+              'Marketing cookies and ad personalization require Marketing consent. Google Ads may load earlier with ad storage denied and send limited cookieless consent signals. Consent may be changed or withdrawn through the cookie preferences link.',
             ],
             [
               'Retaining transaction and tax records',
@@ -399,7 +399,7 @@ export const PRIVACY_CONFIG: LegalPageConfig = {
         {
           kind: 'paragraph',
           content: richText(
-            'Sim subjects all Personal Data received from the European Union, the United Kingdom and Gibraltar, and Switzerland in reliance on the applicable part of the DPF program to the relevant DPF Principles. Sim Studio, Inc. has no other U.S. entities or U.S. subsidiaries covered by its certification. This public policy covers non-human-resources Personal Data. Any human-resources data covered by the certification is addressed in the applicable employee privacy notice.'
+            "Sim subjects all Personal Data received from the European Union, the United Kingdom and Gibraltar, and Switzerland in reliance on the applicable part of the DPF program to the relevant DPF Principles. Sim Studio, Inc. has no other U.S. entities or U.S. subsidiaries covered by its certification. Sim's certification under the EU-U.S. DPF, the UK Extension to the EU-U.S. DPF, and the Swiss-U.S. DPF covers non-human-resources Personal Data only. Human-resources data is not covered by this certification."
           ),
         },
         { kind: 'subheading', text: 'Notice, Use, and Choice' },
@@ -576,7 +576,7 @@ export const PRIVACY_CONFIG: LegalPageConfig = {
         {
           kind: 'paragraph',
           content: richText(
-            'The Company uses Google Ads, Twitter, and Facebook remarketing services to advertise on third-party websites after You visit the Service. These services operate through non-essential Cookies and similar technologies. They are activated only after You give consent to the Marketing category in the cookie banner. No marketing Cookie is set before that consent.'
+            'The Company uses Google Ads, Twitter, and Facebook remarketing services to advertise on third-party websites after You visit the Service. These services operate through non-essential Cookies and similar technologies. Marketing Cookies and ad personalization are enabled only after You give consent to the Marketing category in the cookie banner. Google Ads may load before that consent with ad storage denied and send limited cookieless consent signals, as described in the Cookie Policy.'
           ),
         },
         {

@@ -37,6 +37,18 @@ describe('Credential Group provider registry', () => {
     expect(getCredentialGroupProviderFromProviderId(service.providerId)).toBe('google-calendar')
   })
 
+  it('maps Google Drive to its existing OAuth provider and the Google managed policy', () => {
+    const service = getCredentialGroupProviderService('google-drive')
+
+    expect(service.name).toBe('Google Drive')
+    expect(service.providerId).toBe('google-drive')
+    expect(getCredentialGroupProviderFromProviderId(service.providerId)).toBe('google-drive')
+    expect(getCredentialGroupProviderAdapter('google-drive').provider).toBe('google-drive')
+    expect(getManagedOAuthConnectorPolicy('google-drive')?.getAuthorizationAppId('client')).toBe(
+      createGoogleManagedOAuthConnector('google-drive').getAuthorizationAppId('client')
+    )
+  })
+
   it.each(['confluence', 'jira'] as const)(
     'maps %s to its existing OAuth provider and adapter',
     (provider) => {
@@ -61,6 +73,20 @@ describe('Credential Group provider registry', () => {
     expect(grantedScopes).toContain(GMAIL_MODIFY_SCOPE)
     expect(managedOAuth.hasRequiredScopes(grantedScopes, canonicalScopes)).toBe(true)
     expect(managedOAuth.hasRequiredScopes([], canonicalScopes)).toBe(false)
+  })
+
+  it('accepts a full Drive grant for read-only access without promoting limited grants', () => {
+    const policy = createGoogleManagedOAuthConnector('google-drive')
+    const full = 'https://www.googleapis.com/auth/drive'
+    const readOnly = 'https://www.googleapis.com/auth/drive.readonly'
+    const selectedFiles = 'https://www.googleapis.com/auth/drive.file'
+    expect(policy.hasRequiredScopes([full], [readOnly])).toBe(true)
+    expect(policy.hasRequiredScopes([selectedFiles], [readOnly])).toBe(false)
+    expect(policy.hasRequiredScopes([readOnly], [full])).toBe(false)
+    expect(policy.hasRequiredScopes([readOnly], [selectedFiles])).toBe(false)
+    expect(
+      policy.hasRequiredScopes([full], ['https://www.googleapis.com/auth/calendar.readonly'])
+    ).toBe(false)
   })
 
   it('requires the complete Google Calendar scope policy', () => {

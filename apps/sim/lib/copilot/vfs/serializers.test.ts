@@ -3,14 +3,6 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
-  MAX_SANDBOX_CLI_TOOLS,
-  SANDBOX_CLI_TOOLS,
-  SANDBOX_SELECTABLE_CLI_TOOL_IDS,
-} from '@/lib/execution/remote-sandbox/cli-tools'
-import type { BlockConfig } from '@/blocks/types'
-import { hostedKeyEnabledWhen } from '@/tools/hosting'
-import type { ToolConfig } from '@/tools/types'
-import {
   buildOrganizationReadme,
   serializeAccessControl,
   serializeAccountBilling,
@@ -19,8 +11,10 @@ import {
   serializeAccountWorkspaces,
   serializeApiKeyIntegrations,
   serializeBlockSchema,
+  serializeConnectedAccounts,
+  serializeConnectorOverview,
+  serializeConnectorSchema,
   serializeConnectors,
-  serializeCredentialGroups,
   serializeCredentials,
   serializeDeployments,
   serializeFileMeta,
@@ -36,7 +30,16 @@ import {
   serializeTableMeta,
   serializeWorkflowMeta,
   serializeWorkspaceForks,
-} from './serializers'
+} from '@/lib/copilot/vfs/serializers'
+import {
+  MAX_SANDBOX_CLI_TOOLS,
+  SANDBOX_CLI_TOOLS,
+  SANDBOX_SELECTABLE_CLI_TOOL_IDS,
+} from '@/lib/execution/remote-sandbox/cli-tools'
+import type { BlockConfig } from '@/blocks/types'
+import { gitlabConnectorMeta } from '@/connectors/gitlab/meta'
+import { hostedKeyEnabledWhen } from '@/tools/hosting'
+import type { ToolConfig } from '@/tools/types'
 
 function hostedTool(id: string, conditional = false): ToolConfig {
   return {
@@ -245,6 +248,20 @@ describe('entitlement-projected block schemas', () => {
 })
 
 describe('hosted-key VFS metadata', () => {
+  it('preserves multi-select dropdown behavior in block schemas', () => {
+    const block = {
+      type: 'events',
+      name: 'Events',
+      subBlocks: [{ id: 'eventTypes', type: 'dropdown', multiSelect: true }],
+      tools: { access: [] },
+      inputs: {},
+      outputs: {},
+    } as unknown as BlockConfig
+
+    const schema = JSON.parse(serializeBlockSchema(block))
+    expect(schema.subBlocks[0].multiSelect).toBe(true)
+  })
+
   it('indexes hosted and conditional-hosted operations for every configured service', () => {
     const metadata = JSON.parse(
       serializeApiKeyIntegrations(
@@ -605,6 +622,23 @@ describe('serializeCredentials — type distinguishes reconnect flow', () => {
   })
 })
 
+describe('connector setup guidance', () => {
+  it('describes GitLab PAT setup without requiring an OAuth credential or administrator fields', () => {
+    const schema = JSON.parse(serializeConnectorSchema(gitlabConnectorMeta))
+    expect(schema.auth.mode).toBe('apiKey')
+    expect(schema.configFields.filter((field: { required?: boolean }) => field.required)).toEqual([
+      expect.objectContaining({ id: 'project' }),
+    ])
+
+    const overview = serializeConnectorOverview([gitlabConnectorMeta])
+    expect(overview).toContain(
+      'For API-key connectors, pass apiKey as a `{{SECRET_NAME}}` reference'
+    )
+    expect(overview).toContain('For OAuth connectors, pass a credentialId')
+    expect(overview).not.toContain('the user must have an OAuth credential')
+  })
+})
+
 describe('serializeConnectors — cloneable references, never key material', () => {
   const now = new Date('2026-08-14T00:00:00.000Z')
 
@@ -844,7 +878,7 @@ describe('account and organization namespace serializers', () => {
       ],
       forksMounted: false,
       permissionGroupsMounted: false,
-      credentialGroupsMounted: true,
+      connectedAccountsMounted: true,
     })
 
     expect(readme).toContain('# Organization')
@@ -854,33 +888,49 @@ describe('account and organization namespace serializers', () => {
     // Gated files must not be advertised when unmounted for this viewer.
     expect(readme).not.toContain('forks.json')
     expect(readme).not.toContain('permission-groups.json')
-    expect(readme).toContain('credential-groups.json')
+    expect(readme).toContain('connected-accounts.json')
   })
 
-  it('scopes credential-group people to admins and flags truncated counts', () => {
-    const base = {
+  it('serializes singleton readiness without credentials, people, or container selection', () => {
+    const accounts = {
       id: 'cg-1',
-      name: 'Clients',
-      description: null,
+      name: 'Connected accounts',
       status: 'active' as const,
       options: [
-        { provider: 'gmail', label: 'Work email', required: true, configurationStatus: 'ready' },
-        { provider: 'slack', configurationStatus: 'not_configured' },
+        {
+          provider: 'gmail',
+          label: 'Work email',
+          required: true,
+          status: 'active' as const,
+          configurationStatus: 'ready',
+        },
+        {
+          provider: 'slack',
+          status: 'disabled' as const,
+          configurationStatus: 'not_configured',
+          slackBotCredentialId: 'private-credential-id',
+        },
       ],
-      enrollmentCounts: { completed: 2, invited: 1 },
-      enrollmentsTruncated: true,
-      people: [{ email: 'a@x.com', status: 'completed' }],
+      enrollmentCounts: { completed: 2 },
+      people: [{ email: 'private@example.com', status: 'completed' }],
+      encryptedProviderConfiguration: 'private-configuration',
     }
 
-    const admin = JSON.parse(serializeCredentialGroups([base], { includeEmails: true }))
-    expect(admin.credentialGroups[0].people).toHaveLength(1)
-    expect(admin.credentialGroups[0].enrollments.countsFromFirstPageOnly).toBe(true)
-    expect(admin.credentialGroups[0].options[1].configurationStatus).toBe('not_configured')
-
-    const member = JSON.parse(serializeCredentialGroups([base], { includeEmails: false }))
-    expect(member.credentialGroups[0].people).toBeUndefined()
-    // The runtime contract the model most needs: empty loop, not an error.
-    expect(member.note).toContain('empty loop, not an error')
+    const serialized = serializeConnectedAccounts(accounts)
+    const catalog = JSON.parse(serialized)
+    expect(catalog.status).toBe('active')
+    expect(catalog.options[1]).toEqual({
+      provider: 'slack',
+      status: 'disabled',
+      configurationStatus: 'not_configured',
+    })
+    expect(catalog.credentialGroups).toBeUndefined()
+    expect(catalog.id).toBeUndefined()
+    expect(catalog.people).toBeUndefined()
+    expect(catalog.enrollments).toBeUndefined()
+    expect(serialized).not.toContain('private-')
+    expect(serialized).not.toContain('private@example.com')
+    expect(catalog.note).toContain('no container selection is required')
   })
 
   it('maps the org workspace directory with access flags and fork parentage', () => {

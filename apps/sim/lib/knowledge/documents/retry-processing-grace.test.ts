@@ -18,18 +18,45 @@ vi.mock('@/lib/knowledge/documents/processing-outbox-event', () => ({
 vi.mock('@/lib/uploads', () => ({ StorageService: {} }))
 vi.mock('@/connectors/registry.server', () => ({ CONNECTOR_REGISTRY: {} }))
 
-import { isStuckDocumentSweepEligible } from '@/lib/knowledge/connectors/sync-engine'
+import type { BillingAttributionSnapshot } from '@/lib/billing/core/billing-attribution'
+import { isStuckDocumentSweepEligible } from '@/lib/knowledge/connectors/sync-primitives'
 import {
   processDocumentsWithQueue,
   retryDocumentProcessing,
 } from '@/lib/knowledge/documents/service'
 import { QUEUED_DISPATCH_GRACE_MS } from '@/lib/knowledge/documents/types'
 
+const OBSERVED_DOCUMENT = {
+  uploadedAt: new Date(0),
+  id: 'doc-1',
+  processingStatus: 'completed',
+  processingQueueToken: 'old-token',
+  processingQueuedAt: new Date(0),
+  processingStartedAt: null,
+  processingDeferredUntil: null,
+  processingCompletedAt: new Date(0),
+  processingRecoveryAfter: null,
+}
+
 const DOC_DATA = {
   filename: 'report.pdf',
   fileUrl: 'https://example.com/report.pdf',
   fileSize: 1024,
   mimeType: 'application/pdf',
+}
+
+const BILLING_ATTRIBUTION: BillingAttributionSnapshot = {
+  actorUserId: 'user-1',
+  workspaceId: 'workspace-1',
+  organizationId: null,
+  billedAccountUserId: 'workspace-owner',
+  billingEntity: { type: 'user', id: 'workspace-owner' },
+  billingPeriod: {
+    start: '2026-08-01T00:00:00.000Z',
+    end: '2026-09-01T00:00:00.000Z',
+    source: 'default',
+  },
+  payerSubscription: null,
 }
 
 /**
@@ -51,6 +78,7 @@ describe('retryDocumentProcessing requeue stamp', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
+    dbChainMockFns.limit.mockResolvedValueOnce([OBSERVED_DOCUMENT])
   })
 
   it('clears the previous attempt terminal state', async () => {
@@ -73,7 +101,9 @@ describe('processDocumentsWithQueue dispatch stamp', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
-    dbChainMockFns.limit.mockResolvedValue([{ userId: 'user-1', workspaceId: null }])
+    dbChainMockFns.limit.mockResolvedValue([
+      { userId: 'user-1', workspaceId: 'workspace-1', organizationId: null },
+    ])
   })
 
   /**
@@ -86,7 +116,7 @@ describe('processDocumentsWithQueue dispatch stamp', () => {
       'kb-1',
       {},
       'req-1',
-      undefined
+      BILLING_ATTRIBUTION
     ).catch(() => {})
   }
 
@@ -154,6 +184,7 @@ describe('retryDocumentProcessing requeue guard', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
+    dbChainMockFns.limit.mockResolvedValueOnce([OBSERVED_DOCUMENT])
   })
 
   /**
@@ -184,7 +215,15 @@ describe('retryDocumentProcessing requeue guard', () => {
       )
     )
     expect(call).toBeDefined()
-    const guard = flattenMockConditions(call?.[0]).find((node: MockCondition) => node.type === 'or')
+    const guard = flattenMockConditions(call?.[0]).find(
+      (node: MockCondition) =>
+        node.type === 'or' &&
+        hasBranch(
+          node,
+          (branch) =>
+            branch.type === 'inArray' && branch.column === schemaMock.document.processingStatus
+        )
+    )
     expect(guard).toBeDefined()
     return guard as MockCondition
   }
@@ -332,7 +371,9 @@ describe('processing attempt budget', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
-    dbChainMockFns.limit.mockResolvedValue([{ userId: 'user-1', workspaceId: null }])
+    dbChainMockFns.limit.mockResolvedValue([
+      { userId: 'user-1', workspaceId: 'workspace-1', organizationId: null },
+    ])
   })
 
   it('spends one attempt per dispatch, in the same guarded write', async () => {
@@ -341,7 +382,7 @@ describe('processing attempt budget', () => {
       'kb-1',
       {},
       'req-1',
-      undefined
+      BILLING_ATTRIBUTION
     ).catch(() => {})
 
     const stampCall = dbChainMockFns.set.mock.calls.find(
@@ -366,6 +407,7 @@ describe('retryDocumentProcessing dispatch unwind', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
+    dbChainMockFns.limit.mockResolvedValueOnce([OBSERVED_DOCUMENT])
   })
 
   /**
@@ -407,9 +449,17 @@ describe('retryDocumentProcessing dispatch unwind', () => {
       .mockResolvedValueOnce([{ id: 'doc-1' }])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
-    dbChainMockFns.limit.mockResolvedValue([{ userId: 'user-1', workspaceId: null }])
+    dbChainMockFns.limit.mockResolvedValue([
+      { userId: 'user-1', workspaceId: 'workspace-1', organizationId: null },
+    ])
 
-    const result = await retryDocumentProcessing('kb-1', 'doc-1', DOC_DATA, 'req-1', undefined)
+    const result = await retryDocumentProcessing(
+      'kb-1',
+      'doc-1',
+      DOC_DATA,
+      'req-1',
+      BILLING_ATTRIBUTION
+    )
 
     expect(result).toMatchObject({ success: false, status: 'failed' })
     expect(result.message).toContain('was not accepted')

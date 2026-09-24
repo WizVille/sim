@@ -1,7 +1,7 @@
 /**
  * @vitest-environment node
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   getToolInputParamConfigs,
   indexWorkflowSearchMatches,
@@ -15,15 +15,11 @@ import { WORKFLOW_SEARCH_SUBFLOW_FIELD_IDS } from '@/lib/workflows/search-replac
 import { NoteBlock } from '@/blocks/blocks/note'
 
 /**
- * Uses the real tool registry. Nothing here imports it directly — the dependency
- * is transitive: the search-replace planner resolves tool input params through
- * real subblock configs, so the global `@/tools/registry` mock in
- * vitest.setup.ts empties the data these assertions read.
- *
- * Not a no-op, despite the lack of a direct import. Dropping this opt-out fails
- * 8 tests across this file and its sibling suite.
+ * Asserts real tool params and outputs, which the global `@/tools/metadata`
+ * and `@/tools/metadata-outputs` mocks in vitest.setup.ts empty.
  */
-vi.unmock('@/tools/registry')
+vi.unmock('@/tools/metadata')
+vi.unmock('@/tools/metadata-outputs')
 
 describe('indexWorkflowSearchMatches', () => {
   it('marks generic tool-param fallbacks as non-authoritative', () => {
@@ -1388,6 +1384,11 @@ describe('indexWorkflowSearchMatches', () => {
           type: 'input-mapping',
           value: { childInput: 'mapped visible value' },
         },
+        fallbackModels: {
+          id: 'fallbackModels',
+          type: 'model-fallback-list',
+          value: [{ id: 'row-1', model: 'fallback-visible-model', apiKey: '{{HIDDEN_KEY_REF}}' }],
+        },
       },
     }
     const blockConfigs = {
@@ -1400,6 +1401,7 @@ describe('indexWorkflowSearchMatches', () => {
           { id: 'skills', title: 'Skills', type: 'skill-input' },
           { id: 'runAt', title: 'Run At', type: 'time-input' },
           { id: 'mapping', title: 'Input Mapping', type: 'input-mapping' },
+          { id: 'fallbackModels', title: 'Fallback models', type: 'model-fallback-list' },
         ],
       },
     }
@@ -1434,7 +1436,28 @@ describe('indexWorkflowSearchMatches', () => {
       mode: 'text',
       blockConfigs,
     }).filter((match) => match.blockId === 'structured-1')
+    const fallbackMatches = indexWorkflowSearchMatches({
+      workflow,
+      query: 'fallback-visible',
+      mode: 'text',
+      blockConfigs,
+    }).filter((match) => match.blockId === 'structured-1')
 
+    expect(fallbackMatches).toEqual([
+      expect.objectContaining({
+        subBlockId: 'fallbackModels',
+        valuePath: [0, 'model'],
+        searchText: 'fallback-visible-model',
+      }),
+    ])
+    /** A row key is a `{{VAR}}` reference; text search must never offer to rewrite it. */
+    const keyMatches = indexWorkflowSearchMatches({
+      workflow,
+      query: 'HIDDEN_KEY_REF',
+      mode: 'text',
+      blockConfigs,
+    }).filter((match) => match.blockId === 'structured-1')
+    expect(keyMatches).toEqual([])
     expect(containsMatches).toEqual([
       expect.objectContaining({
         subBlockId: 'filters',
@@ -1700,6 +1723,67 @@ describe('indexWorkflowSearchMatches', () => {
       ])
     )
     expect(matches.some((match) => match.valuePath.includes('schema'))).toBe(false)
+  })
+
+  it('indexes only the active variable-capable Agent tool mode value', () => {
+    const workflow = createSearchReplaceWorkflowFixture()
+    workflow.blocks['tool-input-1'] = {
+      id: 'tool-input-1',
+      type: 'custom',
+      name: 'Tool Input Block',
+      position: { x: 0, y: 0 },
+      enabled: true,
+      outputs: {},
+      data: { canonicalModes: { '0:agentToolUsageControl': 'advanced' } },
+      subBlocks: {
+        tools: {
+          id: 'tools',
+          type: 'tool-input',
+          value: [
+            {
+              type: 'native',
+              usageControl: 'auto',
+              usageControlExpression: '<route.toolMode>',
+            },
+          ],
+        },
+      },
+    }
+    const blockConfigs = {
+      ...SEARCH_REPLACE_BLOCK_CONFIGS,
+      custom: { subBlocks: [{ id: 'tools', title: 'Tools', type: 'tool-input' as const }] },
+      native: { name: 'Native', subBlocks: [] },
+    }
+
+    const advancedMatches = indexWorkflowSearchMatches({
+      workflow,
+      query: 'route',
+      mode: 'all',
+      blockConfigs,
+    }).filter((match) => match.blockId === 'tool-input-1')
+
+    expect(advancedMatches.map((match) => match.kind)).toEqual(['text', 'workflow-reference'])
+    expect(advancedMatches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          fieldTitle: 'Permission Mode',
+          valuePath: [0, 'usageControlExpression'],
+          searchText: '<route.toolMode>',
+        }),
+      ])
+    )
+
+    workflow.blocks['tool-input-1'].data = {
+      canonicalModes: { '0:agentToolUsageControl': 'basic' },
+    }
+    const basicMatches = indexWorkflowSearchMatches({
+      workflow,
+      query: 'route',
+      mode: 'all',
+      blockConfigs,
+    }).filter((match) => match.blockId === 'tool-input-1')
+
+    expect(basicMatches).toHaveLength(0)
   })
 
   it('indexes canonical MCP and custom-tool names over mutated stored titles', () => {

@@ -17,6 +17,7 @@ vi.mock('@/lib/integrations/availability.server', () => ({
   isOAuthServiceDeploymentAvailable: vi.fn(() => true),
 }))
 
+import { resolveIntegrationAvailability } from '@/lib/integrations/availability'
 import { createIntegrationCredentialVisibility } from '@/lib/integrations/credential-visibility.server'
 
 const SERVICES: readonly OAuthServiceMetadata[] = [
@@ -71,6 +72,41 @@ describe('integration credential visibility', () => {
     ])
   })
 
+  it('exposes Coda token credentials without OAuth while honoring integration policy and visibility', () => {
+    const catalog = resolveIntegrationAvailability({})
+    expect(catalog.find((entry) => entry.type === 'coda')).toMatchObject({
+      state: 'ready',
+      oauthAvailable: false,
+      serviceAccountAvailable: true,
+    })
+    getIntegrationAvailabilityMock.mockReturnValue(catalog)
+    const service: OAuthServiceMetadata = {
+      serviceId: 'coda',
+      providerId: 'coda',
+      serviceAccountProviderId: 'coda-service-account',
+      authType: 'service_account',
+      name: 'Coda',
+      description: 'Coda token',
+      baseProvider: 'coda',
+    }
+    const identity = { providerId: 'coda-service-account', type: 'service_account' } as const
+    const visibility = (allowed: ReadonlySet<string> | null, disabled: boolean) =>
+      createIntegrationCredentialVisibility({
+        allowedIntegrationTypes: allowed,
+        oauthServices: [service],
+        blockVisibility: {
+          revealed: new Set(),
+          previewTagged: new Set(),
+          disabled: new Set(disabled ? ['coda'] : []),
+        },
+      })
+    expect(visibility(new Set(['coda']), false).isCredentialVisible(identity)).toBe(true)
+    expect(visibility(new Set(['slack_v2']), false).isCredentialVisible(identity)).toBe(false)
+    expect(visibility(null, true).isCredentialVisible(identity)).toBe(false)
+    getBlockMock.mockReturnValue({ type: 'coda', preview: true })
+    expect(visibility(null, false).isCredentialVisible(identity)).toBe(false)
+  })
+
   it('applies the integration allowlist to OAuth and service-account credentials', () => {
     const visibility = createIntegrationCredentialVisibility({
       allowedIntegrationTypes: new Set(['slack_v2']),
@@ -101,6 +137,50 @@ describe('integration credential visibility', () => {
         type: 'service_account',
       })
     ).toBe(true)
+  })
+
+  it.each(['unavailable', 'misconfigured'] as const)(
+    'allows enrolled OAuth with its own app when deployment OAuth is %s',
+    (state) => {
+      getIntegrationAvailabilityMock.mockReturnValue([
+        availability('slack_v2', state, {
+          oauthAvailable: false,
+          serviceAccountAvailable: false,
+        }),
+      ])
+      const visibility = createIntegrationCredentialVisibility({
+        allowedIntegrationTypes: new Set(['slack_v2']),
+        blockVisibility: null,
+        oauthServices: SERVICES,
+      })
+      expect(visibility.isCredentialVisible({ providerId: 'slack', type: 'managed_oauth' })).toBe(
+        true
+      )
+      expect(visibility.isCredentialVisible({ providerId: 'slack', type: 'oauth' })).toBe(false)
+    }
+  )
+
+  it('still applies allowlists and kill switches to enrolled OAuth', () => {
+    for (const blockVisibility of [
+      null,
+      {
+        revealed: new Set(['slack_v2']),
+        disabled: new Set(['slack_v2']),
+        previewTagged: new Set<string>(),
+      },
+    ]) {
+      const visibility = createIntegrationCredentialVisibility({
+        allowedIntegrationTypes: blockVisibility ? new Set(['slack_v2']) : new Set(),
+        blockVisibility,
+        oauthServices: SERVICES,
+      })
+      expect(visibility.isCredentialVisible({ providerId: 'slack', type: 'managed_oauth' })).toBe(
+        false
+      )
+      expect(visibility.isCredentialVisible({ providerId: 'unknown', type: 'managed_oauth' })).toBe(
+        false
+      )
+    }
   })
 
   it('exposes released Slack custom-bot credentials without a preview reveal', () => {

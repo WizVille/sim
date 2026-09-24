@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react'
 import {
-  ButtonGroup,
-  ButtonGroupItem,
+  ChipButtonGroup,
+  ChipButtonGroupItem,
   ChipConfirmModal,
   ChipEmailsInput,
   ChipInput,
@@ -20,9 +20,10 @@ import { Check, TriangleAlert } from '@sim/emcn/icons'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
 import { GeneratedPasswordInput } from '@/components/ui'
-import { isSsoEnabled } from '@/lib/core/config/env-flags'
+import { useDeploymentShape } from '@/lib/core/config/deployment-shape'
 import { getBaseUrl, getEmailDomain } from '@/lib/core/utils/urls'
 import { validateAllowlistEntry } from '@/lib/messaging/email/validation'
+import { formatInternalOutputSelector } from '@/lib/workflows/streaming/output-selector'
 import { OutputSelect } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/chat/components/output-select/output-select'
 import {
   type AuthType,
@@ -201,7 +202,8 @@ export function ChatDeploy({
           existingChat.customizations?.welcomeMessage || 'Hi there! How can I help you today?',
         selectedOutputBlocks: Array.isArray(existingChat.outputConfigs)
           ? existingChat.outputConfigs.map(
-              (config: { blockId: string; path: string }) => `${config.blockId}_${config.path}`
+              (config: { workflowId?: string; blockId: string; path: string }) =>
+                formatInternalOutputSelector(config.blockId, config.path, config.workflowId)
             )
           : [],
         includeThinking: existingChat.includeThinking ?? false,
@@ -341,7 +343,7 @@ export function ChatDeploy({
       >
         {errors.general && (
           <div className='flex items-center gap-2 rounded-md border border-[color-mix(in_srgb,var(--text-error)_20%,transparent)] bg-[color-mix(in_srgb,var(--text-error)_10%,transparent)] px-3 py-2 text-[var(--text-error)] text-small'>
-            <TriangleAlert className='size-4 flex-shrink-0' />
+            <TriangleAlert className='size-4 shrink-0' />
             <span>{errors.general}</span>
           </div>
         )}
@@ -387,7 +389,9 @@ export function ChatDeploy({
               placeholder='Select which block outputs to use'
               disabled={chatSubmitting}
               size='md'
+              variant='chip'
               className='w-full'
+              disablePortal
             />
             {errors.outputBlocks && (
               <p className='mt-[6.5px] text-[var(--text-error)] text-caption'>
@@ -693,6 +697,7 @@ function AuthSelector({
   error,
 }: AuthSelectorProps) {
   const revealPasswordMutation = useRevealChatPassword()
+  const { features } = useDeploymentShape()
 
   /**
    * Editing or regenerating the password clears a failed reveal. The mutation
@@ -708,7 +713,7 @@ function AuthSelector({
   const allowedAuthTypes = permissionConfig.allowedChatDeployAuthTypes
 
   const ssoAvailable =
-    isSsoEnabled || savedAuthType === 'sso' || (allowedAuthTypes?.includes('sso') ?? false)
+    features.sso || savedAuthType === 'sso' || (allowedAuthTypes?.includes('sso') ?? false)
   const baseAuthOptions: AuthType[] = ssoAvailable
     ? ['public', 'password', 'email', 'sso']
     : ['public', 'password', 'email']
@@ -729,17 +734,17 @@ function AuthSelector({
         <Label className='mb-[6.5px] block pl-0.5 text-[var(--text-primary)] text-small'>
           Access control
         </Label>
-        <ButtonGroup
+        <ChipButtonGroup
           value={authType}
           onValueChange={(val) => onAuthTypeChange(val as AuthType)}
           disabled={disabled}
         >
           {authOptions.map((type) => (
-            <ButtonGroupItem key={type} value={type}>
+            <ChipButtonGroupItem key={type} value={type}>
               {AUTH_LABELS[type]}
-            </ButtonGroupItem>
+            </ChipButtonGroupItem>
           ))}
-        </ButtonGroup>
+        </ChipButtonGroup>
       </div>
 
       {authType === 'password' && (

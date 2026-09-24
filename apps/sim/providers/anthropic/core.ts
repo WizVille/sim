@@ -1,5 +1,4 @@
 import type Anthropic from '@anthropic-ai/sdk'
-import { transformJSONSchema } from '@anthropic-ai/sdk/lib/transform-json-schema'
 import type { RawMessageStreamEvent } from '@anthropic-ai/sdk/resources/messages/messages'
 import type { Logger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
@@ -8,19 +7,31 @@ import type { IterationToolCall, NormalizedBlockOutput, StreamingExecution } fro
 import { MAX_TOOL_ITERATIONS } from '@/providers'
 import { convertAnthropicRequestHistory } from '@/providers/anthropic/request-history'
 import { createAnthropicStreamingToolLoopStream } from '@/providers/anthropic/streaming-tool-loop'
+import { buildAnthropicStructuredOutputSchema } from '@/providers/anthropic/structured-output-schema'
 import {
   addAnthropicUsage,
+  buildAnthropicModelUsage,
   buildAnthropicUsageCost,
   buildAnthropicUsageTokens,
   createAnthropicUsageAccumulator,
+  toAnthropicModelUsage,
 } from '@/providers/anthropic/usage'
 import {
   checkForForcedToolUsage,
   createReadableStreamFromAnthropicStream,
 } from '@/providers/anthropic/utils'
 import {
+  isConversationContextError,
+  prepareConversationGeneration,
+} from '@/providers/conversation-generation'
+import {
+  captureProviderConversationStep,
+  recordProviderConversationToolError,
+} from '@/providers/conversation-history'
+import {
   getMaxOutputTokensForModel,
   getThinkingCapability,
+  supportsForcedToolUse,
   supportsNativeStructuredOutputs,
   supportsTemperature,
 } from '@/providers/models'
@@ -132,7 +143,7 @@ const ANTHROPIC_THINKING_OUTPUT_HEADROOM = 4096
 
 /**
  * Checks if a model supports adaptive thinking (thinking.type: "adaptive").
- * Fable 5 supports ONLY adaptive thinking (always on; type: "disabled" is rejected).
+ * Fable 5, Fable 5.1, and Opus 5.5 support ONLY adaptive thinking (always on; type: "disabled" is rejected).
  * Sonnet 5 supports ONLY adaptive thinking (manual budget_tokens returns a 400 error).
  * Opus 5, Opus 4.8, and Opus 4.7 support ONLY adaptive thinking (no extended thinking / budget_tokens).
  * Opus 4.6 and Sonnet 4.6 support both extended and adaptive thinking — use adaptive.
@@ -158,7 +169,7 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 /**
  * Builds the thinking configuration for the Anthropic API based on model capabilities and level.
  *
- * - Fable 5, Sonnet 5, Opus 5, Opus 4.8, Opus 4.7: Uses adaptive thinking only (no extended thinking support)
+ * - Fable 5.1, Fable 5, Sonnet 5, Opus 5.5, Opus 5, Opus 4.8, Opus 4.7: Uses adaptive thinking only (no extended thinking support)
  * - Opus 4.6, Sonnet 4.6: Uses adaptive thinking with effort parameter
  * - Other models: Uses budget_tokens-based extended thinking
  *
@@ -332,7 +343,7 @@ export async function executeAnthropicProviderRequest(
     const schema = request.responseFormat.schema || request.responseFormat
 
     if (useNativeStructuredOutputs) {
-      const transformedSchema = transformJSONSchema(schema)
+      const transformedSchema = buildAnthropicStructuredOutputSchema(schema)
       payload.output_config = {
         ...payload.output_config,
         format: {
@@ -417,7 +428,13 @@ export async function executeAnthropicProviderRequest(
     } else if (toolChoice === 'none') {
       payload.tool_choice = { type: 'none' }
     } else if (toolChoice !== 'auto') {
-      payload.tool_choice = toolChoice
+      if (!supportsForcedToolUse(request.model)) {
+        logger.warn(
+          `Model ${modelId} rejects forced tool_choice; sending tool "${toolChoice.name}" with tool_choice auto`
+        )
+      } else {
+        payload.tool_choice = toolChoice
+      }
     }
   }
 
@@ -493,10 +510,10 @@ export async function executeAnthropicProviderRequest(
     const providerStartTimeISO = new Date(providerStartTime).toISOString()
 
     const streamResponse = await anthropic.messages.create(
-      {
+      await prepareConversationGeneration(request, 'anthropic', {
         ...payload,
         stream: true,
-      } as Anthropic.Messages.MessageCreateParamsStreaming,
+      } as Anthropic.Messages.MessageCreateParamsStreaming),
       request.abortSignal ? { signal: request.abortSignal } : undefined
     )
 
@@ -512,7 +529,13 @@ export async function executeAnthropicProviderRequest(
       createStream: ({ output, finalizeTiming }) =>
         createReadableStreamFromAnthropicStream(
           streamResponse as AsyncIterable<RawMessageStreamEvent>,
-          ({ content, usage, thinking }) => {
+          async ({ content, usage, thinking, nativeContent }) => {
+            await captureProviderConversationStep(
+              request,
+              'anthropic',
+              nativeContent,
+              buildAnthropicModelUsage(usage)
+            )
             const tokens = buildAnthropicUsageTokens(usage)
             const cost = buildAnthropicUsageCost(request.model, usage)
             output.content = content
@@ -550,7 +573,17 @@ export async function executeAnthropicProviderRequest(
     const forcedTools = preparedTools?.forcedTools || []
     let usedForcedTools: string[] = []
 
-    let currentResponse = await createMessage(anthropic, payload, request.abortSignal)
+    let currentResponse = await createMessage(
+      anthropic,
+      await prepareConversationGeneration(request, 'anthropic', payload),
+      request.abortSignal
+    )
+    await captureProviderConversationStep(
+      request,
+      'anthropic',
+      currentResponse.content,
+      toAnthropicModelUsage(currentResponse.usage)
+    )
     const firstResponseTime = Date.now() - initialCallTime
 
     let content = ''
@@ -639,6 +672,12 @@ export async function executeAnthropicProviderRequest(
 
             const tool = request.tools?.find((t) => t.id === toolName)
             if (!tool) {
+              await recordProviderConversationToolError(
+                request,
+                toolUse.id,
+                toolName,
+                `Tool "${toolName}" is not available`
+              )
               const toolCallEndTime = Date.now()
               return {
                 toolUseId,
@@ -687,6 +726,12 @@ export async function executeAnthropicProviderRequest(
               throw error
             }
             const toolCallEndTime = Date.now()
+            await recordProviderConversationToolError(
+              request,
+              toolUse.id,
+              toolName,
+              getErrorMessage(error, 'Tool execution failed')
+            )
             logger.error('Error processing tool call:', { error, toolName })
 
             return {
@@ -846,7 +891,18 @@ export async function executeAnthropicProviderRequest(
 
         const nextModelStartTime = Date.now()
 
-        currentResponse = await createMessage(anthropic, nextPayload, request.abortSignal)
+        currentResponse = await createMessage(
+          anthropic,
+          await prepareConversationGeneration(request, 'anthropic', nextPayload),
+          request.abortSignal
+        )
+
+        await captureProviderConversationStep(
+          request,
+          'anthropic',
+          currentResponse.content,
+          toAnthropicModelUsage(currentResponse.usage)
+        )
 
         const nextCheckResult = checkForForcedToolUsage(
           currentResponse,
@@ -936,7 +992,7 @@ export async function executeAnthropicProviderRequest(
       duration: totalDuration,
     })
 
-    if (isAbortError(error) || request.abortSignal?.aborted) {
+    if (isAbortError(error) || request.abortSignal?.aborted || isConversationContextError(error)) {
       throw error
     }
 

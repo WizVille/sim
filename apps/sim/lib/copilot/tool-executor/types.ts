@@ -1,12 +1,19 @@
 import type { BillingAttributionSnapshot } from '@/lib/billing/core/billing-attribution'
-import type { MothershipResource } from '@/lib/copilot/resources/types'
+import type { MothershipResourceUpdate } from '@/lib/copilot/resources/types'
 import type { SecretMountPolicy } from '@/lib/copilot/secret-mount-policy'
+import type { WorkspaceSearchFilters } from '@/lib/knowledge/search/filters'
+import type { ExecutorDelegationOrigin } from '@/executor/types'
 import type { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
 
 export interface ToolExecutionContext {
+  /** Trusted entry point for Search metering; never read from model arguments. */
+  searchSurface?: 'copilot' | 'slack'
+  mcpBlockId?: string
+  executorDelegationOrigin?: ExecutorDelegationOrigin
   userId: string
   workflowId: string
   workspaceId?: string
+  organizationId?: string
   chatId?: string
   messageId?: string
   executionId?: string
@@ -28,6 +35,7 @@ export interface ToolExecutionContext {
   /** Server-owned base image selected from the fixed Go route for this turn. */
   sandboxProfile?: 'mothership'
   requestMode?: string
+  assistantSearch?: WorkspaceSearchFilters
   currentAgentId?: string
   /**
    * The invoking subagent's channel id (its outer tool_use id), threaded per
@@ -84,7 +92,7 @@ export interface ToolExecutionResult {
   success: boolean
   output?: unknown
   error?: string
-  resources?: MothershipResource[]
+  resources?: MothershipResourceUpdate[]
   /**
    * Declared by tools whose failure a caller cannot otherwise act on. Consumed by
    * the egress projection and never returned to the model as-is — on a withheld

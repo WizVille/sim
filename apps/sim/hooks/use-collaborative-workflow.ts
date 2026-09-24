@@ -15,8 +15,8 @@ import { generateId } from '@sim/utils/id'
 import type { BlockRetryConfig } from '@sim/workflow-types/workflow'
 import { filterAcyclicEdges, getWorkflowBlockNameConflict } from '@sim/workflow-types/workflow'
 import { useQueryClient } from '@tanstack/react-query'
+import type { Edge } from '@xyflow/react'
 import { isEqual } from 'es-toolkit'
-import type { Edge } from 'reactflow'
 import { useShallow } from 'zustand/react/shallow'
 import { requestJson } from '@/lib/api/client/request'
 import { getWorkflowStateContract } from '@/lib/api/contracts'
@@ -58,6 +58,18 @@ import type {
 import { findAllDescendantNodes, isBlockProtected } from '@/stores/workflows/workflow/utils'
 
 const logger = createLogger('CollaborativeWorkflow')
+
+/** Applies a subblock value and its block's replacement `canonicalModes` to the local stores. */
+function applySubblockValueWithCanonicalModes(
+  blockId: string,
+  subblockId: string,
+  value: unknown,
+  canonicalModes: Record<string, 'basic' | 'advanced'>
+) {
+  useSubBlockStore.getState().setValue(blockId, subblockId, value)
+  useWorkflowStore.getState().syncDynamicHandleSubblockValue(blockId, subblockId, value)
+  useWorkflowStore.getState().setBlockCanonicalModes(blockId, canonicalModes)
+}
 
 export function useCollaborativeWorkflow() {
   const queryClient = useQueryClient()
@@ -259,6 +271,11 @@ export function useCollaborativeWorkflow() {
           }
         } else if (target === OPERATION_TARGETS.SUBBLOCK) {
           switch (operation) {
+            case SUBBLOCK_OPERATIONS.UPDATE_WITH_CANONICAL_MODES: {
+              const { blockId, subblockId, value, canonicalModes } = payload
+              applySubblockValueWithCanonicalModes(blockId, subblockId, value, canonicalModes)
+              break
+            }
             case SUBBLOCK_OPERATIONS.BATCH_UPDATE: {
               const { updates } = payload
               if (Array.isArray(updates)) {
@@ -865,8 +882,13 @@ export function useCollaborativeWorkflow() {
           workflowId,
         })
         diffStore.markExternalUpdatePending(workflowId)
-        void operationQueue.waitForWorkflowOperations(workflowId).then((ready) => {
-          if (!ready) {
+        void operationQueue.waitForWorkflowOperations(workflowId).then((result) => {
+          if (result === 'cancelled') {
+            useWorkflowDiffStore.getState().clearExternalUpdatePending(workflowId)
+            return
+          }
+
+          if (result === 'failed') {
             const latestQueue = useOperationQueueStore.getState()
             if (latestQueue.hasPendingOperations(workflowId) && !latestQueue.hasOperationError) {
               return
@@ -879,6 +901,7 @@ export function useCollaborativeWorkflow() {
             )
             return
           }
+
           void replayPendingExternalUpdate(workflowId, 'deferred external update after local save')
         })
         return
@@ -1356,39 +1379,6 @@ export function useCollaborativeWorkflow() {
     [isBaselineDiffView, activeWorkflowId, addToQueue, session?.user?.id]
   )
 
-  /**
-   * Wholesale-replaces `block.data.canonicalModes`, rather than merging one key like
-   * {@link collaborativeSetBlockCanonicalMode}. Needed to reindex nested tool-input overrides on
-   * reorder/removal: a merge can't atomically drop a now-stale index key, and sequential
-   * per-key sets can clobber each other when two tools swap positions.
-   */
-  const collaborativeSetBlockCanonicalModes = useCallback(
-    (id: string, canonicalModes: Record<string, 'basic' | 'advanced'>) => {
-      if (isBaselineDiffView) {
-        return
-      }
-
-      useWorkflowStore.getState().setBlockCanonicalModes(id, canonicalModes)
-
-      if (!activeWorkflowId) {
-        return
-      }
-
-      const operationId = generateId()
-      addToQueue({
-        id: operationId,
-        operation: {
-          operation: BLOCK_OPERATIONS.REPLACE_CANONICAL_MODES,
-          target: OPERATION_TARGETS.BLOCK,
-          payload: { id, data: { canonicalModes } },
-        },
-        workflowId: activeWorkflowId,
-        userId: session?.user?.id || 'unknown',
-      })
-    },
-    [isBaselineDiffView, activeWorkflowId, addToQueue, session?.user?.id]
-  )
-
   const collaborativeBatchToggleBlockHandles = useCallback(
     (ids: string[]) => {
       if (isBaselineDiffView) {
@@ -1639,6 +1629,43 @@ export function useCollaborativeWorkflow() {
       } catch {
         // Best-effort; do not block on clearing
       }
+    },
+    [activeWorkflowId, addToQueue, session?.user?.id, isBaselineDiffView]
+  )
+
+  /**
+   * Sets a subblock value and wholesale-replaces its block's `canonicalModes` as ONE persisted
+   * operation, so a `tool-input` reorder or removal can never save its list without the modes
+   * keyed to its positions.
+   */
+  const collaborativeSetSubblockValueWithCanonicalModes = useCallback(
+    (
+      blockId: string,
+      subblockId: string,
+      value: unknown,
+      canonicalModes: Record<string, 'basic' | 'advanced'>
+    ) => {
+      if (isApplyingRemoteChange.current) return
+
+      if (isBaselineDiffView) {
+        logger.debug('Skipping collaborative subblock update while viewing baseline diff')
+        return
+      }
+
+      applySubblockValueWithCanonicalModes(blockId, subblockId, value, canonicalModes)
+
+      if (!activeWorkflowId) return
+
+      addToQueue({
+        id: generateId(),
+        operation: {
+          operation: SUBBLOCK_OPERATIONS.UPDATE_WITH_CANONICAL_MODES,
+          target: OPERATION_TARGETS.SUBBLOCK,
+          payload: { blockId, subblockId, value, canonicalModes },
+        },
+        workflowId: activeWorkflowId,
+        userId: session?.user?.id || 'unknown',
+      })
     },
     [activeWorkflowId, addToQueue, session?.user?.id, isBaselineDiffView]
   )
@@ -2286,7 +2313,6 @@ export function useCollaborativeWorkflow() {
     collaborativeSetBlockErrorEnabled,
     collaborativeSetBlockRetry,
     collaborativeSetBlockCanonicalMode,
-    collaborativeSetBlockCanonicalModes,
     collaborativeBatchToggleBlockHandles,
     collaborativeBatchToggleLocked,
     collaborativeBatchAddBlocks,
@@ -2294,6 +2320,7 @@ export function useCollaborativeWorkflow() {
     collaborativeBatchAddEdges,
     collaborativeBatchRemoveEdges,
     collaborativeSetSubblockValue,
+    collaborativeSetSubblockValueWithCanonicalModes,
     collaborativeBatchSetSubblockValues,
     collaborativeSetTagSelection,
 

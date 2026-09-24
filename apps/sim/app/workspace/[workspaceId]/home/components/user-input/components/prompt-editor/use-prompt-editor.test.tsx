@@ -6,7 +6,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@/hooks/queries/skills', () => ({ useSkills: () => ({ data: [] }) }))
-vi.mock('@/hooks/queries/mcp', () => ({ useMcpServers: () => ({ data: [] }) }))
+vi.mock('@/hooks/queries/mcp', () => ({ useMcpToolServers: () => ({ data: [] }) }))
 vi.mock('@/blocks/integration-matcher', () => ({
   getIntegrationMatcher: () => ({ regex: null, byName: new Map() }),
 }))
@@ -19,6 +19,10 @@ import {
 } from '@/app/workspace/[workspaceId]/home/components/user-input/components/prompt-editor/use-prompt-editor'
 import type { SkillsMenuHandle } from '@/app/workspace/[workspaceId]/home/components/user-input/components/skills-menu-dropdown/skills-menu-dropdown'
 import type { ChatContext } from '@/stores/panel'
+
+function selectionPayload(context: ChatContext, sourceWorkspaceId = 'ws-1'): string {
+  return JSON.stringify({ version: 1, sourceWorkspaceId, context })
+}
 
 /**
  * Mounts `usePromptEditor` in a real React 19 root under jsdom (no
@@ -300,7 +304,7 @@ describe('usePromptEditor context insertion', () => {
         clipboardData: {
           getData: (type: string) => {
             if (type === 'text/plain') return 'x'.repeat(1_000_001)
-            if (type === SIM_SELECTION_MIME) return JSON.stringify(context)
+            if (type === SIM_SELECTION_MIME) return selectionPayload(context)
             return ''
           },
         },
@@ -311,6 +315,37 @@ describe('usePromptEditor context insertion', () => {
     expect(preventDefault).toHaveBeenCalledOnce()
     expect(result().value).toBe('@Large table (1 row) ')
     expect(result().contexts).toEqual([context])
+
+    unmount()
+  })
+
+  it('leaves a cross-workspace selection to the ordinary plain-text paste path', () => {
+    const context = {
+      kind: 'file_selection',
+      fileId: 'file-1',
+      fileName: 'notes.md',
+      label: 'notes.md:1',
+      text: 'ordinary text',
+    } satisfies ChatContext
+    const { result, textarea, unmount } = renderPromptEditor({ workspaceId: 'ws-2' })
+    const preventDefault = vi.fn()
+
+    act(() => {
+      result().handlePaste({
+        currentTarget: textarea,
+        clipboardData: {
+          getData: (type: string) => {
+            if (type === 'text/plain') return context.text
+            if (type === SIM_SELECTION_MIME) return selectionPayload(context)
+            return ''
+          },
+        },
+        preventDefault,
+      } as unknown as React.ClipboardEvent<HTMLTextAreaElement>)
+    })
+
+    expect(preventDefault).not.toHaveBeenCalled()
+    expect(result().contexts).toEqual([])
 
     unmount()
   })
@@ -393,5 +428,56 @@ describe('usePromptEditor context insertion', () => {
 
     expect(contextsAtSubmit).toEqual([])
     unmount()
+  })
+})
+
+describe('folder resource mention identity', () => {
+  it('retains distinct folder IDs and labels when inserting a batch', () => {
+    const { result, unmount } = renderPromptEditor({ workspaceId: 'ws-1' })
+    try {
+      act(() =>
+        result().insertResources([
+          { type: 'folder', id: 'workflow-folder', title: 'Planning' },
+          { type: 'folder', id: 'table-folder', title: 'Planning' },
+          { type: 'folder', id: 'knowledge-folder', title: 'Planning' },
+          { type: 'filefolder', id: 'file-folder', title: 'Planning' },
+          { type: 'folder', id: 'table-folder', title: 'Planning' },
+        ])
+      )
+      expect(result().contexts).toEqual([
+        { kind: 'folder', folderId: 'workflow-folder', label: 'Planning' },
+        { kind: 'folder', folderId: 'table-folder', label: 'Planning (2)' },
+        { kind: 'folder', folderId: 'knowledge-folder', label: 'Planning (3)' },
+        { kind: 'filefolder', fileFolderId: 'file-folder', label: 'Planning (4)' },
+      ])
+      expect(result().value).toBe(
+        '@Planning @Planning (2) @Planning (3) @Planning (4) @Planning (2) '
+      )
+    } finally {
+      unmount()
+    }
+  })
+
+  it('keeps same-named folders as separate chips and reuses the label for a repeated ID', () => {
+    const { result, unmount } = renderPromptEditor({ workspaceId: 'ws-1' })
+    try {
+      act(() =>
+        result().insertResource({ type: 'folder', id: 'workflow-folder', title: 'Planning' })
+      )
+      act(() => result().insertResource({ type: 'folder', id: 'table-folder', title: 'Planning' }))
+      act(() =>
+        result().insertResource({ type: 'folder', id: 'knowledge-folder', title: 'Planning' })
+      )
+      act(() => result().insertResource({ type: 'folder', id: 'table-folder', title: 'Planning' }))
+      expect(result().contexts).toEqual([
+        { kind: 'folder', folderId: 'workflow-folder', label: 'Planning' },
+        { kind: 'folder', folderId: 'table-folder', label: 'Planning (2)' },
+        { kind: 'folder', folderId: 'knowledge-folder', label: 'Planning (3)' },
+      ])
+      expect(result().value).toContain('@Planning (2)')
+      expect(result().value).toContain('@Planning (3)')
+    } finally {
+      unmount()
+    }
   })
 })

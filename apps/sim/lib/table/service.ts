@@ -43,6 +43,7 @@ import {
   TABLE_LIMITS,
 } from '@/lib/table/constants'
 import { appendTableEvent } from '@/lib/table/events'
+import { generateTableId } from '@/lib/table/ids'
 import {
   EMPTY_JOB_FIELDS,
   latestJobsForTables,
@@ -57,6 +58,7 @@ import {
   mutateTableRowsWithSecretProvenance,
 } from '@/lib/table/rows/secret-provenance'
 import { assertValidSchema } from '@/lib/table/schema-invariants'
+import { assertTableRowTtlEnabled } from '@/lib/table/ttl-availability'
 import { setTableTxTimeouts } from '@/lib/table/tx'
 import {
   type CreateTableData,
@@ -560,7 +562,11 @@ export async function createTable(
     )
   }
 
-  const tableId = `tbl_${generateId().replace(/-/g, '')}`
+  if (data.schema.columns.some((column) => column.type === 'ttl')) {
+    await assertTableRowTtlEnabled()
+  }
+
+  const tableId = generateTableId()
   const now = new Date()
 
   // Stamp stable ids so the table is id-keyed from its first row write.
@@ -828,6 +834,7 @@ export async function addTableColumnsWithTx(
     ...table.schema,
     columns: [...table.schema.columns, ...additions],
   }
+  assertValidSchema(updatedSchema, table.metadata?.columnOrder)
   const now = new Date()
 
   await trx

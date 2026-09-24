@@ -3,12 +3,17 @@ import { resolvePrincipalSubject } from '@sim/auth/principal'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
 import { isPlainRecord } from '@sim/utils/object'
+import { executeCopilotManagedMcpUseCase } from '@/lib/copilot/application/execute-managed-mcp-use-case'
+import { executeCopilotMcpServerUseCase } from '@/lib/copilot/application/execute-mcp-server-use-case'
+import { requireTrustedCopilotExecutionContext } from '@/lib/copilot/auth/application-delegation'
 import {
   capExecutionTimeoutMs,
   getAsyncExecutionTimeoutForBillingAttribution,
   getRemainingExecutionMs,
 } from '@/lib/core/execution-limits'
 import { asOrchestrationError, statusForOrchestrationError } from '@/lib/core/orchestration/types'
+import { MANAGED_MCP_DELEGATION_AUDIENCE } from '@/lib/credentials/application/authorization'
+import { ManagedMcpCredentialError } from '@/lib/credentials/managed-mcp'
 import { extractExecutionIdentityHeaders } from '@/lib/execution/execution-identity'
 import { buildWorkflowVariableHeaders } from '@/lib/execution/workflow-variable-headers'
 import { createExecutorPrincipalFromExecutionContext } from '@/lib/internal/principals/executor'
@@ -19,10 +24,21 @@ import {
 } from '@/lib/internal/tool-operations/identity-faults'
 import type { InternalToolOperationHandler } from '@/lib/internal/tool-operations/types'
 import { MCP_SERVER_DELEGATION_AUDIENCE } from '@/lib/mcp/application/authorization'
-import { executeMcpToolUseCase, McpToolsNotAllowedError } from '@/lib/mcp/application/execute-tool'
+import { executeManagedMcpToolUseCase } from '@/lib/mcp/application/execute-managed-tool'
+import {
+  type ExecuteMcpToolInput,
+  type ExecuteMcpToolResult,
+  executeMcpToolUseCase,
+  McpToolsNotAllowedError,
+} from '@/lib/mcp/application/execute-tool'
 import { McpOauthRedirectRequired } from '@/lib/mcp/oauth'
 import { McpOauthAuthorizationRequiredError } from '@/lib/mcp/types'
-import { categorizeError, parseMcpToolId } from '@/lib/mcp/utils'
+import {
+  categorizeError,
+  isManagedMcpConnectionId,
+  MANAGED_MCP_CONNECTION_PREFIX,
+  parseMcpToolTarget,
+} from '@/lib/mcp/utils'
 import {
   ResolvedSecretTraceProvenanceAccumulator,
   type ResolvedSecretTraceRegistry,
@@ -34,6 +50,7 @@ const logger = createLogger('McpInternalOperation')
 const MCP_AUTHORIZATION_PARAMETER = '_mcpAuthorization'
 
 const MCP_SYSTEM_PARAMETERS = new Set([
+  'operationPolicy',
   'serverId',
   'serverUrl',
   'toolName',
@@ -89,7 +106,7 @@ function parseArguments(input: unknown): Record<string, unknown> | null {
       errorName: error instanceof Error ? error.name : 'UnknownError',
       argumentsLength: value.length,
     })
-    return {}
+    return null
   }
 }
 
@@ -119,16 +136,36 @@ async function createResponse(
 
 export const executeMcpTool: InternalToolOperationHandler = async (request) => {
   request.signal?.throwIfAborted()
-  let serverId: string
-  let toolName: string
+  let target: ReturnType<typeof parseMcpToolTarget>
   try {
-    ;({ serverId, toolName } = parseMcpToolId(request.toolId))
+    if (request.toolId === 'mcp_run_operation') {
+      if (!isPlainRecord(request.input)) throw new Error('MCP operation input is required')
+      const { server, tool } = request.input
+      if (
+        typeof server !== 'string' ||
+        !server.trim() ||
+        typeof tool !== 'string' ||
+        !tool.trim()
+      ) {
+        throw new Error('MCP server and operation name are required')
+      }
+      const targetId = server
+      if (targetId.startsWith(MANAGED_MCP_CONNECTION_PREFIX) && !isManagedMcpConnectionId(targetId))
+        throw new Error('Invalid managed MCP connection ID')
+      target = isManagedMcpConnectionId(targetId)
+        ? { kind: 'managed_connection', credentialId: targetId, toolName: tool }
+        : { kind: 'shared_server', serverId: targetId, toolName: tool }
+    } else {
+      target = parseMcpToolTarget(request.toolId)
+    }
   } catch (error) {
     return Response.json(
       { success: false, error: getErrorMessage(error, 'Invalid MCP tool ID') },
       { status: 400 }
     )
   }
+  const toolName = target.toolName
+  const targetId = target.kind === 'shared_server' ? target.serverId : target.credentialId
 
   if (!request.context.workspaceId) {
     return Response.json(
@@ -154,12 +191,29 @@ export const executeMcpTool: InternalToolOperationHandler = async (request) => {
 
   let provenance: ResolvedSecretTraceProvenanceAccumulator | undefined
   try {
-    const principal = await createExecutorPrincipalFromExecutionContext({
-      context: request.context,
-      audience: MCP_SERVER_DELEGATION_AUDIENCE,
-    })
+    const interactiveCopilot =
+      request.context.copilotToolExecution &&
+      request.context.copilotInteractionMode === 'interactive' &&
+      !request.context.mcpBlockId
+    const principal = interactiveCopilot
+      ? undefined
+      : await createExecutorPrincipalFromExecutionContext({
+          context: request.context,
+          audience:
+            target.kind === 'shared_server'
+              ? MCP_SERVER_DELEGATION_AUDIENCE
+              : MANAGED_MCP_DELEGATION_AUDIENCE,
+          ...(target.kind === 'managed_connection'
+            ? { resourceScope: { credentialId: target.credentialId } }
+            : { resourceScope: { mcpServerId: target.serverId } }),
+        })
     request.signal?.throwIfAborted()
-    const subject = resolvePrincipalSubject(principal)
+    const subject = principal
+      ? resolvePrincipalSubject(principal)
+      : {
+          kind: 'sim_user' as const,
+          userId: requireTrustedCopilotExecutionContext(request.context).userId,
+        }
     provenance =
       request.context.resolvedSecretTraceRegistry && subject?.kind === 'sim_user'
         ? new ResolvedSecretTraceProvenanceAccumulator({
@@ -174,13 +228,19 @@ export const executeMcpTool: InternalToolOperationHandler = async (request) => {
       policyTimeoutMs,
       getRemainingExecutionMs(request.signal)
     )
-    const result = await executeMcpToolUseCase.execute({
-      principal,
-      input: {
-        workspaceId: request.context.workspaceId,
-        serverId,
-        toolName,
-        arguments: args,
+    const commonInput = {
+      workspaceId: request.context.workspaceId,
+      toolName,
+      arguments: args,
+      callChain: request.context.callChain,
+      timeoutMs,
+      signal: request.signal,
+    }
+    let result: ExecuteMcpToolResult
+    if (target.kind === 'shared_server') {
+      const input: ExecuteMcpToolInput = {
+        ...commonInput,
+        serverId: target.serverId,
         forwardedAuthorization: parseForwardedAuthorization(request.input),
         passthroughHeaders: {
           ...buildWorkflowVariableHeaders(
@@ -191,18 +251,34 @@ export const executeMcpTool: InternalToolOperationHandler = async (request) => {
           ),
           ...extractExecutionIdentityHeaders(request.headers),
         },
-        callChain: request.context.callChain,
-        timeoutMs,
-        signal: request.signal,
         onResolvedSecretTraceProvenance: provenance
           ? (value) => provenance?.record(value)
           : undefined,
-      },
-    })
+      }
+      result = principal
+        ? await executeMcpToolUseCase.execute({ principal, input })
+        : await executeCopilotMcpServerUseCase(request.context, executeMcpToolUseCase, input)
+    } else {
+      const input = {
+        ...commonInput,
+        credentialId: target.credentialId,
+      }
+      result = principal
+        ? await executeManagedMcpToolUseCase.execute({ principal, input })
+        : await executeCopilotManagedMcpUseCase(
+            request.context,
+            executeManagedMcpToolUseCase,
+            input,
+            { credentialId: target.credentialId }
+          )
+    }
     request.signal?.throwIfAborted()
-    const body = result.success
-      ? { success: true, data: { success: true, output: result.output } }
-      : { success: false, error: result.error }
+    const body =
+      request.toolId === 'mcp_run_operation'
+        ? result
+        : result.success
+          ? { success: true, data: { success: true, output: result.output } }
+          : { success: false, error: result.error }
     return createResponse(
       body,
       result.success ? 200 : 400,
@@ -228,13 +304,27 @@ export const executeMcpTool: InternalToolOperationHandler = async (request) => {
         request.toolId
       )
     }
+    if (error instanceof ManagedMcpCredentialError && error.statusCode === 401) {
+      return createResponse(
+        {
+          success: false,
+          error: 'OAuth re-authorization required',
+          code: 'reauth_required',
+          serverId: targetId,
+        },
+        401,
+        provenance,
+        request.context.resolvedSecretTraceRegistry,
+        request.toolId
+      )
+    }
     if (
       error instanceof McpOauthAuthorizationRequiredError ||
       error instanceof McpOauthRedirectRequired ||
       error instanceof UnauthorizedError
     ) {
       const oauthServerId =
-        error instanceof McpOauthAuthorizationRequiredError ? error.serverId : serverId
+        error instanceof McpOauthAuthorizationRequiredError ? error.serverId : targetId
       return createResponse(
         {
           success: false,
@@ -243,6 +333,19 @@ export const executeMcpTool: InternalToolOperationHandler = async (request) => {
           serverId: oauthServerId,
         },
         401,
+        provenance,
+        request.context.resolvedSecretTraceRegistry,
+        request.toolId
+      )
+    }
+
+    if (error instanceof ManagedMcpCredentialError) {
+      return createResponse(
+        {
+          success: false,
+          error: error.statusCode === 404 ? 'Resource not found' : 'Managed MCP connection failed',
+        },
+        error.statusCode,
         provenance,
         request.context.resolvedSecretTraceRegistry,
         request.toolId
@@ -270,7 +373,7 @@ export const executeMcpTool: InternalToolOperationHandler = async (request) => {
     logger.error('MCP tool execution failed', {
       error: getErrorMessage(error),
       requestId: request.requestId,
-      serverId,
+      serverId: targetId,
       toolName,
     })
     return createResponse(

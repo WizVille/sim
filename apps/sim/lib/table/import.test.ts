@@ -172,6 +172,28 @@ describe('import', () => {
       )
       expect(coerceValue('not-a-date', 'date')).toBe('not-a-date')
     })
+
+    it('preserves explicit TTL offsets regardless of the import timezone', () => {
+      const input = '2026-06-15T09:00:30Z'
+      for (const timezone of ['UTC', 'America/New_York', 'Asia/Kathmandu']) {
+        expect(coerceValue(input, 'ttl', { timezone })).toBe('2026-06-15T09:00:30-00:00')
+        expect(coerceValue('2026-06-15T02:00:30-07:00', 'ttl', { timezone })).toBe(
+          '2026-06-15T02:00:30-07:00'
+        )
+        expect(coerceValue('2026-06-15T09:00:30.123456Z', 'ttl', { timezone })).toBe(
+          '2026-06-15T09:00:30.123456-00:00'
+        )
+        for (const invalid of [
+          '1700000000',
+          '2026-06-15 09:00:30',
+          '2026-06-15T09:00:30+24:00',
+          '2026-06-15T09:00:30.0000001Z',
+          'not-a-date',
+        ]) {
+          expect(coerceValue(invalid, 'ttl', { timezone })).toBeNull()
+        }
+      }
+    })
   })
 
   describe('buildAutoMapping', () => {

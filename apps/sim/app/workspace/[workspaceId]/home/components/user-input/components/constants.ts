@@ -1,4 +1,5 @@
 import { cn } from '@sim/emcn'
+import { terminalIdFromResourceId } from '@/lib/terminal/resource-id'
 import type {
   MothershipResource,
   MothershipResourceType,
@@ -62,7 +63,7 @@ export interface PlusMenuHandle {
  * so the editor reads the same whether it's the chat input or inside the modal.
  */
 const FIELD_MIRROR_CLASSES = cn(
-  'm-0 box-border min-h-[24px] w-full break-words [overflow-wrap:anywhere] border-0 bg-transparent',
+  'm-0 box-border min-h-[24px] w-full [overflow-wrap:anywhere] border-0 bg-transparent',
   'px-1 py-1 font-body text-[14px] leading-[24px] tracking-[-0.015em]'
 )
 
@@ -74,7 +75,7 @@ const FIELD_MIRROR_CLASSES = cn(
 export const TEXTAREA_BASE_CLASSES = cn(
   FIELD_MIRROR_CLASSES,
   'block h-auto resize-none overflow-hidden',
-  'text-transparent caret-[var(--text-primary)] outline-none',
+  'text-transparent caret-[var(--text-primary)] outline-hidden',
   'placeholder:text-[var(--text-muted)]',
   'focus-visible:ring-0 focus-visible:ring-offset-0'
 )
@@ -96,11 +97,6 @@ export const SCROLLER_CLASSES = cn(
   '[-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden'
 )
 
-export const SEND_BUTTON_BASE = 'h-[28px] w-[28px] rounded-full border-0 p-0 transition-colors'
-export const SEND_BUTTON_ACTIVE =
-  'bg-[#383838] hover:bg-[#575757] dark:bg-[#E0E0E0] dark:hover:bg-[#CFCFCF]'
-export const SEND_BUTTON_DISABLED = 'bg-[#808080] dark:bg-[#808080]'
-
 export const SPEECH_RECOGNITION_LANG = 'en-US'
 
 /**
@@ -109,15 +105,18 @@ export const SPEECH_RECOGNITION_LANG = 'en-US'
  * so adding a new resource type fails compilation here until a conversion is
  * supplied — preventing silent drift between the two taxonomies.
  */
-// Browser/terminal resources may name either the singleton panel or one live
-// inner tab. The singleton ids ask the agent to inspect the whole resource;
-// every other id is a precise live-tab pointer.
+// A browser resource is one live page and a terminal resource one live shell,
+// so each id is a precise pointer the agent can act on directly.
 const RESOURCE_TO_CONTEXT: Record<
   MothershipResourceType,
   (resource: MothershipResource) => ChatContext
 > = {
   browser: (r) => ({ kind: 'browser_tab', tabId: r.id, label: r.title }),
-  terminal: (r) => ({ kind: 'terminal_tab', terminalId: r.id, label: r.title }),
+  terminal: (r) => ({
+    kind: 'terminal_tab',
+    terminalId: terminalIdFromResourceId(r.id),
+    label: r.title,
+  }),
   workflow: (r) => ({ kind: 'workflow', workflowId: r.id, label: r.title }),
   knowledgebase: (r) => ({ kind: 'knowledge', knowledgeId: r.id, label: r.title }),
   table: (r) => ({ kind: 'table', tableId: r.id, label: r.title }),

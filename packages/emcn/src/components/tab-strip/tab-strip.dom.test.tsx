@@ -1,10 +1,12 @@
 /**
  * @vitest-environment jsdom
  */
-import { act, type ReactNode } from 'react'
+import { act, createRef, type ReactNode } from 'react'
+import { Slot } from '@radix-ui/react-slot'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { TabStrip, type TabStripItem } from './tab-strip'
+import { TabStripAction } from './tab-strip-action'
 
 let root: Root | null = null
 let container: HTMLDivElement | null = null
@@ -62,6 +64,38 @@ function scrollRow(): HTMLDivElement {
 }
 
 describe('TabStrip interactions', () => {
+  it('forwards action refs and native props through slotted triggers', () => {
+    const ref = createRef<HTMLButtonElement>()
+    const onTrigger = vi.fn()
+    const onAction = vi.fn()
+    const renderAction = (disabled = false) => (
+      <Slot onClick={onTrigger} data-state='closed'>
+        <TabStripAction ref={ref} aria-label='Export' disabled={disabled} onClick={onAction}>
+          Export
+        </TabStripAction>
+      </Slot>
+    )
+    mount(renderAction())
+    const button = ref.current
+    expect(button).toBe(container?.querySelector('button'))
+    expect(button?.type).toBe('submit')
+    expect(button?.getAttribute('data-state')).toBe('closed')
+    expect(button?.getAttribute('aria-label')).toBe('Export')
+    act(() => {
+      button?.focus()
+      button?.click()
+    })
+    expect(document.activeElement).toBe(button)
+    expect(onTrigger).toHaveBeenCalledTimes(1)
+    expect(onAction).toHaveBeenCalledTimes(1)
+
+    act(() => root?.render(renderAction(true)))
+    act(() => button?.click())
+    expect(ref.current).toBe(button)
+    expect(onAction).toHaveBeenCalledTimes(1)
+    expect(onTrigger).toHaveBeenCalledTimes(1)
+  })
+
   it('uses one keyboard tab stop and exposes tab semantics', () => {
     mount(renderStrip(tabs))
 
@@ -72,6 +106,23 @@ describe('TabStrip interactions', () => {
     expect(container?.querySelector<HTMLButtonElement>('[aria-label="Close Two"]')?.tabIndex).toBe(
       -1
     )
+  })
+
+  it('owns tabs in visual order without making close buttons children of the tablist', () => {
+    const onClose = vi.fn()
+    mount(renderStrip(tabs, vi.fn(), onClose))
+    const list = container?.querySelector('[role="tablist"]')
+    const ownedIds = list?.getAttribute('aria-owns')?.split(' ')
+    expect(ownedIds).toEqual(tabs.map((tab) => tabButton(tab.id).id))
+    for (const id of ownedIds ?? []) {
+      expect(document.getElementById(id)?.getAttribute('role')).toBe('tab')
+    }
+    const close = container?.querySelector<HTMLButtonElement>('[aria-label="Close Two"]')
+    expect(close?.closest('[role="tablist"], [aria-hidden="true"]')).toBeNull()
+    expect(tabButton('two').getAttribute('aria-keyshortcuts')).toBe('Delete')
+    expect(tabButton('pinned').hasAttribute('aria-keyshortcuts')).toBe(false)
+    act(() => close?.click())
+    expect(onClose).toHaveBeenCalledWith('two')
   })
 
   it('cycles, jumps, and closes from the keyboard', () => {
@@ -95,11 +146,74 @@ describe('TabStrip interactions', () => {
     expect(onSelect).toHaveBeenLastCalledWith('pinned', 'keyboard')
 
     act(() => {
+      tabButton('two').focus()
       tabButton('two').dispatchEvent(
         new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true })
       )
     })
     expect(onClose).toHaveBeenCalledWith('two')
+    expect(document.activeElement).toBe(tabButton('two'))
+  })
+
+  it('restores focus to a committed survivor after an asynchronous multi-tab close', () => {
+    const onClose = vi.fn()
+    mount(renderStrip(tabs, vi.fn(), onClose))
+    act(() => {
+      tabButton('one').focus()
+      tabButton('one').dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }))
+    })
+    expect(document.activeElement).toBe(tabButton('one'))
+    act(() => root?.render(renderStrip(tabs, vi.fn(), onClose)))
+    expect(document.activeElement).toBe(tabButton('one'))
+
+    act(() => root?.render(renderStrip([{ ...tabs[0], active: true }], vi.fn(), onClose)))
+    expect(document.activeElement).toBe(tabButton('pinned'))
+  })
+
+  it('does not steal focus from another control when a pending close completes', () => {
+    mount(renderStrip(tabs))
+    act(() => {
+      tabButton('one').focus()
+      tabButton('one').dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }))
+    })
+    const add = container?.querySelector<HTMLButtonElement>('[aria-label="New tab"]')
+    act(() => add?.focus())
+    act(() => root?.render(renderStrip([{ ...tabs[0], active: true }])))
+    expect(document.activeElement).toBe(add)
+  })
+
+  it('exposes a shared DOM ancestor for multi-tab drag images', () => {
+    const onTabDragStart = vi.fn((event) => {
+      const strip = event.currentTarget.closest('[data-tab-strip]')
+      expect(strip?.querySelectorAll('[data-tab-strip-item]')).toHaveLength(3)
+    })
+    mount(<TabStrip tabs={tabs} onSelect={vi.fn()} onTabDragStart={onTabDragStart} />)
+    act(() => stripItem('two').dispatchEvent(dragStartEvent()))
+    expect(onTabDragStart).toHaveBeenCalledOnce()
+  })
+
+  it('follows the active survivor across staggered tab removals', () => {
+    mount(renderStrip(tabs))
+    act(() => tabButton('one').focus())
+    act(() => root?.render(renderStrip([tabs[0], { ...tabs[2], active: true }])))
+    expect(document.activeElement).toBe(tabButton('two'))
+    act(() => root?.render(renderStrip([{ ...tabs[0], active: true }])))
+    expect(document.activeElement).toBe(tabButton('pinned'))
+  })
+
+  it('relinquishes focus ownership when the user leaves the strip', () => {
+    mount(renderStrip(tabs))
+    const outside = document.createElement('button')
+    document.body.append(outside)
+    try {
+      act(() => tabButton('one').focus())
+      act(() => outside.focus())
+      act(() => outside.blur())
+      act(() => root?.render(renderStrip([{ ...tabs[0], active: true }])))
+      expect(document.activeElement).toBe(document.body)
+    } finally {
+      outside.remove()
+    }
   })
 
   it('identifies pointer selection separately from keyboard navigation', () => {

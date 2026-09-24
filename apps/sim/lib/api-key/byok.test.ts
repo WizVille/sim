@@ -59,6 +59,7 @@ vi.mock('@/stores/providers/store', () => ({
   useProvidersStore: { getState: vi.fn() },
 }))
 
+import { byokProviderIdSchema } from '@/lib/api/contracts/byok-keys'
 import { getApiKeyWithBYOK, getBYOKKey } from '@/lib/api-key/byok'
 import { useProvidersStore } from '@/stores/providers/store'
 
@@ -448,6 +449,182 @@ describe('getBYOKKey', () => {
 
     expect(dbChainMockFns.orderBy).toHaveBeenCalledTimes(4)
     expect(mockIsOrganizationBYOKEntitled).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('getApiKeyWithBYOK provider classification', () => {
+  const dynamicProviders = [
+    'ollama',
+    'vllm',
+    'litellm',
+    'fireworks',
+    'together',
+    'baseten',
+    'ollama-cloud',
+  ] as const
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetDbChainMock()
+    mockIsHosted.value = true
+    mockEnv.AZURE_OPENAI_API_KEY = 'azure-env-key'
+    mockEnv.AZURE_ANTHROPIC_API_KEY = 'azure-anthropic-env-key'
+    mockEnv.VLLM_API_KEY = 'vllm-env-key'
+    mockEnv.LITELLM_API_KEY = 'litellm-env-key'
+    dbChainMockFns.orderBy.mockResolvedValue([storedKey('other-provider-key')])
+    mockDecryptSecret.mockImplementation(async (encrypted: string) => ({
+      decrypted: encrypted.replace('encrypted-', 'decrypted-'),
+    }))
+  })
+
+  it.each(dynamicProviders)(
+    'keeps Azure credentials when %s discovery contains the same model ID',
+    async (discoveredProvider) => {
+      const model = 'AZURE/CustomDeployment'
+      vi.mocked(useProvidersStore.getState).mockReturnValue({
+        providers: Object.fromEntries(
+          dynamicProviders.map((provider) => [
+            provider,
+            { models: provider === discoveredProvider ? [model] : [] },
+          ])
+        ),
+      } as ReturnType<typeof useProvidersStore.getState>)
+
+      const result = await getApiKeyWithBYOK('azure-openai', model, uniqueWorkspaceId())
+
+      expect(result).toEqual({ apiKey: 'azure-env-key', isBYOK: false })
+      expect(dbChainMockFns.where).not.toHaveBeenCalled()
+      expect(mockGetRotatingApiKey).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([
+    ['vertex', 'vertex/CustomDeployment', 'vertex-access-token'],
+    ['azure-anthropic', 'azure-anthropic/CustomDeployment', 'azure-anthropic-user-key'],
+  ])(
+    'retains caller credentials for %s despite a local model name collision',
+    async (provider, model, apiKey) => {
+      vi.mocked(useProvidersStore.getState).mockReturnValue({
+        providers: Object.fromEntries(dynamicProviders.map((name) => [name, { models: [model] }])),
+      } as ReturnType<typeof useProvidersStore.getState>)
+
+      expect(await getApiKeyWithBYOK(provider, model, uniqueWorkspaceId(), apiKey)).toEqual({
+        apiKey,
+        isBYOK: false,
+      })
+      expect(dbChainMockFns.where).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([
+    ['ollama', 'empty'],
+    ['vllm', 'vllm-env-key'],
+    ['litellm', 'litellm-env-key'],
+  ])('preserves %s authentication for a custom unprefixed model', async (provider, apiKey) => {
+    expect(await getApiKeyWithBYOK(provider, 'MyCustomModel', uniqueWorkspaceId())).toEqual({
+      apiKey,
+      isBYOK: false,
+    })
+    expect(dbChainMockFns.where).not.toHaveBeenCalled()
+  })
+
+  it.each(['vllm', 'litellm'])(
+    'prefers a caller key to the configured %s key for a local model',
+    async (provider) => {
+      expect(
+        await getApiKeyWithBYOK(provider, 'MyCustomModel', uniqueWorkspaceId(), 'caller-key')
+      ).toEqual({ apiKey: 'caller-key', isBYOK: false })
+    }
+  )
+
+  it('uses Bedrock credentials for an uncataloged inference profile', async () => {
+    expect(
+      await getApiKeyWithBYOK('bedrock', 'BEDROCK/MyInferenceProfile', uniqueWorkspaceId())
+    ).toEqual({ apiKey: 'placeholder', isBYOK: false })
+    expect(dbChainMockFns.where).not.toHaveBeenCalled()
+  })
+})
+
+describe('getApiKeyWithBYOK for TypeSafe', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetDbChainMock()
+    mockIsHosted.value = true
+    mockGetHostedModels.mockReturnValue(['jev-latest', 'jev-1.13.0', 'jev-preview'])
+    mockGetRotatingApiKey.mockReturnValue('hosted-typesafe-key')
+    mockDecryptSecret.mockImplementation(async (encrypted: string) => ({
+      decrypted: encrypted.replace('encrypted-', 'decrypted-'),
+    }))
+    mockIsOrganizationBYOKEntitled.mockResolvedValue(true)
+  })
+
+  it('accepts TypeSafe in workspace and organization BYOK contracts', () => {
+    expect(byokProviderIdSchema.parse('typesafe')).toBe('typesafe')
+  })
+
+  it.each(['jev-latest', 'jev-1.13.0', 'jev-preview'])(
+    'resolves the platform pool when %s has no BYOK key',
+    async (model) => {
+      await expect(getApiKeyWithBYOK('typesafe', model, uniqueWorkspaceId())).resolves.toEqual({
+        apiKey: 'hosted-typesafe-key',
+        isBYOK: false,
+      })
+      expect(mockGetRotatingApiKey).toHaveBeenCalledWith('typesafe')
+    }
+  )
+
+  it('prefers the workspace pool without selecting a hosted key', async () => {
+    dbChainMockFns.orderBy.mockResolvedValueOnce([storedKey('workspace-key')])
+    await expect(getApiKeyWithBYOK('typesafe', 'jev-latest', uniqueWorkspaceId())).resolves.toEqual(
+      {
+        apiKey: 'decrypted-workspace-key',
+        isBYOK: true,
+        scope: 'workspace',
+      }
+    )
+    expect(mockGetRotatingApiKey).not.toHaveBeenCalled()
+    expect(mockIsOrganizationBYOKEntitled).not.toHaveBeenCalled()
+  })
+
+  it('inherits an entitled organization pool before using hosted credits', async () => {
+    dbChainMockFns.orderBy
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([storedOrganizationKey(uniqueOrganizationId(), 'organization-key')])
+    await expect(getApiKeyWithBYOK('typesafe', 'jev-latest', uniqueWorkspaceId())).resolves.toEqual(
+      {
+        apiKey: 'decrypted-organization-key',
+        isBYOK: true,
+        scope: 'organization',
+      }
+    )
+    expect(mockGetRotatingApiKey).not.toHaveBeenCalled()
+  })
+
+  it('rejects missing hosted credentials instead of making an unauthenticated request', async () => {
+    mockGetRotatingApiKey.mockImplementation(() => {
+      throw new Error('No configured key')
+    })
+    await expect(getApiKeyWithBYOK('typesafe', 'jev-latest', uniqueWorkspaceId())).rejects.toThrow(
+      'No API key available for typesafe jev-latest'
+    )
+  })
+
+  it('never gives the hosted key to an unlisted model', async () => {
+    await expect(getApiKeyWithBYOK('typesafe', 'jev-custom', uniqueWorkspaceId())).rejects.toThrow(
+      'API key is required'
+    )
+    expect(mockGetRotatingApiKey).not.toHaveBeenCalled()
+  })
+
+  it('requires caller credentials on self-hosted deployments', async () => {
+    mockIsHosted.value = false
+    await expect(
+      getApiKeyWithBYOK('typesafe', 'jev-latest', uniqueWorkspaceId(), 'caller-key')
+    ).resolves.toEqual({ apiKey: 'caller-key', isBYOK: false })
+    await expect(getApiKeyWithBYOK('typesafe', 'jev-latest', uniqueWorkspaceId())).rejects.toThrow(
+      'API key is required'
+    )
+    expect(mockGetRotatingApiKey).not.toHaveBeenCalled()
   })
 })
 

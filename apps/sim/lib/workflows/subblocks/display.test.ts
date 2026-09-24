@@ -14,7 +14,9 @@ vi.mock('@/blocks', () => ({
 import {
   getDisplayValue,
   resolveDropdownLabel,
+  resolveFallbackModelsLabel,
   resolveFilterFieldLabel,
+  resolveFolderPathLabel,
   resolveSandboxLabel,
   resolveSkillsLabel,
   resolveToolsLabel,
@@ -186,6 +188,26 @@ describe('resolveSkillsLabel', () => {
   })
 })
 
+describe('resolveFallbackModelsLabel', () => {
+  const fallbackList = { id: 'fallbackModels', type: 'model-fallback-list' } as SubBlockConfig
+
+  it('lists the models in order and never the row keys', () => {
+    expect(
+      resolveFallbackModelsLabel(fallbackList, [
+        { id: 'a', model: 'gpt-5' },
+        { id: 'b', model: 'openrouter/x', apiKey: '{{OPENROUTER_API_KEY}}' },
+        { id: 'c', model: 'gemini-3.6-flash' },
+      ])
+    ).toBe('gpt-5, openrouter/x +1')
+  })
+
+  it('returns null for other subblocks and for an empty or model-less list', () => {
+    expect(resolveFallbackModelsLabel(skillInput, [{ model: 'gpt-5' }])).toBeNull()
+    expect(resolveFallbackModelsLabel(fallbackList, [])).toBeNull()
+    expect(resolveFallbackModelsLabel(fallbackList, [{ id: 'a', model: '' }])).toBeNull()
+  })
+})
+
 describe('resolveSandboxLabel', () => {
   const sandboxes = [{ id: '443f4934-26ab-44ab-8000-000000000000', name: 'Test' }]
 
@@ -295,5 +317,64 @@ describe('getDisplayValue', () => {
 
     expect(getDisplayValue(messages)).toBe(content)
     expect(getDisplayValue(serializedMessages)).toBe(content)
+  })
+})
+
+/**
+ * A type listed in SELECTOR_TYPES_HYDRATION_REQUIRED with no resolver renders
+ * as the unset placeholder, so a folder picked in the editor showed as "-" on
+ * the canvas, indistinguishable from having picked nothing.
+ */
+describe('resolveFolderPathLabel', () => {
+  const folderSubBlock = {
+    id: 'createParentPath',
+    type: 'folder-selector',
+    resourceType: 'file',
+  } as any
+
+  it('names a folder from its canonical path', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '/Other')).toBe('Other')
+  })
+
+  it('reads a nested path as its names', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '/Other/Vik')).toBe('Other / Vik')
+  })
+
+  it('decodes an encoded name rather than showing the escape', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '/Reports/Q3%20Results')).toBe(
+      'Reports / Q3 Results'
+    )
+  })
+
+  it('keeps a slash inside a name out of the separator', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '/Q3%2FQ4')).toBe('Q3/Q4')
+  })
+
+  it('leaves an unset value to the placeholder', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '')).toBeNull()
+    expect(resolveFolderPathLabel(folderSubBlock, null)).toBeNull()
+    expect(resolveFolderPathLabel(folderSubBlock, '/')).toBeNull()
+  })
+
+  it('reads an array-shaped value the other readers accept', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, ['/Other/Vik'])).toBe('Other / Vik')
+    expect(resolveFolderPathLabel(folderSubBlock, '["/Other/Vik"]')).toBe('Other / Vik')
+  })
+
+  it('summarizes every selected folder', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, ['/One', '/Two', '/Three'])).toBe('One, Two +1')
+  })
+
+  it('leaves an empty array to the placeholder', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, [])).toBeNull()
+    expect(resolveFolderPathLabel(folderSubBlock, '[]')).toBeNull()
+  })
+
+  it('ignores a subblock of another type', () => {
+    expect(resolveFolderPathLabel({ id: 'x', type: 'short-input' } as any, '/Other')).toBeNull()
+  })
+
+  it('shows a hand-typed path that will not parse as typed', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, 'Other')).toBe('Other')
   })
 })

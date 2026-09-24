@@ -17,6 +17,7 @@ import { getColumnId } from '@/lib/table/column-keys'
 import type { ColumnType } from '@/lib/table/column-types'
 import { parseCurrencyInput } from '@/lib/table/currency'
 import { type NormalizeDateCellOptions, normalizeDateCellValue } from '@/lib/table/dates'
+import { normalizeTtlTimestamp } from '@/lib/table/ttl-values'
 import type { ColumnDefinition, RowData, TableSchema } from '@/lib/table/types'
 import { MAX_WORKSPACE_FILE_SIZE } from '@/lib/uploads/shared/types'
 
@@ -468,12 +469,10 @@ export function inferSchemaFromCsv(
  * back to the original string when unparseable so that schema validation can
  * reject it with context rather than silently inserting `null`.
  *
- * Deliberately NOT routed through the column-type registry's `coerce`, despite
- * covering the same types. The registry's contract is "coerced or rejected",
- * which the write path turns into `null`; an import instead wants an
- * unparseable date or JSON blob to survive as its raw string so the row-level
- * validation error names the offending value. Unifying the two would silently
- * swap a descriptive import error for a blanked cell.
+ * Deliberately not routed through the column-type registry: its contract is
+ * "coerced or rejected", while an import needs invalid raw text to survive so
+ * row-level validation can name it. Lightweight parsers keep the full
+ * column registry out of CSV clients.
  */
 export function coerceValue(
   value: unknown,
@@ -481,7 +480,10 @@ export function coerceValue(
   options?: NormalizeDateCellOptions & { currencyCode?: string }
 ): string | number | boolean | null | Record<string, unknown> | unknown[] {
   if (value === null || value === undefined || value === '') return null
+
   switch (colType) {
+    case 'ttl':
+      return normalizeTtlTimestamp(value)
     case 'number': {
       const n = Number(value)
       return Number.isNaN(n) ? null : n

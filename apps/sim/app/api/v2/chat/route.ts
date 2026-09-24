@@ -1,8 +1,13 @@
+import {
+  isUserCredentialPrincipal,
+  type OAuthAccessTokenPrincipal,
+  type PersonalApiKeyPrincipal,
+} from '@sim/auth/principal'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { truncate } from '@sim/utils/string'
-import type { NextRequest } from 'next/server'
+import type { NextRequest, NextResponse } from 'next/server'
 import { v2ChatContract } from '@/lib/api/contracts/v2/chat'
 import { parseRequest } from '@/lib/api/server'
 import {
@@ -36,9 +41,22 @@ import { runHeadlessCopilotLifecycle } from '@/lib/copilot/request/lifecycle/hea
 import { requestExplicitStreamAbort } from '@/lib/copilot/request/session/explicit-abort'
 import type { OrchestratorResult, StreamEvent } from '@/lib/copilot/request/types'
 import { normalizeSecretMountPolicy } from '@/lib/copilot/secret-mount-policy'
+import {
+  ForbiddenOperationError,
+  forbiddenErrorDetails,
+  PersonalApiKeysDisabledError,
+  requireUserCredentialCapabilities,
+  type WorkspaceAuthorizationContext,
+} from '@/lib/core/application'
 import { isDocSandboxEnabled } from '@/lib/core/config/env-flags'
+import { acceptsMediaType } from '@/lib/core/utils/media-types'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { getPersonalAndWorkspaceEnv } from '@/lib/environment/utils'
+import { CAPABILITY_RULES } from '@/lib/permission-groups/capabilities'
+import {
+  capabilityRefusal,
+  isWorkspaceCapabilityWithheld,
+} from '@/lib/permission-groups/capability-assertions'
 import {
   assertActiveWorkspaceAccess,
   isWorkspaceAccessDeniedError,
@@ -75,6 +93,35 @@ function deriveConversationTitle(message: string): string | undefined {
   return truncate(normalized, CHAT_TITLE_MAX_LENGTH)
 }
 
+/**
+ * The two user-credential checks `authorizeWorkspaceOperation` applies, for
+ * the one route that never reaches it, or `null` when the credential may
+ * proceed.
+ *
+ * The group half runs through the same {@link requirePersonalApiKeysAllowed} the
+ * funnel and the billing reads call, so a third wording of the same refusal
+ * cannot drift in. Its error is projected rather than thrown because this route
+ * renders its own v2 envelope, and the detail code is read off the error so the
+ * column refusal and the group refusal answer with one code.
+ */
+async function userCredentialPolicyRefusal(
+  principal: PersonalApiKeyPrincipal | OAuthAccessTokenPrincipal,
+  context: WorkspaceAuthorizationContext
+): Promise<NextResponse | null> {
+  const refuse = (error: ForbiddenOperationError) =>
+    v2Error('FORBIDDEN', error.message, { details: forbiddenErrorDetails(error) })
+
+  if (!context.allowPersonalApiKeys) return refuse(new PersonalApiKeysDisabledError())
+
+  try {
+    await requireUserCredentialCapabilities(principal, context)
+  } catch (error) {
+    if (error instanceof ForbiddenOperationError) return refuse(error)
+    throw error
+  }
+  return null
+}
+
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
 }
@@ -82,7 +129,7 @@ function isAbortError(error: unknown): boolean {
 function wantsStreamedChatResponse(req: NextRequest): boolean {
   return (
     req.headers.get(CHAT_STREAM_HEADER) === CHAT_STREAM_VALUE ||
-    req.headers.get('accept')?.includes(CHAT_STREAM_CONTENT_TYPE) === true
+    acceptsMediaType(req.headers.get('accept'), CHAT_STREAM_CONTENT_TYPE)
   )
 }
 
@@ -125,8 +172,8 @@ function buildChatResultPayload(
  * POST /api/v2/chat
  *
  * One conversational turn against the same headless execution path as the Sim
- * Chat block (`/api/mothership/execute`), authenticated with a personal API key
- * instead of the executor's internal JWT. JSON callers get one final response;
+ * Chat block (`/api/mothership/execute`), authenticated with an OAuth access
+ * token or personal API key instead of the executor's internal JWT. JSON callers get one final response;
  * NDJSON callers (`Accept: application/x-ndjson`) get heartbeats and incremental
  * `chunk` events followed by a `final` event, so long-running turns do not look
  * idle to intermediaries.
@@ -146,8 +193,8 @@ export const POST = withRouteHandler(
     if (!admission.success) return admission.response
     const { principal } = admission.auth
 
-    if (principal.kind !== 'personal_api_key') {
-      return v2Error('FORBIDDEN', 'Chat requires a personal API key', {
+    if (!isUserCredentialPrincipal(principal)) {
+      return v2Error('FORBIDDEN', 'Chat requires a personal API key or an OAuth access token', {
         details: { code: 'PRINCIPAL_KIND_NOT_PERMITTED' },
       })
     }
@@ -164,6 +211,58 @@ export const POST = withRouteHandler(
     try {
       const workspaceAccess = await assertActiveWorkspaceAccess(workspaceId, userId)
       const userPermission = workspaceAccess.permission
+
+      /**
+       * permission-group-enforced: personal_api_key.use — this route runs for a
+       * user-held credential, and `admitV2Request` authenticates one without
+       * authorizing it, so the funnel's user-credential policy has to be repeated
+       * here or the same principal `authorizeWorkspaceOperation` refuses still
+       * starts a chat turn.
+       *
+       * Both halves, because they combine with AND: the workspace column is the
+       * coarse switch every workspace has, and the group key narrows it further
+       * for one cohort inside an enterprise organization. Either one saying no
+       * is a no, and checking only `copilot.use` applied neither. A CLI token
+       * passes `cli.use` in the same call, for the same reason.
+       *
+       * Both run after workspace access rather than before it, unlike the
+       * funnel, which can afford to check the column first because its caller
+       * has already loaded the workspace. Here the access check is what loads
+       * it, and answering later only ever conceals more: a caller with no reach
+       * into the workspace is refused without learning how it is configured.
+       */
+      const credentialRefusal = await userCredentialPolicyRefusal(principal, {
+        workspaceId,
+        workspaceOrganizationId: workspaceAccess.workspace?.organizationId ?? null,
+        allowPersonalApiKeys: workspaceAccess.workspace?.allowPersonalApiKeys ?? false,
+      })
+      if (credentialRefusal) return credentialRefusal
+
+      /**
+       * permission-group-enforced: copilot.use — read off the operation so this
+       * route and the funnel can never name different capabilities, and the
+       * error's `detailCode` off the rule for the same reason: a capability
+       * whose rule reports something other than the generic block (the way
+       * `personal_api_key.use` reports `PERSONAL_API_KEYS_DISABLED`) would
+       * otherwise be flattened by a constant spelled out here.
+       *
+       * A raw special route: `admitV2Request` authenticates and rate-limits but
+       * never authorizes, so nothing else on this path applies the capability
+       * `chatOperations.send` declares. Checked after workspace access, for the
+       * reason the funnel gives — a caller with no reach into the workspace is
+       * refused first, so the refusal cannot report which capabilities an
+       * organization withholds to someone who is not in it — and before a
+       * conversation is minted or a turn is billed.
+       */
+      const sendCapability = chatOperations.send.capability
+      if (
+        sendCapability !== 'none' &&
+        (await isWorkspaceCapabilityWithheld(userId, workspaceId, sendCapability))
+      ) {
+        return v2Error('FORBIDDEN', capabilityRefusal(sendCapability), {
+          details: { code: CAPABILITY_RULES[sendCapability].detailCode },
+        })
+      }
 
       const conversationTitle = deriveConversationTitle(message)
 
@@ -236,7 +335,7 @@ export const POST = withRouteHandler(
       const [workspaceContext, integrationTools, entitlements, billingAttribution] =
         await Promise.all([
           generateWorkspaceContext(workspaceId, userId, { workspaceAccess, secretMountPolicy }),
-          buildIntegrationToolSchemas(userId, messageId, undefined, workspaceId),
+          buildIntegrationToolSchemas(userId, undefined, workspaceId),
           computeWorkspaceEntitlements(workspaceId, userId),
           // Hosted execution refuses to run without an attribution snapshot;
           // the executor path receives it as a header, this path resolves it

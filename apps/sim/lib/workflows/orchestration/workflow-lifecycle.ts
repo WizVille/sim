@@ -6,7 +6,7 @@ import { isFolderInWorkspace } from '@sim/platform-authz/workflow'
 import { getPostgresConstraintName, getPostgresErrorCode, toError } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { and, eq, isNull, ne } from 'drizzle-orm'
-import type { OrchestrationErrorCode } from '@/lib/core/orchestration/types'
+import { OrchestrationError, type OrchestrationErrorCode } from '@/lib/core/orchestration/types'
 import { generateRequestId } from '@/lib/core/utils/request'
 import type { DbOrTx } from '@/lib/db/types'
 import { buildDefaultWorkflowArtifacts } from '@/lib/workflows/defaults'
@@ -180,6 +180,52 @@ async function isWorkflowFolderInWorkspace(
   return Boolean(row)
 }
 
+/** Inserts only the workflow row so compound creation can commit its graph and receipt together. */
+export async function createWorkflowInTransaction(tx: DbOrTx, params: PerformCreateWorkflowParams) {
+  const folderId = params.folderId ?? null
+  if (!(await isWorkflowFolderInWorkspace(folderId, params.workspaceId, tx))) {
+    throw new OrchestrationError('not_found', 'Target folder not found')
+  }
+  const name = params.deduplicate
+    ? await deduplicateWorkflowName(params.name, params.workspaceId, folderId, tx)
+    : params.name
+  const sortOrder =
+    params.sortOrder ?? (await nextWorkflowSortOrder(params.workspaceId, folderId, tx))
+  const now = new Date()
+  const row = {
+    id: params.id ?? generateId(),
+    userId: params.userId,
+    workspaceId: params.workspaceId,
+    folderId,
+    name,
+    description: params.description ?? null,
+    sortOrder,
+    lastSynced: now,
+    createdAt: now,
+    updatedAt: now,
+    isDeployed: false,
+    runCount: 0,
+    variables: {},
+  }
+  if (!params.deduplicate) {
+    await tx.insert(workflow).values(row)
+    return row
+  }
+  for (let attempt = 0; attempt < WORKFLOW_NAME_DEDUPLICATION_ATTEMPTS; attempt++) {
+    const [inserted] = await tx
+      .insert(workflow)
+      .values(row)
+      .onConflictDoNothing()
+      .returning({ id: workflow.id })
+    if (inserted) return row
+    row.name = await deduplicateWorkflowName(params.name, params.workspaceId, folderId, tx)
+  }
+  throw new OrchestrationError(
+    'conflict',
+    'Concurrent workflow creation prevented assigning an available name; retry this request'
+  )
+}
+
 export async function performCreateWorkflowTransition(
   params: PerformCreateWorkflowParams
 ): Promise<PerformCreateWorkflowResult> {
@@ -239,7 +285,19 @@ export async function performCreateWorkflowTransition(
           variables: {},
         })
 
-        await saveWorkflowToNormalizedTables(workflowId, workflowState, tx)
+        await saveWorkflowToNormalizedTables(
+          workflowId,
+          workflowState,
+          {
+            /**
+             * Actorless: the starter graph a new workflow is seeded with is the
+             * platform's, not a member's choice of blocks.
+             */
+            workspaceId: null,
+            subjectUserId: null,
+          },
+          tx
+        )
       })
       break
     } catch (error) {

@@ -3,15 +3,16 @@ import { db } from '@sim/db'
 import { copilotChats } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
-import { eq } from 'drizzle-orm'
+import { and, eq, isNull } from 'drizzle-orm'
 import {
   assertBillingAttributionSnapshot,
   type BillingAttributionSnapshot,
   createAttributedBillingRequestEnvelope,
   resolveBillingAttribution,
+  resolveOrganizationBillingAttribution,
 } from '@/lib/billing/core/billing-attribution'
 import { createRunSegment } from '@/lib/copilot/async-runs/repository'
-import { chatPubSub } from '@/lib/copilot/chat-status'
+import { publishChatStatusChanged } from '@/lib/copilot/chat-status'
 import {
   MothershipStreamV1EventType,
   MothershipStreamV1SessionKind,
@@ -72,6 +73,7 @@ export interface StreamingOrchestrationParams {
   titleProvider?: string
   requestId: string
   workspaceId?: string
+  organizationId?: string
   orchestrateOptions: Omit<CopilotLifecycleOptions, 'onEvent'>
   /**
    * Pre-started root; child spans bind to it and `finish()` fires on
@@ -95,6 +97,7 @@ export function createSSEStream(params: StreamingOrchestrationParams): ReadableS
     titleProvider,
     requestId,
     workspaceId,
+    organizationId,
     orchestrateOptions,
     otelRoot,
   } = params
@@ -116,7 +119,7 @@ export function createSSEStream(params: StreamingOrchestrationParams): ReadableS
   const abortController = new AbortController()
   registerActiveStream(streamId, abortController)
 
-  const publisher = new StreamWriter({ streamId, chatId, requestId })
+  const publisher = new StreamWriter({ streamId, chatId, requestId, userId })
 
   // Declared at function scope (same rationale as `cancelReason` below) so the
   // leak backstop in the orchestration's outer finally can always reach them:
@@ -252,6 +255,7 @@ export function createSSEStream(params: StreamingOrchestrationParams): ReadableS
             titleModel,
             titleProvider,
             workspaceId,
+            organizationId,
             billingAttribution: orchestrateOptions.billingAttribution,
             requestId,
             publisher,
@@ -457,6 +461,7 @@ function fireTitleGeneration(params: {
   titleModel: string
   titleProvider?: string
   workspaceId?: string
+  organizationId?: string
   billingAttribution?: BillingAttributionSnapshot
   requestId: string
   publisher: StreamWriter
@@ -471,6 +476,7 @@ function fireTitleGeneration(params: {
     titleModel,
     titleProvider,
     workspaceId,
+    organizationId,
     billingAttribution,
     requestId,
     publisher,
@@ -479,46 +485,65 @@ function fireTitleGeneration(params: {
   if (!chatId || currentChat?.title || !isNewChat) return
 
   requestChatTitle({
+    chatId,
     message,
     model: titleModel,
     provider: titleProvider,
     userId,
     workspaceId,
+    organizationId,
     billingAttribution,
     otelContext,
   })
     .then(async (title) => {
       if (!title) return
-      await db.update(copilotChats).set({ title }).where(eq(copilotChats.id, chatId))
+      // Only stamp the generated title while the chat has none. Title
+      // generation is fired at turn start and resolves asynchronously, so a
+      // user could rename the chat in the meantime; the `isNull` guard makes
+      // the write lose that race instead of clobbering the explicit rename.
+      const stamped = await db
+        .update(copilotChats)
+        .set({ title })
+        .where(and(eq(copilotChats.id, chatId), isNull(copilotChats.title)))
+        .returning({ id: copilotChats.id })
+      // The rename won — do not announce a title the row no longer holds.
+      if (stamped.length === 0) return
       await publisher.publish({
         type: MothershipStreamV1EventType.session,
         payload: { kind: MothershipStreamV1SessionKind.title, title },
       })
-      if (workspaceId) {
-        chatPubSub?.publishStatusChanged({
-          workspaceId,
-          chatId,
-          type: 'renamed',
-        })
-      }
+      publishChatStatusChanged({ workspaceId, organizationId, userId }, { chatId, type: 'renamed' })
     })
     .catch((error) => {
       logger.error(`[${requestId}] Title generation failed:`, error)
     })
 }
 
-// Chat title helper
-
+/** Requests a title through the shared Assistant backend and its attributed billing protocol. */
 export async function requestChatTitle(params: {
+  chatId?: string
   message: string
   model: string
   provider?: string
   userId?: string
   workspaceId?: string
+  organizationId?: string
   billingAttribution?: BillingAttributionSnapshot
   otelContext?: Context
+  signal?: AbortSignal
 }): Promise<string | null> {
-  const { message, model, provider, userId, workspaceId, billingAttribution, otelContext } = params
+  const {
+    chatId,
+    message,
+    model,
+    provider,
+    userId,
+    workspaceId,
+    organizationId,
+    billingAttribution,
+    otelContext,
+    signal,
+  } = params
   if (!message || !model) return null
 
   const headers: Record<string, string> = {
@@ -530,14 +555,23 @@ export async function requestChatTitle(params: {
   Object.assign(headers, getMothershipSourceEnvHeaders())
 
   try {
+    if (organizationId && (!chatId || workspaceId)) {
+      throw new Error('Organization titles require a private chat without a workspace')
+    }
     if (isHosted) {
-      if (!userId || !workspaceId) {
+      if (!userId || (!workspaceId && !organizationId)) {
         throw new Error('Title generation requires a billing actor and workspace')
       }
       const attribution = billingAttribution
         ? assertBillingAttributionSnapshot(billingAttribution)
-        : await resolveBillingAttribution({ actorUserId: userId, workspaceId })
-      if (attribution.actorUserId !== userId || attribution.workspaceId !== workspaceId) {
+        : organizationId
+          ? await resolveOrganizationBillingAttribution({ actorUserId: userId, organizationId })
+          : await resolveBillingAttribution({ actorUserId: userId, workspaceId: workspaceId! })
+      if (
+        attribution.actorUserId !== userId ||
+        attribution.workspaceId !== (workspaceId ?? null) ||
+        (organizationId && attribution.organizationId !== organizationId)
+      ) {
         throw new Error('Title billing attribution does not match its actor and workspace')
       }
 
@@ -549,12 +583,14 @@ export async function requestChatTitle(params: {
     const mothershipBaseURL = await getMothershipBaseURL({ userId })
     const response = await fetchGo(`${mothershipBaseURL}/api/generate-chat-title`, {
       method: 'POST',
+      signal,
       headers,
       body: JSON.stringify({
         message,
         model,
         ...(provider ? { provider } : {}),
         ...(workspaceId ? { workspaceId } : {}),
+        ...(organizationId ? { organizationId, chatId } : {}),
         ...(userId ? { userId } : {}),
       }),
       otelContext,

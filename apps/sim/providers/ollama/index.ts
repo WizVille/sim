@@ -3,6 +3,7 @@ import { getErrorMessage } from '@sim/utils/errors'
 import OpenAI from 'openai'
 import { getOllamaUrl } from '@/lib/core/utils/urls'
 import type { StreamingExecution } from '@/executor/types'
+import { inheritConversationGenerationContext } from '@/providers/conversation-generation'
 import { executeOllamaProviderRequest } from '@/providers/ollama/core'
 import type { ModelsObject } from '@/providers/ollama/types'
 import { createReadableStreamFromOllamaStream } from '@/providers/ollama/utils'
@@ -48,17 +49,23 @@ export const ollamaProvider: ProviderConfig = {
   executeRequest: async (
     request: ProviderRequest
   ): Promise<ProviderResponse | StreamingExecution> => {
-    return executeOllamaProviderRequest(request, {
-      providerId: 'ollama',
-      providerLabel: 'Ollama',
-      createClient: () =>
-        new OpenAI({
-          ...openAICompatTransport(),
-          apiKey: 'empty',
-          baseURL: `${OLLAMA_HOST}/v1`,
-        }),
-      createStream: createReadableStreamFromOllamaStream,
-      logger,
-    })
+    return executeOllamaProviderRequest(
+      inheritConversationGenerationContext(request, {
+        ...request,
+        model: request.model.replace(/^ollama\//i, ''),
+      }),
+      {
+        providerId: 'ollama',
+        providerLabel: 'Ollama',
+        createClient: () =>
+          new OpenAI({
+            ...openAICompatTransport(),
+            apiKey: 'empty',
+            baseURL: `${OLLAMA_HOST}/v1`,
+          }),
+        createStream: createReadableStreamFromOllamaStream,
+        logger,
+      }
+    )
   },
 }

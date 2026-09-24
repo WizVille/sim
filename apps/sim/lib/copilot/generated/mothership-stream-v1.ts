@@ -144,6 +144,7 @@ export interface MothershipStreamV1ToolCallEventEnvelope {
   v: 1
 }
 export interface MothershipStreamV1ToolCallDescriptor {
+  activityDescription?: string
   arguments?: MothershipStreamV1AdditionalPropertiesMap
   executor: MothershipStreamV1ToolExecutor
   mode: MothershipStreamV1ToolMode
@@ -279,9 +280,11 @@ export interface MothershipStreamV1ResourceUpsertPayload {
   resource: MothershipStreamV1ResourceDescriptor
 }
 export interface MothershipStreamV1ResourceDescriptor {
+  clearViewId?: boolean
   id: string
   title?: string
   type: string
+  viewId?: string
 }
 export interface MothershipStreamV1ResourceRemoveEventEnvelope {
   payload: MothershipStreamV1ResourceRemovePayload
