@@ -14,9 +14,18 @@ export interface PiProviderConfig {
  *
  * Providers that require richer configuration remain intentionally excluded:
  * Vertex OAuth, Bedrock IAM, Azure endpoint configuration, OAuth-only providers,
- * and user-supplied base-URL providers such as Ollama, vLLM, and LiteLLM.
+ * and user-supplied base-URL providers such as Ollama and vLLM.
+ *
+ * LiteLLM is the exception: this deployment routes every model through the
+ * gateway, so Pi must offer the same catalog the other model pickers do. It is
+ * gateway-backed rather than key-only — see {@link GATEWAY_CATALOG_PROVIDERS}.
  */
 export const PI_PROVIDER_CONFIGS = [
+  {
+    id: 'litellm',
+    piProviderId: 'litellm',
+    apiKeyEnvVar: 'LITELLM_API_KEY',
+  },
   {
     id: 'anthropic',
     piProviderId: 'anthropic',
@@ -79,3 +88,22 @@ export const PI_PROVIDER_CONFIGS = [
 ] as const satisfies readonly PiProviderConfig[]
 
 export type PiSupportedProvider = (typeof PI_PROVIDER_CONFIGS)[number]['id']
+
+const GATEWAY_CATALOG_PROVIDER_IDS = ['litellm'] as const
+
+/**
+ * Providers whose model catalog is the deployment's own OpenAI-compatible
+ * gateway rather than Pi's pinned list.
+ *
+ * `PI_MODEL_IDS_BY_PROVIDER` is generated from the installed Pi SDK, which
+ * cannot know what a self-hosted LiteLLM proxy advertises, so a pinned-catalog
+ * lookup would refuse every gateway model. These providers take the model id
+ * from the picker as-is and let the gateway reject an unknown one.
+ */
+export const GATEWAY_CATALOG_PROVIDERS = new Set<PiSupportedProvider>(GATEWAY_CATALOG_PROVIDER_IDS)
+
+/** A provider whose models come from Pi's generated catalog. */
+export type PinnedCatalogProvider = Exclude<
+  PiSupportedProvider,
+  (typeof GATEWAY_CATALOG_PROVIDER_IDS)[number]
+>

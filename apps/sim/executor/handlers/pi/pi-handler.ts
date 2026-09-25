@@ -58,7 +58,12 @@ import type {
 import { attachTrustedExecutionCost } from '@/executor/utils/errors'
 import { refuseResolvedSecretProjection } from '@/executor/utils/resolved-secret-projection-refusal'
 import type { ModelCost } from '@/providers/cost-policy'
-import { isPiSupportedProvider, resolvePiModelId } from '@/providers/pi-providers'
+import { GATEWAY_CATALOG_PROVIDERS } from '@/providers/pi-provider-configs'
+import {
+  isPiSupportedProvider,
+  resolvePiModelId,
+  runsPiModelClientInSandbox,
+} from '@/providers/pi-providers'
 import { getProviderFromModel } from '@/providers/utils'
 import type { SerializedBlock } from '@/serializer/types'
 
@@ -223,6 +228,14 @@ export class PiBlockHandler implements BlockHandler {
     if (!piModel) {
       throw new Error(
         `Pi model "${model}" is not available for provider "${providerId}" in the installed Pi catalog`
+      )
+    }
+    // WizVille patch: gateway-backed models are defined on Sim's own model
+    // runtime, which only the in-process modes use. Pi's CLI in the sandbox
+    // resolves providers from its pinned catalog and would fail opaquely.
+    if (GATEWAY_CATALOG_PROVIDERS.has(providerId) && runsPiModelClientInSandbox(mode)) {
+      throw new Error(
+        `Pi model "${model}" is served by the ${providerId} gateway, which this mode cannot reach because it runs the model client inside the sandbox. Use Local Dev or Review Code.`
       )
     }
 

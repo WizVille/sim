@@ -26,6 +26,7 @@ import {
   createPiModelRuntime,
   loadPiSdk,
   type PiSdk,
+  registerPiGatewayModel,
   resolvePiSdkModel,
   toPiTool,
 } from '@/executor/handlers/pi/core/pi-sdk'
@@ -40,6 +41,7 @@ import {
   openSshSession,
   type PiSshSession,
 } from '@/executor/handlers/pi/local/ssh-tools'
+import { GATEWAY_CATALOG_PROVIDERS } from '@/providers/pi-provider-configs'
 import { getPiProviderId } from '@/providers/pi-providers'
 
 const logger = createLogger('PiLocalBackend')
@@ -65,6 +67,12 @@ async function runLocalAgent(
 ): Promise<PiRunResult> {
   const piProviderId = getPiProviderId(params.providerId)
   const modelRuntime = await createPiModelRuntime(sdk)
+  // A gateway provider has no entry in Pi's pinned catalog, so its model has to
+  // be declared before the key is set: `setRuntimeApiKey` recomputes the
+  // available-model snapshot from what is registered at that moment.
+  if (GATEWAY_CATALOG_PROVIDERS.has(params.providerId)) {
+    registerPiGatewayModel(modelRuntime, params.providerId, piProviderId, params.piModel)
+  }
   await modelRuntime.setRuntimeApiKey(piProviderId, params.apiKey)
 
   try {

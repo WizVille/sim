@@ -1,8 +1,12 @@
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai'
 import type { ModelRuntime, ResourceLoader, ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { isRecordLike } from '@sim/utils/object'
+import { env } from '@/lib/core/config/env'
 import type { PiToolSpec } from '@/executor/handlers/pi/core/backend'
 import { createScrubbedPiError, scrubPiSecrets } from '@/executor/handlers/pi/core/redaction'
+import { getConversationModelLimits } from '@/providers/conversation-model'
+import { getThinkingCapability } from '@/providers/models'
+import type { PiSupportedProvider } from '@/providers/pi-provider-configs'
 
 /** The Pi SDK module, loaded dynamically so it stays externalized from the bundle. */
 export type PiSdk = typeof import('@earendil-works/pi-coding-agent')
@@ -65,6 +69,65 @@ export function createPiModelRuntime(sdk: PiSdk): Promise<ModelRuntime> {
     modelsPath: null,
     allowModelNetwork: false,
   })
+}
+
+/**
+ * Declares a gateway-backed provider's selected model on the runtime.
+ *
+ * WizVille patch: this deployment routes every model through its own LiteLLM
+ * gateway, whose catalog is unknowable to the Pi SDK's pinned list, so
+ * `getModel` would resolve nothing. Registering the one model the run asked for
+ * is enough — Pi only needs the definition it is about to stream against, and
+ * the gateway rejects an id it does not serve. Keep this on every merge.
+ *
+ * Limits come from Sim's own catalog, which recognizes the gateway's model IDs
+ * because they mirror the upstream vendor IDs, and fall back to conservative
+ * defaults otherwise. Cost is zeroed because Sim prices the run itself from the
+ * Sim catalog ID; a second price here would only be a number Pi displays.
+ *
+ * @throws when the deployment has not configured a base URL for the gateway.
+ */
+export function registerPiGatewayModel(
+  modelRuntime: ModelRuntime,
+  providerId: PiSupportedProvider,
+  piProviderId: string,
+  modelId: string
+): void {
+  const baseUrl = getPiGatewayBaseUrl(providerId)
+  if (!baseUrl) {
+    throw new Error(
+      `Pi provider "${providerId}" is gateway-backed but no base URL is configured for it`
+    )
+  }
+
+  const { contextWindow, outputTokens } = getConversationModelLimits(modelId)
+
+  modelRuntime.registerProvider(piProviderId, {
+    name: providerId,
+    baseUrl,
+    api: 'openai-completions',
+    models: [
+      {
+        id: modelId,
+        name: modelId,
+        reasoning: getThinkingCapability(modelId) !== null,
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow,
+        maxTokens: outputTokens,
+      },
+    ],
+  })
+}
+
+/**
+ * OpenAI-compatible endpoint backing a gateway provider. `/v1` matches the path
+ * Sim's own LiteLLM provider posts to, so both callers reach the same gateway.
+ */
+function getPiGatewayBaseUrl(providerId: PiSupportedProvider): string | undefined {
+  if (providerId !== 'litellm') return undefined
+  const configured = env.LITELLM_BASE_URL?.replace(/\/$/, '')
+  return configured ? `${configured}/v1` : undefined
 }
 
 /** Resolves only model definitions that the installed Pi SDK declares exactly. */

@@ -9,30 +9,62 @@ import { useProvidersStore } from '@/stores/providers/store'
 
 const originalBaseModels = useProvidersStore.getState().providers.base.models
 const originalOpenRouterModels = useProvidersStore.getState().providers.openrouter.models
+const originalLiteLlmModels = useProvidersStore.getState().providers.litellm.models
 
+/**
+ * WizVille patch: every model picker is restricted to the LiteLLM gateway, and
+ * Pi's pinned catalog cannot know what a self-hosted gateway advertises, so
+ * LiteLLM is declared gateway-backed in `PI_PROVIDER_CONFIGS`. Keep these
+ * assertions on every merge — they are the tripwire for both halves of the
+ * patch: the gateway restriction in `buildModelOptions` and the gateway
+ * short-circuit in `resolvePiModelId`. The upstream pinned-catalog coverage
+ * they displace is skipped below.
+ */
 describe('Pi model options under the LiteLLM restriction', () => {
-  /**
-   * WizVille patch: `getModelOptions` only offers what the LiteLLM gateway
-   * advertises, and Pi's pinned catalog has no LiteLLM provider, so the Pi picker is
-   * empty by construction here. Keep this assertion on every merge — it is the
-   * tripwire that fails when the gateway restriction in `buildModelOptions` is
-   * dropped, and the upstream coverage it displaces is skipped below.
-   */
-  it('offers no Pi models while the picker is restricted to the LiteLLM gateway', () => {
+  beforeAll(() => {
     const store = useProvidersStore.getState()
     store.setProviderModels('base', ['claude-sonnet-4-6', 'gpt-5.4'])
     store.setProviderModels('openrouter', ['openrouter/openai/gpt-5'])
-    store.setProviderModels('litellm', ['litellm/gpt-5.4-mini'])
+    store.setProviderModels('litellm', [
+      'litellm/gpt-5.4-mini',
+      'litellm/claude-sonnet-4-6',
+      'litellm/some-self-hosted-model',
+    ])
+  })
 
-    expect(getPiModelOptions()).toEqual([])
-
+  afterAll(() => {
+    const store = useProvidersStore.getState()
     store.setProviderModels('base', originalBaseModels)
     store.setProviderModels('openrouter', originalOpenRouterModels)
+    store.setProviderModels('litellm', originalLiteLlmModels)
+  })
+
+  it('offers the gateway catalog, including models absent from the pinned list', () => {
+    const modelIds = getPiModelOptions().map(({ id }) => id)
+
+    expect(modelIds).toContain('litellm/gpt-5.4-mini')
+    expect(modelIds).toContain('litellm/claude-sonnet-4-6')
+    expect(modelIds).toContain('litellm/some-self-hosted-model')
+  })
+
+  it('offers nothing outside the gateway', () => {
+    const modelIds = getPiModelOptions().map(({ id }) => id)
+
+    expect(modelIds.every((id) => id.startsWith('litellm/'))).toBe(true)
+  })
+
+  it('resolves gateway models to their provider-relative id', () => {
+    expect(resolvePiModelId('litellm', 'litellm/gpt-5.4-mini')).toBe('gpt-5.4-mini')
+  })
+
+  it('rejects an unprefixed id for a gateway provider', () => {
+    expect(resolvePiModelId('litellm', 'gpt-5.4-mini')).toBeUndefined()
+    expect(resolvePiModelId('litellm', 'litellm/')).toBeUndefined()
   })
 })
 
 /**
- * Upstream's catalog-filtering coverage. It needs a Pi-supported provider to reach
+ * Upstream's catalog-filtering coverage. It needs non-LiteLLM providers to reach
  * the model picker, which the LiteLLM-gateway restriction above removes. Re-enable
  * this block if this deployment ever stops routing every model through LiteLLM.
  */
