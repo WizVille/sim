@@ -2,6 +2,7 @@
  * @vitest-environment node
  */
 import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
 import { evaluateSandboxBundle } from '@/lib/execution/sandbox/bundles/verify'
 import type { SandboxBundleName } from '@/lib/execution/sandbox/types'
@@ -36,5 +37,17 @@ describe('sandbox bundles', () => {
   it('pptxgenjs evaluates in a bare context and exposes its constructor', () => {
     const source = readFileSync(new URL('./pptxgenjs.cjs', import.meta.url), 'utf-8')
     expect(typeof evaluateSandboxBundle(source, 'pptxgenjs')).toBe('function')
+  })
+
+  /**
+   * `build.ts` injects `import * as __processPolyfill from 'process/browser'`
+   * into every entry, so an unresolvable `process` fails `bun run build` for
+   * the whole app — at deploy time, long after CI. Assert it here instead: the
+   * package is only reachable through this one import, which makes it an easy
+   * dependency to drop as unused.
+   */
+  it('resolves the process polyfill every bundle entry imports', () => {
+    const require = createRequire(import.meta.url)
+    expect(() => require.resolve('process/browser')).not.toThrow()
   })
 })

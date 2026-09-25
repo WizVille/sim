@@ -1206,10 +1206,16 @@ export function getApiKey(provider: string, model: string, userProvidedKey?: str
     }
   }
 
-  // if (!hasUserKey) {
-  //   throw new Error(`API key is required for ${provider} ${model}`)
-  // }
-
+  /**
+   * WizVille patch: upstream throws `API key is required for ${provider} ${model}`
+   * here. Every model in this fork is served by the LiteLLM gateway, which supplies
+   * the credential itself, and the Azure and Vertex providers mint their own key
+   * after this function has already returned — so demanding one up front rejects
+   * requests that are perfectly able to run. The non-null assertion keeps the
+   * runtime value unchanged rather than substituting a default. Mirrors
+   * `getApiKeyWithBYOK` in `@/lib/api-key/byok`, which is the path production
+   * actually takes. Keep it on every merge.
+   */
   return userProvidedKey!
 }
 

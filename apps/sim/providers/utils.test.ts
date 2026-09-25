@@ -96,13 +96,18 @@ describe('getApiKey', () => {
     expect(key3).toBe('user-key-google')
   })
 
-  it('should throw error if no key provided in non-hosted environment', () => {
+  /**
+   * WizVille patch: upstream throws `API key is required` when no key reaches
+   * `getApiKey`. This fork removed that throw on purpose — see the comment at the
+   * end of `getApiKey` — so the contract these cases pin is "returns the absent
+   * key unchanged", not "rejects". A merge that restores the upstream throw fails
+   * here. Keep it on every merge.
+   */
+  it('returns no key rather than throwing in a non-hosted environment', () => {
     setEnvFlags({ isHosted: false })
 
-    expect(() => getApiKey('openai', 'gpt-4')).toThrow('API key is required for openai gpt-4')
-    expect(() => getApiKey('anthropic', 'claude-3')).toThrow(
-      'API key is required for anthropic claude-3'
-    )
+    expect(getApiKey('openai', 'gpt-4')).toBeUndefined()
+    expect(getApiKey('anthropic', 'claude-3')).toBeUndefined()
   })
 
   it('should fall back to user key in hosted environment if rotation fails', () => {
@@ -126,33 +131,29 @@ describe('getApiKey', () => {
     expect(() => getApiKey('openai', 'gpt-4o')).toThrow('No API key available for openai gpt-4o')
   })
 
-  it('should require user key for non-OpenAI/Anthropic providers even in hosted environment', () => {
+  it('passes a user key through for non-OpenAI/Anthropic providers even in hosted environment', () => {
     setEnvFlags({ isHosted: true })
 
     const key = getApiKey('other-provider', 'some-model', 'user-key')
     expect(key).toBe('user-key')
 
-    expect(() => getApiKey('other-provider', 'some-model')).toThrow(
-      'API key is required for other-provider some-model'
-    )
+    expect(getApiKey('other-provider', 'some-model')).toBeUndefined()
   })
 
-  it('should require user key for models NOT in hosted list even if provider matches', () => {
+  it('never serves a rotating key for models NOT in the hosted list even if the provider matches', () => {
     setEnvFlags({ isHosted: true })
 
     const key1 = getApiKey('anthropic', 'claude-sonnet-4-20250514', 'user-key-anthropic')
     expect(key1).toBe('user-key-anthropic')
 
-    expect(() => getApiKey('anthropic', 'claude-sonnet-4-20250514')).toThrow(
-      'API key is required for anthropic claude-sonnet-4-20250514'
-    )
+    expect(getApiKey('anthropic', 'claude-sonnet-4-20250514')).toBeUndefined()
+    expect(mockGetRotatingApiKey).not.toHaveBeenCalled()
 
     const key2 = getApiKey('openai', 'gpt-4o-2024-08-06', 'user-key-openai')
     expect(key2).toBe('user-key-openai')
 
-    expect(() => getApiKey('openai', 'gpt-4o-2024-08-06')).toThrow(
-      'API key is required for openai gpt-4o-2024-08-06'
-    )
+    expect(getApiKey('openai', 'gpt-4o-2024-08-06')).toBeUndefined()
+    expect(mockGetRotatingApiKey).not.toHaveBeenCalled()
   })
 
   it('should return empty for ollama provider without requiring API key', () => {
@@ -177,7 +178,15 @@ describe('getApiKey', () => {
       })
       try {
         expect(getApiKey('azure-openai', 'azure/MyDeployment', 'azure-key')).toBe('azure-key')
-        expect(() => getApiKey('azure-openai', 'azure/MyDeployment')).toThrow('API key is required')
+        /**
+         * The property under test is that the routed provider never falls into
+         * the colliding local provider's credential-free `'empty'` branch. This
+         * fork returns the absent key instead of throwing, so assert the branch
+         * directly rather than relying on the upstream rejection.
+         */
+        const collided = getApiKey('azure-openai', 'azure/MyDeployment')
+        expect(collided).not.toBe('empty')
+        expect(collided).toBeUndefined()
       } finally {
         useProvidersStore.setState({ providers: originalProviders })
       }

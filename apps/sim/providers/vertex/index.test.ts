@@ -1,7 +1,7 @@
 /**
  * @vitest-environment node
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ProviderRequest } from '@/providers/types'
 
 const { mockGoogleGenAI, genAIArgs, mockExecuteGeminiRequest } = vi.hoisted(() => {
@@ -25,7 +25,14 @@ vi.mock('google-auth-library', () => ({
   },
 }))
 vi.mock('@/providers/gemini/core', () => ({ executeGeminiRequest: mockExecuteGeminiRequest }))
-vi.mock('@/lib/core/config/env', () => ({ env: {} }))
+/**
+ * WizVille patch: the provider mints its access token from our own
+ * `/api/ilovellm/google_access_token` endpoint instead of the caller-supplied
+ * key, so it reads `getEnv` and calls `fetch` before it ever builds a client.
+ * Both have to be stubbed or every test that gets past validation throws.
+ * Keep it on every merge.
+ */
+vi.mock('@/lib/core/config/env', () => ({ env: {}, getEnv: () => 'https://app.wizville.test' }))
 
 import { vertexProvider } from '@/providers/vertex'
 
@@ -44,6 +51,14 @@ describe('vertexProvider location and project validation', () => {
     vi.clearAllMocks()
     genAIArgs.length = 0
     mockExecuteGeminiRequest.mockResolvedValue({ content: 'ok' })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ json: async () => ({ token: 'ya29.minted-token' }) })
+    )
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
   })
 
   it('rejects a location that terminates the URL authority', async () => {

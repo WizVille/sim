@@ -36,6 +36,13 @@ interface BunBuildOptions {
   minify: boolean
   sourcemap: string
   root: string
+  /**
+   * Bun >= 1.2 rejects with an `AggregateError` whose message is a bare
+   * "Bundle failed" and whose causes hang off `.errors`, which structured
+   * logging drops — a failed deploy then reports nothing actionable. Opting
+   * back out keeps the diagnostics in `result.logs`, which the caller prints.
+   */
+  throw: boolean
 }
 declare const Bun: { build: (opts: BunBuildOptions) => Promise<BunBuildResult> }
 
@@ -54,6 +61,13 @@ interface BundleSpec {
 }
 
 const POLYFILLS_PATH = join(HERE, '_polyfills.ts')
+/**
+ * `process/browser` comes from the `process` package, which `apps/sim` depends
+ * on directly for this file alone. It is also a transitive dependency of
+ * `readable-stream`, so the bundle resolves even when the direct entry is
+ * missing and the installer happens to hoist it — until an unrelated install
+ * nests it instead and every deploy fails here. Keep the direct dependency.
+ */
 const POLYFILL_PRELUDE = `
 // Isolate-side polyfills must execute BEFORE any other import (process/browser
 // captures setTimeout at module-init time). Keep this as the first import.
@@ -102,6 +116,14 @@ async function main(): Promise<void> {
   mkdirSync(ENTRIES_DIR, { recursive: true })
   mkdirSync(BUNDLES_DIR, { recursive: true })
 
+  try {
+    await buildAll()
+  } finally {
+    rmSync(ENTRIES_DIR, { recursive: true, force: true })
+  }
+}
+
+async function buildAll(): Promise<void> {
   for (const spec of BUNDLES) {
     const entryPath = join(ENTRIES_DIR, `${spec.name}.entry.ts`)
     writeFileSync(entryPath, spec.entry, 'utf-8')
@@ -113,6 +135,7 @@ async function main(): Promise<void> {
       minify: true,
       sourcemap: 'none',
       root: APP_SIM_ROOT,
+      throw: false,
     })
 
     if (!result.success) {
@@ -139,8 +162,6 @@ async function main(): Promise<void> {
     writeFileSync(join(BUNDLES_DIR, spec.outFile), output, 'utf-8')
     logger.info(`built and verified ${spec.outFile} (${code.length.toLocaleString()} chars)`)
   }
-
-  rmSync(ENTRIES_DIR, { recursive: true, force: true })
 }
 
 main().catch((err) => {
