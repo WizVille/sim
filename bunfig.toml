@@ -1,5 +1,9 @@
 [install]
 exact = true
+# Hoist every package into the root node_modules. Bun 1.3 defaults workspaces to the
+# isolated linker, which leaves isolated-vm under apps/sim/node_modules only; the
+# deploy and Docker builds copy the native module from the root node_modules/isolated-vm.
+linker = "hoisted"
 # Supply-chain gate: only install package versions published at least 7 days ago
 # (blocks freshly published, potentially compromised releases).
 minimumReleaseAge = 604800
