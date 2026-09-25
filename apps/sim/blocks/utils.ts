@@ -10,6 +10,7 @@ import {
   findProviderFromModel,
   getBaseModelProviders,
   getHostedModels,
+  getModelSunsetStatus,
   getProviderIcon,
   getProviderModels,
   isAutoModel,
@@ -85,7 +86,13 @@ function buildModelOptions(includeEvaluation: boolean) {
     ])
   ).filter((m) => !m.includes('fallback'))
 
-  const options = allModels
+  // WizVille patch: every model this deployment can reach is served by the LiteLLM
+  // gateway, so the picker offers only what the gateway advertises — never a direct
+  // provider catalog entry we hold no credential for.
+  // Re-applied after a `Merge branch 'main'` dropped it; keep it on every merge.
+  const selectableModels = allModels.filter((m) => m.startsWith('litellm/'))
+
+  const options = selectableModels
     .filter(
       (model) =>
         getModelSunsetStatus(model) !== 'deprecated' &&
@@ -347,7 +354,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       mode: 'basic',
       requiredScopes: getScopesForService('vertex-ai'),
       placeholder: 'Select Google Cloud account',
-      required: true,
+      required: false,
       condition: getModelProviderCondition('vertex'),
     },
     {
@@ -357,7 +364,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       canonicalParamId: 'vertexCredential',
       mode: 'advanced',
       placeholder: 'Enter credential ID',
-      required: true,
+      required: false,
       condition: getModelProviderCondition('vertex'),
     },
     {
@@ -395,7 +402,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       password: true,
       placeholder: 'your-gcp-project-id',
       connectionDroppable: false,
-      required: true,
+      required: false,
       condition: getModelProviderCondition('vertex'),
     },
     {
@@ -404,7 +411,7 @@ export function getProviderCredentialSubBlocks(): SubBlockConfig[] {
       type: 'short-input',
       placeholder: 'us-central1',
       connectionDroppable: false,
-      required: true,
+      required: false,
       condition: getModelProviderCondition('vertex'),
     },
     {

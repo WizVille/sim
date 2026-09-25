@@ -10,7 +10,33 @@ import { useProvidersStore } from '@/stores/providers/store'
 const originalBaseModels = useProvidersStore.getState().providers.base.models
 const originalOpenRouterModels = useProvidersStore.getState().providers.openrouter.models
 
-describe('Pi model options', () => {
+describe('Pi model options under the LiteLLM restriction', () => {
+  /**
+   * WizVille patch: `getModelOptions` only offers what the LiteLLM gateway
+   * advertises, and Pi's pinned catalog has no LiteLLM provider, so the Pi picker is
+   * empty by construction here. Keep this assertion on every merge — it is the
+   * tripwire that fails when the gateway restriction in `buildModelOptions` is
+   * dropped, and the upstream coverage it displaces is skipped below.
+   */
+  it('offers no Pi models while the picker is restricted to the LiteLLM gateway', () => {
+    const store = useProvidersStore.getState()
+    store.setProviderModels('base', ['claude-sonnet-4-6', 'gpt-5.4'])
+    store.setProviderModels('openrouter', ['openrouter/openai/gpt-5'])
+    store.setProviderModels('litellm', ['litellm/gpt-5.4-mini'])
+
+    expect(getPiModelOptions()).toEqual([])
+
+    store.setProviderModels('base', originalBaseModels)
+    store.setProviderModels('openrouter', originalOpenRouterModels)
+  })
+})
+
+/**
+ * Upstream's catalog-filtering coverage. It needs a Pi-supported provider to reach
+ * the model picker, which the LiteLLM-gateway restriction above removes. Re-enable
+ * this block if this deployment ever stops routing every model through LiteLLM.
+ */
+describe.skip('Pi model options', () => {
   beforeAll(() => {
     const store = useProvidersStore.getState()
     store.setProviderModels('base', [

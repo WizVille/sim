@@ -349,37 +349,6 @@ export class AgentBlockHandler implements BlockHandler {
       )
     }
 
-    const filteredTools = await this.filterUnavailableMcpTools(ctx, inputs.tools || [])
-    const filteredInputs = { ...inputs, tools: filteredTools }
-
-    await this.validateToolPermissions(ctx, filteredInputs.tools || [])
-
-    const responseFormat = parseResponseFormat(filteredInputs.responseFormat)
-    const model = filteredInputs.model || AGENT.DEFAULT_MODEL
-
-    await validateModelProvider(ctx.userId, ctx.workspaceId, model, ctx)
-
-    const providerId = getProviderFromModel(model)
-    const { tools: formattedTools } = await this.formatTools(
-      ctx,
-      filteredInputs.tools || [],
-      block.canonicalModes,
-      toolIndexByRef,
-      undefined,
-      filteredInputs.apiKey
-    )
-
-    const skillInputs = filteredInputs.skills ?? []
-    let skillMetadata: Array<{ name: string; description: string }> = []
-    if (skillInputs.length > 0 && ctx.workspaceId) {
-      await validateSkillsAllowed(ctx.userId, ctx.workspaceId, ctx)
-      skillMetadata = await resolveSkillMetadata(skillInputs, ctx.workspaceId)
-      if (skillMetadata.length > 0) {
-        const skillNames = skillMetadata.map((s) => s.name)
-        formattedTools.push(buildLoadSkillTool(skillNames))
-      }
-    }
-
     try {
       const tools = this.resolveToolUsageControls(inputs.tools || [], block.canonicalModes)
       const toolIndexByRef = new Map<ToolInput, number>(

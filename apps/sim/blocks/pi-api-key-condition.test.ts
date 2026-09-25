@@ -25,9 +25,11 @@ describe('Pi API Key visibility', () => {
 
   afterAll(resetEnvFlagsMock)
 
-  it('exposes an apiKey subblock that is required when visible', () => {
+  it('exposes an apiKey subblock', () => {
     expect(apiKeySubBlock).toBeDefined()
-    expect(apiKeySubBlock?.required).toBe(true)
+    // WizVille patch: the LiteLLM gateway holds the credential server-side, so every
+    // shared provider credential is optional here. Keep on every merge.
+    expect(apiKeySubBlock?.required).toBe(false)
   })
 
   // The bug this guards: the field used to hide for hosted models in every mode,

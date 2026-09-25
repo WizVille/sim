@@ -10,7 +10,7 @@ import { getBlockReferenceTags } from '@/lib/workflows/blocks/block-reference-ta
 import { evaluateSubBlockCondition } from '@/lib/workflows/subblocks/visibility'
 import { AgentBlock } from '@/blocks/blocks/agent'
 import { getAgentModelOptions, getModelOptions } from '@/blocks/utils'
-import { getBaseModelProviders } from '@/providers/models'
+import { getBaseModelProviders, isAutoModel } from '@/providers/models'
 import { Serializer } from '@/serializer'
 import { useProvidersStore } from '@/stores/providers/store'
 import type { BlockState } from '@/stores/workflows/workflow/types'
@@ -41,10 +41,17 @@ describe('Agent evaluation configuration', () => {
     }
   })
 
-  it.each([false, true])('shows TypeSafe credentials only when needed, hosted=%s', (hosted) => {
+  /**
+   * WizVille patch: the LiteLLM gateway holds the credential server-side, so the API
+   * Key field is unconditional and optional here rather than gated on the model's
+   * provider the way upstream gates it. Keep this fork assertion on every merge.
+   */
+  it.each([false, true])('keeps the API key field optional, hosted=%s', (hosted) => {
     setEnvFlags({ isHosted: hosted })
     const apiKey = AgentBlock.subBlocks.find((field) => field.id === 'apiKey')!
-    expect(evaluateSubBlockCondition(apiKey.condition, { model: 'jev-latest' })).toBe(!hosted)
+    expect(apiKey.condition).toBeUndefined()
+    expect(apiKey.required).toBe(false)
+    expect(evaluateSubBlockCondition(apiKey.condition, { model: 'jev-latest' })).toBe(true)
   })
 
   it.each(['jev-1.13.0', '<start.model>', '{{MODEL_ID}}'])(
@@ -78,10 +85,25 @@ describe('Agent evaluation configuration', () => {
     }
   )
 
-  it('shows Jev only in the model picker that supports evaluation inputs', () => {
+  /**
+   * WizVille patch: both pickers are restricted to what the LiteLLM gateway
+   * advertises, so a base-catalog model — Jev included — reaches neither one.
+   * Upstream asserts the evaluation split here instead. Keep this fork assertion on
+   * every merge: it is what makes a merge that drops the restriction fail loudly.
+   */
+  it('offers only LiteLLM gateway models in both model pickers', () => {
     useProvidersStore.getState().setProviderModels('base', Object.keys(getBaseModelProviders()))
-    expect(getAgentModelOptions().map((option) => option.id)).toContain('jev-1.13.0')
-    expect(getModelOptions().map((option) => option.id)).not.toContain('jev-1.13.0')
+    useProvidersStore.getState().setProviderModels('litellm', ['litellm/gpt-5.4-mini'])
+
+    const agentIds = getAgentModelOptions().map((option) => option.id)
+    const genericIds = getModelOptions().map((option) => option.id)
+
+    expect(agentIds).toContain('litellm/gpt-5.4-mini')
+    expect(genericIds).toContain('litellm/gpt-5.4-mini')
+    expect(agentIds).not.toContain('jev-1.13.0')
+    expect(genericIds).not.toContain('jev-1.13.0')
+    expect(agentIds.filter((id) => !id.startsWith('litellm/') && !isAutoModel(id))).toEqual([])
+    expect(genericIds.filter((id) => !id.startsWith('litellm/') && !isAutoModel(id))).toEqual([])
   })
 
   describe('evaluation answer references', () => {
