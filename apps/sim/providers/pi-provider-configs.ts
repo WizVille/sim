@@ -18,7 +18,7 @@ export interface PiProviderConfig {
  *
  * LiteLLM is the exception: this deployment routes every model through the
  * gateway, so Pi must offer the same catalog the other model pickers do. It is
- * gateway-backed rather than key-only — see {@link GATEWAY_CATALOG_PROVIDERS}.
+ * gateway-backed rather than key-only — see {@link isGatewayCatalogProvider}.
  */
 export const PI_PROVIDER_CONFIGS = [
   {
@@ -89,8 +89,6 @@ export const PI_PROVIDER_CONFIGS = [
 
 export type PiSupportedProvider = (typeof PI_PROVIDER_CONFIGS)[number]['id']
 
-const GATEWAY_CATALOG_PROVIDER_IDS = ['litellm'] as const
-
 /**
  * Providers whose model catalog is the deployment's own OpenAI-compatible
  * gateway rather than Pi's pinned list.
@@ -100,10 +98,25 @@ const GATEWAY_CATALOG_PROVIDER_IDS = ['litellm'] as const
  * lookup would refuse every gateway model. These providers take the model id
  * from the picker as-is and let the gateway reject an unknown one.
  */
-export const GATEWAY_CATALOG_PROVIDERS = new Set<PiSupportedProvider>(GATEWAY_CATALOG_PROVIDER_IDS)
+export const GATEWAY_CATALOG_PROVIDER_IDS = ['litellm'] as const
+
+/** A provider whose models come from the deployment's own gateway. */
+export type GatewayCatalogProvider = (typeof GATEWAY_CATALOG_PROVIDER_IDS)[number]
+
+const GATEWAY_CATALOG_PROVIDERS = new Set<string>(GATEWAY_CATALOG_PROVIDER_IDS)
+
+/** Whether the provider's models come from the gateway instead of Pi's catalog. */
+export function isGatewayCatalogProvider(
+  providerId: PiSupportedProvider
+): providerId is GatewayCatalogProvider {
+  return GATEWAY_CATALOG_PROVIDERS.has(providerId)
+}
 
 /** A provider whose models come from Pi's generated catalog. */
-export type PinnedCatalogProvider = Exclude<
-  PiSupportedProvider,
-  (typeof GATEWAY_CATALOG_PROVIDER_IDS)[number]
+export type PinnedCatalogProvider = Exclude<PiSupportedProvider, GatewayCatalogProvider>
+
+/** The {@link PI_PROVIDER_CONFIGS} entries Pi's generated catalog covers. */
+export type PinnedCatalogProviderConfig = Extract<
+  (typeof PI_PROVIDER_CONFIGS)[number],
+  { id: PinnedCatalogProvider }
 >

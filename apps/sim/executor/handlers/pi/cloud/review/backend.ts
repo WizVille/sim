@@ -53,7 +53,7 @@ import {
   PI_SEARCH_TOOL_NAME,
   PI_SEARCH_UNTRUSTED_SENTENCE,
 } from '@/executor/handlers/pi/search/normalize'
-import { GATEWAY_CATALOG_PROVIDERS } from '@/providers/pi-provider-configs'
+import { isGatewayCatalogProvider } from '@/providers/pi-provider-configs'
 import { getPiProviderId } from '@/providers/pi-providers'
 import { executeTool } from '@/tools'
 import { requiredTrimmedString } from '@/tools/github/response-parsers'
@@ -295,7 +295,7 @@ export const runCloudReviewPi: PiBackendRun<PiCloudReviewRunParams> = async (par
         // A gateway provider has no entry in Pi's pinned catalog, so its model
         // has to be declared before the key is set: `setRuntimeApiKey`
         // recomputes the available-model snapshot from what is registered then.
-        if (GATEWAY_CATALOG_PROVIDERS.has(params.providerId)) {
+        if (isGatewayCatalogProvider(params.providerId)) {
           registerPiGatewayModel(modelRuntime, params.providerId, piProviderId, params.piModel)
         }
         await modelRuntime.setRuntimeApiKey(piProviderId, params.apiKey)

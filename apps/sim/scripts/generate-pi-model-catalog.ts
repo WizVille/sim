@@ -2,12 +2,27 @@ import { execFileSync } from 'node:child_process'
 import { writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
-import { PI_PROVIDER_CONFIGS } from '@/providers/pi-provider-configs'
+import {
+  isGatewayCatalogProvider,
+  PI_PROVIDER_CONFIGS,
+  type PinnedCatalogProviderConfig,
+} from '@/providers/pi-provider-configs'
 
 const OUTPUT_PATH = new URL('../providers/pi-model-catalog.generated.ts', import.meta.url)
 
+/**
+ * Gateway-backed providers are not Pi built-ins: their models come from the
+ * deployment's own OpenAI-compatible endpoint at run time, so there is nothing
+ * here to pin.
+ */
+function isPinnedCatalogConfig(
+  config: (typeof PI_PROVIDER_CONFIGS)[number]
+): config is PinnedCatalogProviderConfig {
+  return !isGatewayCatalogProvider(config.id)
+}
+
 const catalog = Object.fromEntries(
-  PI_PROVIDER_CONFIGS.map(({ id, piProviderId }) => [
+  PI_PROVIDER_CONFIGS.filter(isPinnedCatalogConfig).map(({ id, piProviderId }) => [
     id,
     getBuiltinModels(piProviderId)
       .map(({ id: modelId }) => modelId)

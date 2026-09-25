@@ -5,7 +5,7 @@ import { env } from '@/lib/core/config/env'
 import type { PiToolSpec } from '@/executor/handlers/pi/core/backend'
 import { createScrubbedPiError, scrubPiSecrets } from '@/executor/handlers/pi/core/redaction'
 import { getConversationModelLimits } from '@/providers/conversation-model'
-import { getThinkingCapability } from '@/providers/models'
+import { getThinkingCapability, isKnownModelId } from '@/providers/models'
 import type { PiSupportedProvider } from '@/providers/pi-provider-configs'
 
 /** The Pi SDK module, loaded dynamically so it stays externalized from the bundle. */
@@ -72,6 +72,15 @@ export function createPiModelRuntime(sdk: PiSdk): Promise<ModelRuntime> {
 }
 
 /**
+ * Limits for a gateway model Sim's catalog does not know. Deliberately below
+ * what a current model offers: Pi compacts the context and caps its output from
+ * these numbers, so overstating them makes the gateway reject a request
+ * mid-run, while understating them only costs some headroom.
+ */
+const GATEWAY_FALLBACK_CONTEXT_WINDOW = 128_000
+const GATEWAY_FALLBACK_MAX_TOKENS = 16_384
+
+/**
  * Declares a gateway-backed provider's selected model on the runtime.
  *
  * WizVille patch: this deployment routes every model through its own LiteLLM
@@ -80,10 +89,8 @@ export function createPiModelRuntime(sdk: PiSdk): Promise<ModelRuntime> {
  * is enough — Pi only needs the definition it is about to stream against, and
  * the gateway rejects an id it does not serve. Keep this on every merge.
  *
- * Limits come from Sim's own catalog, which recognizes the gateway's model IDs
- * because they mirror the upstream vendor IDs, and fall back to conservative
- * defaults otherwise. Cost is zeroed because Sim prices the run itself from the
- * Sim catalog ID; a second price here would only be a number Pi displays.
+ * Cost is zeroed because Sim prices the run itself from the Sim catalog ID; a
+ * second price here would only be a number Pi displays.
  *
  * @throws when the deployment has not configured a base URL for the gateway.
  */
@@ -100,7 +107,10 @@ export function registerPiGatewayModel(
     )
   }
 
-  const { contextWindow, outputTokens } = getConversationModelLimits(modelId)
+  const catalogId = resolveGatewayCatalogId(modelId)
+  const limits = catalogId
+    ? getConversationModelLimits(catalogId)
+    : { contextWindow: GATEWAY_FALLBACK_CONTEXT_WINDOW, outputTokens: GATEWAY_FALLBACK_MAX_TOKENS }
 
   modelRuntime.registerProvider(piProviderId, {
     name: providerId,
@@ -110,14 +120,24 @@ export function registerPiGatewayModel(
       {
         id: modelId,
         name: modelId,
-        reasoning: getThinkingCapability(modelId) !== null,
+        reasoning: catalogId !== undefined && getThinkingCapability(catalogId) !== null,
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow,
-        maxTokens: outputTokens,
+        contextWindow: limits.contextWindow,
+        maxTokens: limits.outputTokens,
       },
     ],
   })
+}
+
+/**
+ * Maps a gateway model ID onto Sim's catalog so its real limits and reasoning
+ * support can be read. A LiteLLM deployment names its models after the upstream
+ * vendor IDs, so most match directly; a version spelled with a dot
+ * (`claude-sonnet-4.6`) matches Sim's dashed ID instead.
+ */
+function resolveGatewayCatalogId(modelId: string): string | undefined {
+  return [modelId, modelId.replace(/\./g, '-')].find(isKnownModelId)
 }
 
 /**

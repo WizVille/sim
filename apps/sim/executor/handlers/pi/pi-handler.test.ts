@@ -80,6 +80,8 @@ vi.mock('@/executor/handlers/pi/cloud/review/backend', () => ({
 vi.mock('@/providers/pi-providers', () => ({
   isPiSupportedProvider: mockIsPiSupportedProvider,
   resolvePiModelId: mockResolvePiModelId,
+  runsPiModelClientInSandbox: (mode: unknown) =>
+    mode === 'cloud' || mode === 'cloud_branch' || mode === 'cloud_plan',
 }))
 vi.mock('@/providers/utils', () => ({
   isFunctionToolCall: (toolCall: unknown) =>
@@ -265,6 +267,40 @@ describe('PiBlockHandler', () => {
       /not available.*installed Pi catalog/
     )
     expect(mockResolveKey).not.toHaveBeenCalled()
+  })
+
+  /**
+   * WizVille patch: gateway models are declared on Sim's own model runtime, so
+   * only the in-process modes can reach them. Keep these on every merge.
+   */
+  it('rejects a gateway model in a mode that runs the model client in the sandbox', async () => {
+    mockGetProviderFromModel.mockReturnValue('litellm')
+    mockResolvePiModelId.mockReturnValue('gpt-5.4')
+
+    await expect(
+      handler.execute(ctx(), block, {
+        mode: 'cloud_plan',
+        task: 'x',
+        model: 'litellm/gpt-5.4',
+        owner: 'o',
+        repo: 'r',
+        githubToken: 'gh',
+      })
+    ).rejects.toThrow(/cannot reach because it runs the model client inside the sandbox/)
+    expect(mockResolveKey).not.toHaveBeenCalled()
+  })
+
+  it('accepts a gateway model in Local Dev', async () => {
+    mockGetProviderFromModel.mockReturnValue('litellm')
+    mockResolvePiModelId.mockReturnValue('gpt-5.4')
+
+    await handler.execute(ctx(), block, localInputs({ model: 'litellm/gpt-5.4' }))
+
+    expect(mockRunLocal.mock.calls[0][0]).toMatchObject({
+      model: 'litellm/gpt-5.4',
+      piModel: 'gpt-5.4',
+      providerId: 'litellm',
+    })
   })
 
   it('passes a persisted catalog model to the backend', async () => {

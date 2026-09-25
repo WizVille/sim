@@ -58,7 +58,7 @@ import type {
 import { attachTrustedExecutionCost } from '@/executor/utils/errors'
 import { refuseResolvedSecretProjection } from '@/executor/utils/resolved-secret-projection-refusal'
 import type { ModelCost } from '@/providers/cost-policy'
-import { GATEWAY_CATALOG_PROVIDERS } from '@/providers/pi-provider-configs'
+import { isGatewayCatalogProvider } from '@/providers/pi-provider-configs'
 import {
   isPiSupportedProvider,
   resolvePiModelId,
@@ -68,7 +68,10 @@ import { getProviderFromModel } from '@/providers/utils'
 import type { SerializedBlock } from '@/serializer/types'
 
 const logger = createLogger('PiBlockHandler')
-const DEFAULT_MODEL = 'claude-sonnet-4-6'
+// WizVille patch: mirrors the Pi block's default; every model is served by the
+// LiteLLM gateway, so upstream's `claude-sonnet-4-6` is unreachable here. Keep
+// this on every merge.
+const DEFAULT_MODEL = 'litellm/claude-sonnet-4.6'
 const REVIEW_EVENTS = ['COMMENT', 'REQUEST_CHANGES'] as const
 const MAX_REVIEW_MENTIONS = 10
 const MAX_REVIEW_MENTION_LENGTH = 200
@@ -233,7 +236,7 @@ export class PiBlockHandler implements BlockHandler {
     // WizVille patch: gateway-backed models are defined on Sim's own model
     // runtime, which only the in-process modes use. Pi's CLI in the sandbox
     // resolves providers from its pinned catalog and would fail opaquely.
-    if (GATEWAY_CATALOG_PROVIDERS.has(providerId) && runsPiModelClientInSandbox(mode)) {
+    if (isGatewayCatalogProvider(providerId) && runsPiModelClientInSandbox(mode)) {
       throw new Error(
         `Pi model "${model}" is served by the ${providerId} gateway, which this mode cannot reach because it runs the model client inside the sandbox. Use Local Dev or Review Code.`
       )

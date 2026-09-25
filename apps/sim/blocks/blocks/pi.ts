@@ -248,7 +248,10 @@ export const PiBlock: BlockConfig<PiResponse> = {
       type: 'combobox',
       placeholder: 'Type or select a model...',
       required: true,
-      defaultValue: 'claude-sonnet-4-6',
+      // WizVille patch: every model is served by the LiteLLM gateway, so the
+      // upstream default (`claude-sonnet-4-6`) is not in the picker. Keep this
+      // on every merge.
+      defaultValue: 'litellm/claude-sonnet-4.6',
       options: getPiModelOptions,
       commandSearchable: true,
     },

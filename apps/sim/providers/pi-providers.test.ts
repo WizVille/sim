@@ -1,17 +1,31 @@
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { describe, expect, it } from 'vitest'
 import { PI_MODEL_IDS_BY_PROVIDER } from '@/providers/pi-model-catalog.generated'
-import { PI_PROVIDER_CONFIGS } from '@/providers/pi-provider-configs'
+import {
+  GATEWAY_CATALOG_PROVIDER_IDS,
+  isGatewayCatalogProvider,
+  PI_PROVIDER_CONFIGS,
+} from '@/providers/pi-provider-configs'
 import { resolvePiModelId } from '@/providers/pi-providers'
 
 describe('Pi provider catalog', () => {
   it('matches the model catalog in the pinned Pi package', () => {
     for (const { id, piProviderId } of PI_PROVIDER_CONFIGS) {
+      // WizVille patch: a gateway-backed provider has no Pi built-in to compare
+      // against — its models are whatever the deployment's own endpoint serves.
+      // Keep this skip on every merge; the generator applies the same rule.
+      if (isGatewayCatalogProvider(id)) continue
       expect([...PI_MODEL_IDS_BY_PROVIDER[id]].sort()).toEqual(
         getBuiltinModels(piProviderId)
           .map(({ id: modelId }) => modelId)
           .sort()
       )
+    }
+  })
+
+  it('leaves gateway providers out of the generated catalog', () => {
+    for (const id of GATEWAY_CATALOG_PROVIDER_IDS) {
+      expect(PI_MODEL_IDS_BY_PROVIDER).not.toHaveProperty(id)
     }
   })
 

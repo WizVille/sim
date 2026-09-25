@@ -1,6 +1,6 @@
 import { PI_MODEL_IDS_BY_PROVIDER } from '@/providers/pi-model-catalog.generated'
 import {
-  GATEWAY_CATALOG_PROVIDERS,
+  isGatewayCatalogProvider,
   PI_PROVIDER_CONFIGS,
   type PinnedCatalogProvider,
   type PiProviderConfig,
@@ -91,7 +91,7 @@ export function resolvePiModelId(providerId: string, modelId: string): string | 
   // provider-relative id is taken as-is. The prefix is still required: an
   // unprefixed id here means the model was resolved to this provider by
   // something other than its own naming, which is never a gateway model.
-  if (GATEWAY_CATALOG_PROVIDERS.has(providerId)) {
+  if (isGatewayCatalogProvider(providerId)) {
     if (!modelId.startsWith(providerPrefix)) return undefined
     return modelId.slice(providerPrefix.length) || undefined
   }

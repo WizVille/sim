@@ -1,7 +1,8 @@
 /**
  * @vitest-environment node
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { resetEnvMock, setEnv } from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
   mockOpenSshSession,
@@ -15,6 +16,7 @@ const {
   mockSetRuntimeApiKey,
   mockRemoveRuntimeApiKey,
   mockCreatePiModelRuntime,
+  mockRegisterProvider,
 } = vi.hoisted(() => ({
   mockOpenSshSession: vi.fn(),
   mockCloseSshSession: vi.fn(),
@@ -27,6 +29,7 @@ const {
   mockSetRuntimeApiKey: vi.fn(),
   mockRemoveRuntimeApiKey: vi.fn(),
   mockCreatePiModelRuntime: vi.fn(),
+  mockRegisterProvider: vi.fn(),
 }))
 
 let sessionEventListener: ((event: unknown) => void) | undefined
@@ -48,6 +51,7 @@ const mockSdk = {
 const mockModelRuntime = {
   setRuntimeApiKey: mockSetRuntimeApiKey,
   removeRuntimeApiKey: mockRemoveRuntimeApiKey,
+  registerProvider: mockRegisterProvider,
 }
 
 vi.mock('@/executor/handlers/pi/core/context', () => ({
@@ -232,5 +236,51 @@ describe('runLocalPi secret boundaries', () => {
     await expect(runLocalPi(params, { onEvent: vi.fn() })).rejects.toThrow(
       'SSH rejected password ***'
     )
+  })
+})
+
+/**
+ * WizVille patch: LiteLLM is gateway-backed, so its model must be declared on
+ * the runtime before the key is set — otherwise `getModel` returns nothing and
+ * the run fails. Keep this on every merge.
+ */
+describe('runLocalPi gateway providers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    setEnv({ LITELLM_BASE_URL: 'https://gateway.test' })
+    mockCreatePiModelRuntime.mockResolvedValue(mockModelRuntime)
+    mockOpenSshSession.mockResolvedValue({ client: {}, sftp: {}, close: mockCloseSshSession })
+    mockBuildSshToolSpecs.mockReturnValue([])
+    mockCaptureRepoChanges.mockResolvedValue({ changedFiles: [], diff: '' })
+    mockCreateAgentSession.mockResolvedValue({ session: mockAgentSession })
+  })
+
+  afterAll(resetEnvMock)
+
+  it('declares the gateway model before the runtime key is set', async () => {
+    const params = baseParams()
+    params.providerId = 'litellm'
+    params.model = 'litellm/gpt-5.4'
+    params.piModel = 'gpt-5.4'
+
+    await runLocalPi(params, { onEvent: vi.fn() })
+
+    expect(mockRegisterProvider).toHaveBeenCalledWith(
+      'litellm',
+      expect.objectContaining({
+        baseUrl: 'https://gateway.test/v1',
+        api: 'openai-completions',
+        models: [expect.objectContaining({ id: 'gpt-5.4' })],
+      })
+    )
+    expect(mockRegisterProvider.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSetRuntimeApiKey.mock.invocationCallOrder[0]
+    )
+  })
+
+  it('leaves pinned-catalog providers unregistered', async () => {
+    await runLocalPi(baseParams(), { onEvent: vi.fn() })
+
+    expect(mockRegisterProvider).not.toHaveBeenCalled()
   })
 })
