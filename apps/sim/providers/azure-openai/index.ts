@@ -830,10 +830,14 @@ export const azureOpenAIProvider: ProviderConfig = {
 
     // Default: base URL provided, construct the responses API URL
     logger.info('Using base endpoint, constructing Responses API URL')
-    const azureApiVersion =
-      request.azureApiVersion || env.AZURE_OPENAI_API_VERSION || '2024-07-01-preview'
     const deploymentName = request.model.replace(/^azure\//i, '')
-    const apiUrl = `${azureEndpoint.replace(/\/$/, '')}/openai/v1/responses?api-version=${azureApiVersion}`
+    // WizVille patch: the `/openai/v1` surface accepts only `api-version=preview`
+    // or no api-version at all — a dated value (including the one forced at the
+    // top of this handler) is answered with 400 "API version not supported".
+    // Dated versions belong to the `/openai/deployments` chat-completions
+    // surface handled above, which keeps reading AZURE_OPENAI_API_VERSION.
+    // Re-applied after a `Merge branch 'main'` dropped it; keep it on every merge.
+    const apiUrl = `${azureEndpoint.replace(/\/$/, '')}/openai/v1/responses`
 
     return executeResponsesProviderRequest(request, {
       providerId: 'azure-openai',

@@ -163,6 +163,27 @@ describe('azureOpenAIProvider — SSRF pinning', () => {
       expect(responsesConfig().fetch).toBeUndefined()
     })
 
+    /**
+     * WizVille patch: the `/openai/v1` surface answers 400 "API version not
+     * supported" to any dated api-version — it takes `preview` or nothing. Keep
+     * this on every merge; a `Merge branch 'main'` has already reintroduced the
+     * query parameter once, which broke every Azure Responses call.
+     */
+    it('builds the v1 Responses URL without an api-version query parameter', async () => {
+      setEnv({
+        AZURE_OPENAI_ENDPOINT: 'https://trusted.openai.azure.com/',
+        AZURE_OPENAI_API_VERSION: '2023-05-15',
+      })
+
+      await azureOpenAIProvider.executeRequest(
+        request({ azureEndpoint: undefined, azureApiVersion: '2024-12-01-preview' })
+      )
+
+      expect(responsesConfig().endpoint).toBe(
+        'https://trusted.openai.azure.com/openai/v1/responses'
+      )
+    })
+
     it.each([false, true])(
       'preserves a custom deployment name through Responses routing (full endpoint: %s)',
       async (fullEndpoint) => {
